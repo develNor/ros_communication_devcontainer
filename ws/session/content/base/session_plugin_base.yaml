@@ -399,7 +399,7 @@ windows:
       - commands:
         - if [ '${irt_1_topic}' = "None" ]; then exit; fi
         - ros2 run image_transport republish --ros-args -p in_transport:=${irt_1_transport} -p out_transport:=raw
-            --remap in/ffmpeg:=${irt_1_topic} --remap out:=${irt_1_topic}/raw
+            --remap in/${irt_1_transport}:=${irt_1_topic} --remap out:=${irt_1_topic}/raw
       - commands:
         - if [ '${irt_2_topic}' = "None" ]; then exit; fi
         - ros2 run image_transport republish --ros-args -p in_transport:=${irt_2_transport} -p out_transport:=raw

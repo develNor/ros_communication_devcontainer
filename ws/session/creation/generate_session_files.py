@@ -1702,6 +1702,16 @@ def func(
                         items2.append((f"it_{i}_ffmpeg_bit_rate", int(tspec.params["bit_rate"])))
                     if "encoder_av_options" in tspec.params:
                         items2.append((f"it_{i}_ffmpeg_encoder_av_options", tspec.params["encoder_av_options"]))
+                elif tspec.type == "foxglove":
+                    # image_transport "foxglove" transport (CompressedVideo) tunables
+                    if "gop_size" in tspec.params:
+                        items2.append((f"it_{i}_foxglove_gop_size", int(tspec.params["gop_size"])))
+                    if "encoder_av_options" in tspec.params:
+                        items2.append((f"it_{i}_foxglove_encoder_av_options", tspec.params["encoder_av_options"]))
+                    if "bit_rate" in tspec.params:
+                        items2.append((f"it_{i}_foxglove_bit_rate", int(tspec.params["bit_rate"])))
+                    if "qmax" in tspec.params:
+                        items2.append((f"it_{i}_foxglove_qmax", int(tspec.params["qmax"])))
                 elif tspec.type == "compressed":
                     if "jpeg_quality" in tspec.params:
                         items2.append((f"it_{i}_compressed_jpeg_quality", int(tspec.params["jpeg_quality"])))

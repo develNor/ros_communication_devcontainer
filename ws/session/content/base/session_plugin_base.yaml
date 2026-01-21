@@ -107,6 +107,10 @@ parameters:
   it_1_ffmpeg_gop_size: # e.g. 10
   it_1_ffmpeg_encoder_av_options: # e.g. "-preset medium -tune zerolatency"
   it_1_ffmpeg_bit_rate: # e.g. "1000000"
+  it_1_foxglove_gop_size:
+  it_1_foxglove_encoder_av_options: 
+  it_1_foxglove_bit_rate: 
+  it_1_foxglove_qmax: -1
   it_1_outgoing_suffix: # e.g. compressed (defaults to it_1_transport if not set)
   it_2_topic: # e.g. /sensors/front_camera/image_raw/compressed
   it_2_transport: # e.g. raw
@@ -114,6 +118,10 @@ parameters:
   it_2_ffmpeg_gop_size: # e.g. 10
   it_2_ffmpeg_encoder_av_options: # e.g. "-preset medium -tune zerolatency"
   it_2_ffmpeg_bit_rate: # e.g. "1000000"
+  it_2_foxglove_gop_size:
+  it_2_foxglove_encoder_av_options:
+  it_2_foxglove_bit_rate:
+  it_2_foxglove_qmax: -1
   it_2_outgoing_suffix: # e.g. compressed (defaults to it_2_transport if not set)
   it_3_topic: # e.g. /sensor/front_camera/image_color/compressed
   it_3_transport: # e.g. raw
@@ -121,6 +129,10 @@ parameters:
   it_3_ffmpeg_gop_size: # e.g. 10
   it_3_ffmpeg_encoder_av_options: # e.g. "-preset medium -tune zerolatency"
   it_3_ffmpeg_bit_rate: # e.g. "1000000"
+  it_3_foxglove_gop_size:
+  it_3_foxglove_encoder_av_options:
+  it_3_foxglove_bit_rate:
+  it_3_foxglove_qmax: -1
   it_3_outgoing_suffix: # e.g. compressed (defaults to it_3_transport if not set)
   it_4_topic: # e.g. /sensor/front_camera/image_color/compressed
   it_4_transport: # e.g. raw
@@ -128,6 +140,10 @@ parameters:
   it_4_ffmpeg_gop_size: # e.g. 10
   it_4_ffmpeg_encoder_av_options: # e.g. "-preset medium -tune zerolatency"
   it_4_ffmpeg_bit_rate: # e.g. "1000000"
+  it_4_foxglove_gop_size:
+  it_4_foxglove_encoder_av_options:
+  it_4_foxglove_bit_rate:
+  it_4_foxglove_qmax: -1
   it_4_outgoing_suffix: # e.g. compressed (defaults to it_4_transport if not set)
 
   irt: false
@@ -320,6 +336,10 @@ windows:
         - '[[ "${it_1_ffmpeg_gop_size}" != "None" ]] && args+=(-p "ut.ffmpeg.gop_size:=${it_1_ffmpeg_gop_size}")'
         - '[[ "${it_1_ffmpeg_encoder_av_options}" != "None" ]] && args+=(-p "ut.ffmpeg.encoder_av_options:=${it_1_ffmpeg_encoder_av_options}")'
         - '[[ "${it_1_ffmpeg_bit_rate}" != "None" ]] && args+=(-p "ut.ffmpeg.bit_rate:=${it_1_ffmpeg_bit_rate}")'
+        - '[[ "${it_1_foxglove_gop_size}" != "None" ]] && args+=(-p "ut.foxglove.gop_size:=${it_1_foxglove_gop_size}")'
+        - '[[ "${it_1_foxglove_encoder_av_options}" != "None" ]] && args+=(-p "ut.foxglove.encoder_av_options:=${it_1_foxglove_encoder_av_options}")'
+        - '[[ "${it_1_foxglove_bit_rate}" != "None" ]] && args+=(-p "ut.foxglove.bit_rate:=${it_1_foxglove_bit_rate}")'
+        - '[[ "${it_1_foxglove_qmax}" != "None" ]] && args+=(-p "ut.foxglove.qmax:=${it_1_foxglove_qmax}")'
         - if [[ "${it_1_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_1_outgoing_suffix}"; else outgoing_suffix="${it_1_transport}"; fi
         - args+=(--remap "in:=${it_1_topic}" --remap "out/${it_1_transport}:=${it_1_topic}/${outgoing_suffix}")
         - echo ${args[@]} 
@@ -332,6 +352,10 @@ windows:
         - '[[ "${it_2_ffmpeg_gop_size}" != "None" ]] && args+=(-p "ut.ffmpeg.gop_size:=${it_2_ffmpeg_gop_size}")'
         - '[[ "${it_2_ffmpeg_encoder_av_options}" != "None" ]] && args+=(-p "ut.ffmpeg.encoder_av_options:=${it_2_ffmpeg_encoder_av_options}")'
         - '[[ "${it_2_ffmpeg_bit_rate}" != "None" ]] && args+=(-p "ut.ffmpeg.bit_rate:=${it_2_ffmpeg_bit_rate}")'
+        - '[[ "${it_2_foxglove_gop_size}" != "None" ]] && args+=(-p "ut.foxglove.gop_size:=${it_2_foxglove_gop_size}")'
+        - '[[ "${it_2_foxglove_encoder_av_options}" != "None" ]] && args+=(-p "ut.foxglove.encoder_av_options:=${it_2_foxglove_encoder_av_options}")'
+        - '[[ "${it_2_foxglove_bit_rate}" != "None" ]] && args+=(-p "ut.foxglove.bit_rate:=${it_2_foxglove_bit_rate}")'
+        - '[[ "${it_2_foxglove_qmax}" != "None" ]] && args+=(-p "ut.foxglove.qmax:=${it_2_foxglove_qmax}")'
         - if [[ "${it_2_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_2_outgoing_suffix}"; else outgoing_suffix="${it_2_transport}"; fi
         - args+=(--remap "in:=${it_2_topic}" --remap "out/${it_2_transport}:=${it_2_topic}/${outgoing_suffix}")
         - echo ${args[@]} 
@@ -344,6 +368,10 @@ windows:
         - '[[ "${it_3_ffmpeg_gop_size}" != "None" ]] && args+=(-p "ut.ffmpeg.gop_size:=${it_3_ffmpeg_gop_size}")'
         - '[[ "${it_3_ffmpeg_encoder_av_options}" != "None" ]] && args+=(-p "ut.ffmpeg.encoder_av_options:=${it_3_ffmpeg_encoder_av_options}")'
         - '[[ "${it_3_ffmpeg_bit_rate}" != "None" ]] && args+=(-p "ut.ffmpeg.bit_rate:=${it_3_ffmpeg_bit_rate}")'
+        - '[[ "${it_3_foxglove_gop_size}" != "None" ]] && args+=(-p "ut.foxglove.gop_size:=${it_3_foxglove_gop_size}")'
+        - '[[ "${it_3_foxglove_encoder_av_options}" != "None" ]] && args+=(-p "ut.foxglove.encoder_av_options:=${it_3_foxglove_encoder_av_options}")'
+        - '[[ "${it_3_foxglove_bit_rate}" != "None" ]] && args+=(-p "ut.foxglove.bit_rate:=${it_3_foxglove_bit_rate}")'
+        - '[[ "${it_3_foxglove_qmax}" != "None" ]] && args+=(-p "ut.foxglove.qmax:=${it_3_foxglove_qmax}")'
         - if [[ "${it_3_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_3_outgoing_suffix}"; else outgoing_suffix="${it_3_transport}"; fi
         - args+=(--remap "in:=${it_3_topic}" --remap "out/${it_3_transport}:=${it_3_topic}/${outgoing_suffix}")
         - echo ${args[@]} 
@@ -356,6 +384,10 @@ windows:
         - '[[ "${it_4_ffmpeg_gop_size}" != "None" ]] && args+=(-p "ut.ffmpeg.gop_size:=${it_4_ffmpeg_gop_size}")'
         - '[[ "${it_4_ffmpeg_encoder_av_options}" != "None" ]] && args+=(-p "ut.ffmpeg.encoder_av_options:=${it_4_ffmpeg_encoder_av_options}")'
         - '[[ "${it_4_ffmpeg_bit_rate}" != "None" ]] && args+=(-p "ut.ffmpeg.bit_rate:=${it_4_ffmpeg_bit_rate}")'
+        - '[[ "${it_4_foxglove_gop_size}" != "None" ]] && args+=(-p "ut.foxglove.gop_size:=${it_4_foxglove_gop_size}")'
+        - '[[ "${it_4_foxglove_encoder_av_options}" != "None" ]] && args+=(-p "ut.foxglove.encoder_av_options:=${it_4_foxglove_encoder_av_options}")'
+        - '[[ "${it_4_foxglove_bit_rate}" != "None" ]] && args+=(-p "ut.foxglove.bit_rate:=${it_4_foxglove_bit_rate}")'
+        - '[[ "${it_4_foxglove_qmax}" != "None" ]] && args+=(-p "ut.foxglove.qmax:=${it_4_foxglove_qmax}")'
         - if [[ "${it_4_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_4_outgoing_suffix}"; else outgoing_suffix="${it_4_transport}"; fi
         - args+=(--remap "in:=${it_4_topic}" --remap "out/${it_4_transport}:=${it_4_topic}/${outgoing_suffix}")
         - echo ${args[@]} 

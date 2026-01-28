@@ -36,6 +36,13 @@
 #
 # ---------------------------------------------------------------------
 
+# TODO:
+# - loss10 ist etwas zu langfristig um in den Status einberechnet zu werden.
+# - loss1 wäre aber zu redundant zu Hz, was bereits in den Status einzahlt
+# - => zusätzliche zwischenstufe loss2 oder loss3 hinzufügen. Für den Status dann maximal loss2 oder loss3 einberechnen.
+# - meist gibt es nur 1 - 2 messages die mal nicht transmitted werden. Dafür den Status ganze 10s lang zu reduzieren scheint zu viel.
+# - loss10 wird weiterhin in die summery ausgegeben, aber nicht für den Status einberechnet.
+
 from __future__ import annotations
 
 from collections import deque

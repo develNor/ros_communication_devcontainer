@@ -89,7 +89,7 @@ class HeartbeatInMonitor(Node):
         self.declare_parameter("delay_good_ms", 50)
         self.declare_parameter("delay_bad_ms", 100)
         self.declare_parameter("loss10_degraded_pct", 2.5)
-        self.declare_parameter("loss10_bad_pct", 5.0)
+        self.declare_parameter("loss10_bad_pct", 5.5)
         # Hz tolerance in messages (due to window timing, ±1 is acceptable)
         self.declare_parameter("hz_ok_tol_msgs", 1)       # OK if within ±1 msg
         self.declare_parameter("hz_degraded_tol_msgs", 2) # Degraded at ±2 msgs

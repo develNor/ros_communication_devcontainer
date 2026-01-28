@@ -146,9 +146,10 @@ class HeartbeatInMonitor(Node):
         self.last_heartbeat_time: Time | None = None
         self.last_seq: int | None = None
         self.expected_next_seq: int | None = None
+        self.last_delay_ms: int = 0  # Store last delay for summary
 
-        # For Hz computation over a sliding time window (similar to hz_monitor)
-        self.msg_count: int = 0
+        # For Hz computation over a sliding time window
+        # We track message timestamps in self.events and compute Hz from there
         self.hz_last_time: Time = self.get_clock().now()
         self.last_hz_observed: float = 0.0
 
@@ -284,10 +285,10 @@ class HeartbeatInMonitor(Node):
         delay_msg.data = f"Last Incoming Heartbeat latency {delay_ms} ms"
         self.delay_pub.publish(delay_msg)
 
-        # Update state for Hz calculations
+        # Update state
         self.last_heartbeat_time = now
         self.last_seq = seq
-        self.msg_count += 1
+        self.last_delay_ms = delay_ms  # Store for summary
 
         # Record event for windowed summary stats
         # Expected delta: 1 new message received in this step.
@@ -297,24 +298,22 @@ class HeartbeatInMonitor(Node):
     def hz_timer_callback(self) -> None:
         """
         Periodic timer to compute and publish the observed heartbeat Hz
-        over the last `hz_window_s` seconds.
+        over the last `hz_window_s` seconds, using the events deque.
         """
         now = self.get_clock().now()
-        elapsed_ns = (now - self.hz_last_time).nanoseconds
-        dt = elapsed_ns / 1e9 if elapsed_ns > 0 else 0.0
+        now_ns = now.nanoseconds
 
-        hz = 0.0
-        if dt > 0.0:
-            hz = self.msg_count / dt
+        # Prune and count messages in the Hz window from the events deque
+        self._prune_events(now_ns, 60.0)
+        cutoff_ns = now_ns - int(self.hz_window_s * 1e9)
+        msg_count_in_window = sum(1 for t_ns, *_ in self.events if t_ns >= cutoff_ns)
 
+        hz = msg_count_in_window / self.hz_window_s if self.hz_window_s > 0 else 0.0
         self.last_hz_observed = hz
 
         hz_msg = String()
         hz_msg.data = f"Incoming Heartbeat frequency: {int(hz)} Hz"
         self.hz_pub.publish(hz_msg)
-
-        self.hz_last_time = now
-        self.msg_count = 0
 
     def summary_timer_callback(self) -> None:
         now = self.get_clock().now()
@@ -352,12 +351,14 @@ class HeartbeatInMonitor(Node):
         # Build aligned summary (fixed lines, fixed widths)
         # Keep all fields present always. Pad strings to keep stable.
         topic = self.heartbeat_topic
+        delay_ms = self.last_delay_ms
 
         line1 = f"HB IN  {topic}"
         line2 = f"STATUS : {status:<19} REASON : {reason:<10}"
         line3 = (
             f"AGE_MS :   {self._fmt_ms(age_ms)}"
-            f"              HZ     :  {self._fmt_hz(hz_obs, exp_hz)}"
+            f"   DELAY_MS : {self._fmt_ms(delay_ms)}"
+            f"   HZ : {self._fmt_hz(hz_obs, exp_hz)}"
         )
         line4 = (
             f"LOSS10 :  {self._fmt_pct(loss10_pct)} "

@@ -844,6 +844,7 @@ def _compute_pipeline(
 
     known_keys = {
         "restamp_if",
+        "drop",
         "framebridge",
         "normalize_on_target",
         "compress",
@@ -885,6 +886,28 @@ def _compute_pipeline(
     if restamp:
         topic = topic + restamped_suffix
     restamp_out = topic
+
+    drop_count = None
+    window_size = None
+    drp_in = None
+    drp_out = None
+    if proc.get("drop") is not None:
+        drop_cfg = proc["drop"]
+        if not isinstance(drop_cfg, dict):
+            raise ValueError(f"drop must be a dict with 'drop_count' and 'window_size' for topic '{entry.base}'")
+        drop_count = drop_cfg.get("drop_count")
+        window_size = drop_cfg.get("window_size")
+        if drop_count is None or window_size is None:
+            raise ValueError(f"drop.drop_count and drop.window_size are required for topic '{entry.base}'")
+        drop_count = int(drop_count)
+        window_size = int(window_size)
+        if drop_count < 0 or window_size <= 0:
+            raise ValueError(f"drop.drop_count must be >= 0 and drop.window_size must be > 0 for topic '{entry.base}'")
+        if drop_count >= window_size:
+            raise ValueError(f"drop.drop_count must be < drop.window_size for topic '{entry.base}'")
+        drp_in = topic
+        drp_out = topic + f"/drop{drop_count}of{window_size}"
+        topic = drp_out
 
     thr_in = None
     thr_out = None
@@ -931,6 +954,10 @@ def _compute_pipeline(
         "restamp": restamp,
         "restamp_in": restamp_in,
         "restamp_out": restamp_out,
+        "drop_count": drop_count,
+        "window_size": window_size,
+        "drp_in": drp_in,
+        "drp_out": drp_out,
         "framebridge": framebridge,
         "fb_l2g_in": fb_l2g_in,
         "fb_g2l_base": fb_g2l_base,
@@ -1373,6 +1400,7 @@ def func(
         # Local inbound derived lists for framebridge (global_to_local topics are specified on inbound direction)
         fb_g2l = _dedup_keep_order([p["fb_g2l_base"] for p in in_pipes if p["fb_g2l_base"]])
 
+        drp_items = [(p["drp_in"], p["drop_count"], p["window_size"]) for p in out_pipes if p["drp_in"]]
         thr_items = [(p["thr_in"], p["throttle"]) for p in out_pipes if p["thr_in"]]
         ipx_items = [(p["ipx_in"], p["pixel"]) for p in out_pipes if p["ipx_in"]]
         it_items = [(p["it_in"], p["transport"]) for p in out_pipes if p["it_in"]]
@@ -1409,6 +1437,7 @@ def func(
                     "The base session plugin supports at most 4."
                 )
 
+        _assert_max4("drp", drp_items)
         _assert_max4("thr", thr_items)
         _assert_max4("ipx", ipx_items)
         _assert_max4("it", it_items)
@@ -1675,8 +1704,16 @@ def func(
                 )
             )
 
+        if drp_items:
+            items2: List[Tuple[str, Any]] = [("drp", True)]
+            for i, (t, dc, ws) in enumerate(drp_items, 1):
+                items2.append((f"drp_topic_{i}", t))
+                items2.append((f"drp_drop_count_{i}", dc))
+                items2.append((f"drp_window_size_{i}", ws))
+            blocks.append(PluginBlock("drp", items2))
+
         if thr_items:
-            items2: List[Tuple[str, Any]] = [("thr", True)]
+            items2 = [("thr", True)]
             for i, (t, rate) in enumerate(thr_items, 1):
                 items2.append((f"thr_topic_{i}", t))
                 items2.append((f"thr_rate_{i}", rate))

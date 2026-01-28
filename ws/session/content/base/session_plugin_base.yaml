@@ -312,16 +312,16 @@ windows:
     splits:
       - commands:
         - if [ '${drp_topic_1}' = "None" ]; then exit; fi
-        - ros2 run topic_tools drop ${drp_topic_1} ${drp_topic_1_drop_count} ${drp_topic_1_window_size} ${drp_topic_1}/drop${drp_topic_1_drop_count}of${drp_topic_1_window_size}
+        - ros2 run topic_tools drop ${drp_topic_1} ${drp_drop_count_1} ${drp_window_size_1} ${drp_topic_1}/drop${drp_drop_count_1}of${drp_window_size_1}
       - commands:
         - if [ '${drp_topic_2}' = "None" ]; then exit; fi
-        - ros2 run topic_tools drop ${drp_topic_2} ${drp_topic_2_drop_count} ${drp_topic_2_window_size} ${drp_topic_2}/drop${drp_topic_2_drop_count}of${drp_topic_2_window_size}
+        - ros2 run topic_tools drop ${drp_topic_2} ${drp_drop_count_2} ${drp_window_size_2} ${drp_topic_2}/drop${drp_drop_count_2}of${drp_window_size_2}
       - commands:
         - if [ '${drp_topic_3}' = "None" ]; then exit; fi
-        - ros2 run topic_tools drop ${drp_topic_3} ${drp_topic_3_drop_count} ${drp_topic_3_window_size} ${drp_topic_3}/drop${drp_topic_3_drop_count}of${drp_topic_3_window_size}
+        - ros2 run topic_tools drop ${drp_topic_3} ${drp_drop_count_3} ${drp_window_size_3} ${drp_topic_3}/drop${drp_drop_count_3}of${drp_window_size_3}
       - commands:
         - if [ '${drp_topic_4}' = "None" ]; then exit; fi
-        - ros2 run topic_tools drop ${drp_topic_4} ${drp_topic_4_drop_count} ${drp_topic_4_window_size} ${drp_topic_4}/drop${drp_topic_4_drop_count}of${drp_topic_4_window_size}
+        - ros2 run topic_tools drop ${drp_topic_4} ${drp_drop_count_4} ${drp_window_size_4} ${drp_topic_4}/drop${drp_drop_count_4}of${drp_window_size_4}
   - name: THR
     if: thr
     layout: even-vertical

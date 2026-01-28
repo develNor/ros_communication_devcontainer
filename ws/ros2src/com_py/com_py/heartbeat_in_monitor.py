@@ -86,14 +86,16 @@ class HeartbeatInMonitor(Node):
         self.declare_parameter("expected_hz", 10.0)
 
         # Thresholds for status classification
-        self.declare_parameter("delay_good_ms", 30)
-        self.declare_parameter("delay_bad_ms", 60)
-        self.declare_parameter("loss10_degraded_pct", 0.5)
-        self.declare_parameter("loss10_bad_pct", 2.0)
+        self.declare_parameter("delay_good_ms", 50)
+        self.declare_parameter("delay_bad_ms", 100)
+        self.declare_parameter("loss10_degraded_pct", 2.5)
+        self.declare_parameter("loss10_bad_pct", 5.0)
         # Hz tolerance in messages (due to window timing, ±1 is acceptable)
         self.declare_parameter("hz_ok_tol_msgs", 1)       # OK if within ±1 msg
         self.declare_parameter("hz_degraded_tol_msgs", 2) # Degraded at ±2 msgs
         self.declare_parameter("hz_bad_tol_msgs", 3)      # Bad at ±3 msgs
+        # Age multiplier for LOST status (multiplied by msg_interval)
+        self.declare_parameter("age_lost_intervals", 5)   # LOST if no msg for 5+ intervals
 
         self.heartbeat_topic = self.get_parameter("heartbeat_topic").value
         self.qos_config_file = self.get_parameter("qos_config_file").value
@@ -114,14 +116,17 @@ class HeartbeatInMonitor(Node):
         self.hz_ok_tol_msgs = int(self.get_parameter("hz_ok_tol_msgs").value)
         self.hz_degraded_tol_msgs = int(self.get_parameter("hz_degraded_tol_msgs").value)
         self.hz_bad_tol_msgs = int(self.get_parameter("hz_bad_tol_msgs").value)
+        self.age_lost_intervals = int(self.get_parameter("age_lost_intervals").value)
 
         # Derive age thresholds from expected_hz and delay thresholds
         # Age = time since last message received. At expected_hz, messages arrive every (1000/hz) ms.
         # Good age: one message interval + good delay tolerance
         # Bad age: two message intervals + bad delay tolerance
+        # Lost age: N message intervals (connection seems completely gone)
         msg_interval_ms = int(1000.0 / self.expected_hz) if self.expected_hz > 0 else 100
         self.age_good_ms = msg_interval_ms + self.delay_good_ms
         self.age_bad_ms = 2 * msg_interval_ms + self.delay_bad_ms
+        self.age_lost_ms = self.age_lost_intervals * msg_interval_ms
 
         # Load QoS configuration
         self.qos_config = load_qos_config(self.get_logger(), self.qos_config_file)
@@ -188,27 +193,26 @@ class HeartbeatInMonitor(Node):
         )
 
     # ------------------------------------------------------------------
-    # Formatting helpers (fixed width, stable)
+    # Formatting helpers (fixed width, right-aligned with spaces)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _fmt_int(n: int, width: int) -> str:
         n = max(0, min(n, 10**width - 1))
-        return f"{n:0{width}d}"
+        return f"{n:>{width}d}"
 
     @classmethod
     def _fmt_ms(cls, ms: int) -> str:
-        return cls._fmt_int(ms, 4)  # 0000..9999
+        return cls._fmt_int(ms, 4)  # right-aligned, max 9999
 
     @staticmethod
     def _fmt_hz(obs: float, exp: float) -> str:
-        # Fixed-ish width: "09.8/10.0"
-        return f"{obs:04.1f}/{exp:04.1f}"
+        return f"{obs:4.1f}/{exp:4.1f}"
 
     @staticmethod
     def _fmt_pct(p: float) -> str:
         p = max(0.0, min(p, 99.99))
-        return f"{p:05.2f}%"
+        return f"{p:5.2f}%"
 
     @staticmethod
     def _fmt_hhmmss(total_s: int) -> str:
@@ -360,43 +364,61 @@ class HeartbeatInMonitor(Node):
         # Status decision
         status, reason = self._classify_status(age_ms, delay_ms, loss10_pct, hz_obs, exp_hz)
 
-        # Build aligned summary (fixed lines, fixed widths)
-        # Keep all fields present always. Pad strings to keep stable.
+        # Build aligned summary (fixed lines, right-aligned values)
         topic = self.heartbeat_topic
+        wall_time = datetime.now().strftime("%H:%M:%S")
 
-        line1 = f"HB IN  {topic}"
-        line2 = f"STATUS : {status:<19} REASON : {reason:<10}"
+        # Line 1: Header with topic and timestamp
+        line1 = f"HB IN  {topic}  {wall_time}"
+
+        # Line 2: Status (only show reason when not GOOD)
+        if status == "GOOD":
+            line2 = f"STATUS : {status}"
+        else:
+            line2 = f"STATUS : {status:<8}  REASON : {reason}"
+
+        # Line 3: Age, delay, Hz
         line3 = (
-            f"AGE_MS :   {self._fmt_ms(age_ms)}"
-            f"   DELAY_MS : {self._fmt_ms(delay_ms)}"
+            f"AGE  : {self._fmt_ms(age_ms)} ms"
+            f"   DELAY : {self._fmt_ms(delay_ms)} ms"
             f"   HZ : {self._fmt_hz(hz_obs, exp_hz)}"
         )
+
+        # Line 4: Loss stats
         line4 = (
-            f"LOSS10 :  {self._fmt_pct(loss10_pct)} "
-            f"({self._fmt_int(w10.missing,4)}/{self._fmt_int(w10.expected,4)}) "
-            f"LOSS60 :  {self._fmt_pct(loss60_pct)} "
+            f"LOSS10 : {self._fmt_pct(loss10_pct)} "
+            f"({self._fmt_int(w10.missing,3)}/{self._fmt_int(w10.expected,3)})"
+            f"   LOSS60 : {self._fmt_pct(loss60_pct)} "
             f"({self._fmt_int(w60.missing,4)}/{self._fmt_int(w60.expected,4)})"
         )
-        line5 = ""
-        line6 = (
-            f"LAST_GAP : {self.last_gap_wall_hms:<8}"
-            f"          NO_LOSS : {self._fmt_hhmmss(no_loss_s)}"
-        )
-        line7 = (
-            f"BURST60  : {w60.max_burst_missing:>6d}"
-            f"            REORD60 : {w60.reordered:>6d}"
+
+        # Line 5: Gap and streak info
+        line5 = (
+            f"LAST_GAP : {self.last_gap_wall_hms}"
+            f"   NO_LOSS : {self._fmt_hhmmss(no_loss_s)}"
         )
 
-        summary = "\n".join([line1, line2, line3, line4, line5, line6, line7])
+        # Line 6: Burst and reorder stats
+        line6 = (
+            f"BURST60  : {w60.max_burst_missing:>4d}"
+            f"         REORD60 : {w60.reordered:>4d}"
+        )
+
+        summary = "\n".join([line1, line2, line3, line4, line5, line6])
 
         msg = String()
         msg.data = summary
         self.summary_pub.publish(msg)
 
     def _classify_status(self, age_ms: int, delay_ms: int, loss10_pct: float, hz_obs: float, exp_hz: float) -> Tuple[str, str]:
-        # Age (derived from expected_hz + delay thresholds)
+        # LOST: Connection seems completely gone
+        # Check age first - no messages for a long time
+        if age_ms >= self.age_lost_ms:
+            return "LOST", "age"
+
+        # BAD/DEGRADED: Age (derived from expected_hz + delay thresholds)
         if age_ms >= self.age_bad_ms:
-            return "BAD", "stale"
+            return "BAD", "age"
         if age_ms >= self.age_good_ms:
             return "DEGRADED", "age"
 

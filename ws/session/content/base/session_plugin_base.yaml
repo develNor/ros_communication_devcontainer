@@ -80,6 +80,20 @@ parameters:
   nor_topic_4_base: # e.g. "visualization/planning/pso/submitted_visualization"
   nor_topic_4_suffix: # e.g. "/restamped/globalframe"
 
+  drp: false
+  drp_topic_1: # e.g. /sensors/camera/front_wide/image_color
+  drp_drop_count_1: # e.g. 20
+  drp_window_size_1: # e.g. 20
+  drp_topic_2: # e.g. /sensors/front_camera/image_raw/compressed
+  drp_drop_count_2: # e.g. 20
+  drp_window_size_2: # e.g. 20
+  drp_topic_3: # e.g. /sensors/front_camera/image_raw/compressed
+  drp_drop_count_3: # e.g. 20
+  drp_window_size_3: # e.g. 20
+  drp_topic_4: # e.g. /sensor/front_camera/image_color/compressed
+  drp_drop_count_4: # e.g. 20
+  drp_window_size_4: # e.g. 20
+
   thr: false
   thr_topic_1: # e.g. /sensors/camera/front_wide/image_color
   thr_rate_1: # e.g. 20
@@ -292,6 +306,22 @@ windows:
     splits:
       - commands:
         - ros2 run com_py universal_decompressor --ros-args -p config_file:=${deco_config_file} -p default_algorithm:=${deco_algorithm} -p qos_config_file:='${qos_config_file}'
+  - name: DRP
+    if: drp
+    layout: even-vertical
+    splits:
+      - commands:
+        - if [ '${drp_topic_1}' = "None" ]; then exit; fi
+        - ros2 run topic_tools drop ${drp_topic_1} ${drp_topic_1_drop_count} ${drp_topic_1_window_size} ${drp_topic_1}/drop${drp_topic_1_drop_count}of${drp_topic_1_window_size}
+      - commands:
+        - if [ '${drp_topic_2}' = "None" ]; then exit; fi
+        - ros2 run topic_tools drop ${drp_topic_2} ${drp_topic_2_drop_count} ${drp_topic_2_window_size} ${drp_topic_2}/drop${drp_topic_2_drop_count}of${drp_topic_2_window_size}
+      - commands:
+        - if [ '${drp_topic_3}' = "None" ]; then exit; fi
+        - ros2 run topic_tools drop ${drp_topic_3} ${drp_topic_3_drop_count} ${drp_topic_3_window_size} ${drp_topic_3}/drop${drp_topic_3_drop_count}of${drp_topic_3_window_size}
+      - commands:
+        - if [ '${drp_topic_4}' = "None" ]; then exit; fi
+        - ros2 run topic_tools drop ${drp_topic_4} ${drp_topic_4_drop_count} ${drp_topic_4_window_size} ${drp_topic_4}/drop${drp_topic_4_drop_count}of${drp_topic_4_window_size}
   - name: THR
     if: thr
     layout: even-vertical

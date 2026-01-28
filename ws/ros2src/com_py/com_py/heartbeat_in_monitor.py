@@ -157,7 +157,7 @@ class HeartbeatInMonitor(Node):
 
         # Publish delay in ms
         delay_msg = String()
-        delay_msg.data = f"Incoming Heartbeat latency {int(delay_ms)} ms"
+        delay_msg.data = f"Last Incoming Heartbeat latency {int(delay_ms)} ms"
         self.delay_pub.publish(delay_msg)
 
         # Update state for Hz and anomaly calculations

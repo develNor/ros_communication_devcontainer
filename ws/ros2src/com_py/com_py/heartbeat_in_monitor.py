@@ -86,12 +86,14 @@ class HeartbeatInMonitor(Node):
         self.declare_parameter("expected_hz", 10.0)
 
         # Thresholds for status classification
-        self.declare_parameter("age_good_ms", 200)
-        self.declare_parameter("age_bad_ms", 500)
+        self.declare_parameter("delay_good_ms", 30)
+        self.declare_parameter("delay_bad_ms", 60)
         self.declare_parameter("loss10_degraded_pct", 0.5)
         self.declare_parameter("loss10_bad_pct", 2.0)
-        self.declare_parameter("hz_degraded_tol_pct", 10.0)
-        self.declare_parameter("hz_bad_tol_pct", 30.0)
+        # Hz tolerance in messages (due to window timing, ±1 is acceptable)
+        self.declare_parameter("hz_ok_tol_msgs", 1)       # OK if within ±1 msg
+        self.declare_parameter("hz_degraded_tol_msgs", 2) # Degraded at ±2 msgs
+        self.declare_parameter("hz_bad_tol_msgs", 3)      # Bad at ±3 msgs
 
         self.heartbeat_topic = self.get_parameter("heartbeat_topic").value
         self.qos_config_file = self.get_parameter("qos_config_file").value
@@ -105,12 +107,21 @@ class HeartbeatInMonitor(Node):
         self.summary_rate_hz = float(self.get_parameter("summary_rate_hz").value)
         self.expected_hz = float(self.get_parameter("expected_hz").value)
 
-        self.age_good_ms = int(self.get_parameter("age_good_ms").value)
-        self.age_bad_ms = int(self.get_parameter("age_bad_ms").value)
+        self.delay_good_ms = int(self.get_parameter("delay_good_ms").value)
+        self.delay_bad_ms = int(self.get_parameter("delay_bad_ms").value)
         self.loss10_degraded_pct = float(self.get_parameter("loss10_degraded_pct").value)
         self.loss10_bad_pct = float(self.get_parameter("loss10_bad_pct").value)
-        self.hz_degraded_tol_pct = float(self.get_parameter("hz_degraded_tol_pct").value)
-        self.hz_bad_tol_pct = float(self.get_parameter("hz_bad_tol_pct").value)
+        self.hz_ok_tol_msgs = int(self.get_parameter("hz_ok_tol_msgs").value)
+        self.hz_degraded_tol_msgs = int(self.get_parameter("hz_degraded_tol_msgs").value)
+        self.hz_bad_tol_msgs = int(self.get_parameter("hz_bad_tol_msgs").value)
+
+        # Derive age thresholds from expected_hz and delay thresholds
+        # Age = time since last message received. At expected_hz, messages arrive every (1000/hz) ms.
+        # Good age: one message interval + good delay tolerance
+        # Bad age: two message intervals + bad delay tolerance
+        msg_interval_ms = int(1000.0 / self.expected_hz) if self.expected_hz > 0 else 100
+        self.age_good_ms = msg_interval_ms + self.delay_good_ms
+        self.age_bad_ms = 2 * msg_interval_ms + self.delay_bad_ms
 
         # Load QoS configuration
         self.qos_config = load_qos_config(self.get_logger(), self.qos_config_file)
@@ -344,14 +355,14 @@ class HeartbeatInMonitor(Node):
         # Hz vs expected
         hz_obs = self.last_hz_observed
         exp_hz = self.expected_hz
+        delay_ms = self.last_delay_ms
 
         # Status decision
-        status, reason = self._classify_status(age_ms, loss10_pct, hz_obs, exp_hz)
+        status, reason = self._classify_status(age_ms, delay_ms, loss10_pct, hz_obs, exp_hz)
 
         # Build aligned summary (fixed lines, fixed widths)
         # Keep all fields present always. Pad strings to keep stable.
         topic = self.heartbeat_topic
-        delay_ms = self.last_delay_ms
 
         line1 = f"HB IN  {topic}"
         line2 = f"STATUS : {status:<19} REASON : {reason:<10}"
@@ -382,14 +393,18 @@ class HeartbeatInMonitor(Node):
         msg.data = summary
         self.summary_pub.publish(msg)
 
-    def _classify_status(self, age_ms: int, loss10_pct: float, hz_obs: float, exp_hz: float) -> Tuple[str, str]:
-        # Age
+    def _classify_status(self, age_ms: int, delay_ms: int, loss10_pct: float, hz_obs: float, exp_hz: float) -> Tuple[str, str]:
+        # Age (derived from expected_hz + delay thresholds)
         if age_ms >= self.age_bad_ms:
             return "BAD", "stale"
         if age_ms >= self.age_good_ms:
-            # Don't immediately degrade on age alone; it depends on expected_hz.
-            # But for GUI, "age" is a very strong signal.
             return "DEGRADED", "age"
+
+        # Delay (latency)
+        if delay_ms >= self.delay_bad_ms:
+            return "BAD", "delay"
+        if delay_ms > self.delay_good_ms:
+            return "DEGRADED", "delay"
 
         # Loss
         if loss10_pct >= self.loss10_bad_pct:
@@ -397,13 +412,13 @@ class HeartbeatInMonitor(Node):
         if loss10_pct >= self.loss10_degraded_pct:
             return "DEGRADED", "loss10"
 
-        # Hz deviation
-        if exp_hz > 0.0:
-            dev_pct = abs(hz_obs - exp_hz) / exp_hz * 100.0
-            if dev_pct >= self.hz_bad_tol_pct:
-                return "BAD", "hz"
-            if dev_pct >= self.hz_degraded_tol_pct:
-                return "DEGRADED", "hz"
+        # Hz deviation (message count based, accounting for window timing jitter)
+        hz_dev_msgs = abs(hz_obs - exp_hz)
+        if hz_dev_msgs >= self.hz_bad_tol_msgs:
+            return "BAD", "hz"
+        if hz_dev_msgs >= self.hz_degraded_tol_msgs:
+            return "DEGRADED", "hz"
+        # hz_dev_msgs <= hz_ok_tol_msgs is considered OK
 
         return "GOOD", "-"
 

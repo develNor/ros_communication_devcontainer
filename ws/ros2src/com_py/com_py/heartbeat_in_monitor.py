@@ -74,8 +74,8 @@ class HeartbeatInMonitor(Node):
 
       Numerical (Float64) topics – for time-series plots:
         /age_ms, /delay_ms, /hz, /loss
-        /delay_min_ms, /delay_avg_ms, /delay_med_ms, /delay_max_ms
-        /hz_min, /hz_avg, /hz_med, /hz_max
+        /delay_min_ms, /delay_avg_ms, /delay_med60_ms, /delay_max_ms
+        /hz_min, /hz_avg, /hz_med60, /hz_max
         /loss3_pct, /loss10_pct, /loss60_pct, /loss_total_pct
 
       String topics – for state-transition / enum display:
@@ -98,7 +98,6 @@ class HeartbeatInMonitor(Node):
         self.declare_parameter("summary_topic_suffix", "/summary")
         self.declare_parameter("summary_rate_hz", 5.0)
         self.declare_parameter("expected_hz", 10.0)
-        self.declare_parameter("stats_window_s", 60.0)
 
         # Thresholds for status classification
         self.declare_parameter("delay_good_ms", 50)
@@ -123,8 +122,6 @@ class HeartbeatInMonitor(Node):
         )
         self.summary_rate_hz = float(self.get_parameter("summary_rate_hz").value)
         self.expected_hz = float(self.get_parameter("expected_hz").value)
-        self.stats_window_s = float(self.get_parameter("stats_window_s").value)
-
         self.delay_good_ms = int(self.get_parameter("delay_good_ms").value)
         self.delay_bad_ms = int(self.get_parameter("delay_bad_ms").value)
         self.loss3_degraded_pct = float(self.get_parameter("loss3_degraded_pct").value)
@@ -158,7 +155,7 @@ class HeartbeatInMonitor(Node):
         self.delay_avg_pub = self.create_publisher(
             Float64, self.heartbeat_topic + "/delay_avg_ms", pub_qos)
         self.delay_med_pub = self.create_publisher(
-            Float64, self.heartbeat_topic + "/delay_med_ms", pub_qos)
+            Float64, self.heartbeat_topic + "/delay_med60_ms", pub_qos)
         self.delay_max_pub = self.create_publisher(
             Float64, self.heartbeat_topic + "/delay_max_ms", pub_qos)
 
@@ -169,7 +166,7 @@ class HeartbeatInMonitor(Node):
         self.hz_avg_pub = self.create_publisher(
             Float64, self.heartbeat_topic + "/hz_avg", pub_qos)
         self.hz_med_pub = self.create_publisher(
-            Float64, self.heartbeat_topic + "/hz_med", pub_qos)
+            Float64, self.heartbeat_topic + "/hz_med60", pub_qos)
         self.hz_max_pub = self.create_publisher(
             Float64, self.heartbeat_topic + "/hz_max", pub_qos)
 
@@ -217,11 +214,20 @@ class HeartbeatInMonitor(Node):
         # Each event: (t_monotonic_ns, expected_delta, missing_delta, reordered_delta, burst_missing)
         self.events: Deque[Tuple[int, int, int, int, int]] = deque()
 
-        # Delay history for min/avg/med/max stats  (timestamp_ns, delay_ms)
-        self.delay_history: Deque[Tuple[int, int]] = deque()
+        # Windowed deques for med60 (60s median) computation
+        self.delay_history: Deque[Tuple[int, int]] = deque()    # (timestamp_ns, delay_ms)
+        self.hz_history: Deque[Tuple[int, float]] = deque()     # (timestamp_ns, hz)
 
-        # Hz history for min/avg/med/max stats  (timestamp_ns, hz)
-        self.hz_history: Deque[Tuple[int, float]] = deque()
+        # Running counters for whole-time min/avg/max (O(1) memory)
+        self.delay_min: float = float("inf")
+        self.delay_max: float = 0.0
+        self.delay_sum: float = 0.0
+        self.delay_count: int = 0
+
+        self.hz_min: float = float("inf")
+        self.hz_max: float = 0.0
+        self.hz_sum: float = 0.0
+        self.hz_count: int = 0
 
         # Total counters (since node start)
         self.total_received: int = 0
@@ -238,7 +244,7 @@ class HeartbeatInMonitor(Node):
 
         self.get_logger().info(
             f"HeartbeatInMonitor initialized. Listening on '{self.heartbeat_topic}', "
-            f"Hz window={self.hz_window_s:.2f}s, stats window={self.stats_window_s:.0f}s, "
+            f"Hz window={self.hz_window_s:.2f}s, "
             f"summary='{self.summary_topic}' @ {self.summary_rate_hz:.1f} Hz"
         )
 
@@ -290,16 +296,9 @@ class HeartbeatInMonitor(Node):
         return wc
 
     @staticmethod
-    def _compute_stats(values: List[float]) -> Tuple[float, float, float, float]:
-        """Return (min, avg, median, max) for *values*; (0,0,0,0) if empty."""
-        if not values:
-            return (0.0, 0.0, 0.0, 0.0)
-        return (
-            min(values),
-            statistics.mean(values),
-            statistics.median(values),
-            max(values),
-        )
+    def _median(values: List[float]) -> float:
+        """Return median of *values*; 0.0 if empty."""
+        return statistics.median(values) if values else 0.0
 
     # ------------------------------------------------------------------
     # Publish helpers
@@ -384,7 +383,11 @@ class HeartbeatInMonitor(Node):
 
         # Record delay for statistics
         self.delay_history.append((now_ns, delay_ms))
-        self._prune_deque(self.delay_history, now_ns, self.stats_window_s)
+        self._prune_deque(self.delay_history, now_ns, 60.0)
+        self.delay_min = min(self.delay_min, delay_ms)
+        self.delay_max = max(self.delay_max, delay_ms)
+        self.delay_sum += delay_ms
+        self.delay_count += 1
 
         # Update total counters
         self.total_received += 1
@@ -413,7 +416,11 @@ class HeartbeatInMonitor(Node):
 
         # Record Hz for statistics
         self.hz_history.append((now_ns, hz))
-        self._prune_deque(self.hz_history, now_ns, self.stats_window_s)
+        self._prune_deque(self.hz_history, now_ns, 60.0)
+        self.hz_min = min(self.hz_min, hz)
+        self.hz_max = max(self.hz_max, hz)
+        self.hz_sum += hz
+        self.hz_count += 1
 
     def summary_timer_callback(self) -> None:
         now = self.get_clock().now()
@@ -461,19 +468,23 @@ class HeartbeatInMonitor(Node):
         self._pub_float(self.loss60_pct_pub, loss60_pct)
         self._pub_float(self.loss_total_pct_pub, loss_total_pct)
 
-        # Delay statistics (over stats_window_s)
-        self._prune_deque(self.delay_history, now_ns, self.stats_window_s)
-        delay_values = [float(d) for _, d in self.delay_history]
-        d_min, d_avg, d_med, d_max = self._compute_stats(delay_values)
+        # Delay statistics: min/avg/max whole-time, median over 60s
+        d_min = self.delay_min if self.delay_count > 0 else 0.0
+        d_avg = self.delay_sum / self.delay_count if self.delay_count > 0 else 0.0
+        d_max = self.delay_max if self.delay_count > 0 else 0.0
+        self._prune_deque(self.delay_history, now_ns, 60.0)
+        d_med = self._median([float(d) for _, d in self.delay_history])
         self._pub_float(self.delay_min_pub, d_min)
         self._pub_float(self.delay_avg_pub, d_avg)
         self._pub_float(self.delay_med_pub, d_med)
         self._pub_float(self.delay_max_pub, d_max)
 
-        # Hz statistics (over stats_window_s)
-        self._prune_deque(self.hz_history, now_ns, self.stats_window_s)
-        hz_values = [h for _, h in self.hz_history]
-        h_min, h_avg, h_med, h_max = self._compute_stats(hz_values)
+        # Hz statistics: min/avg/max whole-time, median over 60s
+        h_min = self.hz_min if self.hz_count > 0 else 0.0
+        h_avg = self.hz_sum / self.hz_count if self.hz_count > 0 else 0.0
+        h_max = self.hz_max if self.hz_count > 0 else 0.0
+        self._prune_deque(self.hz_history, now_ns, 60.0)
+        h_med = self._median([h for _, h in self.hz_history])
         self._pub_float(self.hz_min_pub, h_min)
         self._pub_float(self.hz_avg_pub, h_avg)
         self._pub_float(self.hz_med_pub, h_med)

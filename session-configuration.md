@@ -26,6 +26,7 @@ These constraints are **enforced** by the generator (or by the base plugin it ta
 
 - **Feature slot limits (max 4 each)**  
   The base plugin supports at most **4** entries per feature group:
+  - **drop** (`drop`)
   - **throttle** (`throttle_hz`)
   - **pixel cap** (`pixel_cap_preset`)
   - **image transport** (`transport`)
@@ -169,13 +170,16 @@ Only these keys are allowed:
 ```yaml
 processing:
   restamp_if: true                # bool OR common bool strings OR "<VAR_NAME>" (template param name)
+  drop:                           # optional, message drop configuration
+    drop_count: 2                 # int >= 0, number of messages to drop
+    window_size: 3                # int > 0, window size (drop_count must be < window_size)
   framebridge: local_to_global    # local_to_global | global_to_local
   normalize_on_target: false      # bool
   compress: false                 # bool
   throttle_hz: 10                 # int > 0
   pixel_cap_preset: "wsvga"       # scalar, used as suffix only,
   transport:
-    type: ffmpeg                  # ffmpeg | compressed
+    type: ffmpeg                  # ffmpeg | foxglove | compressed
     local_republish: false        # default false
     # plus type-specific params (see below)
 ```
@@ -185,20 +189,27 @@ Given a base topic like `/tf`, stages are applied in this order:
 
 1) base topic (e.g. `/tf`)  
 2) restamp → `+ shared.processing_suffixes.restamped` (default `/restamped`)  
-3) throttle → `+ /max{hz}hz`  
-4) pixel cap → `+ /{preset}`  
-5) framebridge:
-   - `local_to_global`: appended to the restamped outbound topic via `+ /globalframe`
+3) drop → `+ /drop{drop_count}of{window_size}` (e.g. `/drop2of3`)  
+4) throttle → `+ /max{hz}hz`  
+5) pixel cap → `+ /{preset}`  
+6) framebridge:
+   - `local_to_global`: appended to the current topic state via `+ /globalframe`
    - `global_to_local`: appended to the base topic via `+ /globalframe` (configured inbound-side)
-6) compress → `+ /<algorithm>` (default `/bz2`)  
-7) transport → `+ /<type>` (e.g. `/ffmpeg`, `/compressed`)  
-8) optional `local_republish: true` triggers reverse-transport configuration.
+7) compress → `+ /<algorithm>` (default `/bz2`)  
+8) transport → `+ /<type>` (e.g. `/ffmpeg`, `/foxglove`, `/compressed`)  
+9) optional `local_republish: true` triggers reverse-transport configuration.
 
 #### Transport parameters
 `type: ffmpeg` supports:
 - `gop_size` (int)
 - `bit_rate` (int)
 - `encoder_av_options` (string)
+
+`type: foxglove` supports (CompressedVideo):
+- `gop_size` (int)
+- `bit_rate` (int)
+- `encoder_av_options` (string)
+- `qmax` (int)
 
 `type: compressed` supports:
 - `jpeg_quality` (int)

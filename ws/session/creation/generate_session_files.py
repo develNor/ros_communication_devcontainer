@@ -930,8 +930,8 @@ def _compute_pipeline(
             raise ValueError(f"Unknown framebridge '{framebridge}' for topic '{entry.base}'")
 
         if framebridge == "local_to_global":
-            fb_l2g_in = restamp_out
-            topic = restamp_out + globalframe_suffix
+            fb_l2g_in = topic
+            topic = topic + globalframe_suffix
         else:
             fb_g2l_base = entry.base
             topic = entry.base + globalframe_suffix

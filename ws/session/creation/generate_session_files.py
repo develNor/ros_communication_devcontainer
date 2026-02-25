@@ -1429,17 +1429,17 @@ def func(
         rs_topics = _dedup_keep_order([e.base for e, p in zip(out_entries, out_pipes) if p["restamp"]])
         lat_topics = _dedup_keep_order([p["lat_in"] for p in out_pipes if p["lat_in"]])
 
-        # Trickle: local-only periodic republisher (runs on BOTH source and target peers).
-        # On source: subscribes to outbound final topics.  On target: subscribes to inbound final topics (with prefix).
-        trickle_out_items = [(p["final"], p["trickle_hz"]) for p in out_pipes if p["trickle_hz"] is not None]
+        # Trickle: local-only periodic republisher (receiver side only).
+        # Subscribes to inbound final topics (with source-name prefix when applicable)
+        # and republishes at a fixed rate for visualization software.
         trickle_in_items = [
             (_prefix_with_source_name_if_needed(local, remote, p["final"]), p["trickle_hz"])
             for p in in_pipes if p["trickle_hz"] is not None
         ]
-        trickle_all_topics = _dedup_keep_order([t for t, _ in trickle_out_items + trickle_in_items])
+        trickle_all_topics = _dedup_keep_order([t for t, _ in trickle_in_items])
         # Use the first configured rate (all trickle topics share a single timer).
         trickle_hz = None
-        for _, hz in trickle_out_items + trickle_in_items:
+        for _, hz in trickle_in_items:
             if hz is not None:
                 trickle_hz = hz
                 break

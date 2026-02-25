@@ -45,6 +45,7 @@ setup(
             'local_global_frame_bridge = com_py.local_global_frame_bridge:main',
             'restamp = com_py.restamp:main',
             'latch_relay = com_py.latch_relay:main',
+            'trickle = com_py.trickle:main',
         ],
     },
 )

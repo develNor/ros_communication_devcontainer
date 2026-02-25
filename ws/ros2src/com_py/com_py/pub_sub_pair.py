@@ -50,6 +50,7 @@ VALID_QOS_ROLES = {
     "framebridge_sub", "framebridge_pub",
     "restamp_sub", "restamp_pub",
     "latch_sub", "latch_pub",
+    "trickle_sub", "trickle_pub",
     "compressor_sub", "compressor_pub",
     "decompressor_sub", "decompressor_pub",
     "image_reduce_sub", "image_reduce_pub",

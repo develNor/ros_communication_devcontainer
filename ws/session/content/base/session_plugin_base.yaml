@@ -55,6 +55,11 @@ parameters:
   lat_topics: "" # e.g. "/can/is_autonomous,/can/is_rearmed,/site" – only republish when serialized content changes
   lat_topic_suffix: # e.g. "/latched"
 
+  trickle: false
+  trickle_topics: "" # e.g. "/can/is_autonomous/latched,/can/is_rearmed/latched" – periodically republish last msg for visualization
+  trickle_topic_suffix: # e.g. "/trickle"
+  trickle_rate_hz: 1.0
+
   fb: false
   fb_global_frame_prefix: # e.g. "machine_a"
   fb_global_topic_suffix: "" # e.g. "/globalframe"
@@ -282,6 +287,15 @@ windows:
             -p qos_config_file:='${qos_config_file}'
             -p latch_topics:=[${lat_topics}]
             -p topic_suffix:=${lat_topic_suffix}
+  - name: TRICKLE
+    if: trickle
+    splits:
+      - commands:
+        - ros2 run com_py trickle --ros-args
+            -p qos_config_file:='${qos_config_file}'
+            -p trickle_topics:=[${trickle_topics}]
+            -p topic_suffix:=${trickle_topic_suffix}
+            -p rate_hz:=${trickle_rate_hz}
   - name: FB
     if: fb
     splits:

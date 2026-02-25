@@ -200,6 +200,7 @@ def _normalize_plugin_yaml_obj(obj: Any) -> Any:
     csv_set_keys = {
         "rs_restamp_topics",
         "lat_topics",
+        "trickle_topics",
         "fb_local_to_global_topics",
         "fb_global_to_local_topics",
         "fb_prefix_exclude_frames",
@@ -855,6 +856,7 @@ def _compute_pipeline(
     known_keys = {
         "restamp_if",
         "latch",
+        "trickle_hz",
         "drop",
         "framebridge",
         "normalize_on_target",
@@ -903,6 +905,12 @@ def _compute_pipeline(
     if latch:
         lat_in = topic
         topic = topic + latched_suffix
+
+    trickle_hz = proc.get("trickle_hz")
+    if trickle_hz is not None:
+        trickle_hz = float(trickle_hz)
+        if trickle_hz <= 0:
+            raise ValueError(f"trickle_hz must be > 0 for topic '{entry.base}'")
 
     drop_count = None
     window_size = None
@@ -973,6 +981,7 @@ def _compute_pipeline(
         "restamp_out": restamp_out,
         "latch": latch,
         "lat_in": lat_in,
+        "trickle_hz": trickle_hz,
         "drop_count": drop_count,
         "window_size": window_size,
         "drp_in": drp_in,
@@ -1419,6 +1428,22 @@ def func(
         # Local outbound derived lists
         rs_topics = _dedup_keep_order([e.base for e, p in zip(out_entries, out_pipes) if p["restamp"]])
         lat_topics = _dedup_keep_order([p["lat_in"] for p in out_pipes if p["lat_in"]])
+
+        # Trickle: local-only periodic republisher (runs on BOTH source and target peers).
+        # On source: subscribes to outbound final topics.  On target: subscribes to inbound final topics (with prefix).
+        trickle_out_items = [(p["final"], p["trickle_hz"]) for p in out_pipes if p["trickle_hz"] is not None]
+        trickle_in_items = [
+            (_prefix_with_source_name_if_needed(local, remote, p["final"]), p["trickle_hz"])
+            for p in in_pipes if p["trickle_hz"] is not None
+        ]
+        trickle_all_topics = _dedup_keep_order([t for t, _ in trickle_out_items + trickle_in_items])
+        # Use the first configured rate (all trickle topics share a single timer).
+        trickle_hz = None
+        for _, hz in trickle_out_items + trickle_in_items:
+            if hz is not None:
+                trickle_hz = hz
+                break
+
         fb_l2g = _dedup_keep_order([p["fb_l2g_in"] for p in out_pipes if p["fb_l2g_in"]])
         # Local inbound derived lists for framebridge (global_to_local topics are specified on inbound direction)
         fb_g2l = _dedup_keep_order([p["fb_g2l_base"] for p in in_pipes if p["fb_g2l_base"]])
@@ -1695,6 +1720,19 @@ def func(
                         ("lat", True),
                         ("lat_topics", ",".join(lat_topics)),
                         ("lat_topic_suffix", latched_suffix),
+                    ],
+                )
+            )
+
+        if trickle_all_topics and trickle_hz is not None:
+            blocks.append(
+                PluginBlock(
+                    "trickle",
+                    [
+                        ("trickle", True),
+                        ("trickle_topics", ",".join(trickle_all_topics)),
+                        ("trickle_topic_suffix", "/trickle"),
+                        ("trickle_rate_hz", trickle_hz),
                     ],
                 )
             )

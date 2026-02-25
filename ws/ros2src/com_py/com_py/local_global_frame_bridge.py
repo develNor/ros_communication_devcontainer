@@ -58,7 +58,8 @@ Topic mapping model:
 - global → local: subscribe base + global_topic_suffix, publish base topic
 """
 
-from typing import Any, List, Set
+from typing import Any, Dict, List, Set, Tuple
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -125,6 +126,9 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
         self.tf_filter_frames_raw = (
             declare("tf_filter_frames", rclpy.Parameter.Type.STRING_ARRAY) or []
         )
+        self.tf_throttle_links_raw = (
+            declare("tf_throttle_links", rclpy.Parameter.Type.STRING_ARRAY) or []
+        )
         self.qos_config_file = declare("qos_config_file", "")
         self.sub_role = "framebridge_sub"
         self.pub_role = "framebridge_pub"
@@ -161,6 +165,35 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
                 self._tf_filter_set.add(frame)
 
         # -----------------------
+        # Per-link TF throttling
+        # Format: ["parent__child:max_hz", ...]
+        # e.g. ["base_link__floating_odom_can:10"]
+        # The double-underscore (__) separates parent and child frame names
+        # (shell-safe, unlike ">").
+        # -----------------------
+        self._tf_throttle_intervals: Dict[Tuple[str, str], float] = {}
+        self._tf_throttle_last: Dict[Tuple[str, str], float] = {}
+        for spec in self.tf_throttle_links_raw:
+            spec = spec.strip()
+            if not spec:
+                continue
+            try:
+                link_part, hz_str = spec.rsplit(":", 1)
+                if "__" not in link_part:
+                    raise ValueError("missing '__' separator between parent and child frame")
+                parent, child = link_part.split("__", 1)
+                hz = float(hz_str)
+                if hz <= 0:
+                    raise ValueError("hz must be > 0")
+                key = (parent.strip(), child.strip())
+                self._tf_throttle_intervals[key] = 1.0 / hz
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Ignoring malformed tf_throttle_links entry '{spec}': {exc}. "
+                    "Expected format: 'parent_frame__child_frame:max_hz'"
+                )
+
+        # -----------------------
         # Startup logging
         # -----------------------
         self.get_logger().info("=== LocalGlobalFrameBridge configuration ===")
@@ -173,6 +206,13 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
             self.get_logger().info(f"tf_filter_frames={sorted(self._tf_filter_set)}")
         else:
             self.get_logger().info("tf_filter_frames=[] (no TF filtering, all transforms pass through)")
+        if self._tf_throttle_intervals:
+            for (p, c), interval in sorted(self._tf_throttle_intervals.items()):
+                self.get_logger().info(
+                    f"tf_throttle_link: {p} -> {c} @ max {1.0/interval:.1f} Hz"
+                )
+        else:
+            self.get_logger().info("tf_throttle_links=[] (no per-link TF throttling)")
         self.get_logger().info(
             f"local_to_global_topics={self.local_to_global_topics}"
         )
@@ -270,6 +310,57 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
         msg.transforms = kept
         return dropped
 
+    def _throttle_tf_transforms(self, msg: Any, *, topic: str, direction: str) -> int:
+        """
+        Drop individual TF transforms whose parent→child link exceeds the
+        configured max rate (per ``tf_throttle_links``).
+
+        The whitelist always uses **local** frame names.  For global_to_local
+        direction the global prefix is stripped before lookup.
+
+        Returns the number of transforms dropped.
+        """
+        if not self._tf_throttle_intervals:
+            return 0
+        if not hasattr(msg, "transforms"):
+            return 0
+
+        original_count = len(msg.transforms)
+        if original_count == 0:
+            return 0
+
+        def _strip_prefix(frame_id: str) -> str:
+            if self._global_prefix_token and frame_id.startswith(self._global_prefix_token):
+                return frame_id[len(self._global_prefix_token):]
+            return frame_id
+
+        now = time.monotonic()
+        kept = []
+        throttled = 0
+
+        for t in msg.transforms:
+            if direction == "global_to_local":
+                parent = _strip_prefix(t.header.frame_id)
+                child = _strip_prefix(t.child_frame_id)
+            else:
+                parent = t.header.frame_id
+                child = t.child_frame_id
+
+            key = (parent, child)
+            min_interval = self._tf_throttle_intervals.get(key)
+
+            if min_interval is not None:
+                last = self._tf_throttle_last.get(key, 0.0)
+                if (now - last) < min_interval:
+                    throttled += 1
+                    continue
+                self._tf_throttle_last[key] = now
+
+            kept.append(t)
+
+        msg.transforms = kept
+        return throttled
+
     def transform_message(self, msg: Any, map_direction: str, *, topic: str) -> Any:
         key = (topic, map_direction)
         self._dbg_seen[key] = self._dbg_seen.get(key, 0) + 1
@@ -304,7 +395,16 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
                 f"tf_filter: dropped {tf_dropped} transforms, {remaining} remaining"
             )
 
-        # Don't publish empty TFMessages (all transforms were filtered out)
+        # Throttle individual TF links that exceed configured max rate
+        tf_throttled = self._throttle_tf_transforms(msg, topic=topic, direction=map_direction)
+        if tf_throttled > 0 and n <= self.debug_first_n:
+            remaining = len(msg.transforms) if hasattr(msg, "transforms") else "N/A"
+            self.get_logger().info(
+                f"[LocalGlobalFrameBridge] msg#{n} topic='{topic}' "
+                f"tf_throttle: throttled {tf_throttled} transforms, {remaining} remaining"
+            )
+
+        # Don't publish empty TFMessages (all transforms were filtered out / throttled)
         if hasattr(msg, "transforms") and len(msg.transforms) == 0:
             return None
 

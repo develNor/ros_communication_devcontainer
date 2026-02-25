@@ -65,6 +65,7 @@ parameters:
   fb_global_topic_suffix: "" # e.g. "/globalframe"
   fb_prefix_exclude_frames: "" # e.g. "map,cart" – frames to skip when adding/removing the global prefix (not related to tf_filter_frames)
   fb_tf_filter_frames: "" # e.g. "map,cart,odom,base_link" – keep only TFs where both parent and child are in this set (empty = pass all)
+  fb_tf_throttle_links: "" # e.g. "base_link__floating_odom_can:10" – throttle specific parent__child TF links to max Hz (empty = no throttling)
   fb_local_to_global_topics: "" # e.g. "/tf,/tf_static,/costmap"
   fb_global_to_local_topics: "" # e.g. "/move_base_free/goal"
 
@@ -306,6 +307,7 @@ windows:
             -p global_topic_suffix:=${fb_global_topic_suffix}
             -p prefix_exclude_frames:=[${fb_prefix_exclude_frames}]
             -p tf_filter_frames:=[${fb_tf_filter_frames}]
+            -p tf_throttle_links:=[${fb_tf_throttle_links}]
             -p local_to_global_topics:=[${fb_local_to_global_topics}]
             -p global_to_local_topics:=[${fb_global_to_local_topics}]
   - name: NOR

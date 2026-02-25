@@ -205,6 +205,7 @@ def _normalize_plugin_yaml_obj(obj: Any) -> Any:
         "fb_global_to_local_topics",
         "fb_prefix_exclude_frames",
         "fb_tf_filter_frames",
+        "fb_tf_throttle_links",
     }
     for k in csv_set_keys:
         if k in params:
@@ -671,7 +672,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 _assert_allowed_keys(
                     f"peer_settings.{p}.framebridge",
                     fb_ps,
-                    {"global_frame_prefix", "prefix_exclude_frames", "tf_filter_frames"},
+                    {"global_frame_prefix", "prefix_exclude_frames", "tf_filter_frames", "tf_throttle_links"},
                 )
 
     # topics is optional
@@ -1742,6 +1743,7 @@ def func(
             global_frame_prefix = str(fb_cfg.get("global_frame_prefix", peer_name[local])).rstrip("_")
             exclude_frames = fb_cfg.get("prefix_exclude_frames", []) or []
             tf_filter_frames = fb_cfg.get("tf_filter_frames", []) or []
+            tf_throttle_links = fb_cfg.get("tf_throttle_links", []) or []
             items: List[Tuple[str, Any]] = [
                 ("fb", True),
                 ("fb_global_frame_prefix", global_frame_prefix),
@@ -1749,6 +1751,8 @@ def func(
             ]
             if tf_filter_frames:
                 items.append(("fb_tf_filter_frames", ",".join(tf_filter_frames)))
+            if tf_throttle_links:
+                items.append(("fb_tf_throttle_links", ",".join(tf_throttle_links)))
             if fb_l2g:
                 items.append(("fb_local_to_global_topics", ",".join(fb_l2g)))
             if fb_g2l:

@@ -51,6 +51,10 @@ parameters:
   rs_restamp_topics: "" # e.g. "/costmap/costmap,/visualization/planning/pso/submitted_visualization,/visualization/maneuver/announcements_barriers,/visualization/planning/free/curvature_planning,/visualization/planning/free/result"
   rs_topic_suffix: # e.g."/restamped"
 
+  lat: false
+  lat_topics: "" # e.g. "/can/is_autonomous,/can/is_rearmed,/site" – only republish when serialized content changes
+  lat_topic_suffix: # e.g. "/latched"
+
   fb: false
   fb_global_frame_prefix: # e.g. "machine_a"
   fb_global_topic_suffix: "" # e.g. "/globalframe"
@@ -270,6 +274,14 @@ windows:
             -p qos_config_file:='${qos_config_file}'
             -p restamp_topics:=[${rs_restamp_topics}]
             -p topic_suffix:=${rs_topic_suffix}
+  - name: LAT
+    if: lat
+    splits:
+      - commands:
+        - ros2 run com_py latch_relay --ros-args
+            -p qos_config_file:='${qos_config_file}'
+            -p latch_topics:=[${lat_topics}]
+            -p topic_suffix:=${lat_topic_suffix}
   - name: FB
     if: fb
     splits:

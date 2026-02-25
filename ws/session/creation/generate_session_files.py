@@ -199,6 +199,7 @@ def _normalize_plugin_yaml_obj(obj: Any) -> Any:
 
     csv_set_keys = {
         "rs_restamp_topics",
+        "lat_topics",
         "fb_local_to_global_topics",
         "fb_global_to_local_topics",
         "fb_prefix_exclude_frames",
@@ -635,7 +636,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             raise RuntimeError("shared.use_out must be boolean if provided.")
         if "processing_suffixes" in shared and shared["processing_suffixes"] is not None:
             suffixes = _assert_mapping(shared.get("processing_suffixes"), "shared.processing_suffixes")
-            _assert_allowed_keys("shared.processing_suffixes", suffixes, {"restamped", "framebridge_global"})
+            _assert_allowed_keys("shared.processing_suffixes", suffixes, {"restamped", "latched", "framebridge_global"})
         if "compression" in shared and shared["compression"] is not None:
             comp = _assert_mapping(shared.get("compression"), "shared.compression")
             _assert_allowed_keys("shared.compression", comp, {"algorithm", "remove_algorithm_suffix_on_decompression"})
@@ -845,6 +846,7 @@ def _compute_pipeline(
     entry: TopicEntry,
     vars_map: Dict[str, Any],
     restamped_suffix: str,
+    latched_suffix: str,
     globalframe_suffix: str,
     comp_alg_suffix: str,
 ) -> Dict[str, Any]:
@@ -852,6 +854,7 @@ def _compute_pipeline(
 
     known_keys = {
         "restamp_if",
+        "latch",
         "drop",
         "framebridge",
         "normalize_on_target",
@@ -894,6 +897,12 @@ def _compute_pipeline(
     if restamp:
         topic = topic + restamped_suffix
     restamp_out = topic
+
+    latch = bool(proc.get("latch")) if "latch" in proc else False
+    lat_in = None
+    if latch:
+        lat_in = topic
+        topic = topic + latched_suffix
 
     drop_count = None
     window_size = None
@@ -962,6 +971,8 @@ def _compute_pipeline(
         "restamp": restamp,
         "restamp_in": restamp_in,
         "restamp_out": restamp_out,
+        "latch": latch,
+        "lat_in": lat_in,
         "drop_count": drop_count,
         "window_size": window_size,
         "drp_in": drp_in,
@@ -1200,6 +1211,7 @@ def func(
     if not isinstance(suffixes, dict):
         raise RuntimeError(f"shared.processing_suffixes must be a mapping if provided, got {type(suffixes)}")
     restamped_suffix = str(suffixes.get("restamped", "/restamped"))
+    latched_suffix = str(suffixes.get("latched", "/latched"))
     globalframe_suffix = str(suffixes.get("framebridge_global", "/globalframe"))
 
     comp_cfg = (shared.get("compression", {}) or {}) if isinstance(shared, dict) else {}
@@ -1245,7 +1257,7 @@ def func(
     dir_pipes: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for (src, dst), direction_key in direction_key_for.items():
         entries = _topic_entries(cfg, direction_key)
-        pipes = [_compute_pipeline(e, vars_map, restamped_suffix, globalframe_suffix, comp_alg_suffix) for e in entries]
+        pipes = [_compute_pipeline(e, vars_map, restamped_suffix, latched_suffix, globalframe_suffix, comp_alg_suffix) for e in entries]
         dir_entries[(src, dst)] = entries
         dir_pipes[(src, dst)] = pipes
 
@@ -1268,6 +1280,8 @@ def func(
         suffixes: List[str] = []
         if pipe.get("restamp"):
             suffixes.append("restamped")
+        if pipe.get("latch"):
+            suffixes.append("latched")
         if pipe.get("throttle") is not None:
             suffixes.append(f"max{int(pipe['throttle'])}hz")
         if pipe.get("pixel") is not None:
@@ -1404,6 +1418,7 @@ def func(
 
         # Local outbound derived lists
         rs_topics = _dedup_keep_order([e.base for e, p in zip(out_entries, out_pipes) if p["restamp"]])
+        lat_topics = _dedup_keep_order([p["lat_in"] for p in out_pipes if p["lat_in"]])
         fb_l2g = _dedup_keep_order([p["fb_l2g_in"] for p in out_pipes if p["fb_l2g_in"]])
         # Local inbound derived lists for framebridge (global_to_local topics are specified on inbound direction)
         fb_g2l = _dedup_keep_order([p["fb_g2l_base"] for p in in_pipes if p["fb_g2l_base"]])
@@ -1668,6 +1683,18 @@ def func(
                         ("rs", True),
                         ("rs_restamp_topics", ",".join(rs_topics)),
                         ("rs_topic_suffix", restamped_suffix),
+                    ],
+                )
+            )
+
+        if lat_topics:
+            blocks.append(
+                PluginBlock(
+                    "lat",
+                    [
+                        ("lat", True),
+                        ("lat_topics", ",".join(lat_topics)),
+                        ("lat_topic_suffix", latched_suffix),
                     ],
                 )
             )

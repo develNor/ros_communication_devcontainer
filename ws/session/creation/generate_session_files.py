@@ -201,7 +201,7 @@ def _normalize_plugin_yaml_obj(obj: Any) -> Any:
         "rs_restamp_topics",
         "fb_local_to_global_topics",
         "fb_global_to_local_topics",
-        "fb_exclude_frames",
+        "fb_prefix_exclude_frames",
         "fb_tf_filter_frames",
     }
     for k in csv_set_keys:
@@ -669,7 +669,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 _assert_allowed_keys(
                     f"peer_settings.{p}.framebridge",
                     fb_ps,
-                    {"global_frame_prefix", "exclude_frames", "tf_filter_frames"},
+                    {"global_frame_prefix", "prefix_exclude_frames", "tf_filter_frames"},
                 )
 
     # topics is optional
@@ -1675,12 +1675,12 @@ def func(
         if fb_l2g or fb_g2l:
             fb_cfg = (ps_local.get("framebridge", {}) or {}) if isinstance(ps_local, dict) else {}
             global_frame_prefix = str(fb_cfg.get("global_frame_prefix", peer_name[local])).rstrip("_")
-            exclude_frames = fb_cfg.get("exclude_frames", []) or []
+            exclude_frames = fb_cfg.get("prefix_exclude_frames", []) or []
             tf_filter_frames = fb_cfg.get("tf_filter_frames", []) or []
             items: List[Tuple[str, Any]] = [
                 ("fb", True),
                 ("fb_global_frame_prefix", global_frame_prefix),
-                ("fb_exclude_frames", ",".join(exclude_frames)),
+                ("fb_prefix_exclude_frames", ",".join(exclude_frames)),
             ]
             if tf_filter_frames:
                 items.append(("fb_tf_filter_frames", ",".join(tf_filter_frames)))

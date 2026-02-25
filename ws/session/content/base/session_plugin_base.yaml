@@ -54,8 +54,8 @@ parameters:
   fb: false
   fb_global_frame_prefix: # e.g. "machine_a"
   fb_global_topic_suffix: "" # e.g. "/globalframe"
-  fb_exclude_frames: "" # e.g. "map,cart"
-  fb_tf_filter_frames: "" # e.g. "map>cart,cart>odom,odom>base_link" – whitelist of parent>child TF pairs to keep (empty = pass all)
+  fb_prefix_exclude_frames: "" # e.g. "map,cart" – frames to skip when adding/removing the global prefix (not related to tf_filter_frames)
+  fb_tf_filter_frames: "" # e.g. "map,cart,odom,base_link" – keep only TFs where both parent and child are in this set (empty = pass all)
   fb_local_to_global_topics: "" # e.g. "/tf,/tf_static,/costmap"
   fb_global_to_local_topics: "" # e.g. "/move_base_free/goal"
 
@@ -278,7 +278,7 @@ windows:
             -p qos_config_file:='${qos_config_file}'
             -p global_frame_prefix:=${fb_global_frame_prefix}
             -p global_topic_suffix:=${fb_global_topic_suffix}
-            -p exclude_frames:=[${fb_exclude_frames}]
+            -p prefix_exclude_frames:=[${fb_prefix_exclude_frames}]
             -p tf_filter_frames:=[${fb_tf_filter_frames}]
             -p local_to_global_topics:=[${fb_local_to_global_topics}]
             -p global_to_local_topics:=[${fb_global_to_local_topics}]

@@ -58,7 +58,7 @@ Topic mapping model:
 - global → local: subscribe base + global_topic_suffix, publish base topic
 """
 
-from typing import Any, List, Set, Tuple
+from typing import Any, List, Set
 
 import rclpy
 from rclpy.node import Node
@@ -88,7 +88,8 @@ class LocalGlobalFrameBridgePubSubPair(PubSubPair):
             self.first_msg = False
 
         out = self.node.transform_message(msg, self._map_direction, topic=self.sub_topic)
-        self.publisher.publish(out)
+        if out is not None:
+            self.publisher.publish(out)
 
 
 # ======================================================================
@@ -116,8 +117,10 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
             declare("global_to_local_topics", rclpy.Parameter.Type.STRING_ARRAY) or []
         )
 
-        self.exclude_frames = (
-            declare("exclude_frames", rclpy.Parameter.Type.STRING_ARRAY) or []
+        # Frames excluded from prefix remapping (NOT from tf_filter_frames filtering).
+        # These frames keep their original IDs on both local and global side.
+        self.prefix_exclude_frames = (
+            declare("prefix_exclude_frames", rclpy.Parameter.Type.STRING_ARRAY) or []
         )
         self.tf_filter_frames_raw = (
             declare("tf_filter_frames", rclpy.Parameter.Type.STRING_ARRAY) or []
@@ -147,25 +150,15 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
             self._global_prefix_token += "_"
 
         # -----------------------
-        # TF transform filtering (whitelist of parent>child frame pairs)
+        # TF transform filtering (whitelist of allowed frame IDs)
+        # A transform is kept only when BOTH its parent (frame_id) and child
+        # (child_frame_id) are in this set.  Empty set = no filtering.
         # -----------------------
-        self._tf_filter_set: Set[Tuple[str, str]] = set()
-        for spec in self.tf_filter_frames_raw:
-            spec = spec.strip()
-            if not spec:
-                continue
-            if ">" not in spec:
-                raise ValueError(
-                    f"tf_filter_frames entry '{spec}' must use 'parent>child' format "
-                    "(e.g. 'map>cart')"
-                )
-            parent, child = spec.split(">", 1)
-            parent, child = parent.strip(), child.strip()
-            if not parent or not child:
-                raise ValueError(
-                    f"tf_filter_frames entry '{spec}': both parent and child must be non-empty"
-                )
-            self._tf_filter_set.add((parent, child))
+        self._tf_filter_set: Set[str] = set()
+        for frame in self.tf_filter_frames_raw:
+            frame = frame.strip()
+            if frame:
+                self._tf_filter_set.add(frame)
 
         # -----------------------
         # Startup logging
@@ -175,7 +168,7 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
             f"global_prefix_token='{self._global_prefix_token}' (raw='{self.global_frame_prefix}')"
         )
         self.get_logger().info(f"global_topic_suffix='{self.global_topic_suffix}'")
-        self.get_logger().info(f"exclude_frames={self.exclude_frames}")
+        self.get_logger().info(f"prefix_exclude_frames={self.prefix_exclude_frames}")
         if self._tf_filter_set:
             self.get_logger().info(f"tf_filter_frames={sorted(self._tf_filter_set)}")
         else:
@@ -235,14 +228,14 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
 
     def _filter_tf_transforms(self, msg: Any, *, topic: str, direction: str) -> int:
         """
-        Filter TFMessage.transforms to only keep whitelisted (parent, child) pairs.
+        Filter TFMessage.transforms to only keep transforms whose parent AND
+        child frame IDs are both in the allowed set ``_tf_filter_set``.
 
-        Works on tf2_msgs/msg/TFMessage which has a `transforms` field containing
-        a list of geometry_msgs/msg/TransformStamped entries.
+        Works on tf2_msgs/msg/TFMessage which has a ``transforms`` field
+        containing a list of geometry_msgs/msg/TransformStamped entries.
 
-        For local_to_global: matches against local (un-prefixed) frame IDs.
-        For global_to_local: matches against global (prefixed) frame IDs,
-        stripping the prefix before checking the whitelist.
+        For global_to_local direction the global prefix is stripped before
+        checking against the whitelist (the whitelist always uses local names).
 
         Returns the number of transforms dropped.
         """
@@ -263,13 +256,14 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
         if direction == "global_to_local":
             kept = [
                 t for t in msg.transforms
-                if (_strip_prefix(t.header.frame_id), _strip_prefix(t.child_frame_id))
-                in self._tf_filter_set
+                if _strip_prefix(t.header.frame_id) in self._tf_filter_set
+                and _strip_prefix(t.child_frame_id) in self._tf_filter_set
             ]
         else:
             kept = [
                 t for t in msg.transforms
-                if (t.header.frame_id, t.child_frame_id) in self._tf_filter_set
+                if t.header.frame_id in self._tf_filter_set
+                and t.child_frame_id in self._tf_filter_set
             ]
 
         dropped = original_count - len(kept)
@@ -310,6 +304,10 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
                 f"tf_filter: dropped {tf_dropped} transforms, {remaining} remaining"
             )
 
+        # Don't publish empty TFMessages (all transforms were filtered out)
+        if hasattr(msg, "transforms") and len(msg.transforms) == 0:
+            return None
+
         collect = self.debug_samples_per_msg if n <= self.debug_first_n else 0
 
         # Bridge-level mapping names → transform-level direction names.
@@ -326,7 +324,7 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
             msg,
             direction=remap_direction,
             prefix_token=self._global_prefix_token,
-            exclude_frames=set(self.exclude_frames),
+            exclude_frames=set(self.prefix_exclude_frames),
             collect_samples=collect,
         )
 

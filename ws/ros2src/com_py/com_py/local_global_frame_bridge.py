@@ -58,7 +58,7 @@ Topic mapping model:
 - global → local: subscribe base + global_topic_suffix, publish base topic
 """
 
-from typing import Any, List
+from typing import Any, List, Set, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -119,6 +119,9 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
         self.exclude_frames = (
             declare("exclude_frames", rclpy.Parameter.Type.STRING_ARRAY) or []
         )
+        self.tf_filter_frames_raw = (
+            declare("tf_filter_frames", rclpy.Parameter.Type.STRING_ARRAY) or []
+        )
         self.qos_config_file = declare("qos_config_file", "")
         self.sub_role = "framebridge_sub"
         self.pub_role = "framebridge_pub"
@@ -144,6 +147,27 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
             self._global_prefix_token += "_"
 
         # -----------------------
+        # TF transform filtering (whitelist of parent>child frame pairs)
+        # -----------------------
+        self._tf_filter_set: Set[Tuple[str, str]] = set()
+        for spec in self.tf_filter_frames_raw:
+            spec = spec.strip()
+            if not spec:
+                continue
+            if ">" not in spec:
+                raise ValueError(
+                    f"tf_filter_frames entry '{spec}' must use 'parent>child' format "
+                    "(e.g. 'map>cart')"
+                )
+            parent, child = spec.split(">", 1)
+            parent, child = parent.strip(), child.strip()
+            if not parent or not child:
+                raise ValueError(
+                    f"tf_filter_frames entry '{spec}': both parent and child must be non-empty"
+                )
+            self._tf_filter_set.add((parent, child))
+
+        # -----------------------
         # Startup logging
         # -----------------------
         self.get_logger().info("=== LocalGlobalFrameBridge configuration ===")
@@ -152,6 +176,10 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
         )
         self.get_logger().info(f"global_topic_suffix='{self.global_topic_suffix}'")
         self.get_logger().info(f"exclude_frames={self.exclude_frames}")
+        if self._tf_filter_set:
+            self.get_logger().info(f"tf_filter_frames={sorted(self._tf_filter_set)}")
+        else:
+            self.get_logger().info("tf_filter_frames=[] (no TF filtering, all transforms pass through)")
         self.get_logger().info(
             f"local_to_global_topics={self.local_to_global_topics}"
         )
@@ -205,6 +233,49 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
     # Transform + debug
     # ------------------------------------------------------------------
 
+    def _filter_tf_transforms(self, msg: Any, *, topic: str, direction: str) -> int:
+        """
+        Filter TFMessage.transforms to only keep whitelisted (parent, child) pairs.
+
+        Works on tf2_msgs/msg/TFMessage which has a `transforms` field containing
+        a list of geometry_msgs/msg/TransformStamped entries.
+
+        For local_to_global: matches against local (un-prefixed) frame IDs.
+        For global_to_local: matches against global (prefixed) frame IDs,
+        stripping the prefix before checking the whitelist.
+
+        Returns the number of transforms dropped.
+        """
+        if not self._tf_filter_set:
+            return 0
+        if not hasattr(msg, "transforms"):
+            return 0
+
+        original_count = len(msg.transforms)
+        if original_count == 0:
+            return 0
+
+        def _strip_prefix(frame_id: str) -> str:
+            if self._global_prefix_token and frame_id.startswith(self._global_prefix_token):
+                return frame_id[len(self._global_prefix_token):]
+            return frame_id
+
+        if direction == "global_to_local":
+            kept = [
+                t for t in msg.transforms
+                if (_strip_prefix(t.header.frame_id), _strip_prefix(t.child_frame_id))
+                in self._tf_filter_set
+            ]
+        else:
+            kept = [
+                t for t in msg.transforms
+                if (t.header.frame_id, t.child_frame_id) in self._tf_filter_set
+            ]
+
+        dropped = original_count - len(kept)
+        msg.transforms = kept
+        return dropped
+
     def transform_message(self, msg: Any, map_direction: str, *, topic: str) -> Any:
         key = (topic, map_direction)
         self._dbg_seen[key] = self._dbg_seen.get(key, 0) + 1
@@ -228,6 +299,15 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
                 )
             self.get_logger().info(
                 f"[LocalGlobalFrameBridge] topic='{topic}' iter_fields={_iter_field_names(msg)}"
+            )
+
+        # Filter TF transforms before remapping (saves CPU on frames we'd discard)
+        tf_dropped = self._filter_tf_transforms(msg, topic=topic, direction=map_direction)
+        if tf_dropped > 0 and n <= self.debug_first_n:
+            remaining = len(msg.transforms) if hasattr(msg, "transforms") else "N/A"
+            self.get_logger().info(
+                f"[LocalGlobalFrameBridge] msg#{n} topic='{topic}' "
+                f"tf_filter: dropped {tf_dropped} transforms, {remaining} remaining"
             )
 
         collect = self.debug_samples_per_msg if n <= self.debug_first_n else 0

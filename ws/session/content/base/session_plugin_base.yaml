@@ -174,12 +174,16 @@ parameters:
   irt: false
   irt_1_topic: # e.g. /sensors/camera/front_wide/image_color
   irt_1_transport: # e.g. raw
+  irt_1_out_transport: compressed # e.g. raw, compressed – determines the output remap format
   irt_2_topic: # e.g. /sensors/front_camera/image_raw/compressed
   irt_2_transport: # e.g. raw
+  irt_2_out_transport: compressed # e.g. raw, compressed – determines the output remap format
   irt_3_topic: # e.g. /sensor/front_camera/image_color/compressed
   irt_3_transport: # e.g. raw
+  irt_3_out_transport: compressed # e.g. raw, compressed – determines the output remap format
   irt_4_topic: # e.g. /sensor/front_camera/image_color/compressed
   irt_4_transport: # e.g. raw
+  irt_4_out_transport: compressed # e.g. raw, compressed – determines the output remap format
 
 common:
   before_commands:
@@ -390,7 +394,8 @@ windows:
     splits:
       - commands:
         - if [ '${it_1_topic}' = "None" ]; then exit; fi
-        - args=(ros2 run image_transport republish --ros-args -r __node:=republish1 -p in_transport:=raw)
+        - if [[ "${it_1_topic}" == *"/compressed"* ]]; then it_in_transport="compressed"; else it_in_transport="raw"; fi
+        - args=(ros2 run image_transport republish --ros-args -r __node:=republish1 -p in_transport:=${it_in_transport})
         - '[[ "${it_1_transport}" != "None" ]] && args+=(-p "out_transport:=${it_1_transport}")'
         - '[[ "${it_1_compressed_jpeg_quality}" != "None" ]] && args+=(-p "ut.compressed.jpeg_quality:=${it_1_compressed_jpeg_quality}")'
         - '[[ "${it_1_ffmpeg_gop_size}" != "None" ]] && args+=(-p "ut.ffmpeg.gop_size:=${it_1_ffmpeg_gop_size}")'
@@ -401,12 +406,14 @@ windows:
         - '[[ "${it_1_foxglove_bit_rate}" != "None" ]] && args+=(-p "ut.foxglove.bit_rate:=${it_1_foxglove_bit_rate}")'
         - '[[ "${it_1_foxglove_qmax}" != "None" ]] && args+=(-p "ut.foxglove.qmax:=${it_1_foxglove_qmax}")'
         - if [[ "${it_1_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_1_outgoing_suffix}"; else outgoing_suffix="${it_1_transport}"; fi
-        - args+=(--remap "in:=${it_1_topic}" --remap "out/${it_1_transport}:=${it_1_topic}/${outgoing_suffix}")
+        - if [[ "${it_in_transport}" == "raw" ]]; then in_remap="in"; else in_remap="in/${it_in_transport}"; fi
+        - args+=(--remap "${in_remap}:=${it_1_topic}" --remap "out/${it_1_transport}:=${it_1_topic}/${outgoing_suffix}")
         - echo ${args[@]} 
         - ${args[@]}
       - commands:
         - if [ '${it_2_topic}' = "None" ]; then exit; fi
-        - args=(ros2 run image_transport republish --ros-args -r __node:=republish2 -p in_transport:=raw)
+        - if [[ "${it_2_topic}" == *"/compressed"* ]]; then it_in_transport="compressed"; else it_in_transport="raw"; fi
+        - args=(ros2 run image_transport republish --ros-args -r __node:=republish2 -p in_transport:=${it_in_transport})
         - '[[ "${it_2_transport}" != "None" ]] && args+=(-p "out_transport:=${it_2_transport}")'
         - '[[ "${it_2_compressed_jpeg_quality}" != "None" ]] && args+=(-p "ut.compressed.jpeg_quality:=${it_2_compressed_jpeg_quality}")'
         - '[[ "${it_2_ffmpeg_gop_size}" != "None" ]] && args+=(-p "ut.ffmpeg.gop_size:=${it_2_ffmpeg_gop_size}")'
@@ -417,12 +424,14 @@ windows:
         - '[[ "${it_2_foxglove_bit_rate}" != "None" ]] && args+=(-p "ut.foxglove.bit_rate:=${it_2_foxglove_bit_rate}")'
         - '[[ "${it_2_foxglove_qmax}" != "None" ]] && args+=(-p "ut.foxglove.qmax:=${it_2_foxglove_qmax}")'
         - if [[ "${it_2_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_2_outgoing_suffix}"; else outgoing_suffix="${it_2_transport}"; fi
-        - args+=(--remap "in:=${it_2_topic}" --remap "out/${it_2_transport}:=${it_2_topic}/${outgoing_suffix}")
+        - if [[ "${it_in_transport}" == "raw" ]]; then in_remap="in"; else in_remap="in/${it_in_transport}"; fi
+        - args+=(--remap "${in_remap}:=${it_2_topic}" --remap "out/${it_2_transport}:=${it_2_topic}/${outgoing_suffix}")
         - echo ${args[@]} 
         - ${args[@]}
       - commands:
         - if [ '${it_3_topic}' = "None" ]; then exit; fi
-        - args=(ros2 run image_transport republish --ros-args -r __node:=republish3 -p in_transport:=raw)
+        - if [[ "${it_3_topic}" == *"/compressed"* ]]; then it_in_transport="compressed"; else it_in_transport="raw"; fi
+        - args=(ros2 run image_transport republish --ros-args -r __node:=republish3 -p in_transport:=${it_in_transport})
         - '[[ "${it_3_transport}" != "None" ]] && args+=(-p "out_transport:=${it_3_transport}")'
         - '[[ "${it_3_compressed_jpeg_quality}" != "None" ]] && args+=(-p "ut.compressed.jpeg_quality:=${it_3_compressed_jpeg_quality}")'
         - '[[ "${it_3_ffmpeg_gop_size}" != "None" ]] && args+=(-p "ut.ffmpeg.gop_size:=${it_3_ffmpeg_gop_size}")'
@@ -433,12 +442,14 @@ windows:
         - '[[ "${it_3_foxglove_bit_rate}" != "None" ]] && args+=(-p "ut.foxglove.bit_rate:=${it_3_foxglove_bit_rate}")'
         - '[[ "${it_3_foxglove_qmax}" != "None" ]] && args+=(-p "ut.foxglove.qmax:=${it_3_foxglove_qmax}")'
         - if [[ "${it_3_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_3_outgoing_suffix}"; else outgoing_suffix="${it_3_transport}"; fi
-        - args+=(--remap "in:=${it_3_topic}" --remap "out/${it_3_transport}:=${it_3_topic}/${outgoing_suffix}")
+        - if [[ "${it_in_transport}" == "raw" ]]; then in_remap="in"; else in_remap="in/${it_in_transport}"; fi
+        - args+=(--remap "${in_remap}:=${it_3_topic}" --remap "out/${it_3_transport}:=${it_3_topic}/${outgoing_suffix}")
         - echo ${args[@]} 
         - ${args[@]}
       - commands:
         - if [ '${it_4_topic}' = "None" ]; then exit; fi
-        - args=(ros2 run image_transport republish --ros-args -r __node:=republish4 -p in_transport:=raw)
+        - if [[ "${it_4_topic}" == *"/compressed"* ]]; then it_in_transport="compressed"; else it_in_transport="raw"; fi
+        - args=(ros2 run image_transport republish --ros-args -r __node:=republish4 -p in_transport:=${it_in_transport})
         - '[[ "${it_4_transport}" != "None" ]] && args+=(-p "out_transport:=${it_4_transport}")'
         - '[[ "${it_4_compressed_jpeg_quality}" != "None" ]] && args+=(-p "ut.compressed.jpeg_quality:=${it_4_compressed_jpeg_quality}")'
         - '[[ "${it_4_ffmpeg_gop_size}" != "None" ]] && args+=(-p "ut.ffmpeg.gop_size:=${it_4_ffmpeg_gop_size}")'
@@ -449,7 +460,8 @@ windows:
         - '[[ "${it_4_foxglove_bit_rate}" != "None" ]] && args+=(-p "ut.foxglove.bit_rate:=${it_4_foxglove_bit_rate}")'
         - '[[ "${it_4_foxglove_qmax}" != "None" ]] && args+=(-p "ut.foxglove.qmax:=${it_4_foxglove_qmax}")'
         - if [[ "${it_4_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_4_outgoing_suffix}"; else outgoing_suffix="${it_4_transport}"; fi
-        - args+=(--remap "in:=${it_4_topic}" --remap "out/${it_4_transport}:=${it_4_topic}/${outgoing_suffix}")
+        - if [[ "${it_in_transport}" == "raw" ]]; then in_remap="in"; else in_remap="in/${it_in_transport}"; fi
+        - args+=(--remap "${in_remap}:=${it_4_topic}" --remap "out/${it_4_transport}:=${it_4_topic}/${outgoing_suffix}")
         - echo ${args[@]} 
         - ${args[@]}
   - name: IRT
@@ -458,17 +470,29 @@ windows:
     splits:
       - commands:
         - if [ '${irt_1_topic}' = "None" ]; then exit; fi
-        - ros2 run image_transport republish --ros-args -p in_transport:=${irt_1_transport} -p out_transport:=raw
-            --remap in/${irt_1_transport}:=${irt_1_topic} --remap out:=${irt_1_topic}/raw
+        - if [[ "${irt_1_out_transport}" == "raw" ]]; then out_remap="out"; else out_remap="out/${irt_1_out_transport}"; fi
+        - args=(ros2 run image_transport republish --ros-args -r __node:=irt_republish1 -p in_transport:=${irt_1_transport} -p out_transport:=${irt_1_out_transport}
+            --remap in/${irt_1_transport}:=${irt_1_topic} --remap ${out_remap}:=${irt_1_topic}/${irt_1_out_transport})
+        - echo ${args[@]}
+        - ${args[@]}
       - commands:
         - if [ '${irt_2_topic}' = "None" ]; then exit; fi
-        - ros2 run image_transport republish --ros-args -p in_transport:=${irt_2_transport} -p out_transport:=raw
-            --remap in/${irt_2_transport}:=${irt_2_topic} --remap out:=${irt_2_topic}/raw
+        - if [[ "${irt_2_out_transport}" == "raw" ]]; then out_remap="out"; else out_remap="out/${irt_2_out_transport}"; fi
+        - args=(ros2 run image_transport republish --ros-args -r __node:=irt_republish2 -p in_transport:=${irt_2_transport} -p out_transport:=${irt_2_out_transport}
+            --remap in/${irt_2_transport}:=${irt_2_topic} --remap ${out_remap}:=${irt_2_topic}/${irt_2_out_transport})
+        - echo ${args[@]}
+        - ${args[@]}
       - commands:
         - if [ '${irt_3_topic}' = "None" ]; then exit; fi
-        - ros2 run image_transport republish --ros-args -p in_transport:=${irt_3_transport} -p out_transport:=raw
-            --remap in/${irt_3_transport}:=${irt_3_topic} --remap out:=${irt_3_topic}/raw
+        - if [[ "${irt_3_out_transport}" == "raw" ]]; then out_remap="out"; else out_remap="out/${irt_3_out_transport}"; fi
+        - args=(ros2 run image_transport republish --ros-args -r __node:=irt_republish3 -p in_transport:=${irt_3_transport} -p out_transport:=${irt_3_out_transport}
+            --remap in/${irt_3_transport}:=${irt_3_topic} --remap ${out_remap}:=${irt_3_topic}/${irt_3_out_transport})
+        - echo ${args[@]}
+        - ${args[@]}
       - commands:
         - if [ '${irt_4_topic}' = "None" ]; then exit; fi
-        - ros2 run image_transport republish --ros-args -p in_transport:=${irt_4_transport} -p out_transport:=raw
-            --remap in/${irt_4_transport}:=${irt_4_topic} --remap out:=${irt_4_topic}/raw
+        - if [[ "${irt_4_out_transport}" == "raw" ]]; then out_remap="out"; else out_remap="out/${irt_4_out_transport}"; fi
+        - args=(ros2 run image_transport republish --ros-args -r __node:=irt_republish4 -p in_transport:=${irt_4_transport} -p out_transport:=${irt_4_out_transport}
+            --remap in/${irt_4_transport}:=${irt_4_topic} --remap ${out_remap}:=${irt_4_topic}/${irt_4_out_transport})
+        - echo ${args[@]}
+        - ${args[@]}

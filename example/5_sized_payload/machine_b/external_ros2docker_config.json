@@ -1,12 +1,15 @@
 {
   "container_name": "machine_b_logic",
 
-  "run_type": "command",
-  "command": ["ros2", "run", "com_py", "sized_publisher", "--ros-args", "-p", "topic:=/size_test", "-p", "size:=62000", "-p", "rate:=10.0"],
+  "run_type": "catmux",
+  "catmux_file": "/external_session.yaml",
 
   "run_args": [ 
     "--network", "host", 
-    "-e", "ROS_DOMAIN_ID=47"
+    "-v", "./external_session.yaml:/external_session.yaml",
+    "-v", "../../../ws:/ws",
+    "-e", "ROS_DOMAIN_ID=47",
+    "-e", "BUILD_ROS2WS=1"
   ],
 
   "build_args": {

@@ -7,7 +7,9 @@
   "run_args": [ 
     "--network", "host", 
     "-v", "./external_session.yaml:/external_session.yaml",
-    "-e", "ROS_DOMAIN_ID=47"
+    "-v", "../../../ws:/ws",
+    "-e", "ROS_DOMAIN_ID=47",
+    "-e", "BUILD_ROS2WS=1"
   ],
 
   "build_args": {

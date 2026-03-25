@@ -1,0 +1,13 @@
+---
+windows:
+  - name: SIZED_PAYLOAD
+    layout: even-vertical
+    splits:
+      - commands:
+        - ros2 run com_py sized_publisher --ros-args -p topic:=/size_test -p size:=62000 -p rate:=10.0
+      - commands:
+        - ros2 topic hz /size_test
+      - commands:
+        - ros2 topic bw /size_test
+      - commands:
+        - ros2 topic delay /size_test

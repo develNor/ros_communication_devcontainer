@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
 
-import time
-
 import rclpy
 from rclpy.node import Node
 from com_msgs.msg import SizedPayload
+
+
+def _human_bytes(n: float) -> str:
+    """Format a byte count into a human-readable string (KB, MB, GB)."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1000.0:
+            return f"{n:.3g} {unit}"
+        n /= 1000.0
+    return f"{n:.3g} TB"
+
+
+def _human_bits(n: float) -> str:
+    """Format a bit count into a human-readable string (Kb, Mb, Gb)."""
+    for unit in ("bit", "Kb", "Mb", "Gb"):
+        if abs(n) < 1000.0:
+            return f"{n:.3g} {unit}"
+        n /= 1000.0
+    return f"{n:.3g} Tb"
 
 
 class SizedPublisher(Node):
@@ -28,8 +44,9 @@ class SizedPublisher(Node):
         bandwidth_bits = self.size * 8 * rate
         bandwidth_bytes = self.size * rate
         self.get_logger().info(
-            f"Publishing topic {topic} with rate {rate} Hz and payload size {self.size} bytes. "
-            f"Bandwidth: {bandwidth_bits:.0f} bit/s, {bandwidth_bytes:.0f} byte/s"
+            f"Publishing topic {topic} with rate {rate} Hz, "
+            f"payload {_human_bytes(self.size)}. "
+            f"Bandwidth: {_human_bits(bandwidth_bits)}/s, {_human_bytes(bandwidth_bytes)}/s"
         )
 
     def _publish(self):
@@ -43,7 +60,7 @@ class SizedPublisher(Node):
         self.seq += 1
 
         if self.seq % 100 == 0:
-            self.get_logger().info(f"Sent seq={self.seq - 1}")
+            self.get_logger().debug(f"Sent seq={self.seq - 1}")
 
 
 def main(args=None):

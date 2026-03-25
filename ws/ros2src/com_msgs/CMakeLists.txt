@@ -9,6 +9,7 @@ find_package(std_msgs REQUIRED)
 set(msg_files
   "msg/CompressedData.msg"
   "msg/Heartbeat.msg"
+  "msg/SizedPayload.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

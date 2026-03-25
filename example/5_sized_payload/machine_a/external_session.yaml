@@ -1,0 +1,11 @@
+---
+windows:
+  - name: ANALYSIS
+    layout: even-vertical
+    splits:
+      - commands:
+        - ros2 topic hz /size_test
+      - commands:
+        - ros2 topic bw /size_test
+      - commands:
+        - ros2 topic delay /size_test

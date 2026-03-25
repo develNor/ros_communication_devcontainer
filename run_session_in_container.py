@@ -158,16 +158,39 @@ def _list_session_configs() -> list:
     return session_dirs
 
 
+def _list_example_sessions() -> list:
+    example_dir = os.path.join(project_dir, "ws", "example")
+    if not os.path.isdir(example_dir):
+        return []
+    try:
+        entries = os.listdir(example_dir)
+    except OSError:
+        return []
+    sessions = []
+    for name in sorted(entries):
+        p = os.path.join(example_dir, name)
+        if os.path.isdir(p):
+            sessions.append(f"example/{name}")
+    return sessions
+
+
 def _format_available_sessions() -> str:
     sessions = _list_session_configs()
-    if not sessions:
-        return "No session directories found in session_configs_dir."
-    joined = "\n  - ".join(sessions)
-    return f"Available sessions:\n  - {joined}"
+    examples = _list_example_sessions()
+    if not sessions and not examples:
+        return "No session directories found."
+    parts = []
+    if sessions:
+        joined = "\n  - ".join(sessions)
+        parts.append(f"Available sessions:\n  - {joined}")
+    if examples:
+        joined = "\n  - ".join(examples)
+        parts.append(f"Built-in examples:\n  - {joined}")
+    return "\n".join(parts)
 
 
 def _suggest_sessions(session_dir: str) -> list:
-    sessions = _list_session_configs()
+    sessions = _list_session_configs() + _list_example_sessions()
     if not sessions or not session_dir:
         return []
     return difflib.get_close_matches(session_dir, sessions, n=5, cutoff=0.6)
@@ -241,6 +264,11 @@ def _resolve_host_session_dir(session_dir: str) -> str:
         resolved = _map_container_path_to_host(candidate, run_args, config_dir)
         if resolved and os.path.isdir(resolved):
             return resolved
+
+    if not os.path.isabs(session_dir):
+        ws_candidate = os.path.join(project_dir, "ws", session_dir)
+        if os.path.isdir(ws_candidate):
+            return ws_candidate
 
     resolved = _map_container_path_to_host(p, run_args, config_dir)
     if resolved and os.path.isdir(resolved):

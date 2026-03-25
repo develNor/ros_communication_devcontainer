@@ -46,6 +46,7 @@ setup(
             'restamp = com_py.restamp:main',
             'latch_relay = com_py.latch_relay:main',
             'trickle = com_py.trickle:main',
+            'sized_publisher = com_py.sized_publisher:main',
         ],
     },
 )

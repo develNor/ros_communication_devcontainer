@@ -7,5 +7,16 @@ parameters:
   ip_remote: machine_a_ip
   remote_name: a
 
+  qos_config_file: ${session_dir}/qos.yaml
+
+  in: true
+  topic_list_paths_inbound: ${session_dir}/a_to_b_topics.txt
+
   out: true
   topic_list_paths_outbound: ${session_dir}/b_to_a_topics.txt
+
+  topic_monitor: true
+
+  heartbeat: true
+  heartbeat_out_topics: /heartbeat_b
+  heartbeat_in_topic: /heartbeat_a

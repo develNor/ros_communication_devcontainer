@@ -1,0 +1,8 @@
+default:
+  depth: 1
+role_defaults:
+  ota_pub:
+    reliability: best_effort
+  ota_sub:
+    reliability: best_effort
+topics: {}

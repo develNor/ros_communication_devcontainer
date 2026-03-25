@@ -46,6 +46,7 @@ import time
 import datetime
 import re
 from rosidl_runtime_py.utilities import get_message
+from rclpy.serialization import serialize_message
 from std_msgs.msg import Float64
 import subprocess
 import shutil
@@ -223,8 +224,6 @@ class TopicMonitor(Node):
         self.refresh_timer = self.create_timer(self.refresh_interval, self.refresh_subscriptions, callback_group=self.cb_timers)
         self.print_timer = self.create_timer(self.print_interval, self.print_stats, callback_group=self.cb_timers)
 
-        self.warned_topics = set()  # Track topics that triggered a warning
-
         # Publisher for total ROS topic bandwidth
         self.ros_topic_bandwidth_topic = f"/topic_monitor/{self.direction}/{self.sourcename}/ros_topic_bandwidth_kbps"
         if self.to_adressant:
@@ -283,28 +282,7 @@ class TopicMonitor(Node):
     def make_callback(self, topic_name: str):
         """Return a callback function that dynamically handles any message type."""
         def callback(msg):
-            msg_size = 0
-
-            # Handling different data types
-            if hasattr(msg, 'data'):
-                if isinstance(msg.data, bool):
-                    msg_size = 1  # Booleans are typically 1 byte
-                elif isinstance(msg.data, (int, float)):
-                    msg_size = msg.data.__sizeof__()
-                elif isinstance(msg.data, (str, bytes, list, tuple)):
-                    msg_size = len(msg.data)
-                else:
-                    msg_size = msg.data.__sizeof__()
-            elif isinstance(msg, bool):
-                msg_size = 1
-            elif isinstance(msg, (int, float)):
-                msg_size = msg.__sizeof__()
-            else:
-                # Prevent spam: Only warn once per topic
-                if topic_name not in self.warned_topics:
-                    self.get_logger().warn(f"Cannot determine size for message on {topic_name}, using default 0 bytes.")
-                    self.warned_topics.add(topic_name)  # Mark as warned
-                msg_size = 0
+            msg_size = len(serialize_message(msg))
 
             # Extract timestamp if the message has a header
             msg_delay = None

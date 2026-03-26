@@ -5,4 +5,4 @@ set -x
 
 SESSION_DIR=example/5_sized_payload
 IDENTITY=a
-rosotacom --session-dir $SESSION_DIR --identity $IDENTITY
+start_rosotacom $SESSION_DIR --identity $IDENTITY

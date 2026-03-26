@@ -24,5 +24,11 @@
             <BuiltinEndpointSet>minimal</BuiltinEndpointSet>
             <SquashParticipants>true</SquashParticipants>
         </Internal>
+
+        <Tracing>
+            <Verbosity>config</Verbosity>
+            <OutputFile>/tmp/cyclonedds.log</OutputFile>
+            <PacketCaptureFile>/tmp/cyclonedds.pcap</PacketCaptureFile>
+        </Tracing>
     </Domain>
 </CycloneDDS>

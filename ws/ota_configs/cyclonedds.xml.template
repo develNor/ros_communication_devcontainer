@@ -22,7 +22,6 @@
 
         <Internal>
             <BuiltinEndpointSet>minimal</BuiltinEndpointSet>
-            <HeartbeatInterval min="500 ms" minsched="1 s" max="8 s"/>
             <SquashParticipants>true</SquashParticipants>
         </Internal>
     </Domain>

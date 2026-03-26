@@ -6,6 +6,9 @@
                 <NetworkInterface address="#host_ip"/>
             </Interfaces>
             <MulticastRecvNetworkInterfaceAddresses>none</MulticastRecvNetworkInterfaceAddresses>
+            <FragmentSize>1200B</FragmentSize>
+            <MaxMessageSize>1200B</MaxMessageSize>
+            <MaxRexmitMessageSize>1200B</MaxRexmitMessageSize>
         </General>
 
         <Discovery>

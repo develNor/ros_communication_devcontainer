@@ -14,11 +14,19 @@ shared:
     main_port: 7447
 
 topics:
+  a_to_b:
+    - topic: "/heartbeat_a"
+      zen_qos:
+        priority: real_time
+    - topic: "/size_test_a"
+      zen_qos:
+        priority: data
+        express: true
   b_to_a:
     - topic: "/heartbeat_b"
       zen_qos:
         priority: real_time
-    - topic: "/size_test"
+    - topic: "/size_test_b"
       zen_qos:
         priority: data
         express: true

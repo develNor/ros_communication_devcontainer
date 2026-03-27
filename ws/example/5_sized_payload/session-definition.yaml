@@ -18,5 +18,7 @@ shared:
         reliability: best_effort
 
 topics:
+  a_to_b:
+    - "/size_test_a"
   b_to_a:
-    - "/size_test"
+    - "/size_test_b"

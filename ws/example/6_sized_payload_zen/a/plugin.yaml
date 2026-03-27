@@ -23,6 +23,16 @@ parameters:
   zen_main_port: 7447
   topic_monitor: true
 
+  zen_qos_pub: |1
+         {
+           key_exprs: [ "ota/a/size_test_a" ],
+           config: { priority: "data", express: true }
+         },
+         {
+           key_exprs: [ "ota/a/heartbeat_a" ],
+           config: { priority: "real_time" }
+         }
+
   heartbeat: true
   heartbeat_out_topics: /heartbeat_a
   heartbeat_in_topic: /heartbeat_b

@@ -23,7 +23,7 @@ parameters:
   zen_main_port: 7447
   zen_qos_pub: |1
          {
-           key_exprs: [ "ota/b/size_test" ],
+           key_exprs: [ "ota/b/size_test_b" ],
            config: { priority: "data", express: true }
          },
          {

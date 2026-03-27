@@ -23,7 +23,6 @@
         <Internal>
             <BuiltinEndpointSet>minimal</BuiltinEndpointSet>
             <SquashParticipants>true</SquashParticipants>
-            <MinimumSocketReceiveBufferSize>10MB</MinimumSocketReceiveBufferSize>
         </Internal>
 
         <Tracing>

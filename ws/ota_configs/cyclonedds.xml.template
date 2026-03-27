@@ -28,7 +28,7 @@
         <Tracing>
             <Verbosity>config</Verbosity>
             <OutputFile>/tmp/cyclonedds.log</OutputFile>
-            <PacketCaptureFile>/tmp/cyclonedds.pcap</PacketCaptureFile>
+            <!-- <PacketCaptureFile>/tmp/cyclonedds.pcap</PacketCaptureFile> -->
         </Tracing>
     </Domain>
 </CycloneDDS>

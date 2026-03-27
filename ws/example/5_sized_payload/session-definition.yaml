@@ -6,7 +6,7 @@ peers:
 
 shared:
   use_topic_monitor: true
-  use_heartbeat: true
+  use_heartbeat: false
 
   qos:
     defaults:

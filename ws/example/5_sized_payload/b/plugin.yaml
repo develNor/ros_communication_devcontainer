@@ -16,7 +16,3 @@ parameters:
   topic_list_paths_outbound: ${session_dir}/b_to_a_topics.txt
 
   topic_monitor: true
-
-  heartbeat: true
-  heartbeat_out_topics: /heartbeat_b
-  heartbeat_in_topic: /heartbeat_a

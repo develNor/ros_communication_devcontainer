@@ -100,8 +100,8 @@ class HeartbeatInMonitor(Node):
         self.declare_parameter("expected_hz", 10.0)
 
         # Thresholds for status classification
-        self.declare_parameter("delay_good_ms", 50)
-        self.declare_parameter("delay_bad_ms", 100)
+        self.declare_parameter("delay_good_ms", 100)
+        self.declare_parameter("delay_bad_ms", 200)
         self.declare_parameter("loss3_degraded_pct", 5.0)
         self.declare_parameter("loss3_bad_pct", 10.0)
         # Hz tolerance in messages (due to window timing, ±1 is acceptable)

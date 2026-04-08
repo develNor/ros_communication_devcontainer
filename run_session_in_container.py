@@ -48,6 +48,7 @@ import importlib.util
 import difflib
 
 project_dir = os.path.dirname(os.path.realpath(__file__))
+CONFIG_PATH = os.path.join(project_dir, "config.json")
 sys.path.append(project_dir)
 
 from ros2docker.build_run import main as build_run
@@ -128,11 +129,11 @@ def _get_local_ipv4s() -> list:
 
 
 def _resolve_session_configs_base() -> str:
-    local_config = get_local_config()
+    local_config = get_local_config(CONFIG_PATH)
     session_configs_dir = local_config.get("session_configs_dir")
     if not session_configs_dir:
         return None
-    config_dir = get_config_dir()
+    config_dir = get_config_dir(CONFIG_PATH)
     if os.path.isabs(session_configs_dir):
         if os.path.isdir(session_configs_dir):
             return session_configs_dir
@@ -247,9 +248,9 @@ def _resolve_host_session_dir(session_dir: str) -> str:
     if os.path.isdir(p):
         return p
 
-    local_config = get_local_config()
+    local_config = get_local_config(CONFIG_PATH)
     run_args = local_config.get("run_args", [])
-    config_dir = get_config_dir()
+    config_dir = get_config_dir(CONFIG_PATH)
 
     session_configs_dir = local_config.get("session_configs_dir")
     if session_configs_dir and not os.path.isabs(session_dir):
@@ -397,7 +398,7 @@ def main(session_dir, identity=None, force=True, rewrite_formatting=False, auto_
     print(f"Command which will be run in container: {docker_command}")
     remote_peer_name = _resolve_remote_peer_name(session_dir, identity)
     container_name = _sanitize_container_name(f"com_to_{remote_peer_name}")
-    local_config = get_local_config()
+    local_config = get_local_config(CONFIG_PATH)
     override = {
         "run_type": "command",
         "command": docker_command,
@@ -409,7 +410,7 @@ def main(session_dir, identity=None, force=True, rewrite_formatting=False, auto_
         run_args.extend(["-e", f"SESSION_CONFIGS_DIR={session_configs_dir}"])
         override["run_args"] = run_args
 
-    build_run(override=override)
+    build_run(config_file=CONFIG_PATH, override=override)
 
     print("Script execution in container completed.")
 

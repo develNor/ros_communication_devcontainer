@@ -148,9 +148,14 @@ class UniversalOtaUnwrapperNode(Node):
             return
         expected = last_seq + 1
         if seq != expected:
-            self.get_logger().warn(
-                f"[{wrapped_topic}] Sequence jump detected: expected {expected}, received {seq}"
-            )
+            if seq < last_seq:
+                self.get_logger().warn(
+                    f"[{wrapped_topic}] Sequence reordering detected: received {seq} after {last_seq}"
+                )
+            else:
+                self.get_logger().warn(
+                    f"[{wrapped_topic}] Sequence jump detected: expected {expected}, received {seq}"
+                )
 
     def unwrapper_callback(self, wrapped_msg: OtaStamped, wrapped_topic: str, out_topic: str):
         try:

@@ -1014,34 +1014,55 @@ def func(
     force: bool = False,
     rewrite_formatting: bool = False,
     base_plugin_path: str = BASE_PLUGIN_PATH_DEFAULT,
+    session_config_obj: Optional[Dict[str, Any]] = None,
+    output_dir: Optional[str] = None,
+    write_resolved_definition: Optional[bool] = None,
 ) -> None:
-    session_config_yaml = os.path.abspath(session_config_yaml)
-    param_dir = os.path.dirname(session_config_yaml)
+    session_config_yaml = os.path.abspath(session_config_yaml) if session_config_yaml else ""
+    if output_dir:
+        param_dir = os.path.abspath(output_dir)
+    elif session_config_yaml:
+        param_dir = os.path.dirname(session_config_yaml)
+    else:
+        raise RuntimeError("Either session_config_yaml or output_dir must be provided.")
     param_name = os.path.basename(param_dir)
 
-    param = _load_yaml(session_config_yaml)
-
-    if not isinstance(param, dict):
-        raise RuntimeError(f"Session config input YAML must be a mapping, got {type(param)} for '{session_config_yaml}'")
-
-    # session-config supports template-driven configs, but the resulting cfg is validated+handled
-    # with optional blocks: peers is required; shared/topics/peer_settings are optional.
-    template_mode = "load_template" in param
-    if template_mode:
-        session_template_fs, provided_params = _parse_session_config_template_spec(param, param_dir)
-        cfg_raw = _load_yaml(session_template_fs)
-        vars_map = _build_vars_map_from_template(cfg_raw, provided_params)
-        cfg = _substitute(cfg_raw, vars_map)
-    else:
+    if session_config_obj is not None:
+        if not isinstance(session_config_obj, dict):
+            raise RuntimeError(
+                f"session_config_obj must be a mapping, got {type(session_config_obj)}"
+            )
         vars_map = {}
-        cfg = dict(param)
+        cfg = dict(session_config_obj)
+        template_mode = False
+    else:
+        param = _load_yaml(session_config_yaml)
+
+        if not isinstance(param, dict):
+            raise RuntimeError(
+                f"Session config input YAML must be a mapping, got {type(param)} for '{session_config_yaml}'"
+            )
+
+        # session-config supports template-driven configs, but the resulting cfg is validated+handled
+        # with optional blocks: peers is required; shared/topics/peer_settings are optional.
+        template_mode = "load_template" in param
+        if template_mode:
+            session_template_fs, provided_params = _parse_session_config_template_spec(param, param_dir)
+            cfg_raw = _load_yaml(session_template_fs)
+            vars_map = _build_vars_map_from_template(cfg_raw, provided_params)
+            cfg = _substitute(cfg_raw, vars_map)
+        else:
+            vars_map = {}
+            cfg = dict(param)
 
     _validate_session_template_cfg(cfg)
 
     # If the user provided a parametrization (template + parameters), write the resolved, self-contained
     # session definition next to the generated files so it can be inspected/versioned.
     session_definition_yaml: Optional[str] = None
-    if template_mode:
+    if write_resolved_definition is None:
+        write_resolved_definition = template_mode
+    if write_resolved_definition:
         cfg_definition = dict(cfg)
         cfg_definition.pop("input_parameters", None)
         session_definition_yaml = _yaml_canonical_dump(cfg_definition)

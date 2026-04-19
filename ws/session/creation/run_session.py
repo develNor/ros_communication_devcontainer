@@ -38,21 +38,173 @@
 # ---------------------------------------------------------------------
 
 import argparse
+import copy
+import json
+import re
 import yaml
 import subprocess
 import sys
 import os
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 ws_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 sys.path.append(ws_path)
 
 from session.creation.create_session_yaml import main as create_session_yaml
-from session.creation.generate_session_files import func as generate_session_files
+from session.creation import generate_session_files as session_gen
+
+
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def _remove_comments(json_like: str) -> str:
+    pattern = r"//.*?$|/\*.*?\*/"
+    return re.sub(pattern, "", json_like, flags=re.DOTALL | re.MULTILINE)
+
+
+def _load_data_dict(candidate_paths) -> Optional[dict]:
+    for path in candidate_paths:
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.loads(_remove_comments(f.read()))
+    return None
+
+
+def _get_local_ipv4s() -> list:
+    try:
+        out = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True)
+    except Exception:
+        return []
+    return _IPV4_RE.findall(out)
+
+
+def _find_data_dict_leaf(data_dict: dict, leaf_key: str) -> Tuple[Optional[str], str]:
+    matches = []
+    for top_key, value in (data_dict or {}).items():
+        if isinstance(value, dict):
+            if leaf_key in value:
+                matches.append((top_key, value[leaf_key]))
+        elif top_key == leaf_key:
+            matches.append((None, value))
+
+    if not matches:
+        raise RuntimeError(f"Peer override references unknown data_dict key '{leaf_key}'.")
+    if len(matches) > 1:
+        groups = [m[0] for m in matches]
+        raise RuntimeError(
+            f"Peer override key '{leaf_key}' is ambiguous in data_dict; matches groups={groups}."
+        )
+
+    group_name, value = matches[0]
+    return group_name, str(value)
+
+
+def _parse_remote_peer_override(override: str) -> Tuple[str, str]:
+    peer_key, sep, remote_ip_key = (override or "").partition("=")
+    peer_key = peer_key.strip()
+    remote_ip_key = remote_ip_key.strip()
+    if sep != "=" or not peer_key or not remote_ip_key:
+        raise RuntimeError(
+            "--overwrite-peers-via-remote-peer must use '<peer_key>=<data_dict_ip_key>', "
+            "for example 'b=tks-leitstand-02_tks'."
+        )
+    return peer_key, remote_ip_key
+
+
+def _load_session_config_input(session_config_yaml: str) -> Dict:
+    param_dir = os.path.dirname(session_config_yaml)
+    param = session_gen._load_yaml(session_config_yaml)
+    if not isinstance(param, dict):
+        raise RuntimeError(
+            f"Session config input YAML must be a mapping, got {type(param)} for '{session_config_yaml}'"
+        )
+
+    if "load_template" in param:
+        session_template_fs, provided_params = session_gen._parse_session_config_template_spec(param, param_dir)
+        cfg_raw = session_gen._load_yaml(session_template_fs)
+        vars_map = session_gen._build_vars_map_from_template(cfg_raw, provided_params)
+        cfg = session_gen._substitute(cfg_raw, vars_map) or {}
+    else:
+        cfg = dict(param)
+
+    session_gen._validate_session_template_cfg(cfg)
+    return cfg
+
+
+def _apply_remote_peer_override(session_config_yaml: str, override: Optional[str]) -> Optional[Dict]:
+    if not override:
+        return None
+
+    cfg = copy.deepcopy(_load_session_config_input(session_config_yaml))
+    peers = (cfg or {}).get("peers")
+    if not isinstance(peers, dict) or len(peers) != 2:
+        raise RuntimeError(
+            "Peer override currently requires exactly 2 peers in the session config."
+        )
+
+    remote_peer_key, remote_ip_key = _parse_remote_peer_override(override)
+    if remote_peer_key not in peers:
+        raise RuntimeError(
+            f"Peer override references unknown session peer '{remote_peer_key}'. "
+            f"Known peers: {sorted(peers.keys())}"
+        )
+
+    local_peer_key = next(k for k in peers.keys() if k != remote_peer_key)
+    repo_root = os.path.dirname(ws_path)
+    data_dict = _load_data_dict(
+        [
+            "/data_dict.json",
+            "/session/data_dict.json",
+            os.path.join(repo_root, "session", "data_dict.json"),
+        ]
+    )
+    if data_dict is None:
+        raise RuntimeError("Peer override requires a readable data_dict.json.")
+
+    group_name, remote_ip = _find_data_dict_leaf(data_dict, remote_ip_key)
+    if not group_name:
+        raise RuntimeError(
+            f"Peer override key '{remote_ip_key}' is not inside a data_dict group. "
+            "Automatic local peer inference requires grouped entries."
+        )
+
+    group = data_dict.get(group_name)
+    if not isinstance(group, dict):
+        raise RuntimeError(f"data_dict group '{group_name}' must be a mapping.")
+
+    local_ips = set(_get_local_ipv4s())
+    if not local_ips:
+        raise RuntimeError(
+            "Peer override failed: could not determine local IPv4 addresses."
+        )
+
+    local_candidates = []
+    for candidate_key, candidate_value in group.items():
+        candidate_ip = str(candidate_value)
+        if candidate_key == remote_ip_key:
+            continue
+        if candidate_ip in local_ips:
+            local_candidates.append((candidate_key, candidate_ip))
+
+    if len(local_candidates) != 1:
+        raise RuntimeError(
+            "Peer override could not infer a unique local peer from the remote peer group. "
+            f"remote={remote_ip_key} group={group_name} remote_ip={remote_ip} "
+            f"local_ipv4s={sorted(local_ips)} candidates={local_candidates}"
+        )
+
+    local_ip_key, _local_ip = local_candidates[0]
+    peers[remote_peer_key]["ip_key"] = remote_ip_key
+    peers[local_peer_key]["ip_key"] = local_ip_key
+    return cfg
 
 
 def _resolve_peer_dir(
-    session_dir: str, identity: Optional[str], force: bool, rewrite_formatting: bool
+    session_dir: str,
+    identity: Optional[str],
+    force: bool,
+    rewrite_formatting: bool,
+    overwrite_peers_via_remote_peer: Optional[str] = None,
 ) -> str:
     """
     Resolve a runnable session directory (the directory containing session_specification.yaml).
@@ -101,10 +253,14 @@ def _resolve_peer_dir(
             f"{candidates}. Got dir: {p}"
         )
 
-    generate_session_files(
+    cfg_override = _apply_remote_peer_override(param_yaml, overwrite_peers_via_remote_peer)
+    session_gen.func(
         session_config_yaml=param_yaml,
         force=force,
         rewrite_formatting=rewrite_formatting,
+        session_config_obj=cfg_override,
+        output_dir=p,
+        write_resolved_definition=False if cfg_override is not None else None,
     )
     peer_dir = os.path.join(p, identity)
     spec_file = os.path.join(peer_dir, "session_specification.yaml")
@@ -126,9 +282,16 @@ def main(
     identity: Optional[str] = None,
     force: bool = False,
     rewrite_formatting: bool = False,
+    overwrite_peers_via_remote_peer: Optional[str] = None,
 ):
 
-    peer_dir = _resolve_peer_dir(session_dir, identity, force, rewrite_formatting)
+    peer_dir = _resolve_peer_dir(
+        session_dir,
+        identity,
+        force,
+        rewrite_formatting,
+        overwrite_peers_via_remote_peer=overwrite_peers_via_remote_peer,
+    )
 
     # Ensure merged .session_readonly.yaml exists for catmux
     create_session_yaml(peer_dir)
@@ -187,6 +350,14 @@ if __name__ == "__main__":
         "--rewrite-formatting",
         action="store_true",
         help="If generating session files: rewrite files even when semantically equal (format-only differences).",
+    )
+    parser.add_argument(
+        "--overwrite-peers-via-remote-peer",
+        type=str,
+        help=(
+            "Ephemerally override peer ip_keys via '<remote_peer_key>=<data_dict_ip_key>' "
+            "and infer the local peer ip_key from the same data_dict group."
+        ),
     )
     args = parser.parse_args()
 

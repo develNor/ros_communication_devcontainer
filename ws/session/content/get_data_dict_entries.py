@@ -59,22 +59,35 @@ def get_data_dict_entry(key):
     if isinstance(key, list):
         # Nested parameter case
         result = data_dict
-        for key in key:
-            if key in result:
-                result = result[key]
+        for part in key:
+            if isinstance(result, dict) and part in result:
+                result = result[part]
             else:
                 # Key not found in data dict, will use the literal string instead
-                result = key
+                result = part
+                break
     elif isinstance(key, str):
-        # Top-level parameter case
+        # Top-level parameter case, with fallback search inside one nested group.
         if key in data_dict:
             result = data_dict[key]
         else:
-            # Key not found in data dict, will use the literal string instead
-            result = key
+            matches = []
+            for top_value in data_dict.values():
+                if isinstance(top_value, dict) and key in top_value:
+                    matches.append(top_value[key])
+
+            if len(matches) == 1:
+                result = matches[0]
+            elif len(matches) > 1:
+                raise RuntimeError(
+                    f"Ambiguous data_dict key '{key}' found in multiple groups."
+                )
+            else:
+                # Key not found in data dict, will use the literal string instead
+                result = key
     else:
         raise TypeError("target_account_key must be either a string or a list of strings.")
-    return result
+    return str(result)
 
 def main(key_string):
     # Check if the string contains a semicolon

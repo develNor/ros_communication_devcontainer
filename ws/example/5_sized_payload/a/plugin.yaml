@@ -2,9 +2,9 @@ parameters:
   session_dir: /ws/example/5_sized_payload
   peer_dir: ${session_dir}/a
 
-  ip_local: machine_a_ip
+  ip_local: tks-seat_tks
   local_name: a
-  ip_remote: machine_b_ip
+  ip_remote: tks-leitstand-02_tks
   remote_name: b
 
   qos_config_file: ${session_dir}/qos.yaml

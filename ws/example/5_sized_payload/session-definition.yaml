@@ -10,7 +10,7 @@ shared:
 
   qos:
     defaults:
-      depth: 1
+      depth: 10
     for_role:
       ota_sub:
         reliability: best_effort

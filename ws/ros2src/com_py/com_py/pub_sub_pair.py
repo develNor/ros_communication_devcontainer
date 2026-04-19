@@ -44,6 +44,7 @@ from com_py.qos import get_topic_qos
 
 VALID_QOS_ROLES = {
     "ota_sub", "ota_pub",
+    "ota_wrap_sub", "ota_wrap_pub",
     "forward_sub", "forward_pub",
     "relay_sub", "relay_pub",
     "local_sub", "local_pub",

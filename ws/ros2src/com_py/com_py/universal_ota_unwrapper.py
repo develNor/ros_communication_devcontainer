@@ -35,8 +35,9 @@ class UniversalOtaUnwrapperNode(Node):
         self.default_suffix = self.get_parameter('default_suffix').value
 
         self.qos_config_file = self.declare_parameter('qos_config_file', '').value
-        self.sub_role = 'ota_sub'
-        self.pub_role = 'ota_pub'
+        # This is a local processing step after the actual OTA bridge.
+        self.sub_role = 'ota_wrap_sub'
+        self.pub_role = 'ota_wrap_pub'
         self.qos_config = load_qos_config(self.get_logger(), self.qos_config_file)
 
         self.config = self.load_config(config_file)

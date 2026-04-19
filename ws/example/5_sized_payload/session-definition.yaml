@@ -19,6 +19,10 @@ shared:
 
 topics:
   a_to_b:
-    - "/size_test_a"
+    - topic: "/size_test_a"
+      processing:
+        use_ota_wrapper: true
   b_to_a:
-    - "/size_test_b"
+    - topic: "/size_test_b"
+      processing:
+        use_ota_wrapper: true

@@ -4,7 +4,7 @@ windows:
     layout: even-vertical
     splits:
       - commands:
-        - ros2 run com_py sized_publisher --ros-args -p topic:=/size_test_a -p size:=66000 -p rate:=1.0
+        - ros2 run com_py sized_publisher --ros-args -p topic:=/size_test_a -p size_a:=0 -p size_b:=70000 -p pattern:=ax4,bx1 -p rate:=10.0
       - commands:
         - ros2 topic hz /size_test_a
       - commands:

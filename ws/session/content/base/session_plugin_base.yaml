@@ -77,6 +77,14 @@ parameters:
   deco_config_file:
   deco_algorithm: # e.g. "bz2"
 
+  otaw: false
+  otaw_config_file:
+  otaw_suffix: # e.g. "/ota_stamped"
+
+  otau: false
+  otau_config_file:
+  otau_suffix: # e.g. "/ota_stamped"
+
   nor: false
   nor_topic_1_prefix: # e.g. "/${vehicle_name}"
   nor_topic_1_base: # e.g. "tf"
@@ -340,6 +348,16 @@ windows:
     splits:
       - commands:
         - ros2 run com_py universal_decompressor --ros-args -p config_file:=${deco_config_file} -p default_algorithm:=${deco_algorithm} -p qos_config_file:='${qos_config_file}'
+  - name: OTAW
+    if: otaw
+    splits:
+      - commands:
+        - ros2 run com_py universal_ota_wrapper --ros-args -p config_file:=${otaw_config_file} -p default_suffix:=${otaw_suffix} -p qos_config_file:='${qos_config_file}'
+  - name: OTAU
+    if: otau
+    splits:
+      - commands:
+        - ros2 run com_py universal_ota_unwrapper --ros-args -p config_file:=${otau_config_file} -p default_suffix:=${otau_suffix} -p qos_config_file:='${qos_config_file}'
   - name: DRP
     if: drp
     layout: even-vertical

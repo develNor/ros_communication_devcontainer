@@ -1,0 +1,2 @@
+ota_wrapper:
+  - topic_regex: "^/size_test_b$"

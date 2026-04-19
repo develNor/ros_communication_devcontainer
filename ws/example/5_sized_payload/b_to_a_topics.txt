@@ -1,1 +1,1 @@
-/size_test_b
+/size_test_b/ota_stamped

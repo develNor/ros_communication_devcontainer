@@ -164,14 +164,14 @@ def _normalize_csv_set(value: Any) -> Any:
     return ",".join(sorted(set(items)))
 
 
-def _normalize_compression_yaml_obj(obj: Any) -> Any:
+def _normalize_regex_rule_yaml_obj(obj: Any) -> Any:
     # Expected:
     # compression:
     #   - topic_regex: "^/foo$"
     # Keep order stable by sorting by topic_regex
     if not isinstance(obj, dict):
         return obj
-    for key in ("compression", "decompression"):
+    for key in ("compression", "decompression", "ota_wrapper", "ota_unwrapper"):
         if key in obj and isinstance(obj[key], list):
             entries = obj[key]
             norm_entries = []
@@ -265,9 +265,9 @@ def _semantic_equal(path: str, existing_text: str, generated_text: str) -> Tuple
         if base == "plugin.yaml":
             a_obj = _normalize_plugin_yaml_obj(a_obj)
             b_obj = _normalize_plugin_yaml_obj(b_obj)
-        elif base in ("compression.yaml", "decompression.yaml"):
-            a_obj = _normalize_compression_yaml_obj(a_obj)
-            b_obj = _normalize_compression_yaml_obj(b_obj)
+        elif base in ("compression.yaml", "decompression.yaml", "ota_wrapper.yaml", "ota_unwrapper.yaml"):
+            a_obj = _normalize_regex_rule_yaml_obj(a_obj)
+            b_obj = _normalize_regex_rule_yaml_obj(b_obj)
         elif base == "session_specification.yaml":
             a_obj = _normalize_session_spec_yaml_obj(a_obj)
             b_obj = _normalize_session_spec_yaml_obj(b_obj)
@@ -638,7 +638,11 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             raise RuntimeError("shared.use_out must be boolean if provided.")
         if "processing_suffixes" in shared and shared["processing_suffixes"] is not None:
             suffixes = _assert_mapping(shared.get("processing_suffixes"), "shared.processing_suffixes")
-            _assert_allowed_keys("shared.processing_suffixes", suffixes, {"restamped", "latched", "framebridge_global"})
+            _assert_allowed_keys(
+                "shared.processing_suffixes",
+                suffixes,
+                {"restamped", "latched", "framebridge_global", "ota_stamped"},
+            )
         if "compression" in shared and shared["compression"] is not None:
             comp = _assert_mapping(shared.get("compression"), "shared.compression")
             _assert_allowed_keys("shared.compression", comp, {"algorithm", "remove_algorithm_suffix_on_decompression"})
@@ -851,6 +855,7 @@ def _compute_pipeline(
     latched_suffix: str,
     globalframe_suffix: str,
     comp_alg_suffix: str,
+    ota_suffix: str,
 ) -> Dict[str, Any]:
     proc = entry.processing or {}
 
@@ -862,6 +867,7 @@ def _compute_pipeline(
         "framebridge",
         "normalize_on_target",
         "compress",
+        "use_ota_wrapper",
         "throttle_hz",
         "pixel_cap_preset",
         "transport",
@@ -875,6 +881,7 @@ def _compute_pipeline(
     framebridge = proc.get("framebridge")
     normalize = bool(proc.get("normalize_on_target")) if "normalize_on_target" in proc else False
     compress = bool(proc.get("compress")) if "compress" in proc else False
+    ota_wrap = bool(proc.get("use_ota_wrapper")) if "use_ota_wrapper" in proc else False
 
     throttle = proc.get("throttle_hz")
     if throttle is not None:
@@ -967,6 +974,11 @@ def _compute_pipeline(
         comp_in = topic
         topic = topic + comp_alg_suffix
 
+    ota_in = None
+    if ota_wrap:
+        ota_in = topic
+        topic = topic + ota_suffix
+
     it_in = None
     irt_in = None
     if transport:
@@ -993,6 +1005,8 @@ def _compute_pipeline(
         "normalize": normalize,
         "compress": compress,
         "comp_in": comp_in,
+        "ota_wrap": ota_wrap,
+        "ota_in": ota_in,
         "throttle": throttle,
         "thr_in": thr_in,
         "thr_out": thr_out,
@@ -1244,6 +1258,7 @@ def func(
     restamped_suffix = str(suffixes.get("restamped", "/restamped"))
     latched_suffix = str(suffixes.get("latched", "/latched"))
     globalframe_suffix = str(suffixes.get("framebridge_global", "/globalframe"))
+    ota_suffix = str(suffixes.get("ota_stamped", "/ota_stamped"))
 
     comp_cfg = (shared.get("compression", {}) or {}) if isinstance(shared, dict) else {}
     if not isinstance(comp_cfg, dict):
@@ -1288,7 +1303,18 @@ def func(
     dir_pipes: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for (src, dst), direction_key in direction_key_for.items():
         entries = _topic_entries(cfg, direction_key)
-        pipes = [_compute_pipeline(e, vars_map, restamped_suffix, latched_suffix, globalframe_suffix, comp_alg_suffix) for e in entries]
+        pipes = [
+            _compute_pipeline(
+                e,
+                vars_map,
+                restamped_suffix,
+                latched_suffix,
+                globalframe_suffix,
+                comp_alg_suffix,
+                ota_suffix,
+            )
+            for e in entries
+        ]
         dir_entries[(src, dst)] = entries
         dir_pipes[(src, dst)] = pipes
 
@@ -1321,6 +1347,8 @@ def func(
             suffixes.append("globalframe")
         if pipe.get("compress"):
             suffixes.append("compressed")
+        if pipe.get("ota_wrap"):
+            suffixes.append("ota_stamped")
         if pipe.get("transport") is not None:
             ts = pipe.get("transport")
             assert isinstance(ts, TransportSpec)
@@ -1430,6 +1458,8 @@ def func(
     per_peer_plugin: Dict[str, str] = {}
     per_peer_comp_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
     per_peer_deco_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
+    per_peer_otaw_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
+    per_peer_otau_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
 
     def _prefix_with_source_name_if_needed(target_peer: str, source_peer: str, topic: str) -> str:
         ps = peer_settings_all.get(target_peer, {}) or {}
@@ -1481,6 +1511,10 @@ def func(
         if comp_topics:
             per_peer_comp_yaml[local] = _render_regex_list("compression", comp_topics)
 
+        ota_topics = _dedup_keep_order([p["ota_in"] for p in out_pipes if p["ota_in"]])
+        if ota_topics:
+            per_peer_otaw_yaml[local] = _render_regex_list("ota_wrapper", ota_topics)
+
         # Decompression happens on the receiver side for inbound topics that were compressed by the remote.
         inbound_comp_topics = _dedup_keep_order([p["comp_in"] for p in in_pipes if p["comp_in"]])
         if inbound_comp_topics:
@@ -1488,6 +1522,13 @@ def func(
                 _prefix_with_source_name_if_needed(local, remote, t) + comp_alg_suffix for t in inbound_comp_topics
             ]
             per_peer_deco_yaml[local] = _render_regex_list("decompression", deco_topics)
+
+        inbound_ota_topics = _dedup_keep_order([p["ota_in"] for p in in_pipes if p["ota_in"]])
+        if inbound_ota_topics:
+            otau_topics = [
+                _prefix_with_source_name_if_needed(local, remote, t) + ota_suffix for t in inbound_ota_topics
+            ]
+            per_peer_otau_yaml[local] = _render_regex_list("ota_unwrapper", otau_topics)
 
         # Normalization happens on receiver side for topics with normalize_on_target.
         nor_items = []
@@ -1793,6 +1834,18 @@ def func(
                 )
             )
 
+        if ota_topics:
+            blocks.append(
+                PluginBlock(
+                    "otaw",
+                    [
+                        ("otaw", True),
+                        ("otaw_config_file", "${peer_dir}/ota_wrapper.yaml"),
+                        ("otaw_suffix", ota_suffix),
+                    ],
+                )
+            )
+
         if inbound_comp_topics:
             blocks.append(
                 PluginBlock(
@@ -1801,6 +1854,18 @@ def func(
                         ("deco", True),
                         ("deco_config_file", "${peer_dir}/decompression.yaml"),
                         ("deco_algorithm", comp_algorithm),
+                    ],
+                )
+            )
+
+        if inbound_ota_topics:
+            blocks.append(
+                PluginBlock(
+                    "otau",
+                    [
+                        ("otau", True),
+                        ("otau_config_file", "${peer_dir}/ota_unwrapper.yaml"),
+                        ("otau_suffix", ota_suffix),
                     ],
                 )
             )
@@ -1913,6 +1978,10 @@ def func(
             generated.append((os.path.join(param_dir, p, "compression.yaml"), per_peer_comp_yaml[p] or ""))
         if per_peer_deco_yaml.get(p):
             generated.append((os.path.join(param_dir, p, "decompression.yaml"), per_peer_deco_yaml[p] or ""))
+        if per_peer_otaw_yaml.get(p):
+            generated.append((os.path.join(param_dir, p, "ota_wrapper.yaml"), per_peer_otaw_yaml[p] or ""))
+        if per_peer_otau_yaml.get(p):
+            generated.append((os.path.join(param_dir, p, "ota_unwrapper.yaml"), per_peer_otau_yaml[p] or ""))
 
     _write_generated_files(generated, force=force, rewrite_formatting=rewrite_formatting)
 

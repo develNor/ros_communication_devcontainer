@@ -28,6 +28,8 @@ setup(
             'traffic_monitor = com_py.traffic_monitor:main',
             'universal_compressor = com_py.universal_compressor:main',
             'universal_decompressor = com_py.universal_decompressor:main',
+            'universal_ota_unwrapper = com_py.universal_ota_unwrapper:main',
+            'universal_ota_wrapper = com_py.universal_ota_wrapper:main',
             'heartbeat_out_publisher = com_py.heartbeat_out_publisher:main',
             'heartbeat_in_monitor = com_py.heartbeat_in_monitor:main',
             'topic_monitor = com_py.topic_monitor:main',

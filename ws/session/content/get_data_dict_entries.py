@@ -39,6 +39,7 @@
 
 import argparse
 import json
+import os
 import re
 
 def remove_comments(json_like):
@@ -46,17 +47,36 @@ def remove_comments(json_like):
     pattern = r'//.*?$|/\*.*?\*/'
     return re.sub(pattern, '', json_like, flags=re.DOTALL | re.MULTILINE)
 
-def json_to_dict(path_to_json):
-    with open(path_to_json, 'r') as file:
-        content = file.read()
+def _candidate_data_dict_paths():
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    repo_root = os.path.abspath(os.path.join(script_dir, "..", "..", "..", ".."))
+    return [
+        "/data_dict.json",
+        "/session/data_dict.json",
+        os.path.join(repo_root, "session", "data_dict.json"),
+    ]
 
-        content_no_comments = remove_comments(content)
-        # Return parsed JSON
-        return json.loads(content_no_comments)
+
+def json_to_dict():
+    for path_to_json in _candidate_data_dict_paths():
+        if not os.path.exists(path_to_json):
+            continue
+        with open(path_to_json, 'r') as file:
+            content = file.read()
+
+            content_no_comments = remove_comments(content)
+            # Return parsed JSON
+            return json.loads(content_no_comments)
+    raise FileNotFoundError(
+        "Could not find data_dict.json. Tried: "
+        + ", ".join(_candidate_data_dict_paths())
+    )
 
 def get_data_dict_entry(key):
-    data_dict = json_to_dict('/data_dict.json')
+    data_dict = json_to_dict()
     if isinstance(key, list):
+        if len(key) == 1:
+            return get_data_dict_entry(key[0])
         # Nested parameter case
         result = data_dict
         for part in key:

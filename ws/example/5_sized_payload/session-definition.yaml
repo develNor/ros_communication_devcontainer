@@ -14,10 +14,10 @@ shared:
     for_role:
       ota_sub:
         reliability: best_effort
-        livespan: 0.7
+        livespan: 0.07
       ota_pub:
         reliability: best_effort
-        livespan: 0.7
+        livespan: 0.07
 
 topics:
   a_to_b:

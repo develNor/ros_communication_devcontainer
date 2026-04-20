@@ -2,7 +2,9 @@ default:
   depth: 1
 role_defaults:
   ota_pub:
+    livespan: 0.7
     reliability: best_effort
   ota_sub:
+    livespan: 0.7
     reliability: best_effort
 topics: {}

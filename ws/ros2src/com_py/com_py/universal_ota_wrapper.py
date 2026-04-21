@@ -132,10 +132,9 @@ class UniversalOtaWrapperNode(Node):
             serialized = serialize_message(msg)
 
             out_msg = OtaStamped()
+            out_msg.header.stamp = self.get_clock().now().to_msg()
             if hasattr(msg, 'header'):
-                out_msg.header = msg.header
-            else:
-                out_msg.header.stamp = self.get_clock().now().to_msg()
+                out_msg.header.frame_id = msg.header.frame_id
             out_msg.seq = self._next_sequence(source_topic)
             out_msg.msg_type = msg_type_str
             out_msg.serialized_msg = list(serialized)

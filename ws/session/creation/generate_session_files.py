@@ -625,10 +625,12 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "use_heartbeat",
                 "use_in",
                 "use_out",
+                "rmw",
                 "heartbeat_position",
                 "processing_suffixes",
                 "compression",
                 "qos",
+                "fastdds_easy",
                 "zenoh",
             },
         )
@@ -636,6 +638,11 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             raise RuntimeError("shared.use_in must be boolean if provided.")
         if "use_out" in shared and shared["use_out"] is not None and not isinstance(shared["use_out"], bool):
             raise RuntimeError("shared.use_out must be boolean if provided.")
+        if "rmw" in shared and shared["rmw"] is not None:
+            if not isinstance(shared["rmw"], str):
+                raise RuntimeError("shared.rmw must be a string if provided.")
+            if shared["rmw"].strip() not in {"cyclone", "fastdds", "zenoh"}:
+                raise RuntimeError("shared.rmw must be one of: cyclone, fastdds, zenoh.")
         if "processing_suffixes" in shared and shared["processing_suffixes"] is not None:
             suffixes = _assert_mapping(shared.get("processing_suffixes"), "shared.processing_suffixes")
             _assert_allowed_keys(
@@ -649,6 +656,8 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
         if "qos" in shared and shared["qos"] is not None:
             qos = _assert_mapping(shared.get("qos"), "shared.qos")
             _assert_allowed_keys("shared.qos", qos, {"defaults", "for_role"})
+        if "fastdds_easy" in shared and shared["fastdds_easy"] is not None and not isinstance(shared["fastdds_easy"], bool):
+            raise RuntimeError("shared.fastdds_easy must be boolean if provided.")
         if "zenoh" in shared and shared["zenoh"] is not None:
             zen = _assert_mapping(shared.get("zenoh"), "shared.zenoh")
             _assert_allowed_keys("shared.zenoh", zen, {"transport", "main_peer", "main_port"})
@@ -1143,10 +1152,20 @@ def func(
     zenoh_cfg = shared.get("zenoh", None)
     if zenoh_cfg is not None and not isinstance(zenoh_cfg, dict):
         raise RuntimeError(f"shared.zenoh must be a mapping if provided, got {type(zenoh_cfg)}")
+    fastdds_easy = bool(shared.get("fastdds_easy", False))
+    rmw_cfg = str(shared.get("rmw", "") or "").strip()
+    if fastdds_easy and rmw_cfg:
+        raise RuntimeError("Use either shared.rmw or the legacy shared.fastdds_easy flag, not both.")
+    ota_rmw = "fastdds" if fastdds_easy else (rmw_cfg or "cyclone")
+    if ota_rmw == "zenoh" and zenoh_cfg is None:
+        raise RuntimeError("shared.rmw=zenoh requires a shared.zenoh configuration block.")
+    if ota_rmw != "zenoh" and zenoh_cfg is not None:
+        raise RuntimeError("shared.zenoh may only be specified when shared.rmw=zenoh.")
 
     # session_dir is the on-disk directory containing the session config input YAML
     # (session-definition.yaml / session-parametrization.yaml)
     session_dir = _render_session_dir(param_dir)
+    fastdds_easy_mode_ip = peer_ip[peer_keys[0]]
 
     # Heartbeat topics (only if enabled). If not configured, default to /heartbeat_<com-name>.
     hb_topic: Dict[str, str] = {}
@@ -1231,6 +1250,12 @@ def func(
                     ],
                 )
             )
+            rmw_items: List[Tuple[str, Any]] = [("rmw", ota_rmw)]
+            rmw_items.append(("use_zenoh", ota_rmw == "zenoh"))
+            if ota_rmw == "fastdds":
+                rmw_items.append(("fastdds_easy_mode_ip", fastdds_easy_mode_ip))
+                rmw_items.append(("fastdds_config_file", "${peer_dir}/fastdds.xml"))
+            blocks.append(PluginBlock("rmw", rmw_items))
             if use_topic_monitor:
                 blocks.append(PluginBlock("topic_monitor", [("topic_monitor", True)]))
             if use_heartbeat:
@@ -1691,8 +1716,8 @@ def func(
                 out_items.append(("app_has_source_name_outbound", True))
             blocks.append(PluginBlock("out", out_items))
 
-        # Zenoh block (optional, driven by shared.zenoh existence)
-        if zenoh_cfg is not None:
+        # Zenoh block (optional, driven by shared.rmw=zenoh)
+        if ota_rmw == "zenoh":
             transport = str((zenoh_cfg or {}).get("transport", "udp") or "udp").strip()
             if not transport:
                 transport = "udp"
@@ -1713,7 +1738,6 @@ def func(
 
             endpoint_role = "listen" if local == main_peer else "connect"
             zen_items: List[Tuple[str, Any]] = [
-                ("zen", True),
                 ("zen_pub_allow", f"/ota/{peer_name[local]}/.*"),
                 ("zen_sub_allow", f"/ota/{peer_name[remote]}/.*"),
                 ("zen_transport", transport),
@@ -1730,6 +1754,12 @@ def func(
                 zen_items.append(("zen_qos_pub", qos_block))
 
             blocks.append(PluginBlock("zenoh", zen_items))
+
+        rmw_items: List[Tuple[str, Any]] = [("rmw", ota_rmw), ("use_zenoh", ota_rmw == "zenoh")]
+        if ota_rmw == "fastdds":
+            rmw_items.append(("fastdds_easy_mode_ip", fastdds_easy_mode_ip))
+            rmw_items.append(("fastdds_config_file", "${peer_dir}/fastdds.xml"))
+        blocks.append(PluginBlock("rmw", rmw_items))
 
         # Topic monitor: set to_adressant only when target-prefix addressing is in play
         tm_in_to = peer_name[local] if bool(remote_outbound_target.get("use_target_prefix", False)) else None

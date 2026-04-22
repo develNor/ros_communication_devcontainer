@@ -6,3 +6,4 @@ peers:
 
 shared:
   use_heartbeat: true
+  rmw: fastdds

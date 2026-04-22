@@ -68,6 +68,8 @@ shared:
   use_topic_monitor: false   # default false
   use_heartbeat: false       # default false
 
+  rmw: cyclone               # optional; cyclone | fastdds | zenoh
+
   use_in: null               # default null (auto-enable based on topics)
   use_out: null              # default null (auto-enable based on topics)
 
@@ -86,11 +88,20 @@ shared:
     defaults: {}             # free-form, written to qos.yaml
     for_role: {}             # free-form, written to qos.yaml
 
-  zenoh:                     # optional (if you want to use a Zenoh-Router for over the air communication rather than direct RMW communication via Cyclone DDS)
+  zenoh:                     # required when rmw: zenoh
     transport: "udp"         # default udp
     main_peer: "<peer_key>"  # required if zenoh is set
     main_port: 7447          # required if zenoh is set (int)
 ```
+
+If `shared.rmw` is omitted, the generator uses `cyclone`.
+When `shared.rmw: zenoh`, a `shared.zenoh` block is required.
+When `shared.rmw` is `cyclone` or `fastdds`, `shared.zenoh` must not be set.
+
+When `shared.rmw: fastdds`, the generator writes a per-peer plugin setting
+with `rmw: fastdds`, renders a Fast DDS XML profile to `${peer_dir}/fastdds.xml`,
+and exports `FASTDDS_DEFAULT_PROFILES_FILE` for the bridge/relay processes.
+The chosen IP is deterministic: the `ip_key` of the first peer declared under `peers:`.
 
 #### Auto-enable of `use_in` / `use_out`
 If `use_in` / `use_out` are not set, the generator derives them from the topic lists:

@@ -21,7 +21,10 @@ parameters:
   remote_explicitly_targeted_name_outbound: ""
 
   # RMW specific OTA parameters
-  zen: false # to use zenoh for OTA communication instaed of CycloneDDS
+  rmw: cyclone # OTA mode: cyclone, fastdds, or zenoh
+  use_zenoh: false # derived helper; set automatically when rmw=zenoh
+  fastdds_easy_mode_ip: # deterministic Discovery Server IP, e.g. first peer IP
+  fastdds_config_file: ${peer_dir}/fastdds.xml
   zen_mode: # e.g. router, peer or client
   zen_endpoint_role: # e.g. listen or connect
   zen_transport: # e.g. tcp or udp
@@ -199,7 +202,7 @@ common:
 
 windows:
   - name: ZEN
-    if: zen
+    if: use_zenoh
     splits:
       - commands:
         - export RUST_LOG=zenoh=debug,zenoh_bridge_ros2dds=debug
@@ -215,9 +218,9 @@ windows:
     if: in
     splits:
       - commands:
-        - case ${zen} in [Ff]alse) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; esac
-        - case ${zen} in [Ff]alse) export CYCLONEDDS_URI=$(/ws/ota_configs/get_cyclonedds_xml.py -i "${ip_local}" -p "${ip_remote}");; esac
-        - case ${zen} in [Ff]alse) export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}");; esac
+        - case ${rmw} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp;; esac
+        - case ${rmw} in cyclone) export CYCLONEDDS_URI=$(/ws/ota_configs/get_cyclonedds_xml.py -i "${ip_local}" -p "${ip_remote}");; fastdds) /ws/ota_configs/get_fastdds_easy_mode_xml.py -e "${fastdds_easy_mode_ip}" > "${fastdds_config_file}" && export FASTDDS_DEFAULT_PROFILES_FILE="${fastdds_config_file}";; esac
+        - export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}")
         - ros2 run com_py bridge_in --ros-args
             -p base_topic_files:=[${topic_list_paths_inbound}]
             -p local_name:=${local_name}
@@ -236,9 +239,9 @@ windows:
     if: out
     splits:
       - commands:
-        - case ${zen} in [Ff]alse) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; esac
-        - case ${zen} in [Ff]alse) export CYCLONEDDS_URI=$(/ws/ota_configs/get_cyclonedds_xml.py -i "${ip_local}" -p "${ip_remote}");; esac
-        - case ${zen} in [Ff]alse) export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}");; esac
+        - case ${rmw} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp;; esac
+        - case ${rmw} in cyclone) export CYCLONEDDS_URI=$(/ws/ota_configs/get_cyclonedds_xml.py -i "${ip_local}" -p "${ip_remote}");; fastdds) /ws/ota_configs/get_fastdds_easy_mode_xml.py -e "${fastdds_easy_mode_ip}" > "${fastdds_config_file}" && export FASTDDS_DEFAULT_PROFILES_FILE="${fastdds_config_file}";; esac
+        - export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}")
         - ros2 run com_py bridge_out --ros-args
             -p base_topic_files:=[${topic_list_paths_outbound}]
             -p local_name:=${local_name}

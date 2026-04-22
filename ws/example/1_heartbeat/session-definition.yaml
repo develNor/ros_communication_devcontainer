@@ -7,3 +7,4 @@ peers:
 shared:
   use_heartbeat: true
   rmw: fastdds
+  non_ota_rmw: fastdds

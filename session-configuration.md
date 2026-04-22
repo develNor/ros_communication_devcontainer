@@ -37,6 +37,7 @@ These constraints are **enforced** by the generator (or by the base plugin it ta
   - `peer_settings.<peer>.outbound.source_prefix.use_source_prefix: false`
   - `peer_settings.<peer>.inbound.keep_target_prefix: true`
   - `peer_settings.<peer>.outbound.target_prefix.native_have_outgoing_target_prefix != use_target_prefix`
+  - `shared.local_domain_id != shared.ota_domain_id` unless `shared.rmw_ota: zenoh`
 
 ### Root schema (definition)
 Allowed top-level keys:
@@ -68,7 +69,11 @@ shared:
   use_topic_monitor: false   # default false
   use_heartbeat: false       # default false
 
-  rmw: cyclone               # optional; cyclone | fastdds | zenoh
+  rmw_ota: cyclone           # optional; OTA transport mode: cyclone | fastdds | zenoh
+  rmw_local: cyclone         # optional; local ROS graph RMW alias or implementation string
+
+  local_domain_id: 47        # optional; enable /com domain bridging when both domain IDs are set and differ
+  ota_domain_id: 48          # optional; currently supported only together with rmw_ota: zenoh
 
   use_in: null               # default null (auto-enable based on topics)
   use_out: null              # default null (auto-enable based on topics)
@@ -88,18 +93,29 @@ shared:
     defaults: {}             # free-form, written to qos.yaml
     for_role: {}             # free-form, written to qos.yaml
 
-  zenoh:                     # required when rmw: zenoh
+  zenoh:                     # required when rmw_ota: zenoh
     transport: "udp"         # default udp
     main_peer: "<peer_key>"  # required if zenoh is set
     main_port: 7447          # required if zenoh is set (int)
 ```
 
-If `shared.rmw` is omitted, the generator uses `cyclone`.
-When `shared.rmw: zenoh`, a `shared.zenoh` block is required.
-When `shared.rmw` is `cyclone` or `fastdds`, `shared.zenoh` must not be set.
+If `shared.rmw_ota` is omitted, the generator uses `cyclone`.
+If `shared.rmw_local` is omitted, the local graph keeps the ambient ROS RMW unless split-domain bridging requires a default.
+When `shared.rmw_ota: zenoh`, a `shared.zenoh` block is required.
+When `shared.rmw_ota` is `cyclone` or `fastdds`, `shared.zenoh` must not be set.
 
-When `shared.rmw: fastdds`, the generator writes a per-peer plugin setting
-with `rmw: fastdds`, renders a Fast DDS XML profile to `${peer_dir}/fastdds.xml`,
+If `shared.local_domain_id` and `shared.ota_domain_id` are both set and differ, the generator
+creates a per-peer standard ROS 2 `domain_bridge.yaml` for the `/com/...` topics and the runtime
+places:
+- application/processing/relay nodes on `local_domain_id`
+- OTA bridge + Zenoh router on `ota_domain_id`
+- a stock ROS 2 `domain_bridge` process between both domains
+
+This split-domain mode currently requires `shared.rmw_ota: zenoh`, because the standard
+`domain_bridge` executable uses one ROS RMW configuration across both domains.
+
+When `shared.rmw_ota: fastdds`, the generator writes a per-peer plugin setting
+with `rmw_ota: fastdds`, renders a Fast DDS XML profile to `${peer_dir}/fastdds.xml`,
 and exports `FASTDDS_DEFAULT_PROFILES_FILE` for the bridge/relay processes.
 The chosen IP is deterministic: the `ip_key` of the first peer declared under `peers:`.
 
@@ -162,6 +178,7 @@ topics:
   <src>_to_<dst>:
     - "/tf"  # short form: just the base topic string
     - topic: "/camera/image"
+      type: "sensor_msgs/msg/Image"
       processing: {}
       qos: {}
       zen_qos: {}
@@ -171,9 +188,14 @@ Each entry is either:
 - A **string** (base topic only)
 - A **mapping** with:
   - `topic` (**required**, string)
+  - `type` (optional string; required when split-domain mode via `shared.local_domain_id` / `shared.ota_domain_id` is enabled)
   - `processing` (optional mapping)
   - `qos` (optional mapping)
   - `zen_qos` (optional mapping)
+
+In split-domain mode the generator must emit a standard ROS 2 `domain_bridge` YAML with explicit
+message types for `/com/...` topics. For that reason, user-defined topic entries need `type:`.
+The auto-generated heartbeat topic is the only exception because its type is known by the generator.
 
 #### Allowed `processing` keys
 Only these keys are allowed:
@@ -247,6 +269,7 @@ For a session directory containing a session configuration input file, the gener
 - Per peer directory:
   - `<peer>/plugin.yaml`
   - `<peer>/session_specification.yaml`
+  - `<peer>/domain_bridge.yaml` (only when `shared.local_domain_id` / `shared.ota_domain_id` are both set and differ)
 - Optionally:
   - `qos.yaml` (if `shared.qos` or any `topic.qos` exists)
   - `<peer>/compression.yaml` (if that peer compresses outbound topics)

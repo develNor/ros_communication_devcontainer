@@ -1,6 +1,6 @@
 # ROS Communication DevContainer
 
-The ROS Communication DevContainer is a Docker-based solution designed to streamline the bidirectional synchronization of ROS2 topics between two Linux machines. It provides built-in compression and routing capabilities for over-the-air (OTA) data transfer: selected topics are remapped into an OTA namespace and transmitted either via direct DDS (CycloneDDS) or through a Zenoh router. This project aligns with the publication *“Scalable Remote Operation for Autonomous Vehicles: Integration of Cooperative Perception and Open Source Communication.”*
+The ROS Communication DevContainer is a Docker-based solution designed to streamline the bidirectional synchronization of ROS2 topics between two Linux machines. It provides built-in compression and routing capabilities for over-the-air (OTA) data transfer: selected topics are remapped into an OTA namespace and transmitted either via direct DDS (CycloneDDS) or through a Zenoh router. When desired, the session can also place local application nodes and OTA-facing bridge nodes into separate ROS 2 domain IDs and automatically generate a standard ROS 2 `domain_bridge` configuration for the `/com/...` boundary. This project aligns with the publication *“Scalable Remote Operation for Autonomous Vehicles: Integration of Cooperative Perception and Open Source Communication.”*
 
 <details>
 <summary>Key Features</summary>
@@ -64,7 +64,7 @@ rosotacom --session-dir /path/to/session_dir --identity a
 rosotacom --session-dir /path/to/session_dir --identity b
 ```
 
-That’s it: `rosotacom` will read the session config input file and automatically create/update all required generated files in that directory (per-peer plugin/session specs, direction topic lists, optional compression/decompression, optional `qos.yaml`, …).
+That’s it: `rosotacom` will read the session config input file and automatically create/update all required generated files in that directory (per-peer plugin/session specs, direction topic lists, optional compression/decompression, optional `qos.yaml`, optional `domain_bridge.yaml`, …).
 
 ## Usage Examples
 
@@ -156,7 +156,7 @@ including processing steps like restamping and compression/decompression.
 <details>
 <summary>Example 4: Compressed Occupancy Grid (Zenoh)</summary>
 
-This is the same scenario as Example 3, but routed via a Zenoh router layer (useful when peers cannot share a single DDS domain).
+This is the same scenario as Example 3, but routed via a Zenoh router layer (useful when peers cannot share a single DDS domain, or when you want separate local and OTA ROS 2 domains on each peer).
 The session config enables Zenoh with peer `a` as the main/router node.
 
 - On `machine_a`, start the “logic” container and the communication session in separate terminals:
@@ -187,8 +187,8 @@ The session config enables Zenoh with peer `a` as the main/router node.
 - **Use CycloneDDS** when all machines share the **same `ROS_DOMAIN_ID`**.  
   This is the simplest and most direct configuration.
 
-- **Use Zenoh** when machines **require different domain IDs**.  
-  Zenoh naturally bridges DDS domains and avoids additional ROS 2 domain-bridging complexity.
+- **Use Zenoh** when peers cannot rely on one shared DDS domain, or when you want to split local application nodes and OTA-facing bridge nodes into different ROS 2 domains on each peer.  
+  In that split-domain setup this repository generates a standard ROS 2 `domain_bridge` for `/com/...` topics locally, while Zenoh carries the `/ota/...` traffic between peers.
 
 ## Position in the OTA Communication Landscape
 

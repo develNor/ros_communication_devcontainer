@@ -6,5 +6,7 @@ peers:
 
 shared:
   use_heartbeat: true
-  rmw: fastdds
-  non_ota_rmw: fastdds
+  rmw_ota: cyclone
+  rmw_local: cyclone
+  local_domain_id: 47
+  ota_domain_id: 48

@@ -6,4 +6,5 @@ peers:
 
 topics:
   b_to_a:
-    - "/chatter"
+    - topic: "/chatter"
+      type: "std_msgs/msg/String"

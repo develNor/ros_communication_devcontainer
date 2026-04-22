@@ -55,10 +55,18 @@ FULL_VAR_PATTERN = re.compile(r"^\$\{([A-Za-z0-9_]+)\}$")
 
 # Compression algorithms supported by com_py universal_{de}compressor nodes
 ALLOWED_COMPRESSION_ALGORITHMS = {"bz2", "zlib", "lz4", "zstd"}
-NON_OTA_RMW_ALIASES = {
+RMW_ALIASES = {
     "cyclone": "rmw_cyclonedds_cpp",
     "fastdds": "rmw_fastrtps_cpp",
     "zenoh": "rmw_zenoh_cpp",
+}
+HEARTBEAT_MSG_TYPE = "com_msgs/msg/Heartbeat"
+COMPRESSED_MSG_TYPE = "com_msgs/msg/CompressedData"
+OTA_STAMPED_MSG_TYPE = "com_msgs/msg/OtaStamped"
+TRANSPORT_OUTPUT_TYPES = {
+    "compressed": "sensor_msgs/msg/CompressedImage",
+    "ffmpeg": "ffmpeg_image_transport_msgs/msg/FFMPEGPacket",
+    "foxglove": "foxglove_msgs/msg/CompressedVideo",
 }
 
 
@@ -72,6 +80,7 @@ class TransportSpec:
 @dataclass
 class TopicEntry:
     base: str
+    msg_type: Optional[str]
     processing: Dict[str, Any]
     qos: Optional[Dict[str, Any]]
     zen_qos: Optional[Dict[str, Any]]
@@ -103,16 +112,30 @@ class YamlBlockScalar:
     content: str
 
 
-def _resolve_non_ota_rmw_implementation(value: Any) -> Optional[str]:
+def _resolve_rmw_local(value: Any) -> Optional[str]:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise RuntimeError("shared.non_ota_rmw must be a string if provided.")
+        raise RuntimeError("shared.rmw_local must be a string if provided.")
 
     resolved = value.strip()
     if not resolved:
         return None
-    return NON_OTA_RMW_ALIASES.get(resolved, resolved)
+    return resolved
+
+
+def _parse_optional_domain_id(value: Any, field_name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise RuntimeError(f"{field_name} must be an integer if provided.")
+    try:
+        out = int(value)
+    except Exception as e:
+        raise RuntimeError(f"{field_name} must be an integer if provided.") from e
+    if out < 0:
+        raise RuntimeError(f"{field_name} must be >= 0, got {out}.")
+    return out
 
 
 # ---------------------------
@@ -642,8 +665,12 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "use_heartbeat",
                 "use_in",
                 "use_out",
+                "rmw_local",
+                "rmw_ota",
                 "rmw",
                 "non_ota_rmw",
+                "local_domain_id",
+                "ota_domain_id",
                 "heartbeat_position",
                 "processing_suffixes",
                 "compression",
@@ -656,6 +683,16 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             raise RuntimeError("shared.use_in must be boolean if provided.")
         if "use_out" in shared and shared["use_out"] is not None and not isinstance(shared["use_out"], bool):
             raise RuntimeError("shared.use_out must be boolean if provided.")
+        if "rmw_ota" in shared and shared["rmw_ota"] is not None:
+            if not isinstance(shared["rmw_ota"], str):
+                raise RuntimeError("shared.rmw_ota must be a string if provided.")
+            if shared["rmw_ota"].strip() not in {"cyclone", "fastdds", "zenoh"}:
+                raise RuntimeError("shared.rmw_ota must be one of: cyclone, fastdds, zenoh.")
+        if "rmw_local" in shared and shared["rmw_local"] is not None:
+            if not isinstance(shared["rmw_local"], str):
+                raise RuntimeError("shared.rmw_local must be a string if provided.")
+            if not shared["rmw_local"].strip():
+                raise RuntimeError("shared.rmw_local must not be empty if provided.")
         if "rmw" in shared and shared["rmw"] is not None:
             if not isinstance(shared["rmw"], str):
                 raise RuntimeError("shared.rmw must be a string if provided.")
@@ -666,6 +703,10 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 raise RuntimeError("shared.non_ota_rmw must be a string if provided.")
             if not shared["non_ota_rmw"].strip():
                 raise RuntimeError("shared.non_ota_rmw must not be empty if provided.")
+        if "local_domain_id" in shared and shared["local_domain_id"] is not None:
+            _parse_optional_domain_id(shared["local_domain_id"], "shared.local_domain_id")
+        if "ota_domain_id" in shared and shared["ota_domain_id"] is not None:
+            _parse_optional_domain_id(shared["ota_domain_id"], "shared.ota_domain_id")
         if "processing_suffixes" in shared and shared["processing_suffixes"] is not None:
             suffixes = _assert_mapping(shared.get("processing_suffixes"), "shared.processing_suffixes")
             _assert_allowed_keys(
@@ -723,9 +764,12 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 if isinstance(item, str):
                     continue
                 if isinstance(item, dict):
-                    _assert_allowed_keys(f"topics.{dir_key}[{i}]", item, {"topic", "processing", "qos", "zen_qos"})
+                    _assert_allowed_keys(f"topics.{dir_key}[{i}]", item, {"topic", "type", "processing", "qos", "zen_qos"})
                     if "topic" not in item or not isinstance(item["topic"], str) or not item["topic"].strip():
                         raise RuntimeError(f"topics.{dir_key}[{i}].topic must be a non-empty string.")
+                    if "type" in item and item["type"] is not None:
+                        if not isinstance(item["type"], str) or not item["type"].strip():
+                            raise RuntimeError(f"topics.{dir_key}[{i}].type must be a non-empty string if provided.")
                     if "processing" in item and item["processing"] is not None and not isinstance(item["processing"], dict):
                         raise RuntimeError(f"topics.{dir_key}[{i}].processing must be a mapping.")
                     if "qos" in item and item["qos"] is not None and not isinstance(item["qos"], dict):
@@ -748,11 +792,12 @@ def _topic_entries(cfg: Dict[str, Any], direction: str) -> List[TopicEntry]:
     out: List[TopicEntry] = []
     for i, item in enumerate(lst):
         if isinstance(item, str):
-            out.append(TopicEntry(base=item, processing={}, qos=None, zen_qos=None, index=i))
+            out.append(TopicEntry(base=item, msg_type=None, processing={}, qos=None, zen_qos=None, index=i))
         elif isinstance(item, dict):
             out.append(
                 TopicEntry(
                     base=item["topic"],
+                    msg_type=(str(item.get("type")).strip() if item.get("type") is not None else None),
                     processing=item.get("processing", {}) or {},
                     qos=item.get("qos"),
                     zen_qos=item.get("zen_qos"),
@@ -878,6 +923,73 @@ def _render_qos_yaml(shared_qos: Dict[str, Any], qos_overrides: Dict[str, Dict[s
     }
     # Use canonical YAML dump so nested dicts are valid YAML (not Python dict repr).
     return _yaml_canonical_dump(qos_obj)
+
+
+def _resolve_rmw_local_for_graph(
+    ota_rmw: str,
+    rmw_local: Optional[str],
+    *,
+    use_domain_bridge: bool,
+) -> Optional[str]:
+    if not use_domain_bridge:
+        return rmw_local
+
+    if rmw_local is None:
+        return "cyclone"
+
+    if rmw_local == "zenoh" or rmw_local == RMW_ALIASES["zenoh"]:
+        raise RuntimeError(
+            "shared.rmw_local=zenoh is not supported together with shared.rmw_ota=zenoh and "
+            "split local/OTA domain IDs. Use a DDS RMW such as cyclone for the ROS graphs."
+        )
+
+    return rmw_local
+
+
+def _final_topic_type(entry: TopicEntry, pipe: Dict[str, Any]) -> str:
+    transport = pipe.get("transport")
+    if transport is not None:
+        assert isinstance(transport, TransportSpec)
+        if transport.type not in TRANSPORT_OUTPUT_TYPES:
+            raise RuntimeError(
+                f"Unsupported transport type '{transport.type}' for topic '{entry.base}'. "
+                f"Known output type mappings: {sorted(TRANSPORT_OUTPUT_TYPES)}"
+            )
+        return TRANSPORT_OUTPUT_TYPES[transport.type]
+
+    if pipe.get("ota_wrap"):
+        return OTA_STAMPED_MSG_TYPE
+
+    if pipe.get("compress"):
+        return COMPRESSED_MSG_TYPE
+
+    msg_type = str(entry.msg_type or "").strip()
+    if not msg_type:
+        raise RuntimeError(
+            f"Topic '{entry.base}' requires a 'type' when shared.local_domain_id/shared.ota_domain_id are used."
+        )
+    return msg_type
+
+
+def _dedup_topic_type_items(items: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    seen: Dict[str, str] = {}
+    out: List[Tuple[str, str]] = []
+    for topic_name, msg_type in items:
+        existing = seen.get(topic_name)
+        if existing is not None:
+            if existing != msg_type:
+                raise RuntimeError(
+                    f"Conflicting message types for generated topic '{topic_name}': '{existing}' vs '{msg_type}'."
+                )
+            continue
+        seen[topic_name] = msg_type
+        out.append((topic_name, msg_type))
+    return out
+
+
+def _render_domain_bridge_yaml(name: str, topics: Dict[str, Dict[str, Any]]) -> str:
+    cfg: Dict[str, Any] = {"name": name, "topics": topics}
+    return _yaml_canonical_dump(cfg)
 
 
 def _compute_pipeline(
@@ -1176,15 +1288,38 @@ def func(
     if zenoh_cfg is not None and not isinstance(zenoh_cfg, dict):
         raise RuntimeError(f"shared.zenoh must be a mapping if provided, got {type(zenoh_cfg)}")
     fastdds_easy = bool(shared.get("fastdds_easy", False))
-    rmw_cfg = str(shared.get("rmw", "") or "").strip()
-    non_ota_rmw_implementation = _resolve_non_ota_rmw_implementation(shared.get("non_ota_rmw"))
-    if fastdds_easy and rmw_cfg:
-        raise RuntimeError("Use either shared.rmw or the legacy shared.fastdds_easy flag, not both.")
-    ota_rmw = "fastdds" if fastdds_easy else (rmw_cfg or "cyclone")
+    rmw_ota_cfg = str(shared.get("rmw_ota", "") or "").strip()
+    legacy_rmw_cfg = str(shared.get("rmw", "") or "").strip()
+    rmw_local = _resolve_rmw_local(shared.get("rmw_local"))
+    legacy_rmw_local = _resolve_rmw_local(shared.get("non_ota_rmw"))
+    if rmw_ota_cfg and legacy_rmw_cfg and rmw_ota_cfg != legacy_rmw_cfg:
+        raise RuntimeError("Use either shared.rmw_ota or legacy shared.rmw, not both with different values.")
+    if rmw_local and legacy_rmw_local and rmw_local != legacy_rmw_local:
+        raise RuntimeError(
+            "Use either shared.rmw_local or legacy shared.non_ota_rmw, not both with different values."
+        )
+    if fastdds_easy and (rmw_ota_cfg or legacy_rmw_cfg):
+        raise RuntimeError("Use either shared.rmw_ota or the legacy shared.fastdds_easy flag, not both.")
+    ota_rmw = "fastdds" if fastdds_easy else (rmw_ota_cfg or legacy_rmw_cfg or "cyclone")
+    rmw_local = rmw_local or legacy_rmw_local
     if ota_rmw == "zenoh" and zenoh_cfg is None:
-        raise RuntimeError("shared.rmw=zenoh requires a shared.zenoh configuration block.")
+        raise RuntimeError("shared.rmw_ota=zenoh requires a shared.zenoh configuration block.")
     if ota_rmw != "zenoh" and zenoh_cfg is not None:
-        raise RuntimeError("shared.zenoh may only be specified when shared.rmw=zenoh.")
+        raise RuntimeError("shared.zenoh may only be specified when shared.rmw_ota=zenoh.")
+    local_domain_id = _parse_optional_domain_id(shared.get("local_domain_id"), "shared.local_domain_id")
+    ota_domain_id = _parse_optional_domain_id(shared.get("ota_domain_id"), "shared.ota_domain_id")
+    if (local_domain_id is None) != (ota_domain_id is None):
+        raise RuntimeError(
+            "shared.local_domain_id and shared.ota_domain_id must either both be set or both be omitted."
+        )
+    use_domain_bridge = (
+        local_domain_id is not None and ota_domain_id is not None and local_domain_id != ota_domain_id
+    )
+    rmw_local = _resolve_rmw_local_for_graph(
+        ota_rmw,
+        rmw_local,
+        use_domain_bridge=use_domain_bridge,
+    )
 
     # session_dir is the on-disk directory containing the session config input YAML
     # (session-definition.yaml / session-parametrization.yaml)
@@ -1274,14 +1409,14 @@ def func(
                     ],
                 )
             )
-            if non_ota_rmw_implementation is not None:
+            if rmw_local is not None:
                 blocks.append(
                     PluginBlock(
-                        "non_ota_rmw",
-                        [("non_ota_rmw_implementation", non_ota_rmw_implementation)],
+                        "rmw_local",
+                        [("rmw_local", rmw_local)],
                     )
                 )
-            rmw_items: List[Tuple[str, Any]] = [("rmw", ota_rmw)]
+            rmw_items: List[Tuple[str, Any]] = [("rmw_ota", ota_rmw)]
             rmw_items.append(("use_zenoh", ota_rmw == "zenoh"))
             if ota_rmw == "fastdds":
                 rmw_items.append(("fastdds_easy_mode_ip", fastdds_easy_mode_ip))
@@ -1494,10 +1629,30 @@ def func(
             return [x for x in lines if x != hb] + [hb]
         return lines
 
+    def topic_list_with_types(
+        entries: List[TopicEntry],
+        pipes: List[Dict[str, Any]],
+        hb: str,
+        pos: str,
+    ) -> List[Tuple[str, str]]:
+        lines: List[Tuple[str, str]] = []
+        for e, p in zip(entries, pipes):
+            if e.base == hb:
+                continue
+            lines.append((p["final"], _final_topic_type(e, p)))
+        lines = _dedup_topic_type_items(lines)
+        if use_heartbeat and hb:
+            hb_item = (hb, HEARTBEAT_MSG_TYPE)
+            if pos == "prepend":
+                return [hb_item] + [x for x in lines if x[0] != hb]
+            return [x for x in lines if x[0] != hb] + [hb_item]
+        return lines
+
     # ---------------------------
     # Generate topic lists for each direction (written to <src>_to_<dst>_topics.txt)
     # ---------------------------
     dir_topic_list: Dict[Tuple[str, str], List[str]] = {}
+    dir_topic_list_with_types: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
     for (src, dst), direction_key in direction_key_for.items():
         pos = _hb_position(direction_key)
         hb = hb_topic.get(src, "")
@@ -1507,6 +1662,13 @@ def func(
             hb,
             pos,
         )
+        if use_domain_bridge:
+            dir_topic_list_with_types[(src, dst)] = topic_list_with_types(
+                dir_entries[(src, dst)],
+                dir_pipes[(src, dst)],
+                hb,
+                pos,
+            )
 
     # ---------------------------
     # Per-peer plugin.yaml generation
@@ -1516,12 +1678,16 @@ def func(
     per_peer_deco_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
     per_peer_otaw_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
     per_peer_otau_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
+    per_peer_domain_bridge_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
 
     def _prefix_with_source_name_if_needed(target_peer: str, source_peer: str, topic: str) -> str:
         ps = peer_settings_all.get(target_peer, {}) or {}
         keep_source = bool((ps.get("inbound", {}) or {}).get("keep_source_prefix", False)) if isinstance(ps, dict) else False
         prefix = f"/{peer_name[source_peer]}" if keep_source else ""
         return f"{prefix}{topic}"
+
+    def _com_topic(direction: str, source_name: str, forward_topic: str) -> str:
+        return f"/com/{direction}/{source_name}/{forward_topic.lstrip('/')}"
 
     for local in peer_keys:
         remote = peer_keys[0] if local == peer_keys[1] else peer_keys[1]
@@ -1642,11 +1808,11 @@ def func(
                 ],
             )
         )
-        if non_ota_rmw_implementation is not None:
+        if rmw_local is not None:
             blocks.append(
                 PluginBlock(
-                    "non_ota_rmw",
-                    [("non_ota_rmw_implementation", non_ota_rmw_implementation)],
+                    "rmw_local",
+                    [("rmw_local", rmw_local)],
                 )
             )
         if write_qos:
@@ -1719,6 +1885,7 @@ def func(
 
         # IN: only if inbound direction exists (or explicitly requested, in which case error if missing)
         in_list = dir_topic_list.get((remote, local), []) if in_dir_key else []
+        in_list_with_types = dir_topic_list_with_types.get((remote, local), []) if use_domain_bridge and in_dir_key else []
         in_enabled = bool(shared_use_in) if shared_use_in is not None else (len(in_list) > 0)
         if in_enabled and not in_dir_key:
             raise RuntimeError(f"shared.use_in=true but no inbound topics direction '{remote}_to_{local}' is defined.")
@@ -1740,6 +1907,7 @@ def func(
 
         # OUT: only if outbound direction exists (or explicitly requested, in which case error if missing)
         out_list = dir_topic_list.get((local, remote), []) if out_dir_key else []
+        out_list_with_types = dir_topic_list_with_types.get((local, remote), []) if use_domain_bridge and out_dir_key else []
         out_enabled = bool(shared_use_out) if shared_use_out is not None else (len(out_list) > 0)
         if out_enabled and not out_dir_key:
             raise RuntimeError(f"shared.use_out=true but no outbound topics direction '{local}_to_{remote}' is defined.")
@@ -1754,7 +1922,47 @@ def func(
                 out_items.append(("app_has_source_name_outbound", True))
             blocks.append(PluginBlock("out", out_items))
 
-        # Zenoh block (optional, driven by shared.rmw=zenoh)
+        if use_domain_bridge:
+            assert local_domain_id is not None
+            assert ota_domain_id is not None
+            assert rmw_local is not None
+
+            domain_bridge_topics: Dict[str, Dict[str, Any]] = {}
+            if out_enabled:
+                for topic_name, msg_type in out_list_with_types:
+                    forward_topic = f"/to_{peer_name[remote]}{topic_name}" if use_target_prefix else topic_name
+                    domain_bridge_topics[_com_topic("out", peer_name[local], forward_topic)] = {
+                        "type": msg_type,
+                        "from_domain": local_domain_id,
+                        "to_domain": ota_domain_id,
+                    }
+            if in_enabled:
+                for topic_name, msg_type in in_list_with_types:
+                    forward_topic = f"/to_{peer_name[local]}{topic_name}" if remote_uses_target_prefix else topic_name
+                    domain_bridge_topics[_com_topic("in", peer_name[remote], forward_topic)] = {
+                        "type": msg_type,
+                        "from_domain": ota_domain_id,
+                        "to_domain": local_domain_id,
+                    }
+
+            if domain_bridge_topics:
+                per_peer_domain_bridge_yaml[local] = _render_domain_bridge_yaml(
+                    f"{peer_name[local]}_com_domain_bridge",
+                    domain_bridge_topics,
+                )
+                blocks.append(
+                    PluginBlock(
+                        "domain_bridge",
+                        [
+                            ("use_domain_bridge", True),
+                            ("local_domain_id", local_domain_id),
+                            ("ota_domain_id", ota_domain_id),
+                            ("domain_bridge_config_file", "${peer_dir}/domain_bridge.yaml"),
+                        ],
+                    )
+                )
+
+        # Zenoh block (optional, driven by shared.rmw_ota=zenoh)
         if ota_rmw == "zenoh":
             transport = str((zenoh_cfg or {}).get("transport", "udp") or "udp").strip()
             if not transport:
@@ -1793,7 +2001,7 @@ def func(
 
             blocks.append(PluginBlock("zenoh", zen_items))
 
-        rmw_items: List[Tuple[str, Any]] = [("rmw", ota_rmw), ("use_zenoh", ota_rmw == "zenoh")]
+        rmw_items: List[Tuple[str, Any]] = [("rmw_ota", ota_rmw), ("use_zenoh", ota_rmw == "zenoh")]
         if ota_rmw == "fastdds":
             rmw_items.append(("fastdds_easy_mode_ip", fastdds_easy_mode_ip))
             rmw_items.append(("fastdds_config_file", "${peer_dir}/fastdds.xml"))
@@ -2050,6 +2258,8 @@ def func(
             generated.append((os.path.join(param_dir, p, "ota_wrapper.yaml"), per_peer_otaw_yaml[p] or ""))
         if per_peer_otau_yaml.get(p):
             generated.append((os.path.join(param_dir, p, "ota_unwrapper.yaml"), per_peer_otau_yaml[p] or ""))
+        if per_peer_domain_bridge_yaml.get(p):
+            generated.append((os.path.join(param_dir, p, "domain_bridge.yaml"), per_peer_domain_bridge_yaml[p] or ""))
 
     _write_generated_files(generated, force=force, rewrite_formatting=rewrite_formatting)
 

@@ -7,6 +7,9 @@ peers:
 shared:
   use_topic_monitor: true
   use_heartbeat: true
+  rmw_ota: zenoh
+  local_domain_id: 47
+  ota_domain_id: 48
 
   zenoh:
     transport: udp
@@ -16,17 +19,21 @@ shared:
 topics:
   a_to_b:
     - topic: "/heartbeat_a"
+      type: "com_msgs/msg/Heartbeat"
       zen_qos:
         priority: real_time
     - topic: "/size_test_a"
+      type: "com_msgs/msg/SizedPayload"
       zen_qos:
         priority: data
         express: true
   b_to_a:
     - topic: "/heartbeat_b"
+      type: "com_msgs/msg/Heartbeat"
       zen_qos:
         priority: real_time
     - topic: "/size_test_b"
+      type: "com_msgs/msg/SizedPayload"
       zen_qos:
         priority: data
         express: true

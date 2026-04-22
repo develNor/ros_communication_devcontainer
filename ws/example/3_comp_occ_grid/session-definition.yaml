@@ -20,6 +20,7 @@ shared:
 topics:
   b_to_a:
     - topic: "/costmap/costmap"
+      type: "nav_msgs/msg/OccupancyGrid"
       processing:
         restamp_if: true
         compress: true

@@ -7,3 +7,4 @@ zenoh.json5
 # ignore temporary data
 __pycache__
 .session_readonly.yaml
+.codex

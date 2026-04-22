@@ -55,6 +55,11 @@ FULL_VAR_PATTERN = re.compile(r"^\$\{([A-Za-z0-9_]+)\}$")
 
 # Compression algorithms supported by com_py universal_{de}compressor nodes
 ALLOWED_COMPRESSION_ALGORITHMS = {"bz2", "zlib", "lz4", "zstd"}
+NON_OTA_RMW_ALIASES = {
+    "cyclone": "rmw_cyclonedds_cpp",
+    "fastdds": "rmw_fastrtps_cpp",
+    "zenoh": "rmw_zenoh_cpp",
+}
 
 
 @dataclass
@@ -96,6 +101,18 @@ class YamlBlockScalar:
 
     header: str
     content: str
+
+
+def _resolve_non_ota_rmw_implementation(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError("shared.non_ota_rmw must be a string if provided.")
+
+    resolved = value.strip()
+    if not resolved:
+        return None
+    return NON_OTA_RMW_ALIASES.get(resolved, resolved)
 
 
 # ---------------------------
@@ -626,6 +643,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "use_in",
                 "use_out",
                 "rmw",
+                "non_ota_rmw",
                 "heartbeat_position",
                 "processing_suffixes",
                 "compression",
@@ -643,6 +661,11 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 raise RuntimeError("shared.rmw must be a string if provided.")
             if shared["rmw"].strip() not in {"cyclone", "fastdds", "zenoh"}:
                 raise RuntimeError("shared.rmw must be one of: cyclone, fastdds, zenoh.")
+        if "non_ota_rmw" in shared and shared["non_ota_rmw"] is not None:
+            if not isinstance(shared["non_ota_rmw"], str):
+                raise RuntimeError("shared.non_ota_rmw must be a string if provided.")
+            if not shared["non_ota_rmw"].strip():
+                raise RuntimeError("shared.non_ota_rmw must not be empty if provided.")
         if "processing_suffixes" in shared and shared["processing_suffixes"] is not None:
             suffixes = _assert_mapping(shared.get("processing_suffixes"), "shared.processing_suffixes")
             _assert_allowed_keys(
@@ -1154,6 +1177,7 @@ def func(
         raise RuntimeError(f"shared.zenoh must be a mapping if provided, got {type(zenoh_cfg)}")
     fastdds_easy = bool(shared.get("fastdds_easy", False))
     rmw_cfg = str(shared.get("rmw", "") or "").strip()
+    non_ota_rmw_implementation = _resolve_non_ota_rmw_implementation(shared.get("non_ota_rmw"))
     if fastdds_easy and rmw_cfg:
         raise RuntimeError("Use either shared.rmw or the legacy shared.fastdds_easy flag, not both.")
     ota_rmw = "fastdds" if fastdds_easy else (rmw_cfg or "cyclone")
@@ -1250,6 +1274,13 @@ def func(
                     ],
                 )
             )
+            if non_ota_rmw_implementation is not None:
+                blocks.append(
+                    PluginBlock(
+                        "non_ota_rmw",
+                        [("non_ota_rmw_implementation", non_ota_rmw_implementation)],
+                    )
+                )
             rmw_items: List[Tuple[str, Any]] = [("rmw", ota_rmw)]
             rmw_items.append(("use_zenoh", ota_rmw == "zenoh"))
             if ota_rmw == "fastdds":
@@ -1611,6 +1642,13 @@ def func(
                 ],
             )
         )
+        if non_ota_rmw_implementation is not None:
+            blocks.append(
+                PluginBlock(
+                    "non_ota_rmw",
+                    [("non_ota_rmw_implementation", non_ota_rmw_implementation)],
+                )
+            )
         if write_qos:
             blocks.append(PluginBlock("qos", [("qos_config_file", "${session_dir}/qos.yaml")]))
 

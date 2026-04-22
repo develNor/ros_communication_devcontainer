@@ -2,6 +2,7 @@
 parameters:
   dir_path: # will be set automatically by create_session.py
   before_command: # e.g. "echo test"
+  non_ota_rmw_implementation: # e.g. "rmw_cyclonedds_cpp"
 
   # General OTA parameters
   ip_local: # e.g. "machine_a ip"
@@ -198,6 +199,7 @@ parameters:
 
 common:
   before_commands:
+    - if [ '${non_ota_rmw_implementation}' != "None" ]; then export RMW_IMPLEMENTATION='${non_ota_rmw_implementation}'; fi
     - if [ '${before_command}' != "None" ]; then ${before_command}; fi
 
 windows:

@@ -9,6 +9,11 @@
               <address>#peer</address>
             </udpv4>
           </locator><!--/peer-block-->
+          <locator>
+            <udpv4>
+              <address>127.0.0.1</address>
+            </udpv4>
+          </locator>
         </initialPeersList>
       </builtin>
     </rtps>

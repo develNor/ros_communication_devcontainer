@@ -1,7 +1,6 @@
 <CycloneDDS>
     <Domain>
         <General>
-            <AllowMulticast>false</AllowMulticast>
             <Interfaces>
                 <NetworkInterface address="#host_ip"/>
             </Interfaces>

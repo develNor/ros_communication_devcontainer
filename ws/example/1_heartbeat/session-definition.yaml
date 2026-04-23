@@ -11,10 +11,10 @@ shared:
   #   implementation: fastdds
   #   config: fastdds_v1.xml
 
-  rmw_local: cyclone # if no ota config is provided, the defaul dds config is not overridden (so cyclone uri and fastdds-files are not set)
+  rmw_local: fastdds # if no ota config is provided, the defaul dds config is not overridden (so cyclone uri and fastdds-files are not set)
   rmw_ota:
-    implementation: cyclone
-    config: cyclonedds.xml
+    implementation: fastdds
+    config: fastdds_v1.xml
 
   local_domain_id: 47
   ota_domain_id: 48

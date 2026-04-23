@@ -37,8 +37,8 @@ These constraints are **enforced** by the generator (or by the base plugin it ta
   - `peer_settings.<peer>.outbound.source_prefix.use_source_prefix: false`
   - `peer_settings.<peer>.inbound.keep_target_prefix: true`
   - `peer_settings.<peer>.outbound.target_prefix.native_have_outgoing_target_prefix != use_target_prefix`
-  - `shared.rmw.ota=zenoh` without all of `shared.ota_domain_id` and `peer_settings.<peer>.domain_id` (every peer) being set to three distinct values (native rmw_zenoh_cpp's router forwards across ROS domains, so each logical graph — per-peer local + shared OTA — must live on its own domain).
-  - `shared.rmw.ota=zenoh` with `shared.rmw.local != zenoh` (rmw_zenoh_cpp is not interoperable with DDS-based RMWs).
+  - `shared.rmw.ota=zenoh_connect_endpoints` without all of `shared.ota_domain_id` and `peer_settings.<peer>.domain_id` (every peer) being set to three distinct values (native rmw_zenoh_cpp's router forwards across ROS domains, so each logical graph — per-peer local + shared OTA — must live on its own domain).
+  - `shared.rmw.ota=zenoh_connect_endpoints` with `shared.rmw.local != zenoh` (rmw_zenoh_cpp is not interoperable with DDS-based RMWs).
   - `shared.rmw.ota=zenoh_ros2dds` with `shared.rmw.local = zenoh` (the bridge speaks DDS locally; native zenoh locally is incompatible).
   - **Legacy keys** `shared.rmw_ota`, `shared.rmw_local`, `shared.zenoh` are rejected. Use `shared.rmw` (and `shared.local_domain_id` / `peer_settings.<peer>.domain_id`) instead.
 
@@ -83,12 +83,12 @@ shared:
 
   ota_domain_id: 48          # optional; ROS_DOMAIN_ID used by OTA bridge processes (IN/OUT, Z2D, domain_bridge).
                              # When it differs from a peer's local domain_id, a stock ROS 2 domain_bridge is spun up.
-                             # Must NOT be set together with shared.rmw.ota=zenoh (native rmw_zenoh_cpp uses a single
-                             # cross-domain router; see per-peer domain_id instead).
+                             # Required with shared.rmw.ota=zenoh_connect_endpoints and must differ from each
+                             # peer_settings.<peer>.domain_id.
 
   local_domain_id: 47        # optional shortcut; applied as `peer_settings.<peer>.domain_id` to every peer that did
                              # not set its own. A per-peer value overrides this shortcut, but setting both to
-                             # different values is an error. Not useful with shared.rmw.ota=zenoh, which requires
+                             # different values is an error. Not useful with shared.rmw.ota=zenoh_connect_endpoints, which requires
                              # distinct per-peer domain ids.
 
   use_in: null               # default null (auto-enable based on topics)
@@ -119,13 +119,16 @@ both sides of the bridge. It may be given in three forms:
    ```yaml
    rmw: cyclone          # local=cyclone, ota=cyclone
    rmw: fastdds          # local=fastdds, ota=fastdds
-   rmw: zenoh            # local=zenoh,   ota=zenoh (native rmw_zenoh_cpp)
+   rmw: zenoh            # shortcut for local=zenoh, ota=zenoh (legacy native shorthand)
    ```
 2. **Per-side string** (no extra config):
    ```yaml
    rmw:
      local: cyclone
      ota: fastdds
+   rmw:
+     local: zenoh
+     ota: zenoh_connect_endpoints
    ```
 3. **Per-side tagged union** (with optional DDS / zenoh config block):
    ```yaml
@@ -146,7 +149,8 @@ Recognized implementation names:
 |---|---|---|---|---|
 | `cyclone` / `cyclonedds` | ✓ | ✓ | `rmw_cyclonedds_cpp` | |
 | `fastdds` / `fastrtps` | ✓ | ✓ | `rmw_fastrtps_cpp` | |
-| `zenoh` | ✓ | ✓ | `rmw_zenoh_cpp` (native) | single router per peer; see below |
+| `zenoh` | ✓ | legacy alias | `rmw_zenoh_cpp` (native) | use `zenoh_connect_endpoints` on OTA for transparent endpoint setup |
+| `zenoh_connect_endpoints` | — | ✓ | `rmw_zenoh_cpp` (native) + `ZENOH_CONFIG_OVERRIDE` on non-main peers | single router per peer; see below |
 | `zenoh_ros2dds` | — | ✓ | `zenoh_bridge_ros2dds` | DDS ↔ zenoh bridge; requires DDS locally |
 
 Every side is **optional**. If a side is omitted, the runtime on that side does
@@ -158,7 +162,7 @@ Per-side config blocks:
 - DDS implementations (`cyclone`, `fastdds`) accept:
   - `config: <template>` — template file under `ws/ota_configs/` (e.g. `fastdds_v1.xml`, `cyclonedds.xml`, `fastdds_easy_mode.xml`). Omit to use the RMW's built-in defaults.
   - `easy_mode_ip_key: <string>` — only honored by `fastdds_easy_mode.xml`; defaults to the first peer's `ip_key`.
-- `zenoh` (native) accepts (OTA side only):
+- `zenoh_connect_endpoints` (native, OTA side only; `zenoh` is still accepted as a legacy OTA alias) accepts:
   - `main_peer: <peer_key>` — the peer whose zenoh router listens. Defaults to the first peer declared under `peers:`.
   - `main_port: 7447` — listening port. Default `7447`.
 - `zenoh_ros2dds` (bridge) accepts (OTA side only):
@@ -166,13 +170,21 @@ Per-side config blocks:
   - `main_peer: <peer_key>` — defaults to the first peer.
   - `main_port: 7447` — default `7447`.
 
-##### Native zenoh (`rmw: zenoh`)
+##### Native zenoh (`rmw.ota: zenoh_connect_endpoints`)
 
 Native `rmw_zenoh_cpp` is only interoperable with itself, so the local and OTA
-sides must both be `zenoh`. The runtime starts exactly one `rmw_zenohd` router
-per peer (the `ZEN` window) and the non-main peer opens a TCP connect endpoint
-back to the main peer via `ZENOH_CONFIG_OVERRIDE` — everything else uses the
-zenoh defaults.
+sides must both use native zenoh. Prefer the explicit mapping:
+
+```yaml
+rmw:
+  local: zenoh
+  ota: zenoh_connect_endpoints
+```
+
+The `rmw: zenoh` shortcut is still accepted, but `ota: zenoh_connect_endpoints`
+is more honest about what the OTA mode does: the runtime starts exactly one
+`rmw_zenohd` router per peer (the `ZEN` window) and the non-main peer opens a
+TCP connect endpoint back to the main peer via `ZENOH_CONFIG_OVERRIDE`.
 
 Because that single router forwards across **all** ROS domains, each logical
 graph — every peer's local apps *and* the shared OTA bridge traffic — must live
@@ -272,7 +284,7 @@ peer_settings:
   <peer_key>:
     heartbeat_topic: "/heartbeat_custom"   # optional
     domain_id: 47                          # optional; pins this peer's ROS_DOMAIN_ID for its local graph.
-                                           # Required (and must be distinct across peers) when shared.rmw.ota=zenoh.
+                                           # Required (and must be distinct across peers) when shared.rmw.ota=zenoh_connect_endpoints.
                                            # Combined with shared.ota_domain_id, enables split-domain bridging.
 
     inbound:
@@ -386,7 +398,7 @@ Any mapping keys are written to `qos.yaml`.
 Special logic: if `depth` is set but `history` is missing, the generator adds `history: keep_last`.
 
 #### `zen_qos`
-Only used when `shared.rmw.ota: zenoh_ros2dds` is set (the bridge config is baked into the generated `zenoh.json5`). Ignored for native `rmw: zenoh` and for non-zenoh RMWs.
+Only used when `shared.rmw.ota: zenoh_ros2dds` is set (the bridge config is baked into the generated `zenoh.json5`). Ignored for native `rmw.ota: zenoh_connect_endpoints` and for non-zenoh RMWs.
 
 ```yaml
 zen_qos:

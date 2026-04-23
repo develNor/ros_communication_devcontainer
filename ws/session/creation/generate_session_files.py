@@ -126,23 +126,36 @@ class YamlBlockScalar:
 #     ota:   <side-spec>
 #
 # Each <side-spec> is either:
-#   - a string: cyclone | fastdds | zenoh | zenoh_ros2dds | <raw rmw string>
+#   - a string: cyclone | fastdds | zenoh_connect_endpoints | zenoh_ros2dds | <raw rmw string>
 #     (zenoh_ros2dds is allowed for ota only; raw rmw strings are for local only)
 #   - a tagged-union mapping with exactly one key (the RMW name):
 #       {cyclone: {config?: <fname.xml>, easy_mode_ip_key?: <key>}}
 #       {fastdds: {config?: <fname.xml>, easy_mode_ip_key?: <key>}}
-#       {zenoh:   {main_peer?: <peer_key>}}
+#       {zenoh_connect_endpoints: {main_peer?: <peer_key>, main_port?: 7447}}
 #       {zenoh_ros2dds: {transport?: udp|tcp, main_peer?: <peer_key>, main_port?: 7447}}
 # -----------------------------------------------------------------------------
 
 _DDS_SHORTS = {"cyclone", "fastdds"}
-_OTA_SHORTS = {"cyclone", "fastdds", "zenoh", "zenoh_ros2dds"}
+_ZENOH_CONNECT_ENDPOINTS = "zenoh_connect_endpoints"
+_NATIVE_ZENOH_OTA_SHORTS = {"zenoh", _ZENOH_CONNECT_ENDPOINTS}
+_OTA_SHORTS = {"cyclone", "fastdds", *_NATIVE_ZENOH_OTA_SHORTS, "zenoh_ros2dds"}
 _LOCAL_SHORTS = {"cyclone", "fastdds", "zenoh"}
 _SHORTCUT_ALLOWED = {"cyclone", "fastdds", "zenoh"}
 
 _DDS_CFG_KEYS = {"config", "easy_mode_ip_key"}
-_ZEN_OTA_CFG_KEYS = {"main_peer"}
+_ZEN_OTA_CFG_KEYS = {"main_peer", "main_port"}
 _ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
+
+
+def _is_native_zenoh_ota(impl: Optional[str]) -> bool:
+    return impl in _NATIVE_ZENOH_OTA_SHORTS
+
+
+def _rmw_ota_runtime_impl(impl: Optional[str]) -> Optional[str]:
+    """Map user-facing OTA modes to the RMW implementation used by the base plugin."""
+    if _is_native_zenoh_ota(impl):
+        return "zenoh"
+    return impl
 
 
 @dataclass
@@ -214,16 +227,24 @@ def _parse_rmw_side(value: Any, ctx: str, *, is_local: bool) -> RmwSideSpec:
             if not isinstance(cfg["easy_mode_ip_key"], str) or not cfg["easy_mode_ip_key"].strip():
                 raise RuntimeError(f"{ctx}.{impl}.easy_mode_ip_key must be a non-empty string if provided.")
             spec.dds_easy_mode_ip_key = cfg["easy_mode_ip_key"].strip()
-    elif impl == "zenoh":
+    elif _is_native_zenoh_ota(impl):
         extra = set(cfg.keys()) - _ZEN_OTA_CFG_KEYS
         if extra:
             raise RuntimeError(
-                f"{ctx}.zenoh contains unsupported keys {sorted(extra)}. Allowed: {sorted(_ZEN_OTA_CFG_KEYS)}."
+                f"{ctx}.{impl} contains unsupported keys {sorted(extra)}. Allowed: {sorted(_ZEN_OTA_CFG_KEYS)}."
             )
         if cfg.get("main_peer") is not None:
             if not isinstance(cfg["main_peer"], str) or not cfg["main_peer"].strip():
-                raise RuntimeError(f"{ctx}.zenoh.main_peer must be a non-empty string if provided.")
+                raise RuntimeError(f"{ctx}.{impl}.main_peer must be a non-empty string if provided.")
             spec.zen_main_peer = cfg["main_peer"].strip()
+        if cfg.get("main_port") is not None:
+            mp = cfg["main_port"]
+            if isinstance(mp, bool):
+                raise RuntimeError(f"{ctx}.{impl}.main_port must be an integer.")
+            try:
+                spec.zen_main_port = int(mp)
+            except Exception as e:
+                raise RuntimeError(f"{ctx}.{impl}.main_port must be an integer.") from e
     elif impl == "zenoh_ros2dds":
         extra = set(cfg.keys()) - _ZEN_R2D_CFG_KEYS
         if extra:
@@ -261,6 +282,10 @@ def _validate_rmw_impl(impl: str, ctx: str, *, is_local: bool) -> None:
         if impl == "zenoh_ros2dds":
             raise RuntimeError(
                 f"{ctx}: 'zenoh_ros2dds' is OTA-only and cannot be used as the local RMW."
+            )
+        if impl == _ZENOH_CONNECT_ENDPOINTS:
+            raise RuntimeError(
+                f"{ctx}: '{_ZENOH_CONNECT_ENDPOINTS}' is OTA-only; use local: zenoh for native rmw_zenoh_cpp."
             )
         # Everything else (including raw rmw strings) is permitted for local.
     else:
@@ -318,17 +343,17 @@ def _parse_rmw_block(value: Any, peer_keys: List[str]) -> RmwSpec:
 def _validate_rmw_spec_combination(spec: RmwSpec, *, ota_domain_id: Optional[int]) -> None:
     """Cross-side validation of an RmwSpec after parsing."""
     local_impl, ota_impl = spec.local.impl, spec.ota.impl
-    if ota_impl == "zenoh":
+    if _is_native_zenoh_ota(ota_impl):
         # Native rmw_zenoh_cpp: local must also be zenoh (rmw_zenoh_cpp is not
         # interoperable with DDS-based RMWs).
         if local_impl not in (None, "zenoh", RMW_ALIASES["zenoh"]):
             raise RuntimeError(
-                "shared.rmw.ota=zenoh requires shared.rmw.local=zenoh "
+                f"shared.rmw.ota={ota_impl} requires shared.rmw.local=zenoh "
                 "(rmw_zenoh_cpp is not interoperable with DDS-based RMWs)."
             )
         if ota_domain_id is None:
             raise RuntimeError(
-                "shared.rmw.ota=zenoh requires shared.ota_domain_id to be set. "
+                f"shared.rmw.ota={ota_impl} requires shared.ota_domain_id to be set. "
                 "Native rmw_zenoh_cpp's router forwards across ROS domains, so the OTA bridge "
                 "processes must run on a dedicated ROS_DOMAIN_ID that differs from every peer's "
                 "peer_settings.<peer>.domain_id (all three — both peer domains and ota_domain_id — "
@@ -1507,11 +1532,12 @@ def func(
     # across ROS domains, so the only way to keep each peer's local graph
     # isolated from the other peer's and from the OTA bridge traffic is to
     # pin every logical graph to its own domain.
-    if rmw_spec.ota.impl == "zenoh":
+    if _is_native_zenoh_ota(rmw_spec.ota.impl):
+        ota_label = rmw_spec.ota.impl
         missing = [p for p in peer_keys if peer_local_domain_id[p] is None]
         if missing:
             raise RuntimeError(
-                f"shared.rmw.ota=zenoh requires peer_settings.<peer>.domain_id for every peer; "
+                f"shared.rmw.ota={ota_label} requires peer_settings.<peer>.domain_id for every peer; "
                 f"missing: {missing}."
             )
         # ota_domain_id presence is already enforced by _validate_rmw_spec_combination.
@@ -1522,12 +1548,12 @@ def func(
             assert d is not None
             if d == ota_domain_id:
                 raise RuntimeError(
-                    f"shared.rmw.ota=zenoh requires shared.ota_domain_id ({ota_domain_id}) to differ "
+                    f"shared.rmw.ota={ota_label} requires shared.ota_domain_id ({ota_domain_id}) to differ "
                     f"from every peer_settings.<peer>.domain_id; peer '{p}' also uses {d}."
                 )
             if d in seen_ids:
                 raise RuntimeError(
-                    f"shared.rmw.ota=zenoh requires distinct peer_settings.<peer>.domain_id across peers; "
+                    f"shared.rmw.ota={ota_label} requires distinct peer_settings.<peer>.domain_id across peers; "
                     f"peers '{seen_ids[d]}' and '{p}' both use {d}."
                 )
             seen_ids[d] = p
@@ -1536,7 +1562,7 @@ def func(
             ipk = peer_ip[p]
             if ipk in seen_ips:
                 raise RuntimeError(
-                    f"shared.rmw.ota=zenoh requires distinct peers.<peer>.ip_key across peers; "
+                    f"shared.rmw.ota={ota_label} requires distinct peers.<peer>.ip_key across peers; "
                     f"peers '{seen_ips[ipk]}' and '{p}' both use {ipk!r}."
                 )
             seen_ips[ipk] = p
@@ -1580,10 +1606,11 @@ def func(
         ota = rmw_spec.ota
         local = rmw_spec.local
         items: List[Tuple[str, Any]] = []
-        if ota.impl is not None:
-            items.append(("rmw_ota", ota.impl))
+        runtime_impl = _rmw_ota_runtime_impl(ota.impl)
+        if runtime_impl is not None:
+            items.append(("rmw_ota", runtime_impl))
         # Native rmw_zenoh_cpp router (ZEN window): enabled if either side uses native zenoh.
-        items.append(("use_zenoh_rmw", ota.impl == "zenoh" or local.impl == "zenoh"))
+        items.append(("use_zenoh_rmw", _is_native_zenoh_ota(ota.impl) or local.impl == "zenoh"))
         # zenoh_bridge_ros2dds router (Z2D window): enabled for OTA only.
         items.append(("use_zenoh_ros2dds", ota.impl == "zenoh_ros2dds"))
         if ota.dds_config:
@@ -1605,7 +1632,7 @@ def func(
         None when no zenoh transport is configured on the OTA side.
         """
         ota = rmw_spec.ota
-        if ota.impl == "zenoh":
+        if _is_native_zenoh_ota(ota.impl):
             main_peer = ota.zen_main_peer or peer_keys[0]
             main_port = ota.zen_main_port or 7447
             return PluginBlock(

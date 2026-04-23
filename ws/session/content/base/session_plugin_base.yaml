@@ -29,7 +29,7 @@ parameters:
   remote_explicitly_targeted_name_outbound: ""
 
   # RMW specific OTA parameters
-  rmw_ota: # OTA RMW: cyclone, fastdds, zenoh or zenoh_ros2dds. Empty => no RMW_IMPLEMENTATION override.
+  rmw_ota: # Runtime OTA RMW: cyclone, fastdds, zenoh or zenoh_ros2dds. Empty => no RMW_IMPLEMENTATION override.
   use_zenoh_rmw: false # derived helper; true when either side uses native rmw_zenoh_cpp (starts rmw_zenohd in the ZEN window)
   use_zenoh_ros2dds: false # derived helper; true when OTA uses the zenoh_bridge_ros2dds plugin (starts zenohd in the Z2D window)
   ota_config_template: # e.g. fastdds_v1.xml, cyclonedds.xml. Empty => use the RMW's default config.

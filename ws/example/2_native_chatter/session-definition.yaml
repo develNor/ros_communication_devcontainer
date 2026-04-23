@@ -4,6 +4,24 @@ peers:
   b:
     ip_key: "machine_b_ip"
 
+shared:
+  # Active variant: fastdds shortcut (sets both local and ota).
+  rmw: fastdds
+
+  # --- Alternative rmw syntaxes (uncomment one, comment out the others) ---
+  #
+  # fastdds with default config (per-side string form):
+  # rmw:
+  #   local: fastdds
+  #   ota: fastdds
+  #
+  # cyclone with minimal config (per-side tagged-union form):
+  # rmw:
+  #   local: cyclone
+  #   ota:
+  #     cyclone:
+  #       config: cyclonedds_minimal.xml
+
 topics:
   b_to_a:
     - topic: "/chatter"

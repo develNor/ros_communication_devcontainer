@@ -326,11 +326,13 @@ def _validate_rmw_spec_combination(spec: RmwSpec, *, ota_domain_id: Optional[int
                 "shared.rmw.ota=zenoh requires shared.rmw.local=zenoh "
                 "(rmw_zenoh_cpp is not interoperable with DDS-based RMWs)."
             )
-        if ota_domain_id is not None:
+        if ota_domain_id is None:
             raise RuntimeError(
-                "shared.ota_domain_id must not be set when shared.rmw.ota=zenoh (native rmw_zenoh_cpp "
-                "uses a single router per peer — split local/OTA domains are not applicable). "
-                "Use per-peer peer_settings.<peer>.domain_id instead."
+                "shared.rmw.ota=zenoh requires shared.ota_domain_id to be set. "
+                "Native rmw_zenoh_cpp's router forwards across ROS domains, so the OTA bridge "
+                "processes must run on a dedicated ROS_DOMAIN_ID that differs from every peer's "
+                "peer_settings.<peer>.domain_id (all three — both peer domains and ota_domain_id — "
+                "must be set and distinct)."
             )
     elif ota_impl == "zenoh_ros2dds":
         # Bridge mode: local must be DDS (cyclone/fastdds). Raw RMW strings are
@@ -881,7 +883,6 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
         _LEGACY_SHARED_KEYS = {
             "rmw_ota": "shared.rmw.ota",
             "rmw_local": "shared.rmw.local",
-            "local_domain_id": "peer_settings.<peer>.domain_id (per-peer local domain id)",
             "zenoh": "shared.rmw.ota.zenoh_ros2dds (tagged-union form)",
         }
         for legacy, replacement in _LEGACY_SHARED_KEYS.items():
@@ -900,6 +901,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "use_out",
                 "rmw",
                 "ota_domain_id",
+                "local_domain_id",
                 "heartbeat_position",
                 "processing_suffixes",
                 "compression",
@@ -917,6 +919,8 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             _parse_rmw_block(shared.get("rmw"), list(peers.keys()))
         if "ota_domain_id" in shared and shared["ota_domain_id"] is not None:
             _parse_optional_domain_id(shared["ota_domain_id"], "shared.ota_domain_id")
+        if "local_domain_id" in shared and shared["local_domain_id"] is not None:
+            _parse_optional_domain_id(shared["local_domain_id"], "shared.local_domain_id")
         if "processing_suffixes" in shared and shared["processing_suffixes"] is not None:
             suffixes = _assert_mapping(shared.get("processing_suffixes"), "shared.processing_suffixes")
             _assert_allowed_keys(
@@ -1473,20 +1477,36 @@ def func(
     rmw_spec = _parse_rmw_block(shared.get("rmw"), peer_keys)
 
     ota_domain_id = _parse_optional_domain_id(shared.get("ota_domain_id"), "shared.ota_domain_id")
-    # Per-peer local domain id (from peer_settings.<peer>.domain_id).
-    peer_local_domain_id: Dict[str, Optional[int]] = {
-        p: _parse_optional_domain_id(
+    # Per-peer local domain id. Resolution order:
+    #   1. peer_settings.<peer>.domain_id (per-peer explicit)
+    #   2. shared.local_domain_id (shortcut applied to every peer that did not set its own)
+    # If both are set for the same peer and disagree, that's an error — either the
+    # user meant the shortcut (drop the per-peer value) or they meant to override it
+    # (drop the shared one), but silently letting them diverge would hide mistakes.
+    shared_local_domain_id = _parse_optional_domain_id(
+        shared.get("local_domain_id"), "shared.local_domain_id"
+    )
+    peer_local_domain_id: Dict[str, Optional[int]] = {}
+    for p in peer_keys:
+        per_peer = _parse_optional_domain_id(
             (peer_settings_all.get(p) or {}).get("domain_id"),
             f"peer_settings.{p}.domain_id",
         )
-        for p in peer_keys
-    }
+        if per_peer is not None and shared_local_domain_id is not None and per_peer != shared_local_domain_id:
+            raise RuntimeError(
+                f"peer_settings.{p}.domain_id ({per_peer}) conflicts with "
+                f"shared.local_domain_id ({shared_local_domain_id}). "
+                f"Set only one, or make them agree."
+            )
+        peer_local_domain_id[p] = per_peer if per_peer is not None else shared_local_domain_id
 
     _validate_rmw_spec_combination(rmw_spec, ota_domain_id=ota_domain_id)
 
-    # Native rmw_zenoh_cpp: require distinct peer domain_ids and distinct IP keys.
-    # rmw_zenoh_cpp's router forwards across domains, so distinct domains are
-    # the only way to keep local/OTA traffic from being accidentally multiplexed.
+    # Native rmw_zenoh_cpp: require distinct peer domain_ids, a distinct
+    # ota_domain_id, and distinct IP keys. rmw_zenoh_cpp's router forwards
+    # across ROS domains, so the only way to keep each peer's local graph
+    # isolated from the other peer's and from the OTA bridge traffic is to
+    # pin every logical graph to its own domain.
     if rmw_spec.ota.impl == "zenoh":
         missing = [p for p in peer_keys if peer_local_domain_id[p] is None]
         if missing:
@@ -1494,10 +1514,17 @@ def func(
                 f"shared.rmw.ota=zenoh requires peer_settings.<peer>.domain_id for every peer; "
                 f"missing: {missing}."
             )
+        # ota_domain_id presence is already enforced by _validate_rmw_spec_combination.
+        assert ota_domain_id is not None
         seen_ids: Dict[int, str] = {}
         for p in peer_keys:
             d = peer_local_domain_id[p]
             assert d is not None
+            if d == ota_domain_id:
+                raise RuntimeError(
+                    f"shared.rmw.ota=zenoh requires shared.ota_domain_id ({ota_domain_id}) to differ "
+                    f"from every peer_settings.<peer>.domain_id; peer '{p}' also uses {d}."
+                )
             if d in seen_ids:
                 raise RuntimeError(
                     f"shared.rmw.ota=zenoh requires distinct peer_settings.<peer>.domain_id across peers; "

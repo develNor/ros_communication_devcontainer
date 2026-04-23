@@ -37,10 +37,10 @@ These constraints are **enforced** by the generator (or by the base plugin it ta
   - `peer_settings.<peer>.outbound.source_prefix.use_source_prefix: false`
   - `peer_settings.<peer>.inbound.keep_target_prefix: true`
   - `peer_settings.<peer>.outbound.target_prefix.native_have_outgoing_target_prefix != use_target_prefix`
-  - `shared.rmw.ota=zenoh` together with `shared.ota_domain_id` (native rmw_zenoh_cpp uses a single router per peer; split OTA/local domains are not applicable — use `peer_settings.<peer>.domain_id` instead).
+  - `shared.rmw.ota=zenoh` without all of `shared.ota_domain_id` and `peer_settings.<peer>.domain_id` (every peer) being set to three distinct values (native rmw_zenoh_cpp's router forwards across ROS domains, so each logical graph — per-peer local + shared OTA — must live on its own domain).
   - `shared.rmw.ota=zenoh` with `shared.rmw.local != zenoh` (rmw_zenoh_cpp is not interoperable with DDS-based RMWs).
   - `shared.rmw.ota=zenoh_ros2dds` with `shared.rmw.local = zenoh` (the bridge speaks DDS locally; native zenoh locally is incompatible).
-  - **Legacy keys** `shared.rmw_ota`, `shared.rmw_local`, `shared.local_domain_id`, `shared.zenoh` are rejected. Use `shared.rmw` and `peer_settings.<peer>.domain_id` instead.
+  - **Legacy keys** `shared.rmw_ota`, `shared.rmw_local`, `shared.zenoh` are rejected. Use `shared.rmw` (and `shared.local_domain_id` / `peer_settings.<peer>.domain_id`) instead.
 
 ### Root schema (definition)
 Allowed top-level keys:
@@ -85,6 +85,11 @@ shared:
                              # When it differs from a peer's local domain_id, a stock ROS 2 domain_bridge is spun up.
                              # Must NOT be set together with shared.rmw.ota=zenoh (native rmw_zenoh_cpp uses a single
                              # cross-domain router; see per-peer domain_id instead).
+
+  local_domain_id: 47        # optional shortcut; applied as `peer_settings.<peer>.domain_id` to every peer that did
+                             # not set its own. A per-peer value overrides this shortcut, but setting both to
+                             # different values is an error. Not useful with shared.rmw.ota=zenoh, which requires
+                             # distinct per-peer domain ids.
 
   use_in: null               # default null (auto-enable based on topics)
   use_out: null              # default null (auto-enable based on topics)
@@ -169,15 +174,18 @@ per peer (the `ZEN` window) and the non-main peer opens a TCP connect endpoint
 back to the main peer via `ZENOH_CONFIG_OVERRIDE` — everything else uses the
 zenoh defaults.
 
-Because that single router forwards across **all** ROS domains, each peer must
-pin a **distinct** `ROS_DOMAIN_ID` via `peer_settings.<peer>.domain_id`
-(otherwise publications on peer A's domain would be duplicated back to the same
-domain on peer B). The generator enforces this:
+Because that single router forwards across **all** ROS domains, each logical
+graph — every peer's local apps *and* the shared OTA bridge traffic — must live
+on its own `ROS_DOMAIN_ID`; otherwise publications would leak between graphs.
+The generator enforces this:
 
-- `peer_settings.<peer>.domain_id` must be set for **every** peer.
-- `domain_id` values must be distinct across peers.
+- `peer_settings.<peer>.domain_id` must be set for **every** peer, with distinct values.
+- `shared.ota_domain_id` must be set and must differ from every peer's `domain_id`.
 - Peer `ip_key`s must be distinct across peers.
-- `shared.ota_domain_id` must **not** be set (there is no separate OTA domain in this mode).
+
+A stock ROS 2 `domain_bridge` process (the `COM` window) is then spun up on
+each peer to bridge `/com/...` topics between that peer's `local_domain_id` and
+`shared.ota_domain_id`, just like in the DDS split-domain case.
 
 ##### Bridged zenoh (`rmw.ota: zenoh_ros2dds`)
 

@@ -6,19 +6,54 @@ peers:
 
 shared:
   use_heartbeat: true
+  ota_domain_id: 48
+
+  # Version 1 (variant i/ii, both should work)
+  rmw:
+    local: zenoh
+    ota: zenoh
+
+  # Version 1, (variant ii/ii, both should work)
+  rmw: zenoh
+
+  # Version 2
+  rmw:
+    local: cyclone
+    ota: zenoh_ros2dds
+
+  # examples with non-default configs
+  # Version 1 with config
+  rmw:
+    local: zenoh
+    ota: 
+      zenoh:
+        main_peer: a
+  # Version 2
+  rmw:
+    local: cyclone
+    ota: 
+      zenoh_ros2dds:
+        transport: udp
+        main_peer: a
+        main_port: 7447
+
+
+  # Version 1 with some config for 
+
   # rmw_local: fastdds # if no ota config is provided, the defaul dds config is not overridden (so cyclone uri and fastdds-files are not set)
   # rmw_ota:
   #   implementation: fastdds
   #   config: fastdds_v1.xml
-
-  rmw_local: zenoh
-  rmw_ota: zenoh
 
   # rmw_local: fastdds # if no ota config is provided, the defaul dds config is not overridden (so cyclone uri and fastdds-files are not set)
   # rmw_ota: fastdds
   # rmw_ota:
   #   implementation: fastdds
+
   #   config: fastdds_v1.xml
 
-  local_domain_id: 47
-  ota_domain_id: 48
+peer_settings:
+  a:
+    domain_id: 46
+  b:
+    domain_id: 47

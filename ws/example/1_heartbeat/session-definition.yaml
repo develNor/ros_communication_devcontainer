@@ -8,13 +8,31 @@ shared:
   use_heartbeat: true
   ota_domain_id: 48
 
-  # Native rmw_zenoh_cpp for both local and OTA traffic.
-  # A single zenoh router runs per machine (the ZEN window) and forwards across
-  # peers over TCP. Because rmw_zenoh_cpp's router forwards across ROS domains,
-  # each logical graph (per-peer local + shared OTA) must pin its own
-  # ROS_DOMAIN_ID -- so all three of ota_domain_id, peer.a.domain_id,
-  # peer.b.domain_id must be set and distinct.
-  rmw: zenoh
+  # rmw: fastdds
+  # rmw:
+  #   local: cyclone
+  #   ota:
+  #     cyclone:
+  #       config: cyclonedds_minimal.xml
+  rmw: 
+    local: zenoh
+    ota: zenoh_connect_endpoints
+
+  # rmw:
+  #   local: fastdds
+  #   ota:
+  #     cyclone:
+  #       config: cyclonedds_minimal.xml
+  # rmw:
+  #   local: cyclone
+  #   ota: fastdds
+  # rmw:
+  #   local: zenoh
+  #   ota: zenoh_ros2dds
+  # rmw:
+  #   local: zenoh
+  #   ota: zenoh_ros2dds
+
 
 peer_settings:
   a:

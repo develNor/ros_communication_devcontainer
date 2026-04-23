@@ -17,11 +17,11 @@ shared:
   # Tested Working RMW-Config Combinations:
 
   # 1. FastDDS (not fully working yet)
-  # rmw:
-  #   local: fastdds
-  #   ota:
-  #     fastdds:
-  #       config: fastdds_initial_peer_list.xml
+  rmw:
+    local: fastdds
+    ota:
+      fastdds:
+        config: fastdds_initial_peer_list.xml
 
   # 2. Cyclone with OTA config (working)
   # rmw:
@@ -48,9 +48,9 @@ shared:
   #   ota: fastdds
 
   # 6. Zenoh-ROS2DDS for OTA and locally cyclone (working)
-  rmw:
-    local: cyclone
-    ota: zenoh_ros2dds
+  # rmw:
+  #   local: cyclone
+  #   ota: zenoh_ros2dds
 
   # 7. Zenoh-ROS2DDS for OTA and locally fastdds (not working weird message dublication)
   # rmw:

@@ -977,22 +977,22 @@ def _render_qos_yaml(shared_qos: Dict[str, Any], qos_overrides: Dict[str, Dict[s
 
 
 def _resolve_rmw_local_for_graph(
-    ota_rmw: str,
+    ota_rmw: Optional[str],
     rmw_local: Optional[str],
     *,
     use_domain_bridge: bool,
 ) -> Optional[str]:
+    """Resolve the effective rmw_local for the local ROS graph.
+
+    When split-domain bridging is in play and the user hasn't pinned an explicit
+    `rmw_local`, fall back to 'cyclone' so the stock `domain_bridge` executable
+    has a deterministic RMW. Otherwise return whatever the user provided.
+    """
     if not use_domain_bridge:
         return rmw_local
 
     if rmw_local is None:
         return "cyclone"
-
-    if rmw_local == "zenoh" or rmw_local == RMW_ALIASES["zenoh"]:
-        raise RuntimeError(
-            "shared.rmw_local=zenoh is not supported together with shared.rmw_ota=zenoh and "
-            "split local/OTA domain IDs. Use a DDS RMW such as cyclone for the ROS graphs."
-        )
 
     return rmw_local
 
@@ -1353,8 +1353,10 @@ def func(
         shared.get("rmw_local"), "shared.rmw_local",
     )
 
-    if ota_rmw == "zenoh" and zenoh_cfg is None:
-        raise RuntimeError("shared.rmw_ota=zenoh requires a shared.zenoh configuration block.")
+    # shared.zenoh is now fully optional. When absent, the session plugin falls
+    # back to starting `ros2 run rmw_zenoh_cpp rmw_zenohd` for any zenoh-using
+    # side (local and/or OTA). shared.zenoh only configures the advanced
+    # cross-host zenohd+ros2dds bridge path, which only makes sense for OTA.
     if ota_rmw != "zenoh" and zenoh_cfg is not None:
         raise RuntimeError("shared.zenoh may only be specified when shared.rmw_ota=zenoh.")
 
@@ -1414,6 +1416,20 @@ def func(
         items: List[Tuple[str, Any]] = []
         if rmw_local is not None:
             items.append(("rmw_local", rmw_local))
+        # use_zenoh_local is a derived flag that triggers the local rmw_zenohd
+        # window in the base plugin. Only emit it when the local RMW is
+        # explicitly set, since we otherwise don't touch RMW_IMPLEMENTATION.
+        if rmw_local is not None:
+            local_is_zenoh = rmw_local in {"zenoh", RMW_ALIASES["zenoh"]}
+            # Avoid racing two rmw_zenohd instances on the same port: when OTA
+            # is also zenoh on the same ROS_DOMAIN_ID (no domain bridge), the
+            # ZEN window already runs a router that local processes can share.
+            ota_covers_local = (
+                local_is_zenoh
+                and ota_rmw == "zenoh"
+                and not use_domain_bridge
+            )
+            items.append(("use_zenoh_local", local_is_zenoh and not ota_covers_local))
         items.extend(_build_dds_config_items("local", local_rmw, local_config, local_easy_mode_ip_key))
         return items
 
@@ -2040,8 +2056,11 @@ def func(
                     )
                 )
 
-        # Zenoh block (optional, driven by shared.rmw_ota=zenoh)
-        if ota_rmw == "zenoh":
+        # Zenoh advanced block (optional). Only emitted when the user provided
+        # a shared.zenoh configuration explicitly. When rmw_ota=zenoh but no
+        # shared.zenoh is set, the session base plugin falls back to starting
+        # `ros2 run rmw_zenoh_cpp rmw_zenohd` with no extra config.
+        if ota_rmw == "zenoh" and zenoh_cfg is not None:
             transport = str((zenoh_cfg or {}).get("transport", "udp") or "udp").strip()
             if not transport:
                 transport = "udp"

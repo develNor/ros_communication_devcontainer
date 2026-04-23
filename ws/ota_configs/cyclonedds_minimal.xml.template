@@ -1,0 +1,9 @@
+<CycloneDDS>
+    <Domain>
+        <Discovery>
+            <Peers>
+                <!--peer-block--><Peer Address="#peer"/><!--/peer-block-->
+            </Peers>
+        </Discovery>
+    </Domain>
+</CycloneDDS>

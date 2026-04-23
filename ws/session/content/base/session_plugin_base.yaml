@@ -3,12 +3,11 @@ parameters:
   dir_path: # will be set automatically by create_session.py
   before_command: # e.g. "echo test"
   rmw_local: # local RMW: cyclone, fastdds, zenoh, or a raw rmw string. Empty => no override.
-  use_zenoh_local: false # derived helper; set automatically when rmw_local=zenoh (starts a local rmw_zenohd)
   local_config_template: # e.g. fastdds_v1.xml, cyclonedds.xml. Empty => use RMW default config.
   local_config_file: ${peer_dir}/local_dds.xml # destination path for the resolved local DDS XML
   local_easy_mode_ip_key: # data_dict key for #easy_mode_ip (only honored when the template uses it)
   use_domain_bridge: false
-  local_domain_id:
+  local_domain_id:   # pinned per-peer ROS_DOMAIN_ID (from peer_settings.<peer>.domain_id)
   ota_domain_id:
   domain_bridge_config_file:
 
@@ -30,21 +29,25 @@ parameters:
   remote_explicitly_targeted_name_outbound: ""
 
   # RMW specific OTA parameters
-  rmw_ota: # OTA RMW: cyclone, fastdds, or zenoh. Empty => no RMW_IMPLEMENTATION override.
-  use_zenoh: false # derived helper; set automatically when rmw_ota=zenoh
+  rmw_ota: # OTA RMW: cyclone, fastdds, zenoh or zenoh_ros2dds. Empty => no RMW_IMPLEMENTATION override.
+  use_zenoh_rmw: false # derived helper; true when either side uses native rmw_zenoh_cpp (starts rmw_zenohd in the ZEN window)
+  use_zenoh_ros2dds: false # derived helper; true when OTA uses the zenoh_bridge_ros2dds plugin (starts zenohd in the Z2D window)
   ota_config_template: # e.g. fastdds_v1.xml, cyclonedds.xml. Empty => use the RMW's default config.
   ota_config_file: ${peer_dir}/ota_dds.xml # destination path for the resolved DDS XML
   ota_easy_mode_ip_key: # data_dict key for #easy_mode_ip (only honored when the template uses it)
+  # Z2D (zenoh_ros2dds) parameters — used only when use_zenoh_ros2dds=true
   zen_mode: # e.g. router, peer or client
   zen_endpoint_role: # e.g. listen or connect
   zen_transport: # e.g. tcp or udp
-  zen_main_ip: # ip address of zenoh main endpoint (usually listening router)
-  zen_main_port: # e.g. 7447
   zen_pub_allow: # e.g. /ota/machine_a/.*
   zen_sub_allow: # e.g. /ota/machine_b/.*
   zen_qos_pub:
   zen_config_file: ${dir_path}/zenoh.json5
-  zen_config_override:
+  # Shared between ZEN and Z2D windows: main peer's listening endpoint.
+  zen_main_ip: # ip_key of the zenoh main endpoint (usually listening router)
+  zen_main_port: # e.g. 7447
+  # ZEN (native rmw_zenoh_cpp) parameters — used only when use_zenoh_rmw=true
+  zen_connect: false # when true on this peer, export ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/<zen_main_ip>:<zen_main_port>"]' before launching rmw_zenohd
 
   # Utility
   topic_monitor: false
@@ -208,44 +211,50 @@ parameters:
 
 common:
   before_commands:
+    - if [ '${local_domain_id}' != "None" ] && [ -n '${local_domain_id}' ]; then export ROS_DOMAIN_ID='${local_domain_id}'; fi
     - if [ '${rmw_local}' != "None" ]; then case ${rmw_local} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp;; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; *) export RMW_IMPLEMENTATION='${rmw_local}';; esac; fi
     - if [ '${local_config_template}' != "None" ] && [ -n '${local_config_template}' ]; then local_args=(--config "${local_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${local_easy_mode_ip_key}' != "None" ] && [ -n '${local_easy_mode_ip_key}' ] && local_args+=(--easy-mode-ip "${local_easy_mode_ip_key}"); /ws/ota_configs/get_ota_xml.py "${local_args[@]}" > "${local_config_file}"; case ${rmw_local} in cyclone) export CYCLONEDDS_URI="file://${local_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${local_config_file}";; esac; fi
-    - case '${use_domain_bridge}' in [Tt]rue) export ROS_DOMAIN_ID='${local_domain_id}' ;; esac
     - if [ '${before_command}' != "None" ]; then ${before_command}; fi
 
 windows:
+  # Z2D: zenoh_bridge_ros2dds router. Bridges local DDS (on ota_domain_id) to zenoh.
   - name: Z2D
     if: use_zenoh_ros2dds
     splits:
       - commands:
-        - case '${use_domain_bridge}' in [Tt]rue) export ROS_DOMAIN_ID='${ota_domain_id}' ;; esac
+        - if [ '${ota_domain_id}' != "None" ] && [ -n '${ota_domain_id}' ]; then export ROS_DOMAIN_ID='${ota_domain_id}'; fi
         - export RUST_LOG=zenoh=debug,zenoh_bridge_ros2dds=debug
-        - export ZENOH_CONFIG_OVERRIDE='${zen_config_override}'
-        - /ws/ota_configs/create_zenoh_json5.py -m ${zen_mode} -e ${zen_endpoint_role} -t ${zen_transport} -i ${zen_main_ip} -r ${zen_main_port} -p ${zen_pub_allow} -s ${zen_sub_allow} -q '${zen_qos_pub}' -f ${zen_config_file}
+        - zen_main_ip_resolved=$(/ws/session/content/get_data_dict_entries.py -k "${zen_main_ip}")
+        - /ws/ota_configs/create_zenoh_json5.py -m ${zen_mode} -e ${zen_endpoint_role} -t ${zen_transport} -i ${zen_main_ip_resolved} -r ${zen_main_port} -p ${zen_pub_allow} -s ${zen_sub_allow} -q '${zen_qos_pub}' -f ${zen_config_file}
         - zenohd -c ${zen_config_file}
       # Debugging commands:
       #   - zenohd -c ${zen_config_file} --rest-http-port 8000 2>&1 | tee ${zen_config_file}.log
       # - commands:
       #   - sleep 45
       #   - curl http://localhost:8000/@/local/ros2/route/** 2>&1 | tee ${zen_config_file}.route-log
+  # ZEN: native rmw_zenoh_cpp router. Runs on this peer's local_domain_id (already exported
+  # by common.before_commands). Exactly one of the two peers (the non-main peer) opens a
+  # TCP connect endpoint to the main peer via ZENOH_CONFIG_OVERRIDE; the main peer runs
+  # rmw_zenohd with default config and listens on its endpoint.
   - name: ZEN
     if: use_zenoh_rmw
     splits:
       - commands:
-        - case '${use_domain_bridge}' in [Tt]rue) export ROS_DOMAIN_ID='${local_domain_id}' ;; esac
-        optionally set export ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/#peer_ip:7447"]'
+        - if [ '${zen_connect}' = "True" ] || [ '${zen_connect}' = "true" ]; then
+            zen_main_ip_resolved=$(/ws/session/content/get_data_dict_entries.py -k "${zen_main_ip}");
+            export ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/'"${zen_main_ip_resolved}"':'"${zen_main_port}"'"]';
+          fi
         - ros2 run rmw_zenoh_cpp rmw_zenohd
   - name: COM
     if: use_domain_bridge
     splits:
       - commands:
-        - export ROS_DOMAIN_ID='${local_domain_id}'
         - ros2 run domain_bridge domain_bridge ${domain_bridge_config_file}
   - name: IN
     if: in
     splits:
       - commands:
-        - case '${use_domain_bridge}' in [Tt]rue) export ROS_DOMAIN_ID='${ota_domain_id}' ;; esac
+        - if [ '${ota_domain_id}' != "None" ] && [ -n '${ota_domain_id}' ]; then export ROS_DOMAIN_ID='${ota_domain_id}'; fi
         - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp;; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
         - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip_key}' != "None" ] && [ -n '${ota_easy_mode_ip_key}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip_key}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}";; esac; fi
         - export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}")
@@ -267,7 +276,7 @@ windows:
     if: out
     splits:
       - commands:
-        - case '${use_domain_bridge}' in [Tt]rue) export ROS_DOMAIN_ID='${ota_domain_id}' ;; esac
+        - if [ '${ota_domain_id}' != "None" ] && [ -n '${ota_domain_id}' ]; then export ROS_DOMAIN_ID='${ota_domain_id}'; fi
         - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp;; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
         - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip_key}' != "None" ] && [ -n '${ota_easy_mode_ip_key}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip_key}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}";; esac; fi
         - export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}")

@@ -42,7 +42,7 @@ import difflib
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
@@ -112,69 +112,235 @@ class YamlBlockScalar:
     content: str
 
 
-_RMW_IMPL_VALUES = {"cyclone", "fastdds", "zenoh"}
-_RMW_SPEC_KEYS = {"implementation", "config", "easy_mode_ip_key"}
+# -----------------------------------------------------------------------------
+# RMW schema
+#
+# Configs use a single `shared.rmw` block. Accepted forms:
+#
+#   shared.rmw: <short-alias>
+#       Short-alias for {local: <x>, ota: <x>}. Must be cyclone | fastdds | zenoh
+#       (zenoh_ros2dds cannot be used as a shortcut — it is OTA-only).
+#
+#   shared.rmw:
+#     local: <side-spec>
+#     ota:   <side-spec>
+#
+# Each <side-spec> is either:
+#   - a string: cyclone | fastdds | zenoh | zenoh_ros2dds | <raw rmw string>
+#     (zenoh_ros2dds is allowed for ota only; raw rmw strings are for local only)
+#   - a tagged-union mapping with exactly one key (the RMW name):
+#       {cyclone: {config?: <fname.xml>, easy_mode_ip_key?: <key>}}
+#       {fastdds: {config?: <fname.xml>, easy_mode_ip_key?: <key>}}
+#       {zenoh:   {main_peer?: <peer_key>}}
+#       {zenoh_ros2dds: {transport?: udp|tcp, main_peer?: <peer_key>, main_port?: 7447}}
+# -----------------------------------------------------------------------------
+
+_DDS_SHORTS = {"cyclone", "fastdds"}
+_OTA_SHORTS = {"cyclone", "fastdds", "zenoh", "zenoh_ros2dds"}
+_LOCAL_SHORTS = {"cyclone", "fastdds", "zenoh"}
+_SHORTCUT_ALLOWED = {"cyclone", "fastdds", "zenoh"}
+
+_DDS_CFG_KEYS = {"config", "easy_mode_ip_key"}
+_ZEN_OTA_CFG_KEYS = {"main_peer"}
+_ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
 
 
-def _parse_rmw_spec(value: Any, ctx: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Parse a `rmw_*` value that may be either a bare string ('zenoh') or a
-    mapping ({implementation, config?, easy_mode_ip_key?}).
+@dataclass
+class RmwSideSpec:
+    """One side (local or ota) of the shared.rmw block."""
 
-    Returns (implementation, config, easy_mode_ip_key); any of them may be None.
-    Raises RuntimeError on schema violations.
+    impl: Optional[str] = None
+    # DDS-specific (cyclone, fastdds)
+    dds_config: Optional[str] = None
+    dds_easy_mode_ip_key: Optional[str] = None
+    # zenoh / zenoh_ros2dds
+    zen_main_peer: Optional[str] = None
+    # zenoh_ros2dds only
+    zen_transport: Optional[str] = None
+    zen_main_port: Optional[int] = None
 
-    For `rmw_local` the convention is: the implementation may be one of the known
-    short aliases (cyclone/fastdds/zenoh) or a raw RMW string (e.g. rmw_cyclonedds_cpp).
-    For `rmw_ota` the implementation must be one of the short aliases. The caller
-    decides which constraint applies via `ctx`.
-    """
+
+@dataclass
+class RmwSpec:
+    local: RmwSideSpec = field(default_factory=RmwSideSpec)
+    ota: RmwSideSpec = field(default_factory=RmwSideSpec)
+
+
+def _parse_rmw_side(value: Any, ctx: str, *, is_local: bool) -> RmwSideSpec:
     if value is None:
-        return (None, None, None)
+        return RmwSideSpec()
 
     if isinstance(value, str):
         impl = value.strip()
         if not impl:
-            return (None, None, None)
-        return (impl, None, None)
+            return RmwSideSpec()
+        _validate_rmw_impl(impl, ctx, is_local=is_local)
+        return RmwSideSpec(impl=impl)
 
     if not isinstance(value, dict):
-        raise RuntimeError(f"{ctx} must be a string or a mapping if provided, got {type(value)}")
+        raise RuntimeError(
+            f"{ctx} must be a string or a single-key mapping {{<rmw_name>: {{...}}}}, got {type(value)}."
+        )
 
-    extra = set(value.keys()) - _RMW_SPEC_KEYS
-    if extra:
-        raise RuntimeError(f"{ctx} contains unsupported keys: {sorted(extra)}. Allowed: {sorted(_RMW_SPEC_KEYS)}.")
+    if len(value) != 1:
+        raise RuntimeError(
+            f"{ctx} mapping must have exactly one key (the RMW name); got {sorted(value.keys())}."
+        )
 
-    impl_raw = value.get("implementation")
-    if impl_raw is None:
-        raise RuntimeError(f"{ctx}.implementation is required when {ctx} is given as a mapping.")
+    (impl_raw, cfg_raw), = value.items()
     if not isinstance(impl_raw, str) or not impl_raw.strip():
-        raise RuntimeError(f"{ctx}.implementation must be a non-empty string.")
+        raise RuntimeError(f"{ctx} key must be a non-empty string (the RMW name).")
     impl = impl_raw.strip()
+    _validate_rmw_impl(impl, ctx, is_local=is_local)
 
-    cfg_raw = value.get("config")
-    if cfg_raw is None:
-        cfg = None
+    cfg: Dict[str, Any] = {}
+    if cfg_raw is not None:
+        if not isinstance(cfg_raw, dict):
+            raise RuntimeError(f"{ctx}.{impl} must be a mapping (or null).")
+        cfg = cfg_raw
+
+    spec = RmwSideSpec(impl=impl)
+    if impl in _DDS_SHORTS:
+        extra = set(cfg.keys()) - _DDS_CFG_KEYS
+        if extra:
+            raise RuntimeError(
+                f"{ctx}.{impl} contains unsupported keys {sorted(extra)}. Allowed: {sorted(_DDS_CFG_KEYS)}."
+            )
+        if cfg.get("config") is not None:
+            if not isinstance(cfg["config"], str) or not cfg["config"].strip():
+                raise RuntimeError(f"{ctx}.{impl}.config must be a non-empty string if provided.")
+            spec.dds_config = cfg["config"].strip()
+        if cfg.get("easy_mode_ip_key") is not None:
+            if not isinstance(cfg["easy_mode_ip_key"], str) or not cfg["easy_mode_ip_key"].strip():
+                raise RuntimeError(f"{ctx}.{impl}.easy_mode_ip_key must be a non-empty string if provided.")
+            spec.dds_easy_mode_ip_key = cfg["easy_mode_ip_key"].strip()
+    elif impl == "zenoh":
+        extra = set(cfg.keys()) - _ZEN_OTA_CFG_KEYS
+        if extra:
+            raise RuntimeError(
+                f"{ctx}.zenoh contains unsupported keys {sorted(extra)}. Allowed: {sorted(_ZEN_OTA_CFG_KEYS)}."
+            )
+        if cfg.get("main_peer") is not None:
+            if not isinstance(cfg["main_peer"], str) or not cfg["main_peer"].strip():
+                raise RuntimeError(f"{ctx}.zenoh.main_peer must be a non-empty string if provided.")
+            spec.zen_main_peer = cfg["main_peer"].strip()
+    elif impl == "zenoh_ros2dds":
+        extra = set(cfg.keys()) - _ZEN_R2D_CFG_KEYS
+        if extra:
+            raise RuntimeError(
+                f"{ctx}.zenoh_ros2dds contains unsupported keys {sorted(extra)}. Allowed: {sorted(_ZEN_R2D_CFG_KEYS)}."
+            )
+        if cfg.get("transport") is not None:
+            if not isinstance(cfg["transport"], str) or not cfg["transport"].strip():
+                raise RuntimeError(f"{ctx}.zenoh_ros2dds.transport must be a non-empty string.")
+            spec.zen_transport = cfg["transport"].strip()
+        if cfg.get("main_peer") is not None:
+            if not isinstance(cfg["main_peer"], str) or not cfg["main_peer"].strip():
+                raise RuntimeError(f"{ctx}.zenoh_ros2dds.main_peer must be a non-empty string.")
+            spec.zen_main_peer = cfg["main_peer"].strip()
+        if cfg.get("main_port") is not None:
+            mp = cfg["main_port"]
+            if isinstance(mp, bool):
+                raise RuntimeError(f"{ctx}.zenoh_ros2dds.main_port must be an integer.")
+            try:
+                spec.zen_main_port = int(mp)
+            except Exception as e:
+                raise RuntimeError(f"{ctx}.zenoh_ros2dds.main_port must be an integer.") from e
     else:
-        if not isinstance(cfg_raw, str) or not cfg_raw.strip():
-            raise RuntimeError(f"{ctx}.config must be a non-empty string if provided.")
-        cfg = cfg_raw.strip()
+        # Raw RMW string (local only) — no config keys allowed.
+        if cfg:
+            raise RuntimeError(
+                f"{ctx}.{impl} does not accept any config keys (raw RMW string has no templated config)."
+            )
 
-    ekey_raw = value.get("easy_mode_ip_key")
-    if ekey_raw is None:
-        ekey = None
+    return spec
+
+
+def _validate_rmw_impl(impl: str, ctx: str, *, is_local: bool) -> None:
+    if is_local:
+        if impl == "zenoh_ros2dds":
+            raise RuntimeError(
+                f"{ctx}: 'zenoh_ros2dds' is OTA-only and cannot be used as the local RMW."
+            )
+        # Everything else (including raw rmw strings) is permitted for local.
     else:
-        if not isinstance(ekey_raw, str) or not ekey_raw.strip():
-            raise RuntimeError(f"{ctx}.easy_mode_ip_key must be a non-empty string if provided.")
-        ekey = ekey_raw.strip()
+        if impl not in _OTA_SHORTS:
+            raise RuntimeError(
+                f"{ctx} must be one of {sorted(_OTA_SHORTS)}; got {impl!r}."
+            )
 
-    return (impl, cfg, ekey)
+
+def _parse_rmw_block(value: Any, peer_keys: List[str]) -> RmwSpec:
+    """Parse `shared.rmw`. Returns an RmwSpec with both sides filled in (each
+    side may have impl=None if absent).
+    """
+    if value is None:
+        return RmwSpec()
+
+    if isinstance(value, str):
+        short = value.strip()
+        if not short:
+            return RmwSpec()
+        if short not in _SHORTCUT_ALLOWED:
+            raise RuntimeError(
+                f"shared.rmw string shortcut must be one of {sorted(_SHORTCUT_ALLOWED)}; got {short!r}. "
+                "Use the {local, ota} mapping form for other combinations."
+            )
+        side = RmwSideSpec(impl=short)
+        return RmwSpec(local=RmwSideSpec(impl=short), ota=RmwSideSpec(impl=short))
+
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f"shared.rmw must be a string or a mapping with {{local, ota}} keys; got {type(value)}."
+        )
+
+    extra = set(value.keys()) - {"local", "ota"}
+    if extra:
+        raise RuntimeError(
+            f"shared.rmw contains unsupported keys {sorted(extra)}. Allowed: ['local', 'ota']."
+        )
+
+    spec = RmwSpec(
+        local=_parse_rmw_side(value.get("local"), "shared.rmw.local", is_local=True),
+        ota=_parse_rmw_side(value.get("ota"), "shared.rmw.ota", is_local=False),
+    )
+
+    # main_peer references must be known peers.
+    for side, side_name in [(spec.local, "local"), (spec.ota, "ota")]:
+        if side.zen_main_peer is not None and side.zen_main_peer not in peer_keys:
+            raise RuntimeError(
+                f"shared.rmw.{side_name}.{side.impl}.main_peer must be one of the declared peers "
+                f"{peer_keys}, got {side.zen_main_peer!r}."
+            )
+    return spec
 
 
-def _resolve_rmw_local(value: Any) -> Optional[str]:
-    """Back-compat thin wrapper: returns just the implementation part of an
-    `rmw_local` spec (string or mapping)."""
-    impl, _cfg, _ekey = _parse_rmw_spec(value, "shared.rmw_local")
-    return impl
+def _validate_rmw_spec_combination(spec: RmwSpec, *, ota_domain_id: Optional[int]) -> None:
+    """Cross-side validation of an RmwSpec after parsing."""
+    local_impl, ota_impl = spec.local.impl, spec.ota.impl
+    if ota_impl == "zenoh":
+        # Native rmw_zenoh_cpp: local must also be zenoh (rmw_zenoh_cpp is not
+        # interoperable with DDS-based RMWs).
+        if local_impl not in (None, "zenoh", RMW_ALIASES["zenoh"]):
+            raise RuntimeError(
+                "shared.rmw.ota=zenoh requires shared.rmw.local=zenoh "
+                "(rmw_zenoh_cpp is not interoperable with DDS-based RMWs)."
+            )
+        if ota_domain_id is not None:
+            raise RuntimeError(
+                "shared.ota_domain_id must not be set when shared.rmw.ota=zenoh (native rmw_zenoh_cpp "
+                "uses a single router per peer — split local/OTA domains are not applicable). "
+                "Use per-peer peer_settings.<peer>.domain_id instead."
+            )
+    elif ota_impl == "zenoh_ros2dds":
+        # Bridge mode: local must be DDS (cyclone/fastdds). Raw RMW strings are
+        # rejected here to keep the `RMW_IMPLEMENTATION` switch in the plugin base deterministic.
+        if local_impl not in (None,) and local_impl not in _DDS_SHORTS:
+            raise RuntimeError(
+                f"shared.rmw.ota=zenoh_ros2dds requires shared.rmw.local in {sorted(_DDS_SHORTS)}; "
+                f"got {local_impl!r}. zenoh_ros2dds bridges DDS ↔ zenoh, so local processes must use DDS."
+            )
+    # DDS-on-DDS / cross-DDS combinations are unconstrained.
 
 
 def _parse_optional_domain_id(value: Any, field_name: str) -> Optional[int]:
@@ -710,6 +876,20 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
     # shared is optional
     if "shared" in cfg and cfg["shared"] is not None:
         shared = _assert_mapping(cfg.get("shared"), "shared")
+        # Reject legacy keys with a clear message so configs that predate the
+        # shared.rmw / peer_settings.<peer>.domain_id schema fail loudly.
+        _LEGACY_SHARED_KEYS = {
+            "rmw_ota": "shared.rmw.ota",
+            "rmw_local": "shared.rmw.local",
+            "local_domain_id": "peer_settings.<peer>.domain_id (per-peer local domain id)",
+            "zenoh": "shared.rmw.ota.zenoh_ros2dds (tagged-union form)",
+        }
+        for legacy, replacement in _LEGACY_SHARED_KEYS.items():
+            if legacy in shared:
+                raise RuntimeError(
+                    f"shared.{legacy} is no longer supported. Use {replacement} instead."
+                )
+
         _assert_allowed_keys(
             "shared",
             shared,
@@ -718,46 +898,23 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "use_heartbeat",
                 "use_in",
                 "use_out",
-                "rmw_local",
-                "rmw_ota",
-                "local_domain_id",
+                "rmw",
                 "ota_domain_id",
                 "heartbeat_position",
                 "processing_suffixes",
                 "compression",
                 "qos",
-                "zenoh",
             },
         )
         if "use_in" in shared and shared["use_in"] is not None and not isinstance(shared["use_in"], bool):
             raise RuntimeError("shared.use_in must be boolean if provided.")
         if "use_out" in shared and shared["use_out"] is not None and not isinstance(shared["use_out"], bool):
             raise RuntimeError("shared.use_out must be boolean if provided.")
-        if "rmw_ota" in shared and shared["rmw_ota"] is not None:
-            ota_impl, ota_cfg, _ota_ekey = _parse_rmw_spec(shared.get("rmw_ota"), "shared.rmw_ota")
-            if ota_impl is not None and ota_impl not in _RMW_IMPL_VALUES:
-                raise RuntimeError(
-                    f"shared.rmw_ota.implementation must be one of: {sorted(_RMW_IMPL_VALUES)}; got {ota_impl!r}."
-                )
-            if ota_impl == "zenoh" and ota_cfg is not None:
-                raise RuntimeError(
-                    "shared.rmw_ota.config is not supported for implementation=zenoh "
-                    "(zenoh uses shared.zenoh + create_zenoh_json5.py)."
-                )
-        if "rmw_local" in shared and shared["rmw_local"] is not None:
-            local_impl, local_cfg, _local_ekey = _parse_rmw_spec(shared.get("rmw_local"), "shared.rmw_local")
-            if local_cfg is not None and local_impl not in _RMW_IMPL_VALUES:
-                # We can only set CYCLONEDDS_URI / FASTDDS_DEFAULT_PROFILES_FILE for known DDS impls.
-                raise RuntimeError(
-                    f"shared.rmw_local.config requires shared.rmw_local.implementation in "
-                    f"{sorted(_RMW_IMPL_VALUES)}; got {local_impl!r}."
-                )
-            if local_impl == "zenoh" and local_cfg is not None:
-                raise RuntimeError(
-                    "shared.rmw_local.config is not supported for implementation=zenoh."
-                )
-        if "local_domain_id" in shared and shared["local_domain_id"] is not None:
-            _parse_optional_domain_id(shared["local_domain_id"], "shared.local_domain_id")
+        if "rmw" in shared and shared["rmw"] is not None:
+            # Full parse (exercises all sub-validators). The cross-side
+            # combination check runs later in build time once peer settings
+            # are known.
+            _parse_rmw_block(shared.get("rmw"), list(peers.keys()))
         if "ota_domain_id" in shared and shared["ota_domain_id"] is not None:
             _parse_optional_domain_id(shared["ota_domain_id"], "shared.ota_domain_id")
         if "processing_suffixes" in shared and shared["processing_suffixes"] is not None:
@@ -773,15 +930,6 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
         if "qos" in shared and shared["qos"] is not None:
             qos = _assert_mapping(shared.get("qos"), "shared.qos")
             _assert_allowed_keys("shared.qos", qos, {"defaults", "for_role"})
-        if "zenoh" in shared and shared["zenoh"] is not None:
-            zen = _assert_mapping(shared.get("zenoh"), "shared.zenoh")
-            _assert_allowed_keys("shared.zenoh", zen, {"transport", "main_peer", "main_port"})
-            if "transport" in zen and zen["transport"] is not None and not isinstance(zen["transport"], str):
-                raise RuntimeError("shared.zenoh.transport must be a string if provided.")
-            if "main_peer" in zen and zen["main_peer"] is not None and not isinstance(zen["main_peer"], str):
-                raise RuntimeError("shared.zenoh.main_peer must be a string if provided.")
-            if "main_port" in zen and zen["main_port"] is not None and not isinstance(zen["main_port"], (int, str)):
-                raise RuntimeError("shared.zenoh.main_port must be an int (or int-like string) if provided.")
 
     # peer_settings is optional
     if "peer_settings" in cfg and cfg["peer_settings"] is not None:
@@ -794,7 +942,13 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             )
         for p, ps in peer_settings.items():
             ps = _assert_mapping(ps, f"peer_settings.{p}")
-            _assert_allowed_keys(f"peer_settings.{p}", ps, {"heartbeat_topic", "inbound", "outbound", "framebridge"})
+            _assert_allowed_keys(
+                f"peer_settings.{p}",
+                ps,
+                {"heartbeat_topic", "inbound", "outbound", "framebridge", "domain_id"},
+            )
+            if "domain_id" in ps and ps["domain_id"] is not None:
+                _parse_optional_domain_id(ps["domain_id"], f"peer_settings.{p}.domain_id")
             if "framebridge" in ps and ps["framebridge"] is not None:
                 fb_ps = _assert_mapping(ps["framebridge"], f"peer_settings.{p}.framebridge")
                 _assert_allowed_keys(
@@ -976,27 +1130,6 @@ def _render_qos_yaml(shared_qos: Dict[str, Any], qos_overrides: Dict[str, Dict[s
     return _yaml_canonical_dump(qos_obj)
 
 
-def _resolve_rmw_local_for_graph(
-    ota_rmw: Optional[str],
-    rmw_local: Optional[str],
-    *,
-    use_domain_bridge: bool,
-) -> Optional[str]:
-    """Resolve the effective rmw_local for the local ROS graph.
-
-    When split-domain bridging is in play and the user hasn't pinned an explicit
-    `rmw_local`, fall back to 'cyclone' so the stock `domain_bridge` executable
-    has a deterministic RMW. Otherwise return whatever the user provided.
-    """
-    if not use_domain_bridge:
-        return rmw_local
-
-    if rmw_local is None:
-        return "cyclone"
-
-    return rmw_local
-
-
 def _final_topic_type(entry: TopicEntry, pipe: Dict[str, Any]) -> str:
     transport = pipe.get("transport")
     if transport is not None:
@@ -1017,7 +1150,7 @@ def _final_topic_type(entry: TopicEntry, pipe: Dict[str, Any]) -> str:
     msg_type = str(entry.msg_type or "").strip()
     if not msg_type:
         raise RuntimeError(
-            f"Topic '{entry.base}' requires a 'type' when shared.local_domain_id/shared.ota_domain_id are used."
+            f"Topic '{entry.base}' requires a 'type' when peer_settings.<peer>.domain_id/shared.ota_domain_id are used."
         )
     return msg_type
 
@@ -1334,104 +1467,149 @@ def func(
     shared_use_in = shared.get("use_in", None)
     shared_use_out = shared.get("use_out", None)
 
-    # Optional zenoh block config
-    zenoh_cfg = shared.get("zenoh", None)
-    if zenoh_cfg is not None and not isinstance(zenoh_cfg, dict):
-        raise RuntimeError(f"shared.zenoh must be a mapping if provided, got {type(zenoh_cfg)}")
+    # RMW spec: the unified `shared.rmw` block. Either a string shortcut (e.g.
+    # `rmw: zenoh`) or a mapping `{local, ota}` per side. See `_parse_rmw_block`
+    # for the full schema.
+    rmw_spec = _parse_rmw_block(shared.get("rmw"), peer_keys)
 
-    # OTA RMW spec: accept either a bare string ('zenoh') or a mapping
-    # ({implementation, config?, easy_mode_ip_key?}). When absent, no OTA RMW
-    # or DDS config is configured at all (intentional break from old behavior,
-    # which silently defaulted to cyclone).
-    ota_rmw, ota_config, ota_easy_mode_ip_key = _parse_rmw_spec(
-        shared.get("rmw_ota"), "shared.rmw_ota",
-    )
-
-    # Local RMW spec: same string-or-mapping schema as OTA. Local config is
-    # optional and only loaded by the runtime if `local_config_template` is set.
-    local_rmw, local_config, local_easy_mode_ip_key = _parse_rmw_spec(
-        shared.get("rmw_local"), "shared.rmw_local",
-    )
-
-    # shared.zenoh is now fully optional. When absent, the session plugin falls
-    # back to starting `ros2 run rmw_zenoh_cpp rmw_zenohd` for any zenoh-using
-    # side (local and/or OTA). shared.zenoh only configures the advanced
-    # cross-host zenohd+ros2dds bridge path, which only makes sense for OTA.
-    if ota_rmw != "zenoh" and zenoh_cfg is not None:
-        raise RuntimeError("shared.zenoh may only be specified when shared.rmw_ota=zenoh.")
-
-    local_domain_id = _parse_optional_domain_id(shared.get("local_domain_id"), "shared.local_domain_id")
     ota_domain_id = _parse_optional_domain_id(shared.get("ota_domain_id"), "shared.ota_domain_id")
-    if (local_domain_id is None) != (ota_domain_id is None):
-        raise RuntimeError(
-            "shared.local_domain_id and shared.ota_domain_id must either both be set or both be omitted."
+    # Per-peer local domain id (from peer_settings.<peer>.domain_id).
+    peer_local_domain_id: Dict[str, Optional[int]] = {
+        p: _parse_optional_domain_id(
+            (peer_settings_all.get(p) or {}).get("domain_id"),
+            f"peer_settings.{p}.domain_id",
         )
-    use_domain_bridge = (
-        local_domain_id is not None and ota_domain_id is not None and local_domain_id != ota_domain_id
-    )
-    rmw_local = _resolve_rmw_local_for_graph(
-        ota_rmw,
-        local_rmw,
-        use_domain_bridge=use_domain_bridge,
-    )
+        for p in peer_keys
+    }
+
+    _validate_rmw_spec_combination(rmw_spec, ota_domain_id=ota_domain_id)
+
+    # Native rmw_zenoh_cpp: require distinct peer domain_ids and distinct IP keys.
+    # rmw_zenoh_cpp's router forwards across domains, so distinct domains are
+    # the only way to keep local/OTA traffic from being accidentally multiplexed.
+    if rmw_spec.ota.impl == "zenoh":
+        missing = [p for p in peer_keys if peer_local_domain_id[p] is None]
+        if missing:
+            raise RuntimeError(
+                f"shared.rmw.ota=zenoh requires peer_settings.<peer>.domain_id for every peer; "
+                f"missing: {missing}."
+            )
+        seen_ids: Dict[int, str] = {}
+        for p in peer_keys:
+            d = peer_local_domain_id[p]
+            assert d is not None
+            if d in seen_ids:
+                raise RuntimeError(
+                    f"shared.rmw.ota=zenoh requires distinct peer_settings.<peer>.domain_id across peers; "
+                    f"peers '{seen_ids[d]}' and '{p}' both use {d}."
+                )
+            seen_ids[d] = p
+        seen_ips: Dict[str, str] = {}
+        for p in peer_keys:
+            ipk = peer_ip[p]
+            if ipk in seen_ips:
+                raise RuntimeError(
+                    f"shared.rmw.ota=zenoh requires distinct peers.<peer>.ip_key across peers; "
+                    f"peers '{seen_ips[ipk]}' and '{p}' both use {ipk!r}."
+                )
+            seen_ips[ipk] = p
+
+    def _use_domain_bridge(peer: str) -> bool:
+        d = peer_local_domain_id[peer]
+        return d is not None and ota_domain_id is not None and d != ota_domain_id
+
+    # Global "any peer uses the domain bridge" flag: domain-bridge-driven
+    # topic lists (with types) are assembled once and shared across peers.
+    use_domain_bridge = any(_use_domain_bridge(p) for p in peer_keys)
 
     # session_dir is the on-disk directory containing the session config input YAML
     # (session-definition.yaml / session-parametrization.yaml)
     session_dir = _render_session_dir(param_dir)
 
-    def _build_dds_config_items(
-        side: str,
-        impl: Optional[str],
-        config: Optional[str],
-        easy_mode_ip_key: Optional[str],
-    ) -> List[Tuple[str, Any]]:
-        """Generic builder for the per-side (ota/local) DDS-config plugin items.
-
-        Emits `<side>_config_template`, `<side>_config_file`, and (when the
-        easy-mode template is selected) `<side>_easy_mode_ip_key`.
-        """
+    def _build_local_rmw_items(peer: str) -> List[Tuple[str, Any]]:
+        """Plugin.yaml block for local-side RMW (rmw_local + optional DDS config)."""
+        side = rmw_spec.local
+        # Effective impl: the stock `domain_bridge` binary needs a
+        # deterministic DDS RMW. Fall back to cyclone when split-domain
+        # bridging is in play on this peer but the user didn't pin a local RMW.
+        effective_impl = side.impl
+        if effective_impl is None and _use_domain_bridge(peer):
+            effective_impl = "cyclone"
         items: List[Tuple[str, Any]] = []
-        if not config:
-            return items
-        items.append((f"{side}_config_template", config))
-        items.append((f"{side}_config_file", f"${{peer_dir}}/{side}_dds.xml"))
-        if impl == "fastdds" and config == "fastdds_easy_mode.xml":
-            items.append((
-                f"{side}_easy_mode_ip_key",
-                easy_mode_ip_key or peer_ip[peer_keys[0]],
-            ))
+        if effective_impl is not None:
+            items.append(("rmw_local", effective_impl))
+        if side.dds_config:
+            items.append(("local_config_template", side.dds_config))
+            items.append(("local_config_file", "${peer_dir}/local_dds.xml"))
+            if side.impl == "fastdds" and side.dds_config == "fastdds_easy_mode.xml":
+                items.append((
+                    "local_easy_mode_ip_key",
+                    side.dds_easy_mode_ip_key or peer_ip[peer_keys[0]],
+                ))
         return items
 
     def _build_ota_rmw_items() -> List[Tuple[str, Any]]:
-        """Plugin.yaml block for the OTA RMW + (optional) DDS config file."""
+        """Plugin.yaml block for OTA-side RMW + derived use_zenoh_* flags."""
+        ota = rmw_spec.ota
+        local = rmw_spec.local
         items: List[Tuple[str, Any]] = []
-        if ota_rmw is not None:
-            items.append(("rmw_ota", ota_rmw))
-        items.append(("use_zenoh", ota_rmw == "zenoh"))
-        items.extend(_build_dds_config_items("ota", ota_rmw, ota_config, ota_easy_mode_ip_key))
+        if ota.impl is not None:
+            items.append(("rmw_ota", ota.impl))
+        # Native rmw_zenoh_cpp router (ZEN window): enabled if either side uses native zenoh.
+        items.append(("use_zenoh_rmw", ota.impl == "zenoh" or local.impl == "zenoh"))
+        # zenoh_bridge_ros2dds router (Z2D window): enabled for OTA only.
+        items.append(("use_zenoh_ros2dds", ota.impl == "zenoh_ros2dds"))
+        if ota.dds_config:
+            items.append(("ota_config_template", ota.dds_config))
+            items.append(("ota_config_file", "${peer_dir}/ota_dds.xml"))
+            if ota.impl == "fastdds" and ota.dds_config == "fastdds_easy_mode.xml":
+                items.append((
+                    "ota_easy_mode_ip_key",
+                    ota.dds_easy_mode_ip_key or peer_ip[peer_keys[0]],
+                ))
         return items
 
-    def _build_local_rmw_items() -> List[Tuple[str, Any]]:
-        """Plugin.yaml block for the local RMW + (optional) DDS config file."""
-        items: List[Tuple[str, Any]] = []
-        if rmw_local is not None:
-            items.append(("rmw_local", rmw_local))
-        # use_zenoh_local is a derived flag that triggers the local rmw_zenohd
-        # window in the base plugin. Only emit it when the local RMW is
-        # explicitly set, since we otherwise don't touch RMW_IMPLEMENTATION.
-        if rmw_local is not None:
-            local_is_zenoh = rmw_local in {"zenoh", RMW_ALIASES["zenoh"]}
-            # Avoid racing two rmw_zenohd instances on the same port: when OTA
-            # is also zenoh on the same ROS_DOMAIN_ID (no domain bridge), the
-            # ZEN window already runs a router that local processes can share.
-            ota_covers_local = (
-                local_is_zenoh
-                and ota_rmw == "zenoh"
-                and not use_domain_bridge
+    def _build_zenoh_block(
+        local_peer: str,
+        remote_peer: str,
+        out_entries_pipes: Optional[List[Tuple[TopicEntry, Dict[str, Any]]]] = None,
+    ) -> Optional[PluginBlock]:
+        """Plugin.yaml `zenoh` block for native zenoh or zenoh_ros2dds. Returns
+        None when no zenoh transport is configured on the OTA side.
+        """
+        ota = rmw_spec.ota
+        if ota.impl == "zenoh":
+            main_peer = ota.zen_main_peer or peer_keys[0]
+            main_port = ota.zen_main_port or 7447
+            return PluginBlock(
+                "zenoh",
+                [
+                    ("zen_main_ip", peer_ip[main_peer]),
+                    ("zen_main_port", main_port),
+                    # Only the non-main peer opens a TCP connect endpoint.
+                    ("zen_connect", local_peer != main_peer),
+                ],
             )
-            items.append(("use_zenoh_local", local_is_zenoh and not ota_covers_local))
-        items.extend(_build_dds_config_items("local", local_rmw, local_config, local_easy_mode_ip_key))
-        return items
+        if ota.impl == "zenoh_ros2dds":
+            main_peer = ota.zen_main_peer or peer_keys[0]
+            main_port = ota.zen_main_port or 7447
+            transport = ota.zen_transport or "udp"
+            endpoint_role = "listen" if local_peer == main_peer else "connect"
+            items: List[Tuple[str, Any]] = [
+                ("zen_pub_allow", f"/ota/{peer_name[local_peer]}/.*"),
+                ("zen_sub_allow", f"/ota/{peer_name[remote_peer]}/.*"),
+                ("zen_transport", transport),
+                ("zen_mode", "router"),
+                ("zen_endpoint_role", endpoint_role),
+                ("zen_main_ip", peer_ip[main_peer]),
+                ("zen_main_port", main_port),
+            ]
+            if out_entries_pipes is not None:
+                qos_block = _zenoh_qos_pub_block(out_entries_pipes, publisher_peer=local_peer)
+                if qos_block is not None:
+                    items.append(("zen_qos_pub", qos_block))
+            return PluginBlock("zenoh", items)
+        return None
 
     # Heartbeat topics (only if enabled). If not configured, default to /heartbeat_<com-name>.
     hb_topic: Dict[str, str] = {}
@@ -1516,9 +1694,31 @@ def func(
                     ],
                 )
             )
-            local_items = _build_local_rmw_items()
+            local_items = _build_local_rmw_items(local)
             if local_items:
                 blocks.append(PluginBlock("rmw_local", local_items))
+            zen_block = _build_zenoh_block(local, remote)
+            if zen_block is not None:
+                blocks.append(zen_block)
+            if _use_domain_bridge(local):
+                ldid = peer_local_domain_id[local]
+                assert ldid is not None and ota_domain_id is not None
+                blocks.append(
+                    PluginBlock(
+                        "domain_bridge",
+                        [
+                            ("use_domain_bridge", True),
+                            ("local_domain_id", ldid),
+                            ("ota_domain_id", ota_domain_id),
+                        ],
+                    )
+                )
+            elif peer_local_domain_id[local] is not None:
+                # Still export ROS_DOMAIN_ID for the peer's local graph even
+                # if no domain bridging is active.
+                blocks.append(
+                    PluginBlock("domain", [("local_domain_id", peer_local_domain_id[local])])
+                )
             blocks.append(PluginBlock("rmw", _build_ota_rmw_items()))
             if use_topic_monitor:
                 blocks.append(PluginBlock("topic_monitor", [("topic_monitor", True)]))
@@ -1906,7 +2106,7 @@ def func(
                 ],
             )
         )
-        local_items = _build_local_rmw_items()
+        local_items = _build_local_rmw_items(local)
         if local_items:
             blocks.append(PluginBlock("rmw_local", local_items))
         if write_qos:
@@ -2016,10 +2216,9 @@ def func(
                 out_items.append(("app_has_source_name_outbound", True))
             blocks.append(PluginBlock("out", out_items))
 
-        if use_domain_bridge:
-            assert local_domain_id is not None
-            assert ota_domain_id is not None
-            assert rmw_local is not None
+        if _use_domain_bridge(local):
+            ldid = peer_local_domain_id[local]
+            assert ldid is not None and ota_domain_id is not None
 
             domain_bridge_topics: Dict[str, Dict[str, Any]] = {}
             if out_enabled:
@@ -2027,7 +2226,7 @@ def func(
                     forward_topic = f"/to_{peer_name[remote]}{topic_name}" if use_target_prefix else topic_name
                     domain_bridge_topics[_com_topic("out", peer_name[local], forward_topic)] = {
                         "type": msg_type,
-                        "from_domain": local_domain_id,
+                        "from_domain": ldid,
                         "to_domain": ota_domain_id,
                     }
             if in_enabled:
@@ -2036,7 +2235,7 @@ def func(
                     domain_bridge_topics[_com_topic("in", peer_name[remote], forward_topic)] = {
                         "type": msg_type,
                         "from_domain": ota_domain_id,
-                        "to_domain": local_domain_id,
+                        "to_domain": ldid,
                     }
 
             if domain_bridge_topics:
@@ -2049,54 +2248,25 @@ def func(
                         "domain_bridge",
                         [
                             ("use_domain_bridge", True),
-                            ("local_domain_id", local_domain_id),
+                            ("local_domain_id", ldid),
                             ("ota_domain_id", ota_domain_id),
                             ("domain_bridge_config_file", "${peer_dir}/domain_bridge.yaml"),
                         ],
                     )
                 )
+        elif peer_local_domain_id[local] is not None:
+            # No domain bridging but the peer still has a pinned ROS_DOMAIN_ID.
+            blocks.append(
+                PluginBlock("domain", [("local_domain_id", peer_local_domain_id[local])])
+            )
 
-        # Zenoh advanced block (optional). Only emitted when the user provided
-        # a shared.zenoh configuration explicitly. When rmw_ota=zenoh but no
-        # shared.zenoh is set, the session base plugin falls back to starting
-        # `ros2 run rmw_zenoh_cpp rmw_zenohd` with no extra config.
-        if ota_rmw == "zenoh" and zenoh_cfg is not None:
-            transport = str((zenoh_cfg or {}).get("transport", "udp") or "udp").strip()
-            if not transport:
-                transport = "udp"
-            main_peer = str((zenoh_cfg or {}).get("main_peer", "") or "").strip()
-            if not main_peer:
-                raise RuntimeError("shared.zenoh.main_peer is required when shared.zenoh is provided.")
-            if main_peer not in peer_keys:
-                raise RuntimeError(
-                    f"shared.zenoh.main_peer must be one of the declared peers {peer_keys}, got '{main_peer}'."
-                )
-            main_port_raw = (zenoh_cfg or {}).get("main_port", None)
-            if main_port_raw is None:
-                raise RuntimeError("shared.zenoh.main_port is required when shared.zenoh is provided.")
-            try:
-                main_port = int(main_port_raw)
-            except Exception as e:
-                raise RuntimeError("shared.zenoh.main_port must be an integer.") from e
-
-            endpoint_role = "listen" if local == main_peer else "connect"
-            zen_items: List[Tuple[str, Any]] = [
-                ("zen_pub_allow", f"/ota/{peer_name[local]}/.*"),
-                ("zen_sub_allow", f"/ota/{peer_name[remote]}/.*"),
-                ("zen_transport", transport),
-                ("zen_mode", "router"),
-                ("zen_endpoint_role", endpoint_role),
-                ("zen_main_ip", peer_ip[main_peer]),
-                ("zen_main_port", main_port),
-            ]
-
-            # zen_qos_pub is per-publisher (outbound) for the local peer
-            out_pairs = list(zip(out_entries, out_pipes))
-            qos_block = _zenoh_qos_pub_block(out_pairs, publisher_peer=local)
-            if qos_block is not None:
-                zen_items.append(("zen_qos_pub", qos_block))
-
-            blocks.append(PluginBlock("zenoh", zen_items))
+        zen_block = _build_zenoh_block(
+            local,
+            remote,
+            out_entries_pipes=list(zip(out_entries, out_pipes)),
+        )
+        if zen_block is not None:
+            blocks.append(zen_block)
 
         blocks.append(PluginBlock("rmw", _build_ota_rmw_items()))
 

@@ -16,17 +16,8 @@ shared:
 
   # Tested Working RMW-Config Combinations:
 
-  # 1. FastDDS (works only sometimes weirdly)
+  # 1. FastDDS (works)
   rmw: fastdds
-
-# works sometimes?
-# gleiche config (peerlist = locale + remote ). Geht in 2/4 fällen
-#   keine first message bei 
-# - Seat IN-Relay, OUT-Bridge und bei  (keine com zwischen local und ota?) (URSACHE)
-# - Leitstand IN-Relaay + Bridge (weil schon nichts ankommt von SEAT)
-# - problem ist die domain bridge, die nicht geht plötzlich
-# pures fastdds ging auch manchmal
-
 
   # 2. Cyclone with OTA config (working)
   # rmw:
@@ -55,10 +46,5 @@ shared:
   # 6. Zenoh-ROS2DDS for OTA and locally cyclone (working)
   # rmw:
   #   local: cyclone
-  #   ota: zenoh_ros2dds
-
-  # 7. Zenoh-ROS2DDS for OTA and locally fastdds (not working weird message dublication)
-  # rmw:
-  #   local: fastdds
   #   ota: zenoh_ros2dds
 

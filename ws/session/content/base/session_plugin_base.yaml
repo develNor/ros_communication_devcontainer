@@ -249,7 +249,7 @@ windows:
     if: use_domain_bridge
     splits:
       - commands:
-        - ros2 run domain_bridge domain_bridge ${domain_bridge_config_file}
+        - ros2 run domain_bridge domain_bridge --wait-for-publisher false ${domain_bridge_config_file}
   - name: IN
     if: in
     splits:

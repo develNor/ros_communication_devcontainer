@@ -17,7 +17,7 @@ shared:
   # Tested Working RMW-Config Combinations:
 
   # 1. FastDDS
-  # rmw: fastdds
+  rmw: fastdds
 
   # 2. Cyclone with OTA config
   # rmw:
@@ -27,9 +27,9 @@ shared:
   #       config: cyclonedds_minimal.xml
 
   # 3. Zenoh with connected endpoints
-  rmw: 
-    local: zenoh
-    ota: zenoh_connect_endpoints
+  # rmw: 
+  #   local: zenoh
+  #   ota: zenoh_connect_endpoints
 
   # 4. Cyclone with OTA config and locally FastDDS
   # rmw:

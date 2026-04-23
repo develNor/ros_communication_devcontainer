@@ -13,7 +13,7 @@
 
         <Discovery>
             <Peers>
-                #peers
+                <!--peer-block--><Peer Address="#peer"/><!--/peer-block-->
             </Peers>
             <EnableTopicDiscoveryEndpoints>false</EnableTopicDiscoveryEndpoints>
             <LeaseDuration>60s</LeaseDuration>

@@ -6,10 +6,6 @@
         <transport_id>ota_udp_transport</transport_id>
         <type>UDPv4</type>
 
-        <!-- We do not know the remote participant IDs beforehand.
-             Keep a little headroom so one remote host can run multiple bridge processes. -->
-        <maxInitialPeersRange>32</maxInitialPeersRange>
-
         <interfaces>
           <allowlist>
             <!-- Needed so the bridge participant can still see localhost-only local peers. -->
@@ -81,7 +77,11 @@
                 <address>127.0.0.1</address>
               </udpv4>
             </locator>
-#peers
+            <!--peer-block--><locator>
+              <udpv4>
+                <address>#peer</address>
+              </udpv4>
+            </locator><!--/peer-block-->
           </initialPeersList>
         </builtin>
 

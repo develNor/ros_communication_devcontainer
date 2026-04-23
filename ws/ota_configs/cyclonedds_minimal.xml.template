@@ -1,5 +1,12 @@
 <CycloneDDS>
     <Domain>
+        <General>
+            <AllowMulticast>false</AllowMulticast>
+            <Interfaces>
+                <NetworkInterface address="#host_ip"/>
+            </Interfaces>
+        </General>
+
         <Discovery>
             <Peers>
                 <!--peer-block--><Peer Address="#peer"/><!--/peer-block-->

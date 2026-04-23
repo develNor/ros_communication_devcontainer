@@ -38,13 +38,16 @@ shared:
   #     cyclone:
   #       config: cyclonedds_minimal.xml
 
-  # 5. FastDDS for OTA and locally Cyclone
-  rmw:
-    local: cyclone
-    ota: fastdds
+  # 5. FastDDS for OTA and locally Cyclone (working)
+  # rmw:
+  #   local: cyclone
+  #   ota: fastdds
 
   # 6. Zenoh-ROS2DDS for OTA and locally cyclone (working)
   # rmw:
   #   local: cyclone
   #   ota: zenoh_ros2dds
 
+  rmw:
+    local: fastdds
+    ota: zenoh_ros2dds

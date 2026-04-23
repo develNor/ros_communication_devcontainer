@@ -11,7 +11,7 @@ shared:
   #   implementation: fastdds
   #   config: fastdds_v1.xml
 
-  rmw_local: cylcone # if no ota config is provided, the defaul dds config is not overridden (so cyclone uri and fastdds-files are not set)
+  rmw_local: cyclone # if no ota config is provided, the defaul dds config is not overridden (so cyclone uri and fastdds-files are not set)
   rmw_ota:
     implementation: cyclone
     config: cyclonedds.xml

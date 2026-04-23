@@ -1,2 +1,0 @@
-ota_unwrapper:
-  - topic_regex: "^/size_test_a/ota_stamped$"

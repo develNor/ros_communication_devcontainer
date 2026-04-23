@@ -8,3 +8,8 @@ zenoh.json5
 __pycache__
 .session_readonly.yaml
 .codex
+ws/example/**/a/**
+ws/example/**/b/**
+ws/example/**/a_to_b_topics.txt
+ws/example/**/b_to_a_topics.txt
+ws/example/**/qos.yaml

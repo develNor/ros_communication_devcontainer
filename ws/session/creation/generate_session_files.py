@@ -112,16 +112,69 @@ class YamlBlockScalar:
     content: str
 
 
-def _resolve_rmw_local(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise RuntimeError("shared.rmw_local must be a string if provided.")
+_RMW_IMPL_VALUES = {"cyclone", "fastdds", "zenoh"}
+_RMW_SPEC_KEYS = {"implementation", "config", "easy_mode_ip_key"}
 
-    resolved = value.strip()
-    if not resolved:
-        return None
-    return resolved
+
+def _parse_rmw_spec(value: Any, ctx: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Parse a `rmw_*` value that may be either a bare string ('zenoh') or a
+    mapping ({implementation, config?, easy_mode_ip_key?}).
+
+    Returns (implementation, config, easy_mode_ip_key); any of them may be None.
+    Raises RuntimeError on schema violations.
+
+    For `rmw_local` the convention is: the implementation may be one of the known
+    short aliases (cyclone/fastdds/zenoh) or a raw RMW string (e.g. rmw_cyclonedds_cpp).
+    For `rmw_ota` the implementation must be one of the short aliases. The caller
+    decides which constraint applies via `ctx`.
+    """
+    if value is None:
+        return (None, None, None)
+
+    if isinstance(value, str):
+        impl = value.strip()
+        if not impl:
+            return (None, None, None)
+        return (impl, None, None)
+
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{ctx} must be a string or a mapping if provided, got {type(value)}")
+
+    extra = set(value.keys()) - _RMW_SPEC_KEYS
+    if extra:
+        raise RuntimeError(f"{ctx} contains unsupported keys: {sorted(extra)}. Allowed: {sorted(_RMW_SPEC_KEYS)}.")
+
+    impl_raw = value.get("implementation")
+    if impl_raw is None:
+        raise RuntimeError(f"{ctx}.implementation is required when {ctx} is given as a mapping.")
+    if not isinstance(impl_raw, str) or not impl_raw.strip():
+        raise RuntimeError(f"{ctx}.implementation must be a non-empty string.")
+    impl = impl_raw.strip()
+
+    cfg_raw = value.get("config")
+    if cfg_raw is None:
+        cfg = None
+    else:
+        if not isinstance(cfg_raw, str) or not cfg_raw.strip():
+            raise RuntimeError(f"{ctx}.config must be a non-empty string if provided.")
+        cfg = cfg_raw.strip()
+
+    ekey_raw = value.get("easy_mode_ip_key")
+    if ekey_raw is None:
+        ekey = None
+    else:
+        if not isinstance(ekey_raw, str) or not ekey_raw.strip():
+            raise RuntimeError(f"{ctx}.easy_mode_ip_key must be a non-empty string if provided.")
+        ekey = ekey_raw.strip()
+
+    return (impl, cfg, ekey)
+
+
+def _resolve_rmw_local(value: Any) -> Optional[str]:
+    """Back-compat thin wrapper: returns just the implementation part of an
+    `rmw_local` spec (string or mapping)."""
+    impl, _cfg, _ekey = _parse_rmw_spec(value, "shared.rmw_local")
+    return impl
 
 
 def _parse_optional_domain_id(value: Any, field_name: str) -> Optional[int]:
@@ -681,33 +734,28 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
         if "use_out" in shared and shared["use_out"] is not None and not isinstance(shared["use_out"], bool):
             raise RuntimeError("shared.use_out must be boolean if provided.")
         if "rmw_ota" in shared and shared["rmw_ota"] is not None:
-            rmw_ota_block = _assert_mapping(shared.get("rmw_ota"), "shared.rmw_ota")
-            _assert_allowed_keys(
-                "shared.rmw_ota",
-                rmw_ota_block,
-                {"implementation", "config", "easy_mode_ip_key"},
-            )
-            impl = rmw_ota_block.get("implementation")
-            if impl is None:
-                raise RuntimeError("shared.rmw_ota.implementation is required when shared.rmw_ota is provided.")
-            if not isinstance(impl, str) or impl.strip() not in {"cyclone", "fastdds", "zenoh"}:
-                raise RuntimeError("shared.rmw_ota.implementation must be one of: cyclone, fastdds, zenoh.")
-            cfg_name = rmw_ota_block.get("config")
-            if cfg_name is not None and (not isinstance(cfg_name, str) or not cfg_name.strip()):
-                raise RuntimeError("shared.rmw_ota.config must be a non-empty string if provided.")
-            if impl.strip() == "zenoh" and cfg_name is not None:
+            ota_impl, ota_cfg, _ota_ekey = _parse_rmw_spec(shared.get("rmw_ota"), "shared.rmw_ota")
+            if ota_impl is not None and ota_impl not in _RMW_IMPL_VALUES:
+                raise RuntimeError(
+                    f"shared.rmw_ota.implementation must be one of: {sorted(_RMW_IMPL_VALUES)}; got {ota_impl!r}."
+                )
+            if ota_impl == "zenoh" and ota_cfg is not None:
                 raise RuntimeError(
                     "shared.rmw_ota.config is not supported for implementation=zenoh "
                     "(zenoh uses shared.zenoh + create_zenoh_json5.py)."
                 )
-            ekey = rmw_ota_block.get("easy_mode_ip_key")
-            if ekey is not None and (not isinstance(ekey, str) or not ekey.strip()):
-                raise RuntimeError("shared.rmw_ota.easy_mode_ip_key must be a non-empty string if provided.")
         if "rmw_local" in shared and shared["rmw_local"] is not None:
-            if not isinstance(shared["rmw_local"], str):
-                raise RuntimeError("shared.rmw_local must be a string if provided.")
-            if not shared["rmw_local"].strip():
-                raise RuntimeError("shared.rmw_local must not be empty if provided.")
+            local_impl, local_cfg, _local_ekey = _parse_rmw_spec(shared.get("rmw_local"), "shared.rmw_local")
+            if local_cfg is not None and local_impl not in _RMW_IMPL_VALUES:
+                # We can only set CYCLONEDDS_URI / FASTDDS_DEFAULT_PROFILES_FILE for known DDS impls.
+                raise RuntimeError(
+                    f"shared.rmw_local.config requires shared.rmw_local.implementation in "
+                    f"{sorted(_RMW_IMPL_VALUES)}; got {local_impl!r}."
+                )
+            if local_impl == "zenoh" and local_cfg is not None:
+                raise RuntimeError(
+                    "shared.rmw_local.config is not supported for implementation=zenoh."
+                )
         if "local_domain_id" in shared and shared["local_domain_id"] is not None:
             _parse_optional_domain_id(shared["local_domain_id"], "shared.local_domain_id")
         if "ota_domain_id" in shared and shared["ota_domain_id"] is not None:
@@ -1291,28 +1339,24 @@ def func(
     if zenoh_cfg is not None and not isinstance(zenoh_cfg, dict):
         raise RuntimeError(f"shared.zenoh must be a mapping if provided, got {type(zenoh_cfg)}")
 
-    # Parse the new rmw_ota mapping form: {implementation, config?, easy_mode_ip_key?}.
-    # When the block is absent, no OTA RMW or DDS config is configured at all
-    # (intentional break from old behavior, which silently defaulted to cyclone).
-    rmw_ota_block = shared.get("rmw_ota") or None
-    if rmw_ota_block is not None and not isinstance(rmw_ota_block, dict):
-        raise RuntimeError(f"shared.rmw_ota must be a mapping if provided, got {type(rmw_ota_block)}")
-    ota_rmw: Optional[str] = None
-    ota_config: Optional[str] = None
-    ota_easy_mode_ip_key: Optional[str] = None
-    if rmw_ota_block is not None:
-        ota_rmw = (rmw_ota_block.get("implementation") or "").strip() or None
-        cfg_name = rmw_ota_block.get("config")
-        ota_config = cfg_name.strip() if isinstance(cfg_name, str) and cfg_name.strip() else None
-        ekey = rmw_ota_block.get("easy_mode_ip_key")
-        ota_easy_mode_ip_key = ekey.strip() if isinstance(ekey, str) and ekey.strip() else None
+    # OTA RMW spec: accept either a bare string ('zenoh') or a mapping
+    # ({implementation, config?, easy_mode_ip_key?}). When absent, no OTA RMW
+    # or DDS config is configured at all (intentional break from old behavior,
+    # which silently defaulted to cyclone).
+    ota_rmw, ota_config, ota_easy_mode_ip_key = _parse_rmw_spec(
+        shared.get("rmw_ota"), "shared.rmw_ota",
+    )
 
-    rmw_local = _resolve_rmw_local(shared.get("rmw_local"))
+    # Local RMW spec: same string-or-mapping schema as OTA. Local config is
+    # optional and only loaded by the runtime if `local_config_template` is set.
+    local_rmw, local_config, local_easy_mode_ip_key = _parse_rmw_spec(
+        shared.get("rmw_local"), "shared.rmw_local",
+    )
 
     if ota_rmw == "zenoh" and zenoh_cfg is None:
-        raise RuntimeError("shared.rmw_ota.implementation=zenoh requires a shared.zenoh configuration block.")
+        raise RuntimeError("shared.rmw_ota=zenoh requires a shared.zenoh configuration block.")
     if ota_rmw != "zenoh" and zenoh_cfg is not None:
-        raise RuntimeError("shared.zenoh may only be specified when shared.rmw_ota.implementation=zenoh.")
+        raise RuntimeError("shared.zenoh may only be specified when shared.rmw_ota=zenoh.")
 
     local_domain_id = _parse_optional_domain_id(shared.get("local_domain_id"), "shared.local_domain_id")
     ota_domain_id = _parse_optional_domain_id(shared.get("ota_domain_id"), "shared.ota_domain_id")
@@ -1325,7 +1369,7 @@ def func(
     )
     rmw_local = _resolve_rmw_local_for_graph(
         ota_rmw,
-        rmw_local,
+        local_rmw,
         use_domain_bridge=use_domain_bridge,
     )
 
@@ -1333,20 +1377,44 @@ def func(
     # (session-definition.yaml / session-parametrization.yaml)
     session_dir = _render_session_dir(param_dir)
 
-    def _build_rmw_items() -> List[Tuple[str, Any]]:
+    def _build_dds_config_items(
+        side: str,
+        impl: Optional[str],
+        config: Optional[str],
+        easy_mode_ip_key: Optional[str],
+    ) -> List[Tuple[str, Any]]:
+        """Generic builder for the per-side (ota/local) DDS-config plugin items.
+
+        Emits `<side>_config_template`, `<side>_config_file`, and (when the
+        easy-mode template is selected) `<side>_easy_mode_ip_key`.
+        """
+        items: List[Tuple[str, Any]] = []
+        if not config:
+            return items
+        items.append((f"{side}_config_template", config))
+        items.append((f"{side}_config_file", f"${{peer_dir}}/{side}_dds.xml"))
+        if impl == "fastdds" and config == "fastdds_easy_mode.xml":
+            items.append((
+                f"{side}_easy_mode_ip_key",
+                easy_mode_ip_key or peer_ip[peer_keys[0]],
+            ))
+        return items
+
+    def _build_ota_rmw_items() -> List[Tuple[str, Any]]:
         """Plugin.yaml block for the OTA RMW + (optional) DDS config file."""
         items: List[Tuple[str, Any]] = []
         if ota_rmw is not None:
             items.append(("rmw_ota", ota_rmw))
         items.append(("use_zenoh", ota_rmw == "zenoh"))
-        if ota_config:
-            items.append(("ota_config_template", ota_config))
-            items.append(("ota_config_file", "${peer_dir}/ota_dds.xml"))
-            if ota_rmw == "fastdds" and ota_config == "fastdds_easy_mode.xml":
-                items.append((
-                    "ota_easy_mode_ip_key",
-                    ota_easy_mode_ip_key or peer_ip[peer_keys[0]],
-                ))
+        items.extend(_build_dds_config_items("ota", ota_rmw, ota_config, ota_easy_mode_ip_key))
+        return items
+
+    def _build_local_rmw_items() -> List[Tuple[str, Any]]:
+        """Plugin.yaml block for the local RMW + (optional) DDS config file."""
+        items: List[Tuple[str, Any]] = []
+        if rmw_local is not None:
+            items.append(("rmw_local", rmw_local))
+        items.extend(_build_dds_config_items("local", local_rmw, local_config, local_easy_mode_ip_key))
         return items
 
     # Heartbeat topics (only if enabled). If not configured, default to /heartbeat_<com-name>.
@@ -1432,14 +1500,10 @@ def func(
                     ],
                 )
             )
-            if rmw_local is not None:
-                blocks.append(
-                    PluginBlock(
-                        "rmw_local",
-                        [("rmw_local", rmw_local)],
-                    )
-                )
-            blocks.append(PluginBlock("rmw", _build_rmw_items()))
+            local_items = _build_local_rmw_items()
+            if local_items:
+                blocks.append(PluginBlock("rmw_local", local_items))
+            blocks.append(PluginBlock("rmw", _build_ota_rmw_items()))
             if use_topic_monitor:
                 blocks.append(PluginBlock("topic_monitor", [("topic_monitor", True)]))
             if use_heartbeat:
@@ -1826,13 +1890,9 @@ def func(
                 ],
             )
         )
-        if rmw_local is not None:
-            blocks.append(
-                PluginBlock(
-                    "rmw_local",
-                    [("rmw_local", rmw_local)],
-                )
-            )
+        local_items = _build_local_rmw_items()
+        if local_items:
+            blocks.append(PluginBlock("rmw_local", local_items))
         if write_qos:
             blocks.append(PluginBlock("qos", [("qos_config_file", "${session_dir}/qos.yaml")]))
 
@@ -2019,7 +2079,7 @@ def func(
 
             blocks.append(PluginBlock("zenoh", zen_items))
 
-        blocks.append(PluginBlock("rmw", _build_rmw_items()))
+        blocks.append(PluginBlock("rmw", _build_ota_rmw_items()))
 
         # Topic monitor: set to_adressant only when target-prefix addressing is in play
         tm_in_to = peer_name[local] if bool(remote_outbound_target.get("use_target_prefix", False)) else None

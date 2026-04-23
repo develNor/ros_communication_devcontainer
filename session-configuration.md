@@ -69,11 +69,16 @@ shared:
   use_topic_monitor: false   # default false
   use_heartbeat: false       # default false
 
-  rmw_ota:                   # optional; mapping form. If omitted: no RMW_IMPLEMENTATION override and no DDS config file override.
-    implementation: fastdds  # required inside block: cyclone | fastdds | zenoh
-    config: fastdds_v1.xml   # optional; template name under ws/ota_configs/ (e.g. fastdds_v1.xml, cyclonedds.xml, fastdds_easy_mode.xml). If omitted: use the RMW's built-in defaults (no file override).
-    easy_mode_ip_key: ""     # optional; only honored by the fastdds_easy_mode.xml template. Defaults to the first peer's ip_key.
-  rmw_local: cyclone         # optional; local ROS graph RMW alias or implementation string
+  rmw_ota: cyclone           # optional; short form (string) selects the RMW with no config file override.
+  # rmw_ota:                 # equivalent long form (mapping). Either form is accepted.
+  #   implementation: fastdds  # required inside block: cyclone | fastdds | zenoh
+  #   config: fastdds_v1.xml   # optional; template under ws/ota_configs/ (e.g. fastdds_v1.xml, cyclonedds.xml, fastdds_easy_mode.xml). Omit => use RMW defaults.
+  #   easy_mode_ip_key: ""     # optional; only honored by the fastdds_easy_mode.xml template. Defaults to the first peer's ip_key.
+
+  rmw_local: cyclone         # optional; same string-or-mapping schema as rmw_ota.
+  # rmw_local:               # mapping form when you want a local DDS config file too.
+  #   implementation: fastdds
+  #   config: fastdds_v3.xml
 
   local_domain_id: 47        # optional; enable /com domain bridging when both domain IDs are set and differ
   ota_domain_id: 48          # optional; currently supported only together with rmw_ota.implementation: zenoh
@@ -102,18 +107,24 @@ shared:
     main_port: 7447          # required if zenoh is set (int)
 ```
 
+Both `shared.rmw_ota` and `shared.rmw_local` accept the same schema: either a
+short string (e.g. `cyclone`) or a mapping `{implementation, config?, easy_mode_ip_key?}`.
+The string form is shorthand for `{implementation: <string>}` (no config file).
+
 If `shared.rmw_ota` is omitted entirely, the generated plugin does **not** set
 `RMW_IMPLEMENTATION` and does **not** export `CYCLONEDDS_URI` /
-`FASTDDS_DEFAULT_PROFILES_FILE` — the runtime relies on the ambient ROS 2 defaults.
-This is an intentional, hard break from the previous behavior where `rmw_ota` defaulted to `cyclone`.
+`FASTDDS_DEFAULT_PROFILES_FILE` for the OTA bridge processes — the runtime relies
+on the ambient ROS 2 defaults. This is an intentional, hard break from the previous
+behavior where `rmw_ota` defaulted to `cyclone`.
 
-If `shared.rmw_ota.config` is omitted (but `implementation` is set), the generator
-only sets `RMW_IMPLEMENTATION` for OTA processes and leaves the DDS configuration
-at the RMW's built-in defaults (no file override).
+If the `config` key is omitted, the generator only sets `RMW_IMPLEMENTATION` (for
+that side: OTA or local) and leaves the DDS configuration at the RMW's built-in
+defaults (no file override).
 
 If `shared.rmw_local` is omitted, the local graph keeps the ambient ROS RMW unless split-domain bridging requires a default.
 When `shared.rmw_ota.implementation: zenoh`, a `shared.zenoh` block is required, and `shared.rmw_ota.config` must not be set (zenoh uses `shared.zenoh` + `create_zenoh_json5.py`).
 When `shared.rmw_ota.implementation` is `cyclone` or `fastdds`, `shared.zenoh` must not be set.
+The same `config: <template>` syntax applies to `shared.rmw_local`; zenoh is not supported for local config files either.
 
 If `shared.local_domain_id` and `shared.ota_domain_id` are both set and differ, the generator
 creates a per-peer standard ROS 2 `domain_bridge.yaml` for the `/com/...` topics and the runtime
@@ -127,14 +138,19 @@ This split-domain mode currently requires `shared.rmw_ota.implementation: zenoh`
 
 #### DDS config generation
 
-When `shared.rmw_ota.config` is set, the generator records the template name in
-each `<peer>/plugin.yaml` and the runtime resolves it via the unified generator
+When the `config` field is set on either side, the generator records the template
+name in each `<peer>/plugin.yaml` (`ota_config_template` / `local_config_template`)
+and the runtime resolves it via the unified generator
 [ws/ota_configs/get_ota_xml.py](ros_communication_devcontainer/ws/ota_configs/get_ota_xml.py),
-writing the resolved XML to `${peer_dir}/ota_dds.xml` and exporting the right
-env var for the RMW:
+writing the resolved XML to `${peer_dir}/ota_dds.xml` (or
+`${peer_dir}/local_dds.xml`) and exporting the right env var for the RMW:
 
-- `implementation: cyclone` → `CYCLONEDDS_URI=${peer_dir}/ota_dds.xml`
-- `implementation: fastdds` → `FASTDDS_DEFAULT_PROFILES_FILE=${peer_dir}/ota_dds.xml`
+- `implementation: cyclone` → `CYCLONEDDS_URI=file://<resolved_xml_path>`
+- `implementation: fastdds` → `FASTDDS_DEFAULT_PROFILES_FILE=<resolved_xml_path>`
+
+The OTA side is bootstrapped per-IN/OUT split (so the bridge can be on a different
+RMW than the rest of the local graph). The local side is bootstrapped in the
+session's `before_commands`, so all non-OTA splits inherit it.
 
 Templates live under [ws/ota_configs/](ros_communication_devcontainer/ws/ota_configs/)
 and may reference these placeholders:

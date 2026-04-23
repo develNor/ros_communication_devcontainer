@@ -23,14 +23,14 @@ shared:
   #     fastdds:
   #       config: fastdds_initial_peer_list.xml
 
-  # 2. Cyclone with OTA config ()
+  # 2. Cyclone with OTA config (working)
   rmw:
     local: cyclone
     ota:
       cyclone:
         config: cyclonedds_minimal.xml
 
-  # 3. Zenoh with connected endpoints
+  # 3. Zenoh with connected endpoints (working)
   # rmw: 
   #   local: zenoh
   #   ota: zenoh_connect_endpoints

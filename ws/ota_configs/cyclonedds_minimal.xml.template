@@ -5,11 +5,5 @@
                 <NetworkInterface address="#host_ip"/>
             </Interfaces>
         </General>
-
-        <Discovery>
-            <Peers>
-                <!--peer-block--><Peer Address="#peer"/><!--/peer-block-->
-            </Peers>
-        </Discovery>
     </Domain>
 </CycloneDDS>

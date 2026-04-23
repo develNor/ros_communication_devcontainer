@@ -225,7 +225,7 @@ windows:
         - case '${use_domain_bridge}' in [Tt]rue) export ROS_DOMAIN_ID='${ota_domain_id}' ;; esac
         - export RUST_LOG=zenoh=debug,zenoh_bridge_ros2dds=debug
         - if [ '${zen_main_ip}' != "None" ] && [ -n '${zen_main_ip}' ]; then if [ '${zen_config_override}' != "None" ]; then export ZENOH_CONFIG_OVERRIDE='${zen_config_override}'; fi; /ws/ota_configs/create_zenoh_json5.py -m ${zen_mode} -e ${zen_endpoint_role} -t ${zen_transport} -i ${zen_main_ip} -r ${zen_main_port} -p ${zen_pub_allow} -s ${zen_sub_allow} -q '${zen_qos_pub}' -f ${zen_config_file}; exec zenohd -c ${zen_config_file}; fi
-        - exec ros2 run rmw_zenoh_cpp rmw_zenohd
+        - ros2 run rmw_zenoh_cpp rmw_zenohd
       # Debugging commands:
       #   - zenohd -c ${zen_config_file} --rest-http-port 8000 2>&1 | tee ${zen_config_file}.log
       # - commands:
@@ -233,12 +233,12 @@ windows:
       #   - curl http://localhost:8000/@/local/ros2/route/** 2>&1 | tee ${zen_config_file}.route-log
   # Local zenoh router for rmw_local=zenoh. Always uses the default
   # rmw_zenoh_cpp router; no config block is required or supported.
-  - name: ZEN_LOCAL
-    if: use_zenoh_local
-    splits:
-      - commands:
-        - case '${use_domain_bridge}' in [Tt]rue) export ROS_DOMAIN_ID='${local_domain_id}' ;; esac
-        - exec ros2 run rmw_zenoh_cpp rmw_zenohd
+  # - name: ZEN_LOCAL
+  #   if: use_zenoh_local
+  #   splits:
+  #     - commands:
+  #       - case '${use_domain_bridge}' in [Tt]rue) export ROS_DOMAIN_ID='${local_domain_id}' ;; esac
+  #       - ros2 run rmw_zenoh_cpp rmw_zenohd
   - name: COM
     if: use_domain_bridge
     splits:

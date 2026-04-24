@@ -10,7 +10,6 @@ shared:
   local_domain_id: 47
   ota_domain_id: 48
 
-  # DDS locally, zenoh_bridge_ros2dds over the air.
   rmw:
     local: cyclone
     ota:

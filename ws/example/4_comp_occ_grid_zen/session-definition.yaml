@@ -7,9 +7,9 @@ peers:
 shared:
   use_topic_monitor: true
   use_heartbeat: true
+  local_domain_id: 47
   ota_domain_id: 48
 
-  # DDS locally, zenoh_bridge_ros2dds over the air.
   rmw:
     local: cyclone
     ota:
@@ -17,12 +17,6 @@ shared:
         transport: udp
         main_peer: a
         main_port: 7447
-
-peer_settings:
-  a:
-    domain_id: 47
-  b:
-    domain_id: 47
 
 topics:
   b_to_a:

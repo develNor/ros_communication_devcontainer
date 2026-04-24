@@ -7,6 +7,9 @@ peers:
 shared:
   use_topic_monitor: true
   use_heartbeat: false
+  local_domain_id: 47
+  ota_domain_id: 48
+  rmw: fastdds
 
   qos:
     defaults:

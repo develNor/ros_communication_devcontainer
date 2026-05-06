@@ -90,6 +90,14 @@ class TricklePubSubPair(PubSubPair):
             )
             self.first_msg = False
 
+        # Forward immediately on every incoming message so a status change is
+        # visible downstream without waiting for the next periodic tick. The
+        # timer-driven tick() continues to republish the cached state in
+        # between, providing the steady stream that visualisation consumers
+        # expect.
+        if self.is_valid and self.publisher is not None:
+            self.publisher.publish(msg)
+
     def tick(self):
         """Called by the node timer.  Republish the cached message (if any)."""
         if self._last_msg is not None and self.is_valid:

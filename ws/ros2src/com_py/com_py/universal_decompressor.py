@@ -49,7 +49,9 @@ import re
 import bz2
 import zlib
 import lz4.frame as lz4
-import zstandard as zstd
+# import zstandard as zstd
+# zstandard is not available on the Ubuntu 26.04 / ROS 2 Lyrical setup.
+# Reject zstd explicitly when a user configures it.
 import time
 from threading import Lock
 
@@ -69,7 +71,7 @@ def format_size(size: int) -> str:
 def decompress_data(input_bytes: bytes, algorithm: str) -> bytes:
     """
     Decompress raw bytes according to the chosen algorithm.
-    Supported: 'bz2', 'zlib', 'lz4', 'zstd'.
+    Supported: 'bz2', 'zlib', 'lz4'.
     """
     if algorithm == 'bz2':
         return bz2.decompress(input_bytes)
@@ -78,7 +80,10 @@ def decompress_data(input_bytes: bytes, algorithm: str) -> bytes:
     elif algorithm == 'lz4':
         return lz4.decompress(input_bytes)
     elif algorithm == 'zstd':
-        return zstd.ZstdDecompressor().decompress(input_bytes)
+        raise ValueError(
+            "zstd decompression is not supported on this Ubuntu 26.04 / ROS 2 Lyrical setup. "
+            "Choose bz2, zlib, or lz4 instead."
+        )
     else:
         raise ValueError(f"Unsupported decompression algorithm: {algorithm}")
 

@@ -49,7 +49,9 @@ import re
 import bz2
 import zlib
 import lz4.frame as lz4
-import zstandard as zstd
+# import zstandard as zstd
+# zstandard is not available on the Ubuntu 26.04 / ROS 2 Lyrical setup.
+# Reject zstd explicitly when a user configures it.
 import time
 from threading import Lock
 
@@ -71,7 +73,7 @@ def format_size(size: int) -> str:
 def compress_data(data: bytes, algorithm: str) -> bytes:
     """
     Compress raw bytes according to the chosen algorithm.
-    Recognized: 'bz2', 'zlib', 'lz4', 'zstd'.
+    Recognized: 'bz2', 'zlib', 'lz4'.
     """
     if algorithm == 'bz2':
         return bz2.compress(data)
@@ -80,7 +82,10 @@ def compress_data(data: bytes, algorithm: str) -> bytes:
     elif algorithm == 'lz4':
         return lz4.compress(data)
     elif algorithm == 'zstd':
-        return zstd.ZstdCompressor().compress(data)
+        raise ValueError(
+            "zstd compression is not supported on this Ubuntu 26.04 / ROS 2 Lyrical setup. "
+            "Choose bz2, zlib, or lz4 instead."
+        )
     else:
         raise ValueError(f"Unsupported compression algorithm: {algorithm}")
 

@@ -54,6 +54,11 @@ import threading
 from typing import Optional
 
 
+def is_internal_transport_topic(topic_name: str) -> bool:
+    parts = topic_name.strip("/").split("/")
+    return any(part.startswith("_buf_") for part in parts)
+
+
 def tshark_cmd(interface: str, host_ip: str, peer_ip: str, direction: str, duration: int):
     if direction == "up":
         flt = f"src host {host_ip} and dst host {peer_ip} and ip"
@@ -243,7 +248,11 @@ class TopicMonitor(Node):
         all_topics = self.get_topic_names_and_types()
         topic_map = {tname: ttypes[0] for tname, ttypes in all_topics if ttypes}
 
-        filtered_topics = [t for t in topic_map.keys() if t.startswith(self.topic_prefix)]
+        filtered_topics = [
+            t for t in topic_map.keys()
+            if t.startswith(self.topic_prefix)
+            and not is_internal_transport_topic(t)
+        ]
 
         # Shorten topic names for logging (remove redundant prefix)
         shortened_topics = [t[len(self.topic_prefix):] if t.startswith(self.topic_prefix) else t for t in filtered_topics]

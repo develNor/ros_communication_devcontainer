@@ -2114,19 +2114,19 @@ def func(
             suffix = suffix_source[len(e.base) :]
             nor_items.append((base, suffix))
 
-        # Hard limits from session_plugin_base.yaml (only 4 slots available).
-        def _assert_max4(label: str, items: List[Any]) -> None:
-            if len(items) > 4:
+        # Hard limits from session_plugin_base.yaml.
+        def _assert_max(label: str, items: List[Any], limit: int) -> None:
+            if len(items) > limit:
                 raise RuntimeError(
                     f"peer '{local}': too many '{label}' entries ({len(items)}). "
-                    "The base session plugin supports at most 4."
+                    f"The base session plugin supports at most {limit}."
                 )
 
-        _assert_max4("drp", drp_items)
-        _assert_max4("thr", thr_items)
-        _assert_max4("ipx", ipx_items)
-        _assert_max4("it", it_items)
-        _assert_max4("nor", nor_items)
+        _assert_max("drp", drp_items, 8)
+        _assert_max("thr", thr_items, 4)
+        _assert_max("ipx", ipx_items, 4)
+        _assert_max("it", it_items, 4)
+        _assert_max("nor", nor_items, 4)
 
         # Remote-side reverse transport is configured (if requested via local_republish) on the receiver, too.
         irt_items_remote = []
@@ -2465,6 +2465,8 @@ def func(
 
         if drp_items:
             items2: List[Tuple[str, Any]] = [("drp", True)]
+            if len(drp_items) > 4:
+                items2.append(("drp2", True))
             for i, (t, dc, ws) in enumerate(drp_items, 1):
                 items2.append((f"drp_topic_{i}", t))
                 items2.append((f"drp_drop_count_{i}", dc))
@@ -2521,7 +2523,7 @@ def func(
             assert tspec is not None
             irt_all.append((t, tspec.type))
         irt_all.extend(irt_items_remote)
-        _assert_max4("irt", irt_all)
+        _assert_max("irt", irt_all, 4)
         if irt_all:
             items2 = [("irt", True)]
             for i, (topic, ttype) in enumerate(irt_all, 1):

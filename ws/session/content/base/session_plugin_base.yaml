@@ -128,6 +128,19 @@ parameters:
   drp_topic_4: # e.g. /sensor/front_camera/image_color/compressed
   drp_drop_count_4: # e.g. 20
   drp_window_size_4: # e.g. 20
+  drp2: false
+  drp_topic_5: # e.g. /sensor/front_camera/image_color/compressed
+  drp_drop_count_5: # e.g. 20
+  drp_window_size_5: # e.g. 20
+  drp_topic_6: # e.g. /sensor/front_camera/image_color/compressed
+  drp_drop_count_6: # e.g. 20
+  drp_window_size_6: # e.g. 20
+  drp_topic_7: # e.g. /sensor/front_camera/image_color/compressed
+  drp_drop_count_7: # e.g. 20
+  drp_window_size_7: # e.g. 20
+  drp_topic_8: # e.g. /sensor/front_camera/image_color/compressed
+  drp_drop_count_8: # e.g. 20
+  drp_window_size_8: # e.g. 20
 
   thr: false
   thr_topic_1: # e.g. /sensors/camera/front_wide/image_color
@@ -415,6 +428,22 @@ windows:
       - commands:
         - if [ '${drp_topic_4}' = "None" ]; then exit; fi
         - ros2 run topic_tools drop ${drp_topic_4} ${drp_drop_count_4} ${drp_window_size_4} ${drp_topic_4}/drop${drp_drop_count_4}of${drp_window_size_4}
+  - name: DRP2
+    if: drp2
+    layout: even-vertical
+    splits:
+      - commands:
+        - if [ '${drp_topic_5}' = "None" ]; then exit; fi
+        - ros2 run topic_tools drop ${drp_topic_5} ${drp_drop_count_5} ${drp_window_size_5} ${drp_topic_5}/drop${drp_drop_count_5}of${drp_window_size_5}
+      - commands:
+        - if [ '${drp_topic_6}' = "None" ]; then exit; fi
+        - ros2 run topic_tools drop ${drp_topic_6} ${drp_drop_count_6} ${drp_window_size_6} ${drp_topic_6}/drop${drp_drop_count_6}of${drp_window_size_6}
+      - commands:
+        - if [ '${drp_topic_7}' = "None" ]; then exit; fi
+        - ros2 run topic_tools drop ${drp_topic_7} ${drp_drop_count_7} ${drp_window_size_7} ${drp_topic_7}/drop${drp_drop_count_7}of${drp_window_size_7}
+      - commands:
+        - if [ '${drp_topic_8}' = "None" ]; then exit; fi
+        - ros2 run topic_tools drop ${drp_topic_8} ${drp_drop_count_8} ${drp_window_size_8} ${drp_topic_8}/drop${drp_drop_count_8}of${drp_window_size_8}
   - name: THR
     if: thr
     layout: even-vertical

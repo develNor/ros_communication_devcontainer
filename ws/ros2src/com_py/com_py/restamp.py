@@ -167,7 +167,7 @@ class Restamp(Node, PairRefreshMixin):
             and topic not in self._dbg_warned
         ):
             self._dbg_warned.add(topic)
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"[Restamp] topic='{topic}': no stamp changes observed. "
                 f"Likely cause: this message type has no 'stamp' fields."
             )

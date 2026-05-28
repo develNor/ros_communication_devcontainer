@@ -86,7 +86,7 @@ class LatchPubSubPair(PubSubPair):
             current_bytes = serialize_message(msg)
         except Exception as exc:
             # If serialization fails, always forward (safe fallback).
-            self.logger.warn(
+            self.logger.warning(
                 f"[LatchPubSubPair] serialize_message failed for sub='{self.sub_topic}': {exc}. "
                 "Forwarding message unconditionally."
             )

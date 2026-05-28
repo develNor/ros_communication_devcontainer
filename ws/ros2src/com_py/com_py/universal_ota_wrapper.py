@@ -66,7 +66,7 @@ class UniversalOtaWrapperNode(Node):
     def check_and_subscribe(self):
         with self.subscribe_lock:
             if 'ota_wrapper' not in self.config:
-                self.get_logger().warn("[universal_ota_wrapper] No 'ota_wrapper' section in config.")
+                self.get_logger().warning("[universal_ota_wrapper] No 'ota_wrapper' section in config.")
                 return
 
             topic_map = {}

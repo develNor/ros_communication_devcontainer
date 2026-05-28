@@ -151,7 +151,7 @@ class UniversalCompressorNode(Node):
         """
         with self.subscribe_lock:
             if 'compression' not in self.config:
-                self.get_logger().warn("[universal_compressor] No 'compression' section in config.")
+                self.get_logger().warning("[universal_compressor] No 'compression' section in config.")
                 return
 
             # 1) Gather all active topics and their types

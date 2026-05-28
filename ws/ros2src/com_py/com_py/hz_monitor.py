@@ -138,7 +138,7 @@ class TopicHzMonitorNode(Node):
         try:
             return get_message(ros1_style_path)
         except Exception as e:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Could not load message class '{ros1_style_path}': {e}. Trying next type if available."
             )
             return None

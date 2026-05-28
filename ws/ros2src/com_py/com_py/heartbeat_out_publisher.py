@@ -75,7 +75,7 @@ class HeartbeatOutPublisher(Node):
         self.declare_parameter('hz', 10.0)
         hz = self.get_parameter('hz').get_parameter_value().double_value
         if hz <= 0.0:
-            self.get_logger().warn(f"Parameter 'hz' must be > 0.0, got {hz}. Falling back to 10.0 Hz.")
+            self.get_logger().warning(f"Parameter 'hz' must be > 0.0, got {hz}. Falling back to 10.0 Hz.")
             hz = 10.0
 
         # Create a timer to publish heartbeats at the configured rate.

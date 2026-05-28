@@ -108,7 +108,7 @@ def load_qos_config(logger, config_file: str):
     If the file is missing or invalid, return an empty dictionary.
     """
     if not config_file:
-        logger.warn("[dds_qos] No qos_config_file param => Using empty config => rclpy defaults only.")
+        logger.warning("[dds_qos] No qos_config_file param => Using empty config => rclpy defaults only.")
         return {}
     if not os.path.isfile(config_file):
         logger.error(f"[dds_qos] QoS config file '{config_file}' not found => no QoS loaded.")
@@ -151,7 +151,7 @@ def get_topic_qos(logger, qos_config: dict, topic_name: str, role_name: str):
     if topic_name not in topics_cfg:
         base_match = _find_best_base_topic_match(topics_cfg, topic_name)
         if base_match is not None:
-            logger.warn(
+            logger.warning(
                 f"[dds_qos] No exact QoS match for topic='{topic_name}'. "
                 f"Falling back to base topic='{base_match}'."
             )

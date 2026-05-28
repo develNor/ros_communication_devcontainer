@@ -302,7 +302,7 @@ class TopicMonitor(Node):
             if stats:
                 stats.record_message(msg_size, msg_delay)
             else:
-                self.get_logger().warn(f"No stats entry for {topic_name}, message ignored!")
+                self.get_logger().warning(f"No stats entry for {topic_name}, message ignored!")
 
         return callback
 
@@ -342,7 +342,7 @@ class TopicMonitor(Node):
                     link_kbps = (down_bytes * 8.0 / 1024.0) / max(1e-9, self.link_window_s)
             except Exception as e:
                 link_exception = e
-                self.get_logger().warn(f"Link bandwidth measurement failed: {e}")
+                self.get_logger().warning(f"Link bandwidth measurement failed: {e}")
 
             with self._link_lock:
                 self._link_last_kbps = link_kbps
@@ -412,14 +412,14 @@ class TopicMonitor(Node):
         # Wait for the link measurement that was started after the previous print_stats()
         wait_timeout = 0.0
         if not self._link_event.wait(timeout=wait_timeout):
-            self.get_logger().warn(f"Link Bandwidth: not ready yet (still measuring) after {wait_timeout} seconds. Skipping publication. Increase link_duration_buffer_s parameter to avoid this issue.")
+            self.get_logger().warning(f"Link Bandwidth: not ready yet (still measuring) after {wait_timeout} seconds. Skipping publication. Increase link_duration_buffer_s parameter to avoid this issue.")
         else:
             with self._link_lock:
                 link_kbps = self._link_last_kbps
                 link_exception = self._link_last_err
 
             if link_exception is not None:
-                self.get_logger().warn(f"Link bandwidth measurement failed: {link_exception}")
+                self.get_logger().warning(f"Link bandwidth measurement failed: {link_exception}")
             elif link_kbps is not None:
                 self.get_logger().info(f"Link Bandwidth: {link_kbps:7.1f} Kbit/s")
 

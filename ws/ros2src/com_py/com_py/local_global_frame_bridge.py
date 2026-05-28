@@ -221,7 +221,7 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
         )
 
         if not self._global_prefix_token:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 "global_frame_prefix is empty -> global-side frame IDs will NOT be prefixed"
             )
 
@@ -441,7 +441,7 @@ class LocalGlobalFrameBridge(Node, PairRefreshMixin):
             and key not in self._dbg_warned
         ):
             self._dbg_warned.add(key)
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"[LocalGlobalFrameBridge] topic='{topic}' dir='{map_direction}': "
                 "no frame-id changes observed. Likely causes: frames already mapped or excluded."
             )

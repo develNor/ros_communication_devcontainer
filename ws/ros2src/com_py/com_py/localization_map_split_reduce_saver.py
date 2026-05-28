@@ -165,7 +165,7 @@ class MapProcessorReducer(Node):
         data = msg.data
 
         if ow % n:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f"Width {ow} not divisible by num_slices={n}. Final slice wider."
             )
 

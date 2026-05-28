@@ -67,7 +67,7 @@ class UniversalOtaUnwrapperNode(Node):
     def check_and_subscribe(self):
         with self.subscribe_lock:
             if 'ota_unwrapper' not in self.config:
-                self.get_logger().warn("[universal_ota_unwrapper] No 'ota_unwrapper' section in config.")
+                self.get_logger().warning("[universal_ota_unwrapper] No 'ota_unwrapper' section in config.")
                 return
 
             wrapped_topics = {}
@@ -149,11 +149,11 @@ class UniversalOtaUnwrapperNode(Node):
         expected = last_seq + 1
         if seq != expected:
             if seq < last_seq:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"[{wrapped_topic}] Sequence reordering detected: received {seq} after {last_seq}"
                 )
             else:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     f"[{wrapped_topic}] Sequence jump detected: expected {expected}, received {seq}"
                 )
 

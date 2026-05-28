@@ -162,7 +162,7 @@ class UniversalDecompressorNode(Node):
         """
         with self.subscribe_lock:
             if 'decompression' not in self.config:
-                self.get_logger().warn("[universal_decompressor] No 'decompression' section in config.")
+                self.get_logger().warning("[universal_decompressor] No 'decompression' section in config.")
                 return
 
             # 1) Gather all active topics
@@ -253,7 +253,7 @@ class UniversalDecompressorNode(Node):
             if cached is not None:
                 # If out_topic changes across rules for the same compressed topic, log once and keep first.
                 if cached.get('out_topic') != out_topic:
-                    self.get_logger().warn(
+                    self.get_logger().warning(
                         f"[universal_decompressor] '{compressed_topic}' out_topic changed from "
                         f"'{cached.get('out_topic')}' to '{out_topic}'. Keeping the first publisher."
                     )

@@ -40,6 +40,8 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.serialization import serialize_message
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rosidl_runtime_py.utilities import get_message
 
 from com_py.qos import load_qos_config, get_topic_qos
@@ -104,6 +106,11 @@ class UniversalCompressorNode(Node):
     def __init__(self):
         super().__init__('universal_compressor')
 
+        # Callback groups: keep dynamic graph polling separate from message callbacks.
+        # This mirrors the safer pattern used by topic_monitor.
+        self.cb_subs = ReentrantCallbackGroup()
+        self.cb_timers = ReentrantCallbackGroup()
+
         # 1) Declare + get parameter for the config file
         self.declare_parameter('config_file', 'compression_config.yaml')
         config_file = self.get_parameter('config_file').value
@@ -120,8 +127,10 @@ class UniversalCompressorNode(Node):
 
         # 3) Simple set to track topics we've already subscribed to
         self.subscribed_topics = set()
-        # Keep subscription objects alive
+        # Keep ROS entity objects alive explicitly.
         self._subscriptions = []
+        self._publishers = []
+        self._owned_output_topics = set()
         # 4) QoS config + roles (configured via qos.py YAML)
         self.qos_config_file = self.declare_parameter('qos_config_file', '').value
         self.sub_role = 'compressor_sub'
@@ -133,7 +142,11 @@ class UniversalCompressorNode(Node):
         self.get_logger().info(f"[universal_compressor] Node initialized with config file: {config_file}")
 
         # 6) Set up a timer to periodically re-check the graph for new topics
-        self.timer = self.create_timer(5.0, self.check_and_subscribe)
+        self.timer = self.create_timer(
+            5.0,
+            self.check_and_subscribe,
+            callback_group=self.cb_timers,
+        )
 
         # Also do an initial subscription check immediately
         self.check_and_subscribe()
@@ -181,10 +194,19 @@ class UniversalCompressorNode(Node):
 
                 for tname, type_name in topic_map.items():
                     if rx.search(tname):
+                        # Avoid recursively compressing our own compressed output topics.
+                        if tname in self._owned_output_topics:
+                            continue
+                        if type_name == 'com_msgs/msg/CompressedData':
+                            continue
+                        if add_suffix and tname.endswith(add_suffix):
+                            continue
+
                         # e.g. matched => /costmap/costmap, type=nav_msgs/msg/OccupancyGrid
                         out_topic = tname + add_suffix
+                        subscription_key = (tname, out_topic)
 
-                        if out_topic not in self.subscribed_topics:
+                        if subscription_key not in self.subscribed_topics:
                             msg_class = self.get_message_class(type_name)
                             if msg_class is None:
                                 # If we can't load or parse the type, skip
@@ -200,6 +222,8 @@ class UniversalCompressorNode(Node):
                                 out_topic,
                                 qos_profile=pub_qos
                             )
+                            self._publishers.append(pub)
+                            self._owned_output_topics.add(out_topic)
 
                             # Create subscription to the original message
                             # We'll pass a small lambda capturing the arguments
@@ -215,11 +239,12 @@ class UniversalCompressorNode(Node):
                                        msg_type_str=type_name: self.compression_callback(
                                            msg, publisher, algo, source_topic, msg_type_str
                                        ),
-                                qos_profile=sub_qos
+                                qos_profile=sub_qos,
+                                callback_group=self.cb_subs,
                             )
                             self._subscriptions.append(sub)
 
-                            self.subscribed_topics.add(out_topic)
+                            self.subscribed_topics.add(subscription_key)
                             self.get_logger().info(
                                 f"[universal_compressor] Subscribed to '{tname}' "
                                 f"(type={type_name}) => publishing compressed to '{out_topic}' "
@@ -282,6 +307,15 @@ class UniversalCompressorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = UniversalCompressorNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()

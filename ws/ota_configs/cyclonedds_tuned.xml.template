@@ -21,7 +21,6 @@
         </Discovery>
 
         <Internal>
-            <BuiltinEndpointSet>minimal</BuiltinEndpointSet>
             <SquashParticipants>true</SquashParticipants>
         </Internal>
 

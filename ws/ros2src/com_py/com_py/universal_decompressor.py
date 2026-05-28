@@ -40,6 +40,8 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.serialization import deserialize_message
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rosidl_runtime_py.utilities import get_message
 
 from com_py.qos import load_qos_config, get_topic_qos
@@ -107,6 +109,10 @@ class UniversalDecompressorNode(Node):
     def __init__(self):
         super().__init__('universal_decompressor')
 
+        # Callback groups: keep graph polling separate from message callbacks.
+        self.cb_subs = ReentrantCallbackGroup()
+        self.cb_timers = ReentrantCallbackGroup()
+
         # 1) Declare + get parameter for config file
         self.declare_parameter('config_file', 'decompression_config.yaml')
         config_file = self.get_parameter('config_file').value
@@ -132,8 +138,9 @@ class UniversalDecompressorNode(Node):
 
         # 4) Keep track of what compressed topics we have already subscribed to
         self.subscribed_topics = set()
-        # Keep subscription objects alive
+        # Keep ROS entity objects alive explicitly.
         self._subscriptions = []
+        self._publishers = []
 
         # 4b) Cache per compressed topic: created typed publisher + message class.
         #     We create these lazily on the first received message because msg_type now comes
@@ -143,7 +150,11 @@ class UniversalDecompressorNode(Node):
 
         # 5) Build a timer to re-check the graph for new topics every 5s
         #    (If you only want one-time subscription, remove the timer & call once.)
-        self.timer = self.create_timer(5.0, self.check_and_subscribe)
+        self.timer = self.create_timer(
+            5.0,
+            self.check_and_subscribe,
+            callback_group=self.cb_timers,
+        )
 
         # 6) Do an initial subscription attempt
         self.check_and_subscribe()
@@ -220,7 +231,8 @@ class UniversalDecompressorNode(Node):
                                    msg_type_hint=msg_type_hint: self.decompression_callback(
                                        msg, algo, original_topic, out_topic, msg_type_hint
                                    ),
-                            qos_profile=sub_qos
+                            qos_profile=sub_qos,
+                            callback_group=self.cb_subs,
                         )
                         self._subscriptions.append(sub)
 
@@ -270,6 +282,7 @@ class UniversalDecompressorNode(Node):
 
             pub_qos = get_topic_qos(self.get_logger(), self.qos_config, out_topic, self.pub_role)
             pub = self.create_publisher(typed_cls, out_topic, qos_profile=pub_qos)
+            self._publishers.append(pub)
             self._typed_pub_cache[compressed_topic] = {
                 'pub': pub,
                 'typed_cls': typed_cls,
@@ -345,6 +358,15 @@ class UniversalDecompressorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = UniversalDecompressorNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()

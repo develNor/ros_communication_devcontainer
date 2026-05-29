@@ -24,7 +24,7 @@
 
   // Build-time arguments — defaults shown; override if necessary
   "build_args": {
-    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp wireless-tools nload iftop iproute2 tshark",
+    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp iw nload iftop iproute2 tshark",
     "PIP_PACKAGES":                  "numpy>=1.26,<2 lz4 pysnmp speedtest-cli psutil zstandard opencv-python"
   }
 }

@@ -19,6 +19,12 @@ The ROS Communication DevContainer is a Docker-based solution designed to stream
 
 - Docker installed on all machines
 - Git for configuration management
+- `ros2docker` installed:
+  ```bash
+  pipx install --force git+ssh://git@github.com/develNor/ros2docker.git@v0.1.0
+  ```
+  For the latest development version, use `@main`. Without pipx, use
+  `python3 -m pip install --user --force-reinstall git+ssh://git@github.com/develNor/ros2docker.git@v0.1.0`.
 - Machines connected to the same network (VPN or local WLAN)
 
 ### Convenience CLI: `rosotacom`
@@ -30,7 +36,7 @@ For convenience, you can expose it as a short command (e.g. `rosotacom`) via a s
 #### Install
 
 ```bash
-cd /path/to/ros_communication_devcontainer && ./install_rosotacom.sh
+cd /path/to/ros_communication_devcontainer && ./install.sh
 ```
 
 Make sure `~/.local/bin` is in your `PATH` (often already true on Ubuntu).
@@ -41,7 +47,7 @@ Make sure `~/.local/bin` is in your `PATH` (often already true on Ubuntu).
 
 2. Configure your environment:
    - `data_dict.json`: Maps semantic names to resources (example in `data_dict.json.examples`)
-   - `local.json`: Container-specific settings (example in `local.json.examples`)
+   - `ros2docker.json`: Container-specific settings (example in `ros2docker.json.example`)
 
 3. Write the session configuration (user-facing) that defines the OTA communication behavior:
    - both peers

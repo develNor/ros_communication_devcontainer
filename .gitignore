@@ -1,7 +1,7 @@
 # ignore local system specific settings
 .devcontainer/devcontainer.json
 data_dict.json
-config.json
+ros2docker.json
 zenoh.json5
 
 # ignore temporary data

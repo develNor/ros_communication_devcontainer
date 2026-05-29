@@ -8,7 +8,7 @@ import sys
 project_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(project_dir)
 
-from ros2docker.stop import main as stop_container
+from ros2docker.api import stop as stop_container
 from run_session_in_container import _auto_identity, _load_session_config, _sanitize_container_name
 
 
@@ -110,4 +110,3 @@ if __name__ == "__main__":
             if v is not None and k != "session_dir_positional"
         }
     )
-

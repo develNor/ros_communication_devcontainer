@@ -19,12 +19,12 @@ The ROS Communication DevContainer is a Docker-based solution designed to stream
 
 - Docker installed on all machines
 - Git for configuration management
-- `ros2docker` installed:
+- `ros2docker` v0.1.1 installed from PyPI:
   ```bash
-  pipx install --force git+ssh://git@github.com/develNor/ros2docker.git@v0.1.0
+  pipx install --force "ros2docker==0.1.1"
   ```
-  For the latest development version, use `@main`. Without pipx, use
-  `python3 -m pip install --user --force-reinstall git+ssh://git@github.com/develNor/ros2docker.git@v0.1.0`.
+  Without pipx, use
+  `python3 -m pip install --user --force-reinstall "ros2docker==0.1.1"`.
 - Machines connected to the same network (VPN or local WLAN)
 
 ### Convenience CLI: `rosotacom`

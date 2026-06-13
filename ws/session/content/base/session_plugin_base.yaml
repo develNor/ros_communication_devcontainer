@@ -5,15 +5,15 @@ parameters:
   rmw_local: # local RMW: cyclone, fastdds, zenoh, or a raw rmw string. Empty => no override.
   local_config_template: # e.g. fastdds_v1.xml, cyclonedds.xml. Empty => use RMW default config.
   local_config_file: ${peer_dir}/local_dds.xml # destination path for the resolved local DDS XML
-  local_easy_mode_ip_key: # data_dict key for #easy_mode_ip (only honored when the template uses it)
+  local_easy_mode_ip_key: # address expression for #easy_mode_ip (only honored when the template uses it)
   use_domain_bridge: false
   local_domain_id:   # pinned per-peer ROS_DOMAIN_ID (from peer_settings.<peer>.domain_id)
   ota_domain_id:
   domain_bridge_config_file:
 
   # General OTA parameters
-  ip_local: # e.g. "machine_a ip"
-  ip_remote: # e.g. "machine_b ip + machine_c ip"
+  ip_local: # address expression, e.g. "data:machine_a_ip" or "192.168.1.10"
+  ip_remote: # address expression(s), e.g. "data:machine_b_ip + data:machine_c_ip"
   local_name: "" # e.g. "control_center"
   remote_name: "" # e.g. "shuttle_ella"
   qos_config_file: '""' # e.g. "/config/qos_config.yaml"
@@ -34,7 +34,7 @@ parameters:
   use_zenoh_ros2dds: false # derived helper; true when OTA uses the zenoh_bridge_ros2dds plugin (starts zenohd in the Z2D window)
   ota_config_template: # e.g. fastdds_v1.xml, cyclonedds.xml. Empty => use the RMW's default config.
   ota_config_file: ${peer_dir}/ota_dds.xml # destination path for the resolved DDS XML
-  ota_easy_mode_ip_key: # data_dict key for #easy_mode_ip (only honored when the template uses it)
+  ota_easy_mode_ip_key: # address expression for #easy_mode_ip (only honored when the template uses it)
   # Z2D (zenoh_ros2dds) parameters — used only when use_zenoh_ros2dds=true
   zen_mode: # e.g. router, peer or client
   zen_endpoint_role: # e.g. listen or connect
@@ -44,7 +44,7 @@ parameters:
   zen_qos_pub:
   zen_config_file: ${dir_path}/zenoh.json5
   # Shared between ZEN and Z2D windows: main peer's listening endpoint.
-  zen_main_ip: # ip_key of the zenoh main endpoint (usually listening router)
+  zen_main_ip: # address expression of the zenoh main endpoint (usually listening router)
   zen_main_port: # e.g. 7447
   # ZEN (native rmw_zenoh_cpp) parameters — used only when use_zenoh_rmw=true
   zen_connect: false # when true on this peer, export ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/<zen_main_ip>:<zen_main_port>"]' before launching rmw_zenohd

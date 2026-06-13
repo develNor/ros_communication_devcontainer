@@ -51,6 +51,7 @@ Make sure `~/.local/bin` is in your `PATH` (often already true on Ubuntu).
 
 3. Write the session configuration (user-facing) that defines the OTA communication behavior:
    - both peers
+   - peer addresses as literals (`192.168.1.42`, `robot-a.local`) or explicit `data_dict.json` references (`data:machine_a_ip`)
    - topic directions (`<src>_to_<dst>`)
    - optional QoS, processing (restamp, compression, transports, …), Zenoh routing, …
    - Reference: `session-configuratoin.md`
@@ -82,6 +83,15 @@ To help you get started, we have provided several examples that showcase the bas
 <summary>Configuring Machine Data</summary>
 
 The examples require two machines, which we will refer to as `machine_a` and `machine_b`. Choose your machines and fill out the `machine_a_ip` and `machine_b_ip` fields in your `data_dict.json`. Make sure this data is synchronized across both machines via Git to ensure seamless communication.
+The example session files refer to those entries as explicit address expressions, e.g. `address: "data:machine_a_ip"`.
+
+For a one-machine smoke test, you can override peer addresses at launch time:
+
+```bash
+LOCAL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+start_rosotacom example/1_heartbeat --identity a --peer-address a="$LOCAL_IP" --peer-address b="$LOCAL_IP"
+start_rosotacom example/1_heartbeat --identity b --peer-address a="$LOCAL_IP" --peer-address b="$LOCAL_IP"
+```
 
 </details>
 

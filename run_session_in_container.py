@@ -41,11 +41,11 @@ import os
 import sys
 import argparse
 import re
-import json
 import yaml
 import subprocess
 import importlib.util
 import difflib
+import shlex
 
 project_dir = os.path.dirname(os.path.realpath(__file__))
 CONFIG_PATH = os.path.join(project_dir, "ros2docker.json")
@@ -59,6 +59,16 @@ spec = importlib.util.spec_from_file_location("session_gen", session_gen_path)
 session_gen = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(session_gen)
 
+ws_dir = os.path.join(project_dir, "ws")
+sys.path.append(ws_dir)
+from session.content.address_resolution import (  # noqa: E402
+    find_data_dict_leaf,
+    format_data_reference,
+    load_data_dict,
+    parse_data_reference,
+    resolve_address_expressions,
+)
+
 # hotfix where usage of robot folders leads to problems
 # unwanted_path = "/home/carpc/robot_folders/src/robot_folders"
 # if unwanted_path in sys.path: 
@@ -67,112 +77,34 @@ spec.loader.exec_module(session_gen)
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
 
-def _remove_comments(json_like: str) -> str:
-    pattern = r"//.*?$|/\*.*?\*/"
-    return re.sub(pattern, "", json_like, flags=re.DOTALL | re.MULTILINE)
-
-
-def _load_data_dict(candidate_paths):
-    for path in candidate_paths:
-        if path and os.path.exists(path):
-            with open(path, "r") as f:
-                return json.loads(_remove_comments(f.read()))
-    return None
-
-
-def _resolve_data_dict_entry(data_dict, key):
-    if isinstance(key, list):
-        result = data_dict
-        for part in key:
-            if isinstance(result, dict) and part in result:
-                result = result[part]
-            else:
-                return part
-        return result
-    if isinstance(key, str):
-        if isinstance(data_dict, dict) and key in data_dict:
-            return data_dict.get(key, key)
-        if isinstance(data_dict, dict):
-            matches = []
-            for top_value in data_dict.values():
-                if isinstance(top_value, dict) and key in top_value:
-                    matches.append(top_value[key])
-            if len(matches) == 1:
-                return matches[0]
-            if len(matches) > 1:
-                raise RuntimeError(
-                    f"Ambiguous data_dict key '{key}' found in multiple groups."
-                )
-        return key
-    return key
-
-
-def _resolve_ip_key(ip_key: str, data_dict) -> list:
-    if not isinstance(ip_key, str):
-        return []
-    if data_dict is None:
-        return [ip_key]
-    if "+" in ip_key:
-        parts = [part.strip() for part in ip_key.split("+")]
-        keys = [part.split() for part in parts]
-    else:
-        keys = [ip_key.split()]
-    resolved = []
-    for key in keys:
-        if len(key) == 1:
-            resolved.append(_resolve_data_dict_entry(data_dict, key[0]))
-        else:
-            resolved.append(_resolve_data_dict_entry(data_dict, key))
-    return [str(r) for r in resolved if r is not None]
-
-
-def _extract_ipv4s(value: str) -> list:
-    if not isinstance(value, str):
-        return []
-    return _IPV4_RE.findall(value)
-
-
-def _find_data_dict_leaf(data_dict: dict, leaf_key: str):
-    matches = []
-    for top_key, value in (data_dict or {}).items():
-        if isinstance(value, dict):
-            if leaf_key in value:
-                matches.append((top_key, value[leaf_key]))
-        elif top_key == leaf_key:
-            matches.append((None, value))
-
-    if not matches:
-        raise RuntimeError(f"Peer override references unknown data_dict key '{leaf_key}'.")
-    if len(matches) > 1:
-        groups = [m[0] for m in matches]
-        raise RuntimeError(
-            f"Peer override key '{leaf_key}' is ambiguous in data_dict; matches groups={groups}."
-        )
-    group_name, value = matches[0]
-    return group_name, str(value)
-
-
 def _parse_remote_peer_override(override: str):
-    peer_key, sep, remote_ip_key = (override or "").partition("=")
+    peer_key, sep, remote_address_ref = (override or "").partition("=")
     peer_key = peer_key.strip()
-    remote_ip_key = remote_ip_key.strip()
-    if sep != "=" or not peer_key or not remote_ip_key:
+    remote_address_ref = remote_address_ref.strip()
+    if sep != "=" or not peer_key or not remote_address_ref:
         raise RuntimeError(
-            "--overwrite-peers-via-remote-peer must use '<peer_key>=<data_dict_ip_key>', "
-            "for example 'b=tks-leitstand-02_tks'."
+            "--overwrite-peers-via-remote-peer must use '<peer_key>=<data_dict_key>', "
+            "for example 'b=tks-leitstand-02_tks' or 'b=data:tks-leitstand-02_tks'."
         )
-    return peer_key, remote_ip_key
+    remote_data_key = parse_data_reference(remote_address_ref) or remote_address_ref
+    return peer_key, remote_data_key
 
 
-def _load_repo_data_dict():
-    repo_root = os.path.dirname(project_dir)
-    return _load_data_dict(
-        [
-            "/data_dict.json",
-            "/session/data_dict.json",
-            os.path.join(repo_root, "session", "data_dict.json"),
-        ]
-    )
+def _parse_peer_address_overrides(overrides) -> dict:
+    result = {}
+    for override in overrides or []:
+        peer_key, sep, address_value = (override or "").partition("=")
+        peer_key = peer_key.strip()
+        address_value = address_value.strip()
+        if sep != "=" or not peer_key or not address_value:
+            raise RuntimeError(
+                "--peer-address must use '<peer_key>=<address_expr>', "
+                "for example 'a=192.168.1.10' or 'a=data:machine_a_ip'."
+            )
+        if peer_key in result:
+            raise RuntimeError(f"Duplicate --peer-address override for peer '{peer_key}'.")
+        result[peer_key] = address_value
+    return result
 
 
 def _apply_remote_peer_override_to_cfg(cfg: dict, override: str, local_ips=None) -> dict:
@@ -183,21 +115,18 @@ def _apply_remote_peer_override_to_cfg(cfg: dict, override: str, local_ips=None)
     if not isinstance(peers, dict) or len(peers) != 2:
         raise RuntimeError("Peer override currently requires exactly 2 peers in the session config.")
 
-    remote_peer_key, remote_ip_key = _parse_remote_peer_override(override)
+    remote_peer_key, remote_data_key = _parse_remote_peer_override(override)
     if remote_peer_key not in peers:
         raise RuntimeError(
             f"Peer override references unknown session peer '{remote_peer_key}'. "
             f"Known peers: {sorted(peers.keys())}"
         )
 
-    data_dict = _load_repo_data_dict()
-    if data_dict is None:
-        raise RuntimeError("Peer override requires a readable data_dict.json.")
-
-    group_name, remote_ip = _find_data_dict_leaf(data_dict, remote_ip_key)
+    data_dict = load_data_dict()
+    group_name, remote_ip = find_data_dict_leaf(data_dict, remote_data_key)
     if not group_name:
         raise RuntimeError(
-            f"Peer override key '{remote_ip_key}' is not inside a data_dict group. "
+            f"Peer override key '{remote_data_key}' is not inside a data_dict group. "
             "Automatic local peer inference requires grouped entries."
         )
 
@@ -216,7 +145,7 @@ def _apply_remote_peer_override_to_cfg(cfg: dict, override: str, local_ips=None)
     local_candidates = []
     for candidate_key, candidate_value in group.items():
         candidate_ip = str(candidate_value)
-        if candidate_key == remote_ip_key:
+        if candidate_key == remote_data_key:
             continue
         if candidate_ip in local_ips:
             local_candidates.append((candidate_key, candidate_ip))
@@ -224,17 +153,40 @@ def _apply_remote_peer_override_to_cfg(cfg: dict, override: str, local_ips=None)
     if len(local_candidates) != 1:
         raise RuntimeError(
             "Peer override could not infer a unique local peer from the remote peer group. "
-            f"remote={remote_ip_key} group={group_name} remote_ip={remote_ip} "
+            f"remote={remote_data_key} group={group_name} remote_ip={remote_ip} "
             f"local_ipv4s={sorted(local_ips)} candidates={local_candidates}"
         )
 
-    local_ip_key, _local_ip = local_candidates[0]
+    local_data_key, _local_ip = local_candidates[0]
     cfg = dict(cfg)
     cfg["peers"] = dict(peers)
     cfg["peers"][remote_peer_key] = dict(cfg["peers"][remote_peer_key])
     cfg["peers"][local_peer_key] = dict(cfg["peers"][local_peer_key])
-    cfg["peers"][remote_peer_key]["ip_key"] = remote_ip_key
-    cfg["peers"][local_peer_key]["ip_key"] = local_ip_key
+    cfg["peers"][remote_peer_key]["address"] = format_data_reference(remote_data_key)
+    cfg["peers"][local_peer_key]["address"] = format_data_reference(local_data_key)
+    return cfg
+
+
+def _apply_peer_address_overrides_to_cfg(cfg: dict, peer_address_overrides: dict) -> dict:
+    if not peer_address_overrides:
+        return cfg
+
+    peers = (cfg or {}).get("peers")
+    if not isinstance(peers, dict):
+        raise RuntimeError("Peer address override requires a session config with a 'peers' mapping.")
+
+    unknown = sorted([peer for peer in peer_address_overrides if peer not in peers])
+    if unknown:
+        raise RuntimeError(
+            f"--peer-address references unknown peer(s) {unknown}. "
+            f"Known peers: {sorted(peers.keys())}"
+        )
+
+    cfg = dict(cfg)
+    cfg["peers"] = dict(peers)
+    for peer_key, address_value in peer_address_overrides.items():
+        cfg["peers"][peer_key] = dict(cfg["peers"][peer_key])
+        cfg["peers"][peer_key]["address"] = address_value
     return cfg
 
 
@@ -315,7 +267,11 @@ def _suggest_sessions(session_dir: str) -> list:
     return difflib.get_close_matches(session_dir, sessions, n=5, cutoff=0.6)
 
 
-def _auto_identity(session_dir: str, overwrite_peers_via_remote_peer: str = None) -> str:
+def _auto_identity(
+    session_dir: str,
+    overwrite_peers_via_remote_peer: str = None,
+    peer_address_overrides: dict = None,
+) -> str:
     cfg = _load_session_config(session_dir)
     local_ips = set(_get_local_ipv4s())
     if overwrite_peers_via_remote_peer:
@@ -324,6 +280,8 @@ def _auto_identity(session_dir: str, overwrite_peers_via_remote_peer: str = None
             overwrite_peers_via_remote_peer,
             local_ips=local_ips,
         )
+    cfg = _apply_peer_address_overrides_to_cfg(cfg, peer_address_overrides or {})
+    session_gen._validate_session_template_cfg(cfg)
     peers = (cfg or {}).get("peers")
     if not isinstance(peers, dict):
         raise RuntimeError("session-config must define a mapping 'peers: { <peer_key>: { ... } }'.")
@@ -332,16 +290,15 @@ def _auto_identity(session_dir: str, overwrite_peers_via_remote_peer: str = None
     if not peer_keys:
         raise RuntimeError("session-config must define at least one peer.")
 
-    data_dict = _load_repo_data_dict()
     if not local_ips:
         raise RuntimeError("Auto identity failed: could not determine local IPv4 addresses. Use --identity.")
 
     matches = []
     for peer_key in peer_keys:
-        ip_key = (peers.get(peer_key) or {}).get("ip_key")
-        if not ip_key:
+        address = (peers.get(peer_key) or {}).get("address")
+        if not address:
             continue
-        resolved = _resolve_ip_key(str(ip_key), data_dict)
+        resolved = resolve_address_expressions(str(address))
         peer_ips = set()
         for value in resolved:
             peer_ips.update(_extract_ipv4s(value))
@@ -352,7 +309,7 @@ def _auto_identity(session_dir: str, overwrite_peers_via_remote_peer: str = None
         return matches[0]
     if len(matches) == 0:
         raise RuntimeError(
-            f"Auto identity failed: no peer ip_key matched local IPv4s={sorted(local_ips)}. "
+            f"Auto identity failed: no peer address matched local IPv4s={sorted(local_ips)}. "
             "Use --identity."
         )
     raise RuntimeError(
@@ -455,10 +412,17 @@ def _load_session_config(session_dir: str) -> dict:
     )
 
 
-def _resolve_remote_peer_name(session_dir: str, identity: str, overwrite_peers_via_remote_peer: str = None) -> str:
+def _resolve_remote_peer_name(
+    session_dir: str,
+    identity: str,
+    overwrite_peers_via_remote_peer: str = None,
+    peer_address_overrides: dict = None,
+) -> str:
     cfg = _load_session_config(session_dir)
     if overwrite_peers_via_remote_peer:
         cfg = _apply_remote_peer_override_to_cfg(cfg, overwrite_peers_via_remote_peer)
+    cfg = _apply_peer_address_overrides_to_cfg(cfg, peer_address_overrides or {})
+    session_gen._validate_session_template_cfg(cfg)
     peers = (cfg or {}).get("peers")
     if not isinstance(peers, dict):
         raise RuntimeError("session-config must define a mapping 'peers: { <peer_key>: { ... } }'.")
@@ -498,14 +462,20 @@ def main(
     rewrite_formatting=False,
     auto_identity=True,
     overwrite_peers_via_remote_peer=None,
+    peer_address=None,
 ):
+    peer_address_overrides = _parse_peer_address_overrides(peer_address)
     if not session_dir:
         print("ERROR: --session-dir is required.\n", file=sys.stderr)
         print(_format_available_sessions(), file=sys.stderr)
         raise SystemExit(2)
     if not identity:
         if auto_identity:
-            identity = _auto_identity(session_dir, overwrite_peers_via_remote_peer=overwrite_peers_via_remote_peer)
+            identity = _auto_identity(
+                session_dir,
+                overwrite_peers_via_remote_peer=overwrite_peers_via_remote_peer,
+                peer_address_overrides=peer_address_overrides,
+            )
             print(f"Auto-selected identity: {identity}")
         else:
             raise RuntimeError(
@@ -513,21 +483,25 @@ def main(
             )
 
     script_path = f"/ws/session/creation/run_session.py"
-    docker_command = f"{script_path} --session-dir {session_dir}"
+    docker_command_parts = [script_path, "--session-dir", session_dir]
     if identity is not None:
-        docker_command += f" --identity {identity}"
+        docker_command_parts.extend(["--identity", identity])
     if force:
-        docker_command += " --force"
+        docker_command_parts.append("--force")
     if rewrite_formatting:
-        docker_command += " --rewrite-formatting"
+        docker_command_parts.append("--rewrite-formatting")
     if overwrite_peers_via_remote_peer:
-        docker_command += f" --overwrite-peers-via-remote-peer {overwrite_peers_via_remote_peer}"
+        docker_command_parts.extend(["--overwrite-peers-via-remote-peer", overwrite_peers_via_remote_peer])
+    for peer_key, address_value in peer_address_overrides.items():
+        docker_command_parts.extend(["--peer-address", f"{peer_key}={address_value}"])
+    docker_command = " ".join(shlex.quote(str(part)) for part in docker_command_parts)
 
     print(f"Command which will be run in container: {docker_command}")
     remote_peer_name = _resolve_remote_peer_name(
         session_dir,
         identity,
         overwrite_peers_via_remote_peer=overwrite_peers_via_remote_peer,
+        peer_address_overrides=peer_address_overrides,
     )
     container_name = _sanitize_container_name(f"com_to_{remote_peer_name}")
     local_config = load_config(CONFIG_PATH)
@@ -585,8 +559,19 @@ if __name__ == "__main__":
         "--overwrite-peers-via-remote-peer",
         type=str,
         help=(
-            "Ephemerally override peer ip_keys via '<remote_peer_key>=<data_dict_ip_key>' "
-            "and infer the local peer ip_key from the same data_dict group."
+            "Ephemerally override peer addresses via '<remote_peer_key>=<data_dict_key>' "
+            "and infer the local peer address from the same data_dict group."
+        ),
+    )
+    parser.add_argument(
+        "--peer-address",
+        action="append",
+        default=[],
+        metavar="PEER=ADDRESS_EXPR",
+        help=(
+            "Ephemerally override peers.<peer>.address for this launch. "
+            "May be used more than once, e.g. --peer-address a=192.168.1.10 "
+            "--peer-address b=data:machine_b_ip."
         ),
     )
     parser.add_argument("--rewrite-formatting", action="store_true")

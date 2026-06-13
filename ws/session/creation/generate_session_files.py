@@ -891,12 +891,18 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
     if not peers:
         raise RuntimeError("peers must be a non-empty mapping.")
     for peer_key, peer_obj in peers.items():
-        _assert_allowed_keys(f"peers.{peer_key}", peer_obj, {"ip_key", "com-name"})
+        if isinstance(peer_obj, dict) and "ip_key" in peer_obj:
+            raise RuntimeError(
+                f"peers.{peer_key}.ip_key is no longer supported. "
+                f"Use peers.{peer_key}.address instead. "
+                "For data_dict references, use address: 'data:<key>'."
+            )
+        _assert_allowed_keys(f"peers.{peer_key}", peer_obj, {"address", "com-name"})
         peer_obj = _assert_mapping(peer_obj, f"peers.{peer_key}")
-        if "ip_key" not in peer_obj:
-            raise RuntimeError(f"peers.{peer_key}.ip_key is required")
-        if not isinstance(peer_obj["ip_key"], str) or not peer_obj["ip_key"].strip():
-            raise RuntimeError(f"peers.{peer_key}.ip_key must be a non-empty string")
+        if "address" not in peer_obj:
+            raise RuntimeError(f"peers.{peer_key}.address is required")
+        if not isinstance(peer_obj["address"], str) or not peer_obj["address"].strip():
+            raise RuntimeError(f"peers.{peer_key}.address must be a non-empty string")
         if "com-name" in peer_obj and peer_obj["com-name"] is not None and not isinstance(peer_obj["com-name"], (str, int, float, bool)):
             raise RuntimeError(f"peers.{peer_key}.com-name must be a scalar if provided")
 
@@ -1443,7 +1449,7 @@ def func(
     # ---------------------------
 
     if "peers" not in cfg or not isinstance(cfg["peers"], dict) or not cfg["peers"]:
-        raise RuntimeError("session-config must define a mapping 'peers: { <peer_key>: {ip_key: ...} }'.")
+        raise RuntimeError("session-config must define a mapping 'peers: { <peer_key>: {address: ...} }'.")
 
     peer_keys = list(cfg["peers"].keys())
     if len(peer_keys) != 2:
@@ -1452,11 +1458,11 @@ def func(
             f"Got peers={peer_keys}"
         )
 
-    def _peer_ip_key(peer_key: str) -> str:
+    def _peer_address(peer_key: str) -> str:
         try:
-            return str(cfg["peers"][peer_key]["ip_key"]).strip()
+            return str(cfg["peers"][peer_key]["address"]).strip()
         except Exception as e:
-            raise RuntimeError(f"session-template must define peers.{peer_key}.ip_key") from e
+            raise RuntimeError(f"session-template must define peers.{peer_key}.address") from e
 
     def _peer_com_name(peer_key: str) -> str:
         """
@@ -1476,7 +1482,7 @@ def func(
             return s if s else peer_key
         return str(v) if v else peer_key
 
-    peer_ip = {p: _peer_ip_key(p) for p in peer_keys}
+    peer_ip = {p: _peer_address(p) for p in peer_keys}
     peer_name = {p: _peer_com_name(p) for p in peer_keys}
 
     # Optional blocks (may be absent in both template-driven and direct configs)
@@ -1562,7 +1568,7 @@ def func(
             ipk = peer_ip[p]
             if ipk in seen_ips:
                 raise RuntimeError(
-                    f"shared.rmw.ota={ota_label} requires distinct peers.<peer>.ip_key across peers; "
+                    f"shared.rmw.ota={ota_label} requires distinct peers.<peer>.address across peers; "
                     f"peers '{seen_ips[ipk]}' and '{p}' both use {ipk!r}."
                 )
             seen_ips[ipk] = p

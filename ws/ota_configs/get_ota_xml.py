@@ -2,8 +2,8 @@
 """Unified OTA DDS XML generator.
 
 Loads an XML template from /ws/ota_configs/<config>(.template), detects which
-placeholders it uses (#host_ip, #peer, #easy_mode_ip), resolves them via the
-shared data_dict, and prints the substituted XML to stdout.
+placeholders it uses (#host_ip, #peer, #easy_mode_ip), resolves them from
+rosotacom address expressions, and prints the substituted XML to stdout.
 
 Replaces the old per-template scripts (get_fastdds_xml.py,
 get_fastdds_easy_mode_xml.py, get_cyclonedds_xml.py).
@@ -17,7 +17,7 @@ import sys
 ws_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(ws_dir)
 
-from session.content.get_data_dict_entries import main as get_data_dict_entries  # noqa: E402
+from session.content.address_resolution import main as resolve_address_expressions  # noqa: E402
 
 
 KNOWN_PLACEHOLDERS = {"#host_ip", "#peer", "#easy_mode_ip"}
@@ -45,7 +45,7 @@ def _template_path(name: str) -> str:
 
 
 def _resolve_single_ip(value: str, label: str) -> str:
-    resolved = get_data_dict_entries(value)
+    resolved = resolve_address_expressions(value)
     if len(resolved) != 1:
         raise ValueError(
             f"{label} must resolve to exactly one IP address, got {resolved}."
@@ -54,7 +54,7 @@ def _resolve_single_ip(value: str, label: str) -> str:
 
 
 def _resolve_peer_ips(value: str) -> list:
-    resolved = get_data_dict_entries(value)
+    resolved = resolve_address_expressions(value)
     seen = set()
     unique = []
     for ip in resolved:
@@ -184,15 +184,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-i", "--host-ip", dest="host_ip",
-        help="Data-dict key resolving to the local host IP (#host_ip).",
+        help="Address expression resolving to the local host IP (#host_ip).",
     )
     parser.add_argument(
         "-p", "--peer", dest="peer",
-        help="Data-dict key resolving to one or more peer IPs (#peer).",
+        help="Address expression resolving to one or more peer IPs (#peer).",
     )
     parser.add_argument(
         "-e", "--easy-mode-ip", dest="easy_mode_ip",
-        help="Data-dict key resolving to the Fast DDS Easy Mode IP (#easy_mode_ip).",
+        help="Address expression resolving to the Fast DDS Easy Mode IP (#easy_mode_ip).",
     )
     args = parser.parse_args()
     print(main(**{k: v for k, v in vars(args).items() if v is not None}))

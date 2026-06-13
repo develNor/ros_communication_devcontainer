@@ -57,13 +57,22 @@ topics: {}         # optional
 ```yaml
 peers:
   <peer_key>:
-    ip_key: <string>         # required (after template substitution: the final IP/hostname string)
+    address: <string>        # required address expression
     com-name: <scalar>       # optional, default: <peer_key>
 ```
 
 - **`peer_key`**: used to form direction keys like `<src>_to_<dst>`.
-- **`ip_key`**: becomes the address used in the generated `plugin.yaml` (`ip_local` / `ip_remote`).
+- **`address`**: becomes the address expression used in the generated `plugin.yaml` (`ip_local` / `ip_remote`).
 - **`com-name`**: peer communication name (default = `peer_key`); affects e.g. topic prefixes.
+
+Address expressions are explicit:
+
+- Literal IPs/hostnames are used as-is: `192.168.1.42`, `127.0.0.1`, `localhost`, `robot-a.local`.
+- `data:<key>` resolves `<key>` from `data_dict.json`, e.g. `data:machine_a_ip`.
+- Missing or ambiguous `data:` references are errors.
+- Bare names such as `machine_a_ip` are literals, not data-dict references.
+
+`peers.<peer>.ip_key` is no longer supported. Use `peers.<peer>.address` instead.
 
 ### `shared` (optional)
 
@@ -161,7 +170,7 @@ Per-side config blocks:
 
 - DDS implementations (`cyclone`, `fastdds`) accept:
   - `config: <template>` — template file under `ws/ota_configs/` (e.g. `fastdds_v1.xml`, `cyclonedds.xml`, `fastdds_easy_mode.xml`). Omit to use the RMW's built-in defaults.
-  - `easy_mode_ip_key: <string>` — only honored by `fastdds_easy_mode.xml`; defaults to the first peer's `ip_key`.
+  - `easy_mode_ip_key: <string>` — only honored by `fastdds_easy_mode.xml`; defaults to the first peer's `address`.
 - `zenoh_connect_endpoints` (native, OTA side only; `zenoh` is still accepted as a legacy OTA alias) accepts:
   - `main_peer: <peer_key>` — the peer whose zenoh router listens. Defaults to the first peer declared under `peers:`.
   - `main_port: 7447` — listening port. Default `7447`.
@@ -193,7 +202,7 @@ The generator enforces this:
 
 - `peer_settings.<peer>.domain_id` must be set for **every** peer, with distinct values.
 - `shared.ota_domain_id` must be set and must differ from every peer's `domain_id`.
-- Peer `ip_key`s must be distinct across peers.
+- Peer `address` expressions must be distinct across peers.
 
 A stock ROS 2 `domain_bridge` process (the `COM` window) is then spun up on
 each peer to bridge `/com/...` topics between that peer's `local_domain_id` and
@@ -249,14 +258,14 @@ session's `before_commands`, so all non-OTA splits inherit it.
 Templates live under [ws/ota_configs/](ros_communication_devcontainer/ws/ota_configs/)
 and may reference these placeholders:
 
-- `#host_ip` — the local peer's IP (single value, resolved via the data dict)
+- `#host_ip` — the local peer's IP (single value, resolved via an address expression)
 - `#peer` — the remote peer's IP. For multiple peers, the template must wrap the
   per-peer region with `<!--peer-block-->...<!--/peer-block-->` markers; the
   marked region is duplicated once per peer IP. For a single peer the markers
   are optional (the generator just strips them).
 - `#easy_mode_ip` — only used by `fastdds_easy_mode.xml`; resolved from
   the side-specific `easy_mode_ip_key` inside `shared.rmw.{local|ota}.fastdds`
-  (defaults to the first peer's `ip_key`).
+  (defaults to the first peer's `address`).
 
 Unknown `#…` placeholders in templates cause the generator to error.
 

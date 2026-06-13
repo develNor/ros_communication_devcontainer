@@ -7,10 +7,10 @@ import argparse
 ws_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(ws_dir)
 from ota_configs.utils import process_template
-from session.content.get_data_dict_entries import main as get_data_dict_entries
+from session.content.address_resolution import main as resolve_address_expressions
 
 def main(zen_mode, zen_endpoint_role, zen_transport, zen_main_ip, zen_main_port, zen_config_file, zen_pub_allow="", zen_sub_allow="", zen_qos_pub=""):
-    zen_main_ip_resolved_list = get_data_dict_entries(zen_main_ip)
+    zen_main_ip_resolved_list = resolve_address_expressions(zen_main_ip)
     if len(zen_main_ip_resolved_list) != 1:
         raise ValueError("Host IP must resolve to exactly one IP address.")
     zen_main_ip_resolved = zen_main_ip_resolved_list[0]

@@ -1,0 +1,26 @@
+parameters:
+  session_dir: /session/configs/1_heartbeat_cyclone-ota
+  peer_dir: ${session_dir}/b
+
+  ip_local: data:machine_b_ip
+  local_name: b
+  ip_remote: data:machine_a_ip
+  remote_name: a
+
+  rmw_local: cyclone
+
+  in: true
+  topic_list_paths_inbound: ${session_dir}/a_to_b_topics.txt
+
+  out: true
+  topic_list_paths_outbound: ${session_dir}/b_to_a_topics.txt
+
+  rmw_ota: cyclone
+  use_zenoh_rmw: false
+  use_zenoh_ros2dds: false
+  ota_config_template: cyclonedds_minimal.xml
+  ota_config_file: ${peer_dir}/ota_dds.xml
+
+  heartbeat: true
+  heartbeat_out_topics: /heartbeat_b
+  heartbeat_in_topic: /heartbeat_a

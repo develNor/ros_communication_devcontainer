@@ -13,7 +13,7 @@ peers:
 shared:
   use_heartbeat: true
   rmw: fastdds
-  # ota_domain_id: 48
+  ota_domain_id: 48
 
   # Tested Working RMW-Config Combinations:
 

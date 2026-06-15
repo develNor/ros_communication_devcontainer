@@ -1,0 +1,9 @@
+<CycloneDDS>
+    <Domain>
+        <General>
+            <Interfaces>
+                <NetworkInterface address="127.0.0.1"/>
+            </Interfaces>
+        </General>
+    </Domain>
+</CycloneDDS>

@@ -33,4 +33,4 @@ Audit and improve test coverage and test execution wiring.
 - [ ] `just test-contract`
 - [ ] `just docs`
 - [ ] `just check`
-- [ ] `just test-e2e-fast`
+- [ ] `just test-e2e-smoke`

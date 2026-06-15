@@ -33,4 +33,4 @@ Ship a validated, well-described `rosotacom` release.
 - [ ] `just test-contract`
 - [ ] `just docs`
 - [ ] `just package`
-- [ ] `just test-e2e-fast`
+- [ ] `just test-e2e-smoke`

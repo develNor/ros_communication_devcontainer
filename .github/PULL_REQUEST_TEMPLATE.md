@@ -27,7 +27,7 @@
 - [ ] `just docs`
 - [ ] `just package`
 - [ ] `just check`
-- [ ] `just test-e2e-fast`, if Docker/runtime behavior changed
+- [ ] `just test-e2e-smoke`, if Docker/runtime behavior changed
 
 ## Test Integrity
 

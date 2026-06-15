@@ -119,6 +119,12 @@ The smoke test verifies both directions through the communication path: it waits
 for `/com/in/a/heartbeat_a` and `/heartbeat_a` in peer `b`, plus
 `/com/in/b/heartbeat_b` and `/heartbeat_b` in peer `a`.
 
+Run the CI heartbeat smoke matrix locally:
+
+```bash
+just test-e2e-smoke
+```
+
 Run the heartbeat example manually:
 
 ```bash

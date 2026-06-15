@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rosotacom"
+version = "0.1.0"
+description = "Host CLI for ROS OTA communication sessions."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6",
+  "ros2docker>=0.1.2,<0.2",
+]
+
+[project.scripts]
+rosotacom = "rosotacom:main"
+start_rosotacom = "rosotacom:start_compat_main"
+stop_rosotacom = "rosotacom:stop_compat_main"
+
+[tool.setuptools]
+py-modules = [
+  "rosotacom",
+  "run_session_in_container",
+  "stop_session_in_container",
+]

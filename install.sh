@@ -1,60 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Installs convenient CLI names into ~/.local/bin by symlinking:
-# - start_rosotacom -> run_session_in_container.py
-# - stop_rosotacom  -> stop_session_in_container.py
+# Install rosotacom into a checkout-local virtual environment.
 #
 # Usage:
 #   ./install.sh
+#   ./install.sh --global-symlink   # optional legacy compatibility symlinks
 #
 # Optional env vars:
-#   BIN_DIR=~/.local/bin         # target bin dir
-#   START_NAME=start_rosotacom   # command name to create
-#   STOP_NAME=stop_rosotacom     # command name to create
+#   VENV_DIR=.venv
+#   ROS2DOCKER_SPEC='ros2docker>=0.1.2,<0.2'
+#   BIN_DIR=~/.local/bin
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR"
-
+VENV_DIR="${VENV_DIR:-"$ROOT_DIR/.venv"}"
+ROS2DOCKER_SPEC="${ROS2DOCKER_SPEC:-"ros2docker>=0.1.2,<0.2"}"
 BIN_DIR="${BIN_DIR:-"$HOME/.local/bin"}"
-START_NAME="${START_NAME:-start_rosotacom}"
-STOP_NAME="${STOP_NAME:-stop_rosotacom}"
 
-START_TARGET="$ROOT_DIR/run_session_in_container.py"
-STOP_TARGET="$ROOT_DIR/stop_session_in_container.py"
-START_DEST="$BIN_DIR/$START_NAME"
-STOP_DEST="$BIN_DIR/$STOP_NAME"
+INSTALL_GLOBAL_SYMLINKS=false
+for arg in "$@"; do
+  case "$arg" in
+    --global-symlink|--global-symlinks)
+      INSTALL_GLOBAL_SYMLINKS=true
+      ;;
+    -h|--help)
+      sed -n '1,18p' "$0"
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
 
-if [[ ! -f "$START_TARGET" ]]; then
-  echo "ERROR: target script not found: $START_TARGET" >&2
-  echo "Run this installer from the fleet_mgmt repo root." >&2
+if [[ ! -f "$ROOT_DIR/pyproject.toml" ]]; then
+  echo "ERROR: pyproject.toml not found in $ROOT_DIR" >&2
   exit 1
 fi
 
-if [[ ! -f "$STOP_TARGET" ]]; then
-  echo "ERROR: target script not found: $STOP_TARGET" >&2
-  echo "Run this installer from the fleet_mgmt repo root." >&2
-  exit 1
-fi
+python3 -m venv "$VENV_DIR"
+"$VENV_DIR/bin/python" -m pip install --upgrade pip
+"$VENV_DIR/bin/python" -m pip install "$ROS2DOCKER_SPEC"
+"$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR"
 
-mkdir -p "$BIN_DIR"
-chmod +x "$START_TARGET" "$STOP_TARGET"
-ln -sf "$START_TARGET" "$START_DEST"
-ln -sf "$STOP_TARGET" "$STOP_DEST"
-
-echo "Installed: $START_DEST -> $START_TARGET"
-echo "Installed: $STOP_DEST -> $STOP_TARGET"
-
-if ! command -v "$START_NAME" >/dev/null 2>&1 || ! command -v "$STOP_NAME" >/dev/null 2>&1; then
-  echo
-  echo "NOTE: commands are not on PATH in this shell."
-  echo "      Add this to your shell rc (~/.bashrc or ~/.zshrc):"
-  echo "      export PATH=\"\$HOME/.local/bin:\$PATH\""
-fi
-
+echo "Installed rosotacom into: $VENV_DIR"
+echo
+echo "Activate it with:"
+echo "  source \"$VENV_DIR/bin/activate\""
 echo
 echo "Try:"
-echo "  $START_NAME --help"
-echo "  $STOP_NAME --help"
+echo "  rosotacom doctor"
+echo "  rosotacom smoke example/1_heartbeat --local"
 
-
+if [[ "$INSTALL_GLOBAL_SYMLINKS" == true ]]; then
+  mkdir -p "$BIN_DIR"
+  ln -sf "$VENV_DIR/bin/rosotacom" "$BIN_DIR/rosotacom"
+  ln -sf "$VENV_DIR/bin/start_rosotacom" "$BIN_DIR/start_rosotacom"
+  ln -sf "$VENV_DIR/bin/stop_rosotacom" "$BIN_DIR/stop_rosotacom"
+  echo
+  echo "Installed legacy global symlinks into: $BIN_DIR"
+fi

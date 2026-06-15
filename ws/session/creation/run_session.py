@@ -60,6 +60,9 @@ from session.content.address_resolution import (
 
 
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_CATMUX_NO_SERVER_RE = re.compile(
+    r"^error connecting to /tmp/tmux-\d+/catmux \(No such file or directory\)$"
+)
 
 
 def _get_local_ipv4s() -> list:
@@ -81,6 +84,27 @@ def _parse_remote_peer_override(override: str) -> Tuple[str, str]:
         )
     remote_data_key = parse_data_reference(remote_address_ref) or remote_address_ref
     return peer_key, remote_data_key
+
+
+def _run_catmux(full_command, attach: bool) -> None:
+    if attach:
+        subprocess.run(full_command, check=True)
+        return
+
+    result = subprocess.run(full_command, text=True, capture_output=True)
+    if result.stdout:
+        print(result.stdout, end="")
+
+    stderr_lines = [
+        line
+        for line in (result.stderr or "").splitlines()
+        if not _CATMUX_NO_SERVER_RE.match(line.strip())
+    ]
+    if stderr_lines:
+        print("\n".join(stderr_lines), file=sys.stderr)
+
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, full_command)
 
 
 def _parse_peer_address_overrides(overrides) -> Dict[str, str]:
@@ -306,6 +330,7 @@ def main(
     rewrite_formatting: bool = False,
     overwrite_peers_via_remote_peer: Optional[str] = None,
     peer_address=None,
+    attach: Optional[bool] = None,
 ):
 
     peer_dir = _resolve_peer_dir(
@@ -340,13 +365,18 @@ def main(
         "--overwrite",
         f"dir_path={peer_dir}",
     ]
+    if attach is None:
+        attach = sys.stdin.isatty() and sys.stdout.isatty()
+    if not attach:
+        full_command.append("--detach")
 
     # Execute the command
     try:
-        subprocess.run(full_command, check=True)
+        _run_catmux(full_command, attach)
         print("Command executed successfully.")
     except subprocess.CalledProcessError as e:
         print(f"An error occurred while executing the command: {e}")
+        raise SystemExit(e.returncode)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -394,6 +424,20 @@ if __name__ == "__main__":
             "--peer-address b=data:machine_b_ip."
         ),
     )
+    attach_group = parser.add_mutually_exclusive_group()
+    attach_group.add_argument(
+        "--attach",
+        dest="attach",
+        action="store_true",
+        help="Attach to the catmux/tmux session after creating it.",
+    )
+    attach_group.add_argument(
+        "--detach",
+        dest="attach",
+        action="store_false",
+        help="Create the catmux/tmux session and return without attaching.",
+    )
+    parser.set_defaults(attach=None)
     args = parser.parse_args()
 
     # Use **vars(args) to convert argparse.Namespace to a dict, filtering out None values

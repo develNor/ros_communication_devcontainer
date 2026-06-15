@@ -1,0 +1,7 @@
+# rosotacom-owned host configuration.
+#
+# Relative paths are resolved from this file's directory.
+# CLI flags override environment variables, which override this file.
+ros2docker_config: ros2docker.json.example
+session_configs_dir: null
+data_dict: null

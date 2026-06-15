@@ -6,6 +6,8 @@ zenoh.json5
 
 # ignore temporary data
 __pycache__
+.venv/
+*.egg-info/
 .session_readonly.yaml
 .codex
 ws/example/**/a/**

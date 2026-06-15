@@ -19,35 +19,38 @@ The ROS Communication DevContainer is a Docker-based solution designed to stream
 
 - Docker installed on all machines
 - Git for configuration management
-- `ros2docker` v0.1.1 installed from PyPI:
-  ```bash
-  pipx install --force "ros2docker==0.1.1"
-  ```
-  Without pipx, use
-  `python3 -m pip install --user --force-reinstall "ros2docker==0.1.1"`.
+- `ros2docker` v0.1.2 or newer. The local installer below installs the pinned
+  supported range into this checkout's virtual environment.
 - Machines connected to the same network (VPN or local WLAN)
 
 ### Convenience CLI: `rosotacom`
 
 This repository's main entrypoint for starting ROS communication sessions is
-`run_session_in_container.py`.
-For convenience, you can expose it as a short command (e.g. `rosotacom`) via a symlink into `~/.local/bin`.
+the checkout-local `rosotacom` command. Each checkout owns its own `.venv`,
+so multiple rosotacom versions can coexist without global symlink drift.
 
 #### Install
 
 ```bash
 cd /path/to/ros_communication_devcontainer && ./install.sh
+source .venv/bin/activate
+rosotacom doctor
 ```
 
-Make sure `~/.local/bin` is in your `PATH` (often already true on Ubuntu).
+Legacy global symlinks are still available when explicitly requested:
+
+```bash
+./install.sh --global-symlink
+```
 
 ### Basic Setup
 
 1. Fork this repository
 
 2. Configure your environment:
-   - `data_dict.json`: Maps semantic names to resources (example in `data_dict.json.examples`)
-   - `ros2docker.json`: Container-specific settings (example in `ros2docker.json.example`)
+   - `rosotacom.yaml`: Host-side rosotacom settings such as optional `session_configs_dir` and `data_dict`
+   - `data_dict.json`: Optional semantic address mapping for `data:<key>` expressions
+   - `ros2docker.json.example`: Generic ros2docker settings used by default
 
 3. Write the session configuration (user-facing) that defines the OTA communication behavior:
    - both peers
@@ -65,10 +68,10 @@ Make sure `~/.local/bin` is in your `PATH` (often already true on Ubuntu).
 
 ```bash
 # on peer "a"
-rosotacom --session-dir /path/to/session_dir --identity a
+rosotacom start --session-dir /path/to/session_dir --identity a
 
 # on peer "b"
-rosotacom --session-dir /path/to/session_dir --identity b
+rosotacom start --session-dir /path/to/session_dir --identity b
 ```
 
 That’s it: `rosotacom` will read the session config input file and automatically create/update all required generated files in that directory (per-peer plugin/session specs, direction topic lists, optional compression/decompression, optional `qos.yaml`, optional `domain_bridge.yaml`, …).
@@ -88,9 +91,15 @@ The example session files refer to those entries as explicit address expressions
 For a one-machine smoke test, you can override peer addresses at launch time:
 
 ```bash
+rosotacom smoke example/1_heartbeat --local
+```
+
+Or launch both local peers manually:
+
+```bash
 LOCAL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
-start_rosotacom example/1_heartbeat --identity a --peer-address a="$LOCAL_IP" --peer-address b="$LOCAL_IP"
-start_rosotacom example/1_heartbeat --identity b --peer-address a="$LOCAL_IP" --peer-address b="$LOCAL_IP"
+rosotacom start example/1_heartbeat --identity a --peer-address a="$LOCAL_IP" --peer-address b="$LOCAL_IP" --mode detached
+rosotacom start example/1_heartbeat --identity b --peer-address a="$LOCAL_IP" --peer-address b="$LOCAL_IP" --mode detached
 ```
 
 </details>

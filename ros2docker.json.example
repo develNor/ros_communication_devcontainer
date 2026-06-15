@@ -5,22 +5,18 @@
   "mount_ws": true,
 
   // Enable X11/Wayland GUI forwarding
-  "enable_gui_forwarding": true,
+  "enable_gui_forwarding": false,
 
   // Extra docker run arguments
   "run_args": [
     "-e", "ROS_DOMAIN_ID=47",
     "-e", "BUILD_ROS2WS=1",
     "-e", "CHECK_ROS2WS_DEPENDENCIES=1",
-    "-v", "./data_dict.json.example:/data_dict.json",
     "--network", "host"
   ],
 
-  // Base directory for session configs. Relative values are resolved from config dir.
-  "session_configs_dir": "/session/configs",
-
   // Forward your local SSH agent into the container
-  "forward_ssh_agent": true,
+  "forward_ssh_agent": false,
 
   // Build-time arguments — defaults shown; override if necessary
   "build_args": {

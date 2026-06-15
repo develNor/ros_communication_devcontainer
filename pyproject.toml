@@ -24,3 +24,14 @@ py-modules = [
   "run_session_in_container",
   "stop_session_in_container",
 ]
+packages = [
+  "rosotacom_examples",
+]
+
+[tool.setuptools.package-dir]
+rosotacom_examples = "examples"
+
+[tool.setuptools.package-data]
+rosotacom_examples = [
+  "**/*",
+]

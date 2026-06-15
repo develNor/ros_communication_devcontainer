@@ -1,17 +1,18 @@
 # ignore local system specific settings
-.devcontainer/devcontainer.json
-data_dict.json
-ros2docker.json
-zenoh.json5
+/.devcontainer/devcontainer.json
+/data_dict.json
+/ros2docker.json
+/zenoh.json5
 
 # ignore temporary data
 __pycache__
 .venv/
+/build/
 *.egg-info/
 .session_readonly.yaml
 .codex
-ws/example/**/a/**
-ws/example/**/b/**
-ws/example/**/a_to_b_topics.txt
-ws/example/**/b_to_a_topics.txt
-ws/example/**/qos.yaml
+examples/sessions/**/a/**
+examples/sessions/**/b/**
+examples/sessions/**/a_to_b_topics.txt
+examples/sessions/**/b_to_a_topics.txt
+examples/sessions/**/qos.yaml

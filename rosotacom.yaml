@@ -1,7 +1,8 @@
-# rosotacom-owned host configuration.
+# Source-checkout rosotacom example setup.
 #
 # Relative paths are resolved from this file's directory.
-# CLI flags override environment variables, which override this file.
-ros2docker_config: ros2docker.json.example
-session_configs_dir: null
-data_dict: null
+# This file is not discovered automatically; use:
+#   eval "$(rosotacom setup-env ./rosotacom.yaml)"
+ros2docker_config: examples/ros2docker.json
+session_configs_dir: examples/sessions
+data_dict: examples/data_dict.json

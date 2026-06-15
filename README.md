@@ -45,166 +45,88 @@ Legacy global symlinks are still available when explicitly requested:
 
 ### Basic Setup
 
-1. Fork this repository
+`rosotacom` uses two layers of configuration:
 
-2. Configure your environment:
-   - `rosotacom.yaml`: Host-side rosotacom settings such as optional `session_configs_dir` and `data_dict`
-   - `data_dict.json`: Optional semantic address mapping for `data:<key>` expressions
-   - `ros2docker.json.example`: Generic ros2docker settings used by default
+- A **project setup** file (`rosotacom.yaml`) points to host-local resources such as `ros2docker.json`, `sessions/`, and `data_dict.json`.
+- A **session config** defines the communication behavior for one run: peers, addresses, topics, QoS, processing, and transport choices.
 
-3. Write the session configuration (user-facing) that defines the OTA communication behavior:
-   - both peers
-   - peer addresses as literals (`192.168.1.42`, `robot-a.local`) or explicit `data_dict.json` references (`data:machine_a_ip`)
-   - topic directions (`<src>_to_<dst>`)
-   - optional QoS, processing (restamp, compression, transports, …), Zenoh routing, …
-   - Reference: `session-configuratoin.md`
-   - Terminology / naming conventions (peer, application/com/OTA topics, inbound/outbound, …): `terminology.md`
+No `rosotacom.yaml` is discovered automatically. Wire one explicitly with a flag or with `ROSOTACOM_CONFIG`:
 
-4. Put the config into a **session directory** (this directory is the input and also the output location for generated files):
-   - `session-definition.yaml` (self-contained), OR
-   - `session-parametrization.yaml` (template + parameters; generator also writes a resolved `session-definition.yaml`)
+```bash
+rosotacom examples create ./rosotacom_examples
+cd ./rosotacom_examples
+eval "$(rosotacom setup-env ./rosotacom.yaml)"
+rosotacom doctor
+```
 
-5. Run `rosotacom` on **each peer** with the same session directory, but with its local peer key (`--identity`):
+The copied example project uses this layout:
+
+```text
+rosotacom.yaml
+ros2docker.json
+data_dict.json
+sessions/
+scripts/
+```
+
+The example `data_dict.json` uses `127.0.0.1` for both peers so the examples can run on one host and show how `data:<key>` references work. For two-machine runs, replace those values with each machine's reachable IP address or hostname.
+
+Write or edit session configs under `sessions/<name>/`:
+
+- `session-definition.yaml` for a self-contained session
+- `session-parametrization.yaml` for a template plus parameters
+
+Run `rosotacom` on each peer with the same active setup but a different identity:
 
 ```bash
 # on peer "a"
-rosotacom start --session-dir /path/to/session_dir --identity a
+rosotacom start 1_heartbeat --identity a
 
 # on peer "b"
-rosotacom start --session-dir /path/to/session_dir --identity b
+rosotacom start 1_heartbeat --identity b
 ```
 
-That’s it: `rosotacom` will read the session config input file and automatically create/update all required generated files in that directory (per-peer plugin/session specs, direction topic lists, optional compression/decompression, optional `qos.yaml`, optional `domain_bridge.yaml`, …).
+`rosotacom` reads the session input and creates generated files in that session directory, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`.
 
 ## Usage Examples
 
-### Starting Points: Examples
-
-To help you get started, we have provided several examples that showcase the basic functionality of the ROS Communication DevContainer. These examples are designed for ease of use and quick setup.
-
-<details>
-<summary>Configuring Machine Data</summary>
-
-The examples require two machines, which we will refer to as `machine_a` and `machine_b`. Choose your machines and fill out the `machine_a_ip` and `machine_b_ip` fields in your `data_dict.json`. Make sure this data is synchronized across both machines via Git to ensure seamless communication.
-The example session files refer to those entries as explicit address expressions, e.g. `address: "data:machine_a_ip"`.
-
-For a one-machine smoke test, you can override peer addresses at launch time:
+Create and wire the example project first:
 
 ```bash
-rosotacom smoke example/1_heartbeat --local
+rosotacom examples create ./rosotacom_examples
+cd ./rosotacom_examples
+eval "$(rosotacom setup-env ./rosotacom.yaml)"
 ```
 
-Or launch both local peers manually:
+Run the local heartbeat smoke test:
 
 ```bash
-LOCAL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
-rosotacom start example/1_heartbeat --identity a --peer-address a="$LOCAL_IP" --peer-address b="$LOCAL_IP" --mode detached
-rosotacom start example/1_heartbeat --identity b --peer-address a="$LOCAL_IP" --peer-address b="$LOCAL_IP" --mode detached
+rosotacom smoke
 ```
 
-</details>
+Run the heartbeat example manually:
 
-<details>
-<summary>Example 1: Heartbeat</summary>
+```bash
+./scripts/1_heartbeat/run_machine_a.sh
+./scripts/1_heartbeat/run_machine_b.sh
+```
 
-This example starts a minimal session that only exchanges heartbeat messages between two peers.
+For examples with external application containers, use the matching machine script directory. Example:
 
-- On `machine_a`, run:
-  ```bash
-  ./example/1_heartbeat/run_machine_a.sh
-  ```
-- On `machine_b`, run:
-  ```bash
-  ./example/1_heartbeat/run_machine_b.sh
-  ```
-- Confirm the heartbeat topics are arriving at each peer.
+```bash
+cd scripts/2_native_chatter/machine_a
+./run_external.py
+./run_communication.sh
+```
 
-</details>
+The `sessions/` directory contains the built-in session definitions:
 
-<details>
-<summary>Example 2: Native Chatter Topic (external containers)</summary>
-
-This example bridges a native ROS 2 topic (`/chatter`) from `machine_b` to `machine_a`.
-The ROS “application logic” runs in separate containers (to emulate an existing, unchanged ROS setup),
-while the communication session runs via `rosotacom`.
-
-- On `machine_a`, start the “logic” container and the communication session in separate terminals:
-  ```bash
-  cd example/2_native_chatter/machine_a
-  ./run_external.py
-  ```
-  ```bash
-  cd example/2_native_chatter/machine_a
-  ./run_communication.sh
-  ```
-- On `machine_b`, start the “logic” container and the communication session in separate terminals:
-  ```bash
-  cd example/2_native_chatter/machine_b
-  ./run_external.py
-  ```
-  ```bash
-  cd example/2_native_chatter/machine_b
-  ./run_communication.sh
-  ```
-- Confirm that `machine_a` receives and echoes messages from `machine_b` on `/chatter`.
-
-</details>
-
-<details>
-<summary>Example 3: Compressed Occupancy Grid (CycloneDDS)</summary>
-
-This example transfers a larger topic (an occupancy grid on `/costmap/costmap`) from `machine_b` to `machine_a`,
-including processing steps like restamping and compression/decompression.
-
-- On `machine_a`, start the “logic” container and the communication session in separate terminals:
-  ```bash
-  cd example/3_comp_occ_grid/machine_a
-  ./run_external.py
-  ```
-  ```bash
-  cd example/3_comp_occ_grid/machine_a
-  ./run_communication.sh
-  ```
-- On `machine_b`, start the bag playback (“logic”) and the communication session in separate terminals:
-  ```bash
-  cd example/3_comp_occ_grid/machine_b
-  ./run_external.py
-  ```
-  ```bash
-  cd example/3_comp_occ_grid/machine_b
-  ./run_communication.sh
-  ```
-- Confirm that `machine_a` receives the data stream and that the processed topics are visible (e.g. the restamped output).
-
-</details>
-
-<details>
-<summary>Example 4: Compressed Occupancy Grid (Zenoh)</summary>
-
-This is the same scenario as Example 3, but routed via a Zenoh router layer (useful when peers cannot share a single DDS domain, or when you want separate local and OTA ROS 2 domains on each peer).
-The session config enables Zenoh with peer `a` as the main/router node.
-
-- On `machine_a`, start the “logic” container and the communication session in separate terminals:
-  ```bash
-  cd example/4_comp_occ_grid_zen/machine_a
-  ./run_external.py
-  ```
-  ```bash
-  cd example/4_comp_occ_grid_zen/machine_a
-  ./run_communication.sh
-  ```
-- On `machine_b`, start the bag playback (“logic”) and the communication session in separate terminals:
-  ```bash
-  cd example/4_comp_occ_grid_zen/machine_b
-  ./run_external.py
-  ```
-  ```bash
-  cd example/4_comp_occ_grid_zen/machine_b
-  ./run_communication.sh
-  ```
-- Confirm that `machine_a` receives the data stream (now via Zenoh), including the heartbeat and occupancy grid topics.
-
-</details>
+- `1_heartbeat`: minimal heartbeat exchange
+- `2_native_chatter`: bridge `/chatter` from `machine_b` to `machine_a`
+- `3_comp_occ_grid`: compressed occupancy grid over DDS
+- `4_comp_occ_grid_zen`: compressed occupancy grid through Zenoh
+- `5_sized_payload`: sized payload test over DDS
+- `6_sized_payload_zen`: sized payload test through Zenoh
 
 
 ## Choosing the Transport Layer: CycloneDDS or Zenoh

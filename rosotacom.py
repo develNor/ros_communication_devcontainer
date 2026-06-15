@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.resources as importlib_resources
 import importlib.util
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -40,8 +42,9 @@ else:
 
 PROJECT_DIR = Path(__file__).resolve().parent
 WS_DIR = PROJECT_DIR / "ws"
-DEFAULT_ROSOTACOM_CONFIG = PROJECT_DIR / "rosotacom.yaml"
 DEFAULT_ROS2DOCKER_CONFIG = PROJECT_DIR / "ros2docker.json.example"
+EXAMPLE_PROJECT_DIR = PROJECT_DIR / "examples"
+EXAMPLE_RESOURCE_PACKAGE = "rosotacom_examples"
 SESSION_CONFIG_CONTAINER_DIR = "/session/configs"
 EXTERNAL_SESSION_CONTAINER_DIR = "/session/current"
 CONTAINER_DATA_DICT_PATH = "/data_dict.json"
@@ -117,8 +120,9 @@ def _resolve_path(raw: str | os.PathLike[str] | None, base_dir: Path, *, must_ex
     return path
 
 
-def _install_id() -> str:
-    return hashlib.sha1(str(PROJECT_DIR.resolve()).encode("utf-8")).hexdigest()[:8]
+def _install_id(scope_path: Path | None = None) -> str:
+    scope = scope_path.resolve() if scope_path else PROJECT_DIR.resolve()
+    return hashlib.sha1(str(scope).encode("utf-8")).hexdigest()[:8]
 
 
 def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfig:
@@ -126,10 +130,9 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
     rosotacom_config_raw = _first_value(
         getattr(args, "rosotacom_config", None),
         os.environ.get("ROSOTACOM_CONFIG"),
-        str(DEFAULT_ROSOTACOM_CONFIG) if DEFAULT_ROSOTACOM_CONFIG.exists() else None,
     )
-    rosotacom_config = _resolve_path(rosotacom_config_raw, PROJECT_DIR, must_exist=True)
-    config_base = rosotacom_config.parent if rosotacom_config else PROJECT_DIR
+    rosotacom_config = _resolve_path(rosotacom_config_raw, Path.cwd(), must_exist=True)
+    config_base = rosotacom_config.parent if rosotacom_config else Path.cwd()
     cfg = _load_yaml_file(rosotacom_config)
 
     ros2docker_config_raw = _first_value(
@@ -149,17 +152,12 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         cfg.get("data_dict"),
     )
 
-    data_dict = _resolve_path(data_dict_raw, config_base, must_exist=True)
-    if data_dict is None:
-        repo_data_dict = PROJECT_DIR / "data_dict.json"
-        data_dict = repo_data_dict if repo_data_dict.exists() else None
-
     return RuntimeConfig(
         rosotacom_config=rosotacom_config,
         ros2docker_config=_resolve_path(ros2docker_config_raw, config_base, must_exist=True),
         session_configs_dir=_resolve_path(session_configs_dir_raw, config_base, must_exist=True),
-        data_dict=data_dict,
-        install_id=_install_id(),
+        data_dict=_resolve_path(data_dict_raw, config_base, must_exist=True),
+        install_id=_install_id(rosotacom_config),
     )
 
 
@@ -265,7 +263,7 @@ def _load_host_data_dict(runtime: RuntimeConfig) -> dict[str, Any]:
     if not runtime.data_dict:
         raise RuntimeError(
             "This session still contains data:<key> address expressions, but no data_dict.json was configured. "
-            "Use --data-dict, ROSOTACOM_DATA_DICT, rosotacom.yaml, or create repo-local data_dict.json."
+            "Use --data-dict, ROSOTACOM_DATA_DICT, or an explicit rosotacom.yaml via --rosotacom-config/ROSOTACOM_CONFIG."
         )
     return load_data_dict([str(runtime.data_dict)])
 
@@ -466,13 +464,7 @@ def _resolve_session(session_dir: str, runtime: RuntimeConfig) -> ResolvedSessio
             candidates.append((runtime.session_configs_dir / rel, "session_configs"))
         candidates.append((raw, "absolute"))
     else:
-        candidates.extend(
-            [
-                ((WS_DIR / raw), "workspace"),
-                ((PROJECT_DIR / raw), "repo"),
-                ((Path.cwd() / raw), "cwd"),
-            ]
-        )
+        candidates.append((Path.cwd() / raw, "cwd"))
         if runtime.session_configs_dir:
             candidates.append((runtime.session_configs_dir / raw, "session_configs"))
 
@@ -498,17 +490,17 @@ def _resolve_session(session_dir: str, runtime: RuntimeConfig) -> ResolvedSessio
 
 def _format_available_sessions(runtime: RuntimeConfig) -> str:
     parts: list[str] = []
-    examples = []
-    example_dir = WS_DIR / "example"
-    if example_dir.is_dir():
-        examples = [f"example/{p.name}" for p in sorted(example_dir.iterdir()) if p.is_dir()]
-    if examples:
-        parts.append("Built-in examples:\n  - " + "\n  - ".join(examples))
     if runtime.session_configs_dir and runtime.session_configs_dir.is_dir():
         sessions = [p.name for p in sorted(runtime.session_configs_dir.iterdir()) if p.is_dir()]
         if sessions:
             parts.append("Configured sessions:\n  - " + "\n  - ".join(sessions))
-    return "\n".join(parts) if parts else "No session directories found."
+    if parts:
+        return "\n".join(parts)
+    return (
+        "No configured session directories found. Create examples with "
+        "`rosotacom examples create ./rosotacom_examples` and wire them with "
+        "`eval \"$(rosotacom setup-env ./rosotacom_examples/rosotacom.yaml)\"`."
+    )
 
 
 def _base_extra_run_args(runtime: RuntimeConfig, session: ResolvedSession, cfg: dict[str, Any]) -> list[str]:
@@ -700,6 +692,61 @@ def list_sessions(args: argparse.Namespace) -> None:
     print(_format_available_sessions(runtime))
 
 
+def _example_project_resource() -> Any:
+    if EXAMPLE_PROJECT_DIR.is_dir():
+        return EXAMPLE_PROJECT_DIR
+    try:
+        return importlib_resources.files(EXAMPLE_RESOURCE_PACKAGE)
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Packaged rosotacom examples are not available in this installation.") from exc
+
+
+def _skip_example_resource(name: str) -> bool:
+    return name == "__pycache__" or name == "__init__.py" or name.endswith(".pyc")
+
+
+def _copy_example_resource_tree(source: Any, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        if _skip_example_resource(child.name):
+            continue
+        destination = target / child.name
+        if child.is_dir():
+            _copy_example_resource_tree(child, destination)
+            continue
+
+        if isinstance(child, Path):
+            shutil.copy2(child, destination)
+        else:
+            destination.write_bytes(child.read_bytes())
+        if destination.suffix in {".sh", ".py"}:
+            destination.chmod(destination.stat().st_mode | 0o111)
+
+
+def examples_create_command(args: argparse.Namespace) -> int:
+    target = Path(os.path.expandvars(os.path.expanduser(args.target))).resolve()
+    if target.exists():
+        if not args.force:
+            raise RuntimeError(f"Target already exists: {target}. Use --force to replace it.")
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _copy_example_resource_tree(_example_project_resource(), target)
+    print(f"Copied rosotacom examples to: {target}")
+    print(f"Wire this shell with: eval \"$(rosotacom setup-env {shlex.quote(str(target / 'rosotacom.yaml'))})\"")
+    return 0
+
+
+def setup_env_command(args: argparse.Namespace) -> int:
+    config = _resolve_path(args.rosotacom_config, Path.cwd(), must_exist=True)
+    if not config or not config.is_file():
+        raise RuntimeError(f"rosotacom config must be a file: {args.rosotacom_config}")
+    print(f"export ROSOTACOM_CONFIG={shlex.quote(str(config))}")
+    return 0
+
+
 def doctor(args: argparse.Namespace) -> int:
     runtime = None
     failures = 0
@@ -723,7 +770,10 @@ def doctor(args: argparse.Namespace) -> int:
 
     try:
         runtime = _load_runtime_config(args)
-        line("OK", "rosotacom config", str(runtime.rosotacom_config) if runtime.rosotacom_config else "repo defaults")
+        if runtime.rosotacom_config:
+            line("OK", "rosotacom config", str(runtime.rosotacom_config))
+        else:
+            line("INFO", "rosotacom config", "not configured; use --rosotacom-config or ROSOTACOM_CONFIG")
         line("OK", "ros2docker config", str(runtime.ros2docker_config))
         line("OK", "install id", runtime.install_id)
         line("OK", "workspace mount", f"{WS_DIR} -> /ws")
@@ -777,7 +827,7 @@ def smoke(args: argparse.Namespace) -> int:
     if not args.local:
         raise RuntimeError("Only --local smoke mode is implemented.")
     local_ip = args.local_ip or _default_local_ip()
-    session_dir = args.session_dir or "example/1_heartbeat"
+    session_dir = args.session_dir or "1_heartbeat"
     common = {
         "rosotacom_config": args.rosotacom_config,
         "ros2docker_config": args.ros2docker_config,
@@ -883,8 +933,10 @@ def stop_command(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"start", "stop", "doctor", "smoke", "list-sessions"}
-    if not argv or argv[0] not in commands:
+    commands = {"start", "stop", "doctor", "smoke", "list-sessions", "examples", "setup-env"}
+    if not argv:
+        argv = ["start"]
+    elif argv[0] not in commands and not argv[0].startswith("-"):
         argv = ["start", *argv]
 
     parser = argparse.ArgumentParser(prog="rosotacom")
@@ -910,15 +962,26 @@ def main(argv: list[str] | None = None) -> int:
 
     smoke_parser = subparsers.add_parser("smoke", help="Run a local smoke test.")
     _add_common_config_args(smoke_parser)
-    smoke_parser.add_argument("session_dir", nargs="?", default="example/1_heartbeat")
+    smoke_parser.add_argument("session_dir", nargs="?", default="1_heartbeat")
     smoke_parser.add_argument("--local", action="store_true", default=True)
     smoke_parser.add_argument("--local-ip")
     smoke_parser.add_argument("--keep-running", action="store_true", help="Leave smoke-test containers running.")
     smoke_parser.set_defaults(func=smoke)
 
-    list_parser = subparsers.add_parser("list-sessions", help="List built-in and configured sessions.")
+    list_parser = subparsers.add_parser("list-sessions", help="List configured sessions.")
     _add_common_config_args(list_parser)
     list_parser.set_defaults(func=lambda args: (list_sessions(args), 0)[1])
+
+    examples_parser = subparsers.add_parser("examples", help="Manage packaged rosotacom examples.")
+    examples_subparsers = examples_parser.add_subparsers(dest="examples_command", required=True)
+    examples_create_parser = examples_subparsers.add_parser("create", help="Copy the packaged example project.")
+    examples_create_parser.add_argument("target", help="Directory to create.")
+    examples_create_parser.add_argument("--force", action="store_true", help="Replace the target if it exists.")
+    examples_create_parser.set_defaults(func=examples_create_command)
+
+    setup_env_parser = subparsers.add_parser("setup-env", help="Print shell exports for a rosotacom setup file.")
+    setup_env_parser.add_argument("rosotacom_config", help="Path to rosotacom.yaml.")
+    setup_env_parser.set_defaults(func=setup_env_command)
 
     args = parser.parse_args(argv)
     try:

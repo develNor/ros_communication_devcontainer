@@ -430,7 +430,8 @@ For a session directory containing a session configuration input file, the gener
   - additional per-feature config files depending on enabled processing stages
 
 ### Examples
-Examples can be found in the `ws/example/` directory of this repository. For hands-on sample session configuration files.
+Examples can be created with `rosotacom examples create ./rosotacom_examples`.
+The copied project stores sample session configuration files under `sessions/`.
 
 ## Session parametrization (`session-parametrization.yaml`)
 If `session-parametrization.yaml` is present, the session is defined indirectly by selecting a template and providing its parameters.

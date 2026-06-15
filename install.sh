@@ -52,7 +52,9 @@ echo "  source \"$VENV_DIR/bin/activate\""
 echo
 echo "Try:"
 echo "  rosotacom doctor"
-echo "  rosotacom smoke example/1_heartbeat --local"
+echo "  rosotacom examples create ./rosotacom_examples"
+echo "  eval \"\$(rosotacom setup-env ./rosotacom_examples/rosotacom.yaml)\""
+echo "  rosotacom smoke"
 
 if [[ "$INSTALL_GLOBAL_SYMLINKS" == true ]]; then
   mkdir -p "$BIN_DIR"

@@ -1,0 +1,6 @@
+// Loopback values make the copied examples runnable on one host.
+// For two-machine use, replace these with each machine's reachable IP address.
+{
+  "machine_a_ip": "127.0.0.1",
+  "machine_b_ip": "127.0.0.1"
+}

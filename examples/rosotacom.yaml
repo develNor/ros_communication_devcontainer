@@ -1,0 +1,8 @@
+# Example rosotacom project setup.
+#
+# Relative paths are resolved from this file's directory.
+# Use `rosotacom setup-env ./rosotacom.yaml` or pass this file with
+# `--rosotacom-config`.
+ros2docker_config: ros2docker.json
+session_configs_dir: sessions
+data_dict: data_dict.json

@@ -1,5 +1,11 @@
 # ROS Communication DevContainer
 
+[![CI](https://github.com/develNor/rosotacom/actions/workflows/pr-merge-gate.yml/badge.svg?branch=main&event=push)](https://github.com/develNor/rosotacom/actions/workflows/pr-merge-gate.yml)
+[![Coverage](https://codecov.io/gh/develNor/rosotacom/branch/main/graph/badge.svg)](https://codecov.io/gh/develNor/rosotacom)
+[![PyPI](https://img.shields.io/pypi/v/rosotacom.svg)](https://pypi.org/project/rosotacom/)
+[![Python](https://img.shields.io/pypi/pyversions/rosotacom.svg)](https://pypi.org/project/rosotacom/)
+[![License](https://img.shields.io/pypi/l/rosotacom.svg)](https://pypi.org/project/rosotacom/)
+
 The ROS Communication DevContainer is a Docker-based solution designed to streamline the bidirectional synchronization of ROS2 topics between two Linux machines. It provides built-in compression and routing capabilities for over-the-air (OTA) data transfer: selected topics are remapped into an OTA namespace and transmitted either via direct DDS (CycloneDDS) or through a Zenoh router. When desired, the session can also place local application nodes and OTA-facing bridge nodes into separate ROS 2 domain IDs and automatically generate a standard ROS 2 `domain_bridge` configuration for the `/com/...` boundary. This project aligns with the publication *“Scalable Remote Operation for Autonomous Vehicles: Integration of Cooperative Perception and Open Source Communication.”*
 
 <details>
@@ -34,6 +40,8 @@ so multiple rosotacom versions can coexist without global symlink drift.
 ```bash
 cd /path/to/ros_communication_devcontainer && ./install.sh
 source .venv/bin/activate
+rosotacom --version
+python -m rosotacom --version
 rosotacom doctor
 ```
 
@@ -59,7 +67,7 @@ eval "$(rosotacom setup-env ./rosotacom.yaml)"
 rosotacom doctor
 ```
 
-The copied example project uses this layout:
+The copied packaged example project uses this layout:
 
 ```text
 rosotacom.yaml
@@ -68,6 +76,9 @@ data_dict.json
 sessions/
 scripts/
 ```
+
+See the [example project README](src/rosotacom/resources/examples/README.md)
+for the copyable example layout.
 
 The example `data_dict.json` uses `127.0.0.1` for both peers so the examples can run on one host and show how `data:<key>` references work. For two-machine runs, replace those values with each machine's reachable IP address or hostname.
 
@@ -128,32 +139,38 @@ The `sessions/` directory contains the built-in session definitions:
 - `5_sized_payload`: sized payload test over DDS
 - `6_sized_payload_zen`: sized payload test through Zenoh
 
+## Development
+
+For contributor setup, local checks, PR workflow, CI, and releases, see
+[CONTRIBUTING.md](CONTRIBUTING.md). CI behavior is summarized in
+[docs/ci.md](docs/ci.md), releases in [docs/release.md](docs/release.md), and
+issue-driven work tracking in [docs/work-items.md](docs/work-items.md).
 
 ## Choosing the Transport Layer: CycloneDDS or Zenoh
 
-- **Use CycloneDDS** when all machines share the **same `ROS_DOMAIN_ID`**.  
+- **Use CycloneDDS** when all machines share the **same `ROS_DOMAIN_ID`**.
   This is the simplest and most direct configuration.
 
-- **Use Zenoh** when peers cannot rely on one shared DDS domain, or when you want to split local application nodes and OTA-facing bridge nodes into different ROS 2 domains on each peer.  
+- **Use Zenoh** when peers cannot rely on one shared DDS domain, or when you want to split local application nodes and OTA-facing bridge nodes into different ROS 2 domains on each peer.
   In that split-domain setup this repository generates a standard ROS 2 `domain_bridge` for `/com/...` topics locally, while Zenoh carries the `/ota/...` traffic between peers.
 
 ## Position in the OTA Communication Landscape
 
 This repository fits into a broader set of ROS-based OTA communication approaches:
 
-- **Direct ROS 2 DDS Communication**  
+- **Direct ROS 2 DDS Communication**
   Native DDS (CycloneDDS, Fast DDS), often with custom configuration for constrained or long-range links.
   The examples in this repository use CycloneDDS to illustrate this approach.
 
-- **ROS 2 over Router-like Backbones**  
+- **ROS 2 over Router-like Backbones**
   Some RMW have their own DDS Routers such as [eProsima/DDS-Router](https://github.com/eProsima/DDS-Router).
   Example 4 uses Zenoh to act as a lightweight router layer.
 
-- **MQTT-based Approaches**  
-  Common in cloud/IoT scenarios. Example:  
+- **MQTT-based Approaches**
+  Common in cloud/IoT scenarios. Example:
   [ika-rwth-aachen/mqtt_client](https://github.com/ika-rwth-aachen/mqtt_client)
 
-- **Custom TCP/UDP Teleoperation Stacks**  
+- **Custom TCP/UDP Teleoperation Stacks**
   Some frameworks implement their manual tcp/udp transportion layers. Example:
   [TUMFTM/teleoperated_driving](https://github.com/TUMFTM/teleoperated_driving)
 

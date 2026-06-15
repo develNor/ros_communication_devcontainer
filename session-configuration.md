@@ -16,15 +16,15 @@ When `session-parametrization.yaml` is used, the generator also writes a resolve
 ### Hard constraints
 These constraints are **enforced** by the generator (or by the base plugin it targets):
 
-- **Exactly 2 peers**  
-  `peers:` must exist and must contain **exactly two** entries.  
+- **Exactly 2 peers**
+  `peers:` must exist and must contain **exactly two** entries.
   Reason: the base plugin (`session_plugin_base.yaml`) is currently “1-remote”.
 
-- **Direction keys in `topics`**  
-  Keys must be exactly `"<src>_to_<dst>"` (e.g. `a_to_b`).  
+- **Direction keys in `topics`**
+  Keys must be exactly `"<src>_to_<dst>"` (e.g. `a_to_b`).
   `<src>` and `<dst>` must be peer keys defined under `peers:`.
 
-- **Feature slot limits (max 4 each)**  
+- **Feature slot limits (max 4 each)**
   The base plugin supports at most **4** entries per feature group:
   - **drop** (`drop`)
   - **throttle** (`throttle_hz`)
@@ -244,7 +244,7 @@ routing.
 When the `config` field is set on either side, the generator records the template
 name in each `<peer>/plugin.yaml` (`ota_config_template` / `local_config_template`)
 and the runtime resolves it via the unified generator
-[ws/ota_configs/get_ota_xml.py](ros_communication_devcontainer/ws/ota_configs/get_ota_xml.py),
+[ws/ota_configs/get_ota_xml.py](src/rosotacom/resources/ws/ota_configs/get_ota_xml.py),
 writing the resolved XML to `${peer_dir}/ota_dds.xml` (or
 `${peer_dir}/local_dds.xml`) and exporting the right env var for the RMW:
 
@@ -255,7 +255,7 @@ The OTA side is bootstrapped per-IN/OUT split (so the bridge can be on a differe
 RMW than the rest of the local graph). The local side is bootstrapped in the
 session's `before_commands`, so all non-OTA splits inherit it.
 
-Templates live under [ws/ota_configs/](ros_communication_devcontainer/ws/ota_configs/)
+Templates live under [ws/ota_configs/](src/rosotacom/resources/ws/ota_configs/)
 and may reference these placeholders:
 
 - `#host_ip` — the local peer's IP (single value, resolved via an address expression)
@@ -282,8 +282,8 @@ If `use_heartbeat: true`:
 - Both directions must exist in `topics:` (they may be empty).
 - `use_in` / `use_out` are set to `true` unless explicitly disabled.
 
-Default heartbeat topic per peer: `/heartbeat_<com-name>`  
-Override: `peer_settings.<peer>.heartbeat_topic`  
+Default heartbeat topic per peer: `/heartbeat_<com-name>`
+Override: `peer_settings.<peer>.heartbeat_topic`
 Placement in topic list: per direction via `shared.heartbeat_position` (default `prepend`).
 
 ### `peer_settings` (optional)
@@ -315,10 +315,10 @@ peer_settings:
 ```
 
 #### Behavioral notes
-- `inbound.keep_source_prefix: true`  
+- `inbound.keep_source_prefix: true`
   Inbound topics keep the `/remote_name` prefix; derived inbound lists (e.g. decompression/normalize) are built accordingly.
 
-- `outbound.target_prefix.use_target_prefix: true`  
+- `outbound.target_prefix.use_target_prefix: true`
   Outbound becomes “explicitly addressed” (affects generated plugin parameters and topic monitor / heartbeat semantics).
 
 ### `topics` (optional)
@@ -373,16 +373,16 @@ processing:
 #### Processing pipeline order (exact)
 Given a base topic like `/tf`, stages are applied in this order:
 
-1) base topic (e.g. `/tf`)  
-2) restamp → `+ shared.processing_suffixes.restamped` (default `/restamped`)  
-3) drop → `+ /drop{drop_count}of{window_size}` (e.g. `/drop2of3`)  
-4) throttle → `+ /max{hz}hz`  
-5) pixel cap → `+ /{preset}`  
+1) base topic (e.g. `/tf`)
+2) restamp → `+ shared.processing_suffixes.restamped` (default `/restamped`)
+3) drop → `+ /drop{drop_count}of{window_size}` (e.g. `/drop2of3`)
+4) throttle → `+ /max{hz}hz`
+5) pixel cap → `+ /{preset}`
 6) framebridge:
    - `local_to_global`: appended to the current topic state via `+ /globalframe`
    - `global_to_local`: appended to the base topic via `+ /globalframe` (configured inbound-side)
-7) compress → `+ /<algorithm>` (default `/bz2`)  
-8) transport → `+ /<type>` (e.g. `/ffmpeg`, `/foxglove`, `/compressed`)  
+7) compress → `+ /<algorithm>` (default `/bz2`)
+8) transport → `+ /<type>` (e.g. `/ffmpeg`, `/foxglove`, `/compressed`)
 9) optional `local_republish: true` triggers reverse-transport configuration.
 
 #### Transport parameters

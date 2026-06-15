@@ -1,0 +1,68 @@
+name: image-scan
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  trivy-image:
+    name: trivy-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      IMAGE_TAG: rosotacom:scan-${{ github.sha }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Show Docker environment
+        run: docker info
+
+      - name: Build default rosotacom image
+        run: |
+          .venv/bin/ros2docker build \
+            -f src/rosotacom/resources/ros2docker.json.example \
+            -o "{\"image_name\":\"${IMAGE_TAG}\"}"
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_TAG }}
+          format: "table"
+          output: "trivy-image-report.txt"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: "true"
+          exit-code: "0"
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-image-report
+          path: trivy-image-report.txt
+          if-no-files-found: warn

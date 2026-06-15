@@ -1,6 +1,6 @@
 # Terminology
 
-This document defines the canonical terminology used throughout this project.  
+This document defines the canonical terminology used throughout this project.
 All contributors **MUST** use the terms defined here. Synonyms are explicitly discouraged.
 
 The terminology separates **orthogonal concerns**:
@@ -15,16 +15,16 @@ The terminology separates **orthogonal concerns**:
 ## 1. Peers and sessions
 
 ### Peer
-A **peer** is a communication participant.  
+A **peer** is a communication participant.
 Peers are symmetric and may both send and receive messages.
 
-> The term *peer* is used exclusively.  
+> The term *peer* is used exclusively.
 > Terms such as *actor*, *participant*, *partner*, or *node* are not used.
 
 ---
 
 ### Local peer
-The **local peer** is the peer on which a given session instance is running  
+The **local peer** is the peer on which a given session instance is running
 (i.e. “this machine / this ROS graph”).
 
 ---
@@ -47,7 +47,7 @@ A **session instance** is a concrete runtime instantiation of a session on a pee
 ---
 
 ### Session runtime
-A **session runtime** is the software runtime that implements a session instance on a peer  
+A **session runtime** is the software runtime that implements a session instance on a peer
 (e.g. App Relay + OTA Bridge and their configuration/orchestration).
 
 In this repository, the session runtime is typically executed inside a Docker container started via `rosotacom`.
@@ -90,7 +90,7 @@ A **peer directory** is the per-peer subdirectory inside a session directory:
 
 `<session_dir>/<peer_key>/`
 
-It contains **only** peer-specific generated session configuration artifacts  
+It contains **only** peer-specific generated session configuration artifacts
 (e.g. `plugin.yaml`, `session_specification.yaml`, optional compression/decompression configs, ...).
 
 ---
@@ -356,8 +356,3 @@ The OTA Bridge consists of two pub/sub pairs:
 - Topic classes are named explicitly: *application* (native or processed), *native*, *processed*, *com*, *OTA*.
 - All documentation and code comments **must** use these terms.
 - New terminology must not be introduced without updating this file.
-
-
-
-
-

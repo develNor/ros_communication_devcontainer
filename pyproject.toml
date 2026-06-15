@@ -1,37 +1,140 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=80", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "rosotacom"
-version = "0.1.0"
 description = "Host CLI for ROS OTA communication sessions."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "BSD-3-Clause"
+authors = [
+  { name = "develNor" },
+]
+keywords = ["ros2", "docker", "teleoperation", "communication", "cli"]
 dependencies = [
   "PyYAML>=6",
   "ros2docker>=0.1.2,<0.2",
 ]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering",
+  "Topic :: System :: Networking",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/develNor/rosotacom"
+Repository = "https://github.com/develNor/rosotacom"
+Issues = "https://github.com/develNor/rosotacom/issues"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "check-wheel-contents>=0.6",
+  "mypy>=1.14",
+  "pre-commit>=4.0",
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff==0.15.17",
+  "twine>=6.0",
+  "types-PyYAML>=6.0",
+]
 
 [project.scripts]
-rosotacom = "rosotacom:main"
-start_rosotacom = "rosotacom:start_compat_main"
-stop_rosotacom = "rosotacom:stop_compat_main"
+rosotacom = "rosotacom.cli:main"
+start_rosotacom = "rosotacom.cli:start_compat_main"
+stop_rosotacom = "rosotacom.cli:stop_compat_main"
 
 [tool.setuptools]
-py-modules = [
-  "rosotacom",
-  "run_session_in_container",
-  "stop_session_in_container",
-]
-packages = [
-  "rosotacom_examples",
-]
+include-package-data = true
+package-dir = {"" = "src"}
 
-[tool.setuptools.package-dir]
-rosotacom_examples = "examples"
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
-rosotacom_examples = [
-  "**/*",
+rosotacom = [
+  "py.typed",
+  "resources/**/*",
 ]
+
+[tool.setuptools_scm]
+fallback_version = "0.1.0"
+local_scheme = "no-local-version"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+  "e2e: Docker-backed end-to-end rosotacom tests",
+]
+
+[tool.ruff]
+line-length = 120
+src = ["src/rosotacom", "tests"]
+target-version = "py310"
+exclude = [
+  ".devcontainer",
+  "src/rosotacom/resources",
+]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rosotacom"]
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "src"
+files = ["src/rosotacom"]
+exclude = [
+  "src/rosotacom/resources",
+]
+check_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = [
+  "ros2docker.*",
+  "session.*",
+]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+source = ["rosotacom"]
+
+[tool.coverage.paths]
+source = [
+  "src/rosotacom",
+  "*/site-packages/rosotacom",
+]
+
+[tool.coverage.report]
+fail_under = 65
+show_missing = true
+skip_covered = true
+exclude_also = [
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
+
+[tool.check-wheel-contents]
+ignore = ["W002", "W004"]
+toplevel = ["rosotacom"]

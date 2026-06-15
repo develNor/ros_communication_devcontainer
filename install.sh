@@ -51,10 +51,15 @@ echo "Activate it with:"
 echo "  source \"$VENV_DIR/bin/activate\""
 echo
 echo "Try:"
+echo "  rosotacom --version"
+echo "  python -m rosotacom --version"
 echo "  rosotacom doctor"
 echo "  rosotacom examples create ./rosotacom_examples"
 echo "  eval \"\$(rosotacom setup-env ./rosotacom_examples/rosotacom.yaml)\""
 echo "  rosotacom smoke"
+echo
+echo "For contributor checks, install dev tooling with:"
+echo "  just setup"
 
 if [[ "$INSTALL_GLOBAL_SYMLINKS" == true ]]; then
   mkdir -p "$BIN_DIR"

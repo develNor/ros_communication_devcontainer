@@ -1,0 +1,5 @@
+recursive-include src/rosotacom/resources *
+include src/rosotacom/py.typed
+
+exclude .gitignore
+global-exclude __pycache__ *.py[cod] .DS_Store

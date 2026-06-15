@@ -1,0 +1,50 @@
+peers:
+  a:
+    address: "data:machine_a_ip"
+  b:
+    address: "data:machine_b_ip"
+
+# peer_settings:
+#   a:
+#     domain_id: 46
+#   b:
+#     domain_id: 47
+
+shared:
+  use_heartbeat: true
+  rmw: fastdds
+  # ota_domain_id: 48
+
+  # Tested Working RMW-Config Combinations:
+
+  # 1. FastDDS
+  # rmw: fastdds
+
+  # 2. Cyclone with OTA config
+  # rmw:
+  #   local: cyclone
+  #   ota:
+  #     cyclone:
+  #       config: cyclonedds_minimal.xml
+
+  # 3. Zenoh with connected endpoints
+  # rmw:
+  #   local: zenoh
+  #   ota: zenoh_connect_endpoints
+
+  # 4. Cyclone with OTA config and locally FastDDS
+  # rmw:
+  #   local: fastdds
+  #   ota:
+  #     cyclone:
+  #       config: cyclonedds_minimal.xml
+
+  # 5. FastDDS for OTA and locally Cyclone
+  # rmw:
+  #   local: cyclone
+  #   ota: fastdds
+
+  # 6. Zenoh-ROS2DDS for OTA and locally cyclone
+  # rmw:
+  #   local: cyclone
+  #   ota: zenoh_ros2dds

@@ -8,6 +8,8 @@ parameters:
   remote_name: a
 
   rmw_local: cyclone
+  local_config_template: cyclonedds_minimal.xml
+  local_config_file: ${peer_dir}/local_dds.xml
 
   in: true
   topic_list_paths_inbound: ${session_dir}/a_to_b_topics.txt

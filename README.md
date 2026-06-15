@@ -91,10 +91,10 @@ Run `rosotacom` on each peer with the same active setup but a different identity
 
 ```bash
 # on peer "a"
-rosotacom start 1_heartbeat_fastdds --identity a
+rosotacom start 1_heartbeat_cyclone-ota --identity a
 
 # on peer "b"
-rosotacom start 1_heartbeat_fastdds --identity b
+rosotacom start 1_heartbeat_cyclone-ota --identity b
 ```
 
 `rosotacom` reads the session input and creates generated files in that session directory, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`.
@@ -114,6 +114,10 @@ Run the local heartbeat smoke test:
 ```bash
 rosotacom smoke
 ```
+
+The smoke test verifies both directions through the communication path: it waits
+for `/com/in/a/heartbeat_a` and `/heartbeat_a` in peer `b`, plus
+`/com/in/b/heartbeat_b` and `/heartbeat_b` in peer `a`.
 
 Run the heartbeat example manually:
 

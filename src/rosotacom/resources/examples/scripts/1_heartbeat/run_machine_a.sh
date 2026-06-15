@@ -6,4 +6,4 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EXAMPLE_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 CONFIG="${ROSOTACOM_CONFIG:-$EXAMPLE_ROOT/rosotacom.yaml}"
 
-rosotacom start --rosotacom-config "$CONFIG" 1_heartbeat_fastdds --identity a --force
+rosotacom start --rosotacom-config "$CONFIG" 1_heartbeat_cyclone-ota --identity a --force

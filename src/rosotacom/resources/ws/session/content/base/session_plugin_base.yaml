@@ -225,7 +225,7 @@ parameters:
 common:
   before_commands:
     - if [ '${local_domain_id}' != "None" ] && [ -n '${local_domain_id}' ]; then export ROS_DOMAIN_ID='${local_domain_id}'; fi
-    - if [ '${rmw_local}' != "None" ]; then case ${rmw_local} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp;; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; *) export RMW_IMPLEMENTATION='${rmw_local}';; esac; fi
+    - if [ '${rmw_local}' != "None" ]; then case ${rmw_local} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4};; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; *) export RMW_IMPLEMENTATION='${rmw_local}';; esac; fi
     - if [ '${local_config_template}' != "None" ] && [ -n '${local_config_template}' ]; then local_args=(--config "${local_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${local_easy_mode_ip_key}' != "None" ] && [ -n '${local_easy_mode_ip_key}' ] && local_args+=(--easy-mode-ip "${local_easy_mode_ip_key}"); /ws/ota_configs/get_ota_xml.py "${local_args[@]}" > "${local_config_file}"; case ${rmw_local} in cyclone) export CYCLONEDDS_URI="file://${local_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${local_config_file}";; esac; fi
     - if [ '${before_command}' != "None" ]; then ${before_command}; fi
 
@@ -268,7 +268,7 @@ windows:
     splits:
       - commands:
         - if [ '${ota_domain_id}' != "None" ] && [ -n '${ota_domain_id}' ]; then export ROS_DOMAIN_ID='${ota_domain_id}'; fi
-        - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp;; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
+        - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4};; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
         - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip_key}' != "None" ] && [ -n '${ota_easy_mode_ip_key}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip_key}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}";; esac; fi
         - export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}")
         - ros2 run com_py bridge_in --ros-args
@@ -290,7 +290,7 @@ windows:
     splits:
       - commands:
         - if [ '${ota_domain_id}' != "None" ] && [ -n '${ota_domain_id}' ]; then export ROS_DOMAIN_ID='${ota_domain_id}'; fi
-        - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp;; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
+        - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4};; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
         - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip_key}' != "None" ] && [ -n '${ota_easy_mode_ip_key}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip_key}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}";; esac; fi
         - export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}")
         - ros2 run com_py bridge_out --ros-args

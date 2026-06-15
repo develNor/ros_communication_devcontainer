@@ -13,7 +13,9 @@ peers:
 shared:
   use_heartbeat: true
   rmw:
-    local: cyclone
+    local:
+      cyclone:
+        config: cyclonedds_minimal.xml
     ota:
       cyclone:
         config: cyclonedds_minimal.xml
@@ -26,7 +28,9 @@ shared:
 
   # 2. Cyclone with OTA config
   # rmw:
-  #   local: cyclone
+  #   local:
+  #     cyclone:
+  #       config: cyclonedds_minimal.xml
   #   ota:
   #     cyclone:
   #       config: cyclonedds_minimal.xml

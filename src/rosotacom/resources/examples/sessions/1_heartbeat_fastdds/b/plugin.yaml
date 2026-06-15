@@ -2,9 +2,9 @@ parameters:
   session_dir: /session/configs/1_heartbeat_fastdds
   peer_dir: ${session_dir}/b
 
-  ip_local: 192.168.178.66
+  ip_local: data:machine_b_ip
   local_name: b
-  ip_remote: 192.168.178.66
+  ip_remote: data:machine_a_ip
   remote_name: a
 
   rmw_local: fastdds

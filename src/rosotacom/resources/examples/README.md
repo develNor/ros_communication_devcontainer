@@ -9,7 +9,7 @@ project setup, reusable session configs, and helper scripts.
 rosotacom examples create ./rosotacom_examples
 cd ./rosotacom_examples
 eval "$(rosotacom setup-env ./rosotacom.yaml)"
-rosotacom start 1_heartbeat_fastdds --identity a
+rosotacom start 1_heartbeat_cyclone-ota --identity a
 ```
 
 In another terminal on the same host:
@@ -17,7 +17,7 @@ In another terminal on the same host:
 ```bash
 cd ./rosotacom_examples
 eval "$(rosotacom setup-env ./rosotacom.yaml)"
-rosotacom start 1_heartbeat_fastdds --identity b
+rosotacom start 1_heartbeat_cyclone-ota --identity b
 ```
 
 ## Layout

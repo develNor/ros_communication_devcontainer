@@ -56,7 +56,7 @@ SESSION_CONFIG_CONTAINER_DIR = "/session/configs"
 EXTERNAL_SESSION_CONTAINER_DIR = "/session/current"
 CONTAINER_DATA_DICT_PATH = "/data_dict.json"
 RUN_SESSION_CONTAINER_PATH = "/ws/session/creation/run_session.py"
-DEFAULT_SMOKE_SESSION = "1_heartbeat_fastdds"
+DEFAULT_SMOKE_SESSION = "1_heartbeat_cyclone-ota"
 
 ws_creation_dir = WS_DIR / "session" / "creation"
 session_gen_path = ws_creation_dir / "generate_session_files.py"
@@ -842,6 +842,22 @@ def _run_container_shell(container_name: str, command: str, timeout_s: int = 30)
     )
 
 
+def _wait_for_topic_hz(container_name: str, ros_setup: str, topic: str, *, timeout_s: int = 60) -> str:
+    deadline = time.time() + timeout_s
+    last_output = ""
+    while time.time() < deadline:
+        result = _run_container_shell(
+            container_name,
+            f"{ros_setup} && timeout 8 ros2 topic hz {shlex.quote(topic)} || true",
+            timeout_s=12,
+        )
+        last_output = (result.stdout or "") + (result.stderr or "")
+        if "average rate" in last_output:
+            return last_output
+        time.sleep(2)
+    return last_output
+
+
 def _alternate_loopback_ip(local_ip: str) -> str:
     if local_ip == "127.0.0.2":
         return "127.0.0.3"
@@ -866,6 +882,92 @@ def _smoke_peer_address_args(session: ResolvedSession, local_ip: str) -> list[st
     return [f"a={local_ip}", f"b={local_ip}"]
 
 
+def _smoke_heartbeat_topic(cfg: dict[str, Any], peer_key: str) -> str:
+    peer_settings = cfg.get("peer_settings", {}) or {}
+    if isinstance(peer_settings, dict):
+        settings = peer_settings.get(peer_key, {}) or {}
+        if isinstance(settings, dict) and settings.get("heartbeat_topic"):
+            return str(settings["heartbeat_topic"])
+    peers = cfg.get("peers", {}) or {}
+    if not isinstance(peers, dict):
+        raise RuntimeError("Smoke verification requires a session config with peers.")
+    return f"/heartbeat_{_peer_com_name(peers, peer_key)}"
+
+
+def _smoke_inbound_bridge_topic(cfg: dict[str, Any], source_peer_key: str) -> str:
+    peers = cfg.get("peers", {}) or {}
+    if not isinstance(peers, dict):
+        raise RuntimeError("Smoke verification requires a session config with peers.")
+    source_name = _peer_com_name(peers, source_peer_key)
+    heartbeat_topic = _smoke_heartbeat_topic(cfg, source_peer_key).lstrip("/")
+    return f"/com/in/{source_name}/{heartbeat_topic}"
+
+
+def _smoke_rmw_spec(cfg: dict[str, Any]) -> Any:
+    peers = cfg.get("peers", {}) or {}
+    if not isinstance(peers, dict):
+        raise RuntimeError("Smoke verification requires a session config with peers.")
+    shared = cfg.get("shared", {}) or {}
+    if not isinstance(shared, dict):
+        shared = {}
+    return session_gen._parse_rmw_block(shared.get("rmw"), list(peers.keys()))
+
+
+def _smoke_rmw_env_value(cfg: dict[str, Any]) -> str | None:
+    rmw_spec = _smoke_rmw_spec(cfg)
+    local_impl = rmw_spec.local.impl
+    if local_impl is None:
+        return None
+    return session_gen.RMW_ALIASES.get(local_impl, local_impl)
+
+
+def _smoke_local_domain_id(cfg: dict[str, Any], receiver_peer_key: str) -> str | None:
+    shared = cfg.get("shared", {}) or {}
+    shared = shared if isinstance(shared, dict) else {}
+    peer_settings = cfg.get("peer_settings", {}) or {}
+    peer_settings = peer_settings if isinstance(peer_settings, dict) else {}
+    settings = peer_settings.get(receiver_peer_key, {}) or {}
+    settings = settings if isinstance(settings, dict) else {}
+    domain_id = settings.get("domain_id")
+    if domain_id is None:
+        domain_id = shared.get("local_domain_id")
+    if domain_id is None or domain_id == "":
+        return None
+    return str(session_gen._parse_optional_domain_id(domain_id, f"peer_settings.{receiver_peer_key}.domain_id"))
+
+
+def _smoke_local_config_commands(session: ResolvedSession, cfg: dict[str, Any], receiver_peer_key: str) -> list[str]:
+    local = _smoke_rmw_spec(cfg).local
+    if not local.dds_config:
+        return []
+    config_file = f"{session.container_dir}/{receiver_peer_key}/local_dds.xml"
+    if local.impl == "cyclone":
+        return [f"export CYCLONEDDS_URI={shlex.quote(f'file://{config_file}')}"]
+    if local.impl == "fastdds":
+        return [f"export FASTDDS_DEFAULT_PROFILES_FILE={shlex.quote(config_file)}"]
+    return []
+
+
+def _smoke_ros_setup(session: ResolvedSession, cfg: dict[str, Any], receiver_peer_key: str) -> str:
+    commands = [
+        'ros_distro="${ROS_DISTRO:-kilted}"',
+        'source "/opt/ros/${ros_distro}/setup.bash"',
+        "source /opt/ros_venv/bin/activate",
+        "{ [ ! -f /opt/custom_ws/install/setup.bash ] || source /opt/custom_ws/install/setup.bash; }",
+        "{ [ ! -f /ros2ws/install/setup.bash ] || source /ros2ws/install/setup.bash; }",
+    ]
+    rmw_env = _smoke_rmw_env_value(cfg)
+    if rmw_env:
+        commands.append(f"export RMW_IMPLEMENTATION={shlex.quote(rmw_env)}")
+        if rmw_env == "rmw_fastrtps_cpp":
+            commands.append("export FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}")
+    local_domain_id = _smoke_local_domain_id(cfg, receiver_peer_key)
+    if local_domain_id:
+        commands.append(f"export ROS_DOMAIN_ID={shlex.quote(local_domain_id)}")
+    commands.extend(_smoke_local_config_commands(session, cfg, receiver_peer_key))
+    return " && ".join(commands)
+
+
 def smoke(args: argparse.Namespace) -> int:
     if not args.local:
         raise RuntimeError("Only --local smoke mode is implemented.")
@@ -874,6 +976,8 @@ def smoke(args: argparse.Namespace) -> int:
     runtime = _load_runtime_config(args)
     session = _resolve_session(session_dir, runtime)
     peer_address_args = _smoke_peer_address_args(session, local_ip)
+    peer_overrides = _parse_peer_address_overrides(peer_address_args)
+    cfg = _effective_session_config(session.host_dir, runtime, peer_address_overrides=peer_overrides)
     common = {
         "rosotacom_config": args.rosotacom_config,
         "ros2docker_config": args.ros2docker_config,
@@ -902,27 +1006,18 @@ def smoke(args: argparse.Namespace) -> int:
             raise RuntimeError("Smoke verification failed: generated plugin.yaml did not use literal CLI addresses.")
         print("OK: generated plugin.yaml files use literal CLI addresses")
 
-        ros_setup = (
-            'ros_distro="${ROS_DISTRO:-kilted}" && '
-            'source "/opt/ros/${ros_distro}/setup.bash" && '
-            "source /opt/ros_venv/bin/activate && "
-            "{ [ ! -f /opt/custom_ws/install/setup.bash ] || source /opt/custom_ws/install/setup.bash; } && "
-            "{ [ ! -f /ros2ws/install/setup.bash ] || source /ros2ws/install/setup.bash; }"
-        )
         checks = [
-            (b_container, "/heartbeat_a"),
-            (a_container, "/heartbeat_b"),
+            (b_container, _smoke_inbound_bridge_topic(cfg, "a"), "a->b inbound bridge heartbeat", "b"),
+            (b_container, _smoke_heartbeat_topic(cfg, "a"), "a->b final heartbeat", "b"),
+            (a_container, _smoke_inbound_bridge_topic(cfg, "b"), "b->a inbound bridge heartbeat", "a"),
+            (a_container, _smoke_heartbeat_topic(cfg, "b"), "b->a final heartbeat", "a"),
         ]
-        for container_name, topic in checks:
-            result = _run_container_shell(
-                container_name,
-                f"{ros_setup} && timeout 12 ros2 topic hz {topic} || true",
-                timeout_s=20,
-            )
-            output = (result.stdout or "") + (result.stderr or "")
+        for container_name, topic, label, receiver_peer_key in checks:
+            ros_setup = _smoke_ros_setup(session, cfg, receiver_peer_key)
+            output = _wait_for_topic_hz(container_name, ros_setup, topic)
             if "average rate" not in output:
-                raise RuntimeError(f"Smoke verification failed for {topic} in {container_name}:\n{output}")
-            print(f"OK: {topic} is publishing in {container_name}")
+                raise RuntimeError(f"Smoke verification failed for {label} ({topic}) in {container_name}:\n{output}")
+            print(f"OK: {label} ({topic}) is publishing in {container_name}")
     finally:
         if not args.keep_running:
             runtime = _load_runtime_config(args)

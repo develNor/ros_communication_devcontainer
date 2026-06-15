@@ -40,6 +40,6 @@ def test_packaged_example_setup_paths_are_relative_to_example_root() -> None:
 def test_packaged_example_project_contains_documented_heartbeat_session() -> None:
     readme = (PACKAGE_ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "`1_heartbeat`" in readme
-    assert (cli.EXAMPLE_PROJECT_DIR / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
+    assert "`1_heartbeat_fastdds`" in readme
+    assert (cli.EXAMPLE_PROJECT_DIR / "sessions" / "1_heartbeat_fastdds" / "session-definition.yaml").is_file()
     assert (cli.EXAMPLE_PROJECT_DIR / "scripts" / "1_heartbeat" / "run_machine_a.sh").is_file()

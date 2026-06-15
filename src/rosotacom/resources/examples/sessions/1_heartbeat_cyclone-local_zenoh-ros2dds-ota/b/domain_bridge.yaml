@@ -1,0 +1,10 @@
+name: b_com_domain_bridge
+topics:
+  /com/in/a/heartbeat_a:
+    from_domain: 48
+    to_domain: 47
+    type: com_msgs/msg/Heartbeat
+  /com/out/b/heartbeat_b:
+    from_domain: 47
+    to_domain: 48
+    type: com_msgs/msg/Heartbeat

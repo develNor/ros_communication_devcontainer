@@ -91,10 +91,10 @@ Run `rosotacom` on each peer with the same active setup but a different identity
 
 ```bash
 # on peer "a"
-rosotacom start 1_heartbeat --identity a
+rosotacom start 1_heartbeat_fastdds --identity a
 
 # on peer "b"
-rosotacom start 1_heartbeat --identity b
+rosotacom start 1_heartbeat_fastdds --identity b
 ```
 
 `rosotacom` reads the session input and creates generated files in that session directory, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`.
@@ -132,7 +132,12 @@ cd scripts/2_native_chatter/machine_a
 
 The `sessions/` directory contains the built-in session definitions:
 
-- `1_heartbeat`: minimal heartbeat exchange
+- `1_heartbeat_fastdds`: minimal heartbeat exchange over FastDDS
+- `1_heartbeat_cyclone-ota`: heartbeat with CycloneDDS OTA config
+- `1_heartbeat_zen-endpoints`: heartbeat with native Zenoh connected endpoints
+- `1_heartbeat_fastdds-local_cyclone-ota`: local FastDDS with CycloneDDS OTA config
+- `1_heartbeat_cyclone-local_fastdds-ota`: local CycloneDDS with FastDDS OTA
+- `1_heartbeat_cyclone-local_zenoh-ros2dds-ota`: local CycloneDDS with Zenoh-ROS2DDS OTA
 - `2_native_chatter`: bridge `/chatter` from `machine_b` to `machine_a`
 - `3_comp_occ_grid`: compressed occupancy grid over DDS
 - `4_comp_occ_grid_zen`: compressed occupancy grid through Zenoh

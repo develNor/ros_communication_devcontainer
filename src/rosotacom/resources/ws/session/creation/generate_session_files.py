@@ -755,6 +755,16 @@ def _render_session_dir(param_dir: str) -> str:
       session directory works when mounted into the container.
     """
     d = os.path.abspath(param_dir)
+
+    session_configs_root = os.environ.get("SESSION_CONFIGS_DIR")
+    if session_configs_root:
+        root = os.path.abspath(session_configs_root)
+        rel = os.path.relpath(d, root)
+        if rel == ".":
+            return "/session/configs"
+        if not rel.startswith(f"..{os.sep}") and rel != "..":
+            return f"/session/configs/{rel}"
+
     session_root = None
     cur = d
     while True:

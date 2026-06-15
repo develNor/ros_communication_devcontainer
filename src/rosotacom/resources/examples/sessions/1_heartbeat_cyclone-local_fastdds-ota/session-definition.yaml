@@ -1,0 +1,12 @@
+peers:
+  a:
+    address: "data:machine_a_ip"
+  b:
+    address: "data:machine_b_ip"
+
+shared:
+  use_heartbeat: true
+  rmw:
+    local: cyclone
+    ota: fastdds
+  ota_domain_id: 48

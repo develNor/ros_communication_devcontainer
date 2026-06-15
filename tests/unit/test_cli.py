@@ -85,7 +85,7 @@ def test_examples_create_copies_project_and_refuses_overwrite(
     assert (target / "rosotacom.yaml").is_file()
     assert (target / "ros2docker.json").is_file()
     assert (target / "data_dict.json").is_file()
-    assert (target / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
+    assert (target / "sessions" / "1_heartbeat_fastdds" / "session-definition.yaml").is_file()
     assert not (target / "__init__.py").exists()
     assert "Copied rosotacom examples" in capsys.readouterr().out
 
@@ -448,3 +448,28 @@ def test_stop_list_doctor_and_smoke_host_flows(
         == 0
     )
     assert stopped[-2:] == ["container_a", "container_b"]
+
+
+def test_native_zenoh_smoke_uses_distinct_loopback_addresses(tmp_path: Path) -> None:
+    session_dir = tmp_path / "sessions" / "1_heartbeat_zen-endpoints"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "peers:",
+                "  a:",
+                "    address: data:machine_a_ip",
+                "  b:",
+                "    address: data:machine_b_ip",
+                "shared:",
+                "  rmw:",
+                "    local: zenoh",
+                "    ota: zenoh_connect_endpoints",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    session = rosotacom.ResolvedSession(session_dir, "/session/configs/1_heartbeat_zen-endpoints", "session_configs")
+
+    assert rosotacom._smoke_peer_address_args(session, "127.0.0.1") == ["a=127.0.0.1", "b=127.0.0.2"]

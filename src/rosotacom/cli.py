@@ -56,6 +56,7 @@ SESSION_CONFIG_CONTAINER_DIR = "/session/configs"
 EXTERNAL_SESSION_CONTAINER_DIR = "/session/current"
 CONTAINER_DATA_DICT_PATH = "/data_dict.json"
 RUN_SESSION_CONTAINER_PATH = "/ws/session/creation/run_session.py"
+DEFAULT_SMOKE_SESSION = "1_heartbeat_fastdds"
 
 ws_creation_dir = WS_DIR / "session" / "creation"
 session_gen_path = ws_creation_dir / "generate_session_files.py"
@@ -841,11 +842,38 @@ def _run_container_shell(container_name: str, command: str, timeout_s: int = 30)
     )
 
 
+def _alternate_loopback_ip(local_ip: str) -> str:
+    if local_ip == "127.0.0.2":
+        return "127.0.0.3"
+    return "127.0.0.2"
+
+
+def _smoke_needs_distinct_peer_addresses(session: ResolvedSession) -> bool:
+    cfg = _load_session_config_from_host(session.host_dir)
+    peers = cfg.get("peers")
+    if not isinstance(peers, dict):
+        return False
+    shared = cfg.get("shared", {}) or {}
+    if not isinstance(shared, dict):
+        return False
+    rmw_spec = session_gen._parse_rmw_block(shared.get("rmw"), list(peers.keys()))
+    return bool(session_gen._is_native_zenoh_ota(rmw_spec.ota.impl))
+
+
+def _smoke_peer_address_args(session: ResolvedSession, local_ip: str) -> list[str]:
+    if _smoke_needs_distinct_peer_addresses(session):
+        return [f"a={local_ip}", f"b={_alternate_loopback_ip(local_ip)}"]
+    return [f"a={local_ip}", f"b={local_ip}"]
+
+
 def smoke(args: argparse.Namespace) -> int:
     if not args.local:
         raise RuntimeError("Only --local smoke mode is implemented.")
     local_ip = args.local_ip or _default_local_ip()
-    session_dir = args.session_dir or "1_heartbeat"
+    session_dir = args.session_dir or DEFAULT_SMOKE_SESSION
+    runtime = _load_runtime_config(args)
+    session = _resolve_session(session_dir, runtime)
+    peer_address_args = _smoke_peer_address_args(session, local_ip)
     common = {
         "rosotacom_config": args.rosotacom_config,
         "ros2docker_config": args.ros2docker_config,
@@ -856,30 +884,30 @@ def smoke(args: argparse.Namespace) -> int:
         "force": True,
         "rewrite_formatting": False,
         "overwrite_peers_via_remote_peer": None,
-        "peer_address": [f"a={local_ip}", f"b={local_ip}"],
+        "peer_address": peer_address_args,
     }
 
-    print(f"Starting local smoke test with LOCAL_IP={local_ip}")
+    print(f"Starting local smoke test with PEER_ADDRESSES={', '.join(peer_address_args)}")
     a_container = None
     b_container = None
     try:
         a_container = start_session(argparse.Namespace(**common, identity="a", auto_identity=True))
         b_container = start_session(argparse.Namespace(**common, identity="b", auto_identity=True))
 
-        runtime = _load_runtime_config(args)
-        session = _resolve_session(session_dir, runtime)
         plugin_text = "\n".join(
             (session.host_dir / peer / "plugin.yaml").read_text(encoding="utf-8") for peer in ("a", "b")
         )
-        if local_ip not in plugin_text or "data:" in plugin_text:
+        expected_addresses = {arg.split("=", 1)[1] for arg in peer_address_args}
+        if any(address not in plugin_text for address in expected_addresses) or "data:" in plugin_text:
             raise RuntimeError("Smoke verification failed: generated plugin.yaml did not use literal CLI addresses.")
         print("OK: generated plugin.yaml files use literal CLI addresses")
 
         ros_setup = (
-            "source /opt/ros/lyrical/setup.bash && "
+            'ros_distro="${ROS_DISTRO:-kilted}" && '
+            'source "/opt/ros/${ros_distro}/setup.bash" && '
             "source /opt/ros_venv/bin/activate && "
-            "source /opt/custom_ws/install/setup.bash && "
-            "source /ros2ws/install/setup.bash"
+            "{ [ ! -f /opt/custom_ws/install/setup.bash ] || source /opt/custom_ws/install/setup.bash; } && "
+            "{ [ ! -f /ros2ws/install/setup.bash ] || source /ros2ws/install/setup.bash; }"
         )
         checks = [
             (b_container, "/heartbeat_a"),
@@ -985,7 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
 
     smoke_parser = subparsers.add_parser("smoke", help="Run a local smoke test.")
     _add_common_config_args(smoke_parser)
-    smoke_parser.add_argument("session_dir", nargs="?", default="1_heartbeat")
+    smoke_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     smoke_parser.add_argument("--local", action="store_true", default=True)
     smoke_parser.add_argument("--local-ip")
     smoke_parser.add_argument("--keep-running", action="store_true", help="Leave smoke-test containers running.")

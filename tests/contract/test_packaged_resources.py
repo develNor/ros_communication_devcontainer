@@ -18,7 +18,7 @@ def test_packaged_resources_include_cli_marker_examples_and_runtime_workspace() 
         "resources/examples/rosotacom.yaml",
         "resources/examples/ros2docker.json",
         "resources/examples/data_dict.json",
-        "resources/examples/sessions/1_heartbeat/session-definition.yaml",
+        "resources/examples/sessions/1_heartbeat_fastdds/session-definition.yaml",
         "resources/ws/session/creation/run_session.py",
         "resources/ws/session/content/address_resolution.py",
         "resources/ws/ota_configs/cyclonedds_tuned.xml.template",

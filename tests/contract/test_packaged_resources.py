@@ -16,10 +16,13 @@ def test_packaged_resources_include_cli_marker_examples_and_runtime_workspace() 
         "py.typed",
         "resources/ros2docker.json.example",
         "resources/examples/rosotacom.yaml",
+        "resources/examples/.gitignore",
         "resources/examples/ros2docker.json",
         "resources/examples/data_dict.json",
         "resources/examples/sessions/1_heartbeat_fastdds/session-definition.yaml",
         "resources/ws/session/creation/run_session.py",
+        "resources/ws/session/creation/catmux_log_setup.sh",
+        "resources/ws/session/creation/strip_ansi.py",
         "resources/ws/session/content/address_resolution.py",
         "resources/ws/ota_configs/cyclonedds_tuned.xml.template",
         "resources/ws/ros2src/com_msgs/msg/Heartbeat.msg",
@@ -41,3 +44,9 @@ def test_shell_entrypoints_pass_syntax_check() -> None:
     assert scripts
     for script in scripts:
         subprocess.run(["bash", "-n", str(script)], check=True)
+
+    subprocess.run(["bash", "-n", str(cli.WS_DIR / "session" / "creation" / "catmux_log_setup.sh")], check=True)
+    subprocess.run(
+        ["python3", "-m", "py_compile", str(cli.WS_DIR / "session" / "creation" / "strip_ansi.py")],
+        check=True,
+    )

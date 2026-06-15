@@ -25,7 +25,8 @@ rosotacom start 1_heartbeat_cyclone-ota --identity b
 - `rosotacom.yaml`: project-local rosotacom setup
 - `ros2docker.json`: Docker runtime defaults used by the communication containers
 - `data_dict.json`: example machine address data used by `data:<key>` session entries
-- `sessions/`: session definitions
+- `sessions/`: tracked static session definitions/templates
+- `session-instances/`: ignored generated runtime configs, catmux logs, smoke logs, and rosbags
 - `scripts/`: convenience wrappers and external-node launchers
 
 `data_dict.json` intentionally uses `127.0.0.1` for both peers so the examples

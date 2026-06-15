@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 import rosotacom.cli as rosotacom
 
@@ -16,6 +17,7 @@ def clear_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "ROSOTACOM_CONFIG",
         "ROSOTACOM_ROS2DOCKER_CONFIG",
         "ROSOTACOM_SESSION_CONFIGS_DIR",
+        "ROSOTACOM_SESSION_INSTANCES_DIR",
         "ROSOTACOM_DATA_DICT",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -29,6 +31,7 @@ def test_no_rosotacom_yaml_auto_discovery(tmp_path: Path, monkeypatch: pytest.Mo
 
     assert runtime.rosotacom_config is None
     assert runtime.ros2docker_config == rosotacom.DEFAULT_ROS2DOCKER_CONFIG.resolve()
+    assert runtime.session_instances_dir == tmp_path / "session-instances"
 
 
 def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -> None:
@@ -41,6 +44,7 @@ def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -
             [
                 "ros2docker_config: ros2docker.json",
                 "session_configs_dir: sessions",
+                "session_instances_dir: session-instances",
                 "data_dict: data_dict.json",
                 "",
             ]
@@ -53,6 +57,7 @@ def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -
     assert runtime.rosotacom_config == config
     assert runtime.ros2docker_config == tmp_path / "ros2docker.json"
     assert runtime.session_configs_dir == tmp_path / "sessions"
+    assert runtime.session_instances_dir == tmp_path / "session-instances"
     assert runtime.data_dict == tmp_path / "data_dict.json"
 
 
@@ -71,6 +76,7 @@ def test_environment_config_is_used_when_no_config_arg(tmp_path: Path, monkeypat
     assert runtime.rosotacom_config == config
     assert runtime.ros2docker_config == tmp_path / "ros2docker.json"
     assert runtime.session_configs_dir == tmp_path / "sessions"
+    assert runtime.session_instances_dir == tmp_path / "session-instances"
 
 
 def test_examples_create_copies_project_and_refuses_overwrite(
@@ -85,6 +91,7 @@ def test_examples_create_copies_project_and_refuses_overwrite(
     assert (target / "rosotacom.yaml").is_file()
     assert (target / "ros2docker.json").is_file()
     assert (target / "data_dict.json").is_file()
+    assert "session-instances/" in (target / ".gitignore").read_text(encoding="utf-8")
     assert (target / "sessions" / "1_heartbeat_fastdds" / "session-definition.yaml").is_file()
     assert not (target / "__init__.py").exists()
     assert "Copied rosotacom examples" in capsys.readouterr().out
@@ -121,7 +128,7 @@ def test_session_name_resolves_through_configured_sessions_dir(tmp_path: Path) -
     resolved = rosotacom._resolve_session("1_heartbeat", runtime)
 
     assert resolved.host_dir == session.resolve()
-    assert resolved.container_dir == "/session/configs/1_heartbeat"
+    assert resolved.container_dir == "/session/definitions/1_heartbeat"
     assert resolved.source == "session_configs"
 
 
@@ -246,8 +253,20 @@ def test_peer_override_identity_and_command_helpers(tmp_path: Path, monkeypatch:
     assert rosotacom._identity_container_names(overridden, runtime, "a") == ["rosotacom_abc_com_to_remote_unit"]
 
     session = rosotacom.ResolvedSession(tmp_path, "/session/current", "absolute")
+    instance = rosotacom.SessionInstance(
+        instance_id="run1",
+        host_dir=tmp_path / "instances" / "2026-01-01" / "1_heartbeat_run1",
+        container_dir="/session/instances/2026-01-01/1_heartbeat_run1",
+        config_host_dir=tmp_path / "instances" / "2026-01-01" / "1_heartbeat_run1" / "config",
+        config_container_dir="/session/instances/2026-01-01/1_heartbeat_run1/config",
+        logs_host_dir=tmp_path / "instances" / "2026-01-01" / "1_heartbeat_run1" / "logs",
+        logs_container_dir="/session/instances/2026-01-01/1_heartbeat_run1/logs",
+        rosbags_host_dir=tmp_path / "instances" / "2026-01-01" / "1_heartbeat_run1" / "rosbags",
+        rosbags_container_dir="/session/instances/2026-01-01/1_heartbeat_run1/rosbags",
+    )
     assert rosotacom._session_command(
         session,
+        instance,
         "a",
         force=True,
         rewrite_formatting=True,
@@ -258,6 +277,14 @@ def test_peer_override_identity_and_command_helpers(tmp_path: Path, monkeypatch:
         "/ws/session/creation/run_session.py",
         "--session-dir",
         "/session/current",
+        "--output-dir",
+        "/session/instances/2026-01-01/1_heartbeat_run1/config",
+        "--instance-dir",
+        "/session/instances/2026-01-01/1_heartbeat_run1",
+        "--catmux-log-dir",
+        "/session/instances/2026-01-01/1_heartbeat_run1/logs/a/catmux",
+        "--rosbag-dir",
+        "/session/instances/2026-01-01/1_heartbeat_run1/rosbags/a",
         "--identity",
         "a",
         "--force",
@@ -285,15 +312,23 @@ def test_resolve_session_and_base_extra_run_args(tmp_path: Path, monkeypatch: py
         session_configs_dir=tmp_path / "sessions",
         data_dict=data_dict,
         install_id="id",
+        session_instances_dir=tmp_path / "session-instances",
     )
 
     resolved = rosotacom._resolve_session("1_heartbeat", runtime)
-    monkeypatch.setattr(rosotacom, "load_config", lambda config: {"mount_ws": False})
-    args = rosotacom._base_extra_run_args(runtime, resolved, {"peers": {"a": {"address": "data:machine_a_ip"}}})
+    instance = rosotacom._resolve_session_instance(runtime, resolved, "test-run")
+    monkeypatch.setattr(rosotacom, "load_config", lambda config: {"mount_ws": False}, raising=False)
+    args = rosotacom._base_extra_run_args(
+        runtime,
+        resolved,
+        {"peers": {"a": {"address": "data:machine_a_ip"}}},
+        instance,
+    )
 
-    assert resolved.container_dir == "/session/configs/1_heartbeat"
+    assert resolved.container_dir == "/session/definitions/1_heartbeat"
     assert f"{rosotacom.WS_DIR.resolve()}:/ws" in args
-    assert f"{runtime.session_configs_dir}:/session/configs" in args
+    assert f"{runtime.session_configs_dir}:/session/definitions:ro" in args
+    assert f"{runtime.session_instances_dir}:/session/instances" in args
     assert f"{data_dict}:/data_dict.json:ro" in args
     assert "Configured sessions:" in rosotacom._format_available_sessions(runtime)
 
@@ -307,7 +342,7 @@ def test_container_helpers_use_docker_and_ros2docker_stop(tmp_path: Path, monkey
     assert not rosotacom._stop_container_name("missing", runtime, quiet_missing=True)
 
     monkeypatch.setattr(rosotacom, "_container_exists", lambda name: True)
-    monkeypatch.setattr(rosotacom, "ros2docker_stop", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(rosotacom, "ros2docker_stop", lambda **kwargs: calls.append(kwargs), raising=False)
     assert rosotacom._stop_container_name("running", runtime)
     assert calls == [{"config_file": runtime.ros2docker_config, "override": {"container_name": "running"}}]
 
@@ -323,22 +358,28 @@ def test_container_helpers_use_docker_and_ros2docker_stop(tmp_path: Path, monkey
 
 
 def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", None, None, "id")
+    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", None, None, "id", tmp_path / "instances")
     session = rosotacom.ResolvedSession(tmp_path, "/session/current", "absolute")
     cfg = {"peers": {"a": {}, "b": {"com-name": "remote"}}}
     calls: list[tuple[str, dict[str, object]]] = []
 
+    monkeypatch.setattr(rosotacom, "_require_ros2docker", lambda: None)
     monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
     monkeypatch.setattr(rosotacom, "_resolve_session", lambda session_dir, runtime: session)
     monkeypatch.setattr(rosotacom, "_effective_session_config", lambda *args, **kwargs: cfg)
     monkeypatch.setattr(rosotacom, "_scoped_image_name", lambda runtime: "image:id")
-    monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg: ["--network", "host"])
+    monkeypatch.setattr(
+        rosotacom,
+        "_base_extra_run_args",
+        lambda runtime, session, cfg, instance: ["--network", "host"],
+    )
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "detached")
     monkeypatch.setattr(rosotacom, "_stop_container_name", lambda *args, **kwargs: True)
     monkeypatch.setattr(rosotacom, "_wait_for_container_ready", lambda name: None)
-    monkeypatch.setattr(rosotacom, "ros2docker_build", lambda **kwargs: calls.append(("build", kwargs)))
-    monkeypatch.setattr(rosotacom, "ros2docker_run", lambda **kwargs: calls.append(("run", kwargs)))
-    monkeypatch.setattr(rosotacom, "ros2docker_exec", lambda **kwargs: calls.append(("exec", kwargs)))
+    monkeypatch.setattr(rosotacom, "_write_docker_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rosotacom, "ros2docker_build", lambda **kwargs: calls.append(("build", kwargs)), raising=False)
+    monkeypatch.setattr(rosotacom, "ros2docker_run", lambda **kwargs: calls.append(("run", kwargs)), raising=False)
+    monkeypatch.setattr(rosotacom, "ros2docker_exec", lambda **kwargs: calls.append(("exec", kwargs)), raising=False)
 
     container = rosotacom.start_session(
         argparse.Namespace(
@@ -350,6 +391,7 @@ def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.Monkey
             mode="detached",
             force=True,
             rewrite_formatting=False,
+            instance_id="unit",
         )
     )
 
@@ -357,24 +399,27 @@ def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.Monkey
     assert [name for name, _ in calls] == ["build", "run", "exec"]
     assert calls[1][1]["override"]["run_type"] == "up"
     assert calls[2][1]["interactive"] is False
+    assert "--output-dir" in calls[2][1]["command"]
 
 
 def test_start_session_attach_dispatches_command_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", None, None, "id")
+    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", None, None, "id", tmp_path / "instances")
     session = rosotacom.ResolvedSession(tmp_path, "/session/current", "absolute")
     cfg = {"peers": {"a": {}, "b": {}}}
     calls: list[tuple[str, dict[str, object]]] = []
 
+    monkeypatch.setattr(rosotacom, "_require_ros2docker", lambda: None)
     monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
     monkeypatch.setattr(rosotacom, "_resolve_session", lambda session_dir, runtime: session)
     monkeypatch.setattr(rosotacom, "_effective_session_config", lambda *args, **kwargs: cfg)
     monkeypatch.setattr(rosotacom, "_auto_identity", lambda *args: "a")
     monkeypatch.setattr(rosotacom, "_scoped_image_name", lambda runtime: "image:id")
-    monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg: [])
+    monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg, instance: [])
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "attach")
     monkeypatch.setattr(rosotacom, "_stop_container_name", lambda *args, **kwargs: True)
-    monkeypatch.setattr(rosotacom, "ros2docker_build", lambda **kwargs: calls.append(("build", kwargs)))
-    monkeypatch.setattr(rosotacom, "ros2docker_run", lambda **kwargs: calls.append(("run", kwargs)))
+    monkeypatch.setattr(rosotacom, "_write_docker_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rosotacom, "ros2docker_build", lambda **kwargs: calls.append(("build", kwargs)), raising=False)
+    monkeypatch.setattr(rosotacom, "ros2docker_run", lambda **kwargs: calls.append(("run", kwargs)), raising=False)
 
     rosotacom.start_session(
         argparse.Namespace(
@@ -386,6 +431,7 @@ def test_start_session_attach_dispatches_command_run(monkeypatch: pytest.MonkeyP
             mode="attach",
             force=True,
             rewrite_formatting=False,
+            instance_id="unit",
         )
     )
 
@@ -405,17 +451,43 @@ def test_stop_list_doctor_and_smoke_host_flows(
     (session_dir / "session-definition.yaml").write_text("peers: {}\n", encoding="utf-8")
     (session_dir / "a" / "plugin.yaml").write_text("127.0.0.1\n", encoding="utf-8")
     (session_dir / "b" / "plugin.yaml").write_text("127.0.0.1\n", encoding="utf-8")
-    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", tmp_path / "sessions", None, "id")
-    session = rosotacom.ResolvedSession(session_dir, "/session/configs/1_heartbeat", "session_configs")
+    runtime = rosotacom.RuntimeConfig(
+        None,
+        tmp_path / "ros2docker.json",
+        tmp_path / "sessions",
+        None,
+        "id",
+        tmp_path / "session-instances",
+    )
+    session = rosotacom.ResolvedSession(session_dir, "/session/definitions/1_heartbeat", "session_configs")
+    instance = rosotacom.SessionInstance(
+        instance_id="smoke",
+        host_dir=tmp_path / "session-instances" / "2026-01-01" / "1_heartbeat_smoke",
+        container_dir="/session/instances/2026-01-01/1_heartbeat_smoke",
+        config_host_dir=tmp_path / "session-instances" / "2026-01-01" / "1_heartbeat_smoke" / "config",
+        config_container_dir="/session/instances/2026-01-01/1_heartbeat_smoke/config",
+        logs_host_dir=tmp_path / "session-instances" / "2026-01-01" / "1_heartbeat_smoke" / "logs",
+        logs_container_dir="/session/instances/2026-01-01/1_heartbeat_smoke/logs",
+        rosbags_host_dir=tmp_path / "session-instances" / "2026-01-01" / "1_heartbeat_smoke" / "rosbags",
+        rosbags_container_dir="/session/instances/2026-01-01/1_heartbeat_smoke/rosbags",
+    )
+    (instance.config_host_dir / "a").mkdir(parents=True)
+    (instance.config_host_dir / "b").mkdir()
+    (instance.config_host_dir / "a" / "plugin.yaml").write_text("127.0.0.1\n", encoding="utf-8")
+    (instance.config_host_dir / "b" / "plugin.yaml").write_text("127.0.0.1\n", encoding="utf-8")
     cfg = {"peers": {"a": {}, "b": {}}}
     stopped: list[str] = []
 
     monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
     monkeypatch.setattr(rosotacom, "_resolve_session", lambda session_dir, runtime: session)
+    monkeypatch.setattr(rosotacom, "_resolve_session_instance", lambda runtime, session, instance_id=None: instance)
     monkeypatch.setattr(rosotacom, "_effective_session_config", lambda *args, **kwargs: cfg)
     monkeypatch.setattr(rosotacom, "_identity_container_names", lambda cfg, runtime, identity=None: ["c1", "c2"])
     monkeypatch.setattr(rosotacom, "_stop_container_name", lambda name, runtime, **kwargs: stopped.append(name) or True)
-    monkeypatch.setattr(rosotacom, "load_config", lambda config: {"mount_ws": True})
+    monkeypatch.setattr(rosotacom, "_ROS2DOCKER_IMPORT_ERROR", None)
+    fake_ros2docker = type("FakeRos2Docker", (), {"__version__": "test", "__file__": __file__})
+    monkeypatch.setattr(rosotacom, "ros2docker", fake_ros2docker)
+    monkeypatch.setattr(rosotacom, "load_config", lambda config: {"mount_ws": True}, raising=False)
     monkeypatch.setattr(rosotacom, "_scoped_image_name", lambda runtime: "image:id")
 
     rosotacom.stop_session(argparse.Namespace(session_dir="1_heartbeat", identity=None, auto_identity=False))
@@ -441,7 +513,9 @@ def test_stop_list_doctor_and_smoke_host_flows(
                 rosotacom_config=None,
                 ros2docker_config=None,
                 session_configs_dir=None,
+                session_instances_dir=None,
                 data_dict=None,
+                instance_id="smoke",
                 keep_running=False,
             )
         )
@@ -470,6 +544,84 @@ def test_native_zenoh_smoke_uses_distinct_loopback_addresses(tmp_path: Path) -> 
         ),
         encoding="utf-8",
     )
-    session = rosotacom.ResolvedSession(session_dir, "/session/configs/1_heartbeat_zen-endpoints", "session_configs")
+    session = rosotacom.ResolvedSession(
+        session_dir,
+        "/session/definitions/1_heartbeat_zen-endpoints",
+        "session_configs",
+    )
 
     assert rosotacom._smoke_peer_address_args(session, "127.0.0.1") == ["a=127.0.0.1", "b=127.0.0.2"]
+
+
+def test_run_session_generates_into_instance_config_without_touching_static_source(tmp_path: Path) -> None:
+    from session.creation import run_session
+
+    source = tmp_path / "sessions" / "1_heartbeat"
+    output = tmp_path / "session-instances" / "2026-01-01" / "1_heartbeat_run" / "config"
+    source.mkdir(parents=True)
+    (source / "session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "peers:",
+                "  a:",
+                "    address: 127.0.0.1",
+                "  b:",
+                "    address: 127.0.0.1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    peer_dir = run_session._resolve_peer_dir(
+        str(source),
+        str(output),
+        "a",
+        force=True,
+        rewrite_formatting=False,
+    )
+
+    assert Path(peer_dir) == output / "a"
+    assert (output / "session-definition.yaml").is_file()
+    assert (output / "a" / "plugin.yaml").is_file()
+    assert not (source / "a").exists()
+
+
+def test_create_session_yaml_injects_catmux_logging_command(tmp_path: Path) -> None:
+    from session.creation import create_session_yaml
+
+    peer_dir = tmp_path / "config" / "a"
+    peer_dir.mkdir(parents=True)
+    (peer_dir / "plugin.yaml").write_text(
+        "\n".join(
+            [
+                "parameters:",
+                "  example: true",
+                "common:",
+                "  before_commands:",
+                "    - echo existing",
+                "windows:",
+                "  - name: TEST",
+                "    splits:",
+                "      - commands:",
+                "        - echo run",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (peer_dir / "session_specification.yaml").write_text("session_plugins:\n  - ./plugin.yaml\n", encoding="utf-8")
+
+    create_session_yaml.main(
+        str(peer_dir),
+        instance_dir="/session/instances/run",
+        config_dir="/session/instances/run/config",
+        catmux_log_dir="/session/instances/run/logs/a/catmux",
+        rosbag_dir="/session/instances/run/rosbags/a",
+    )
+
+    merged = yaml.safe_load((peer_dir / ".session_readonly.yaml").read_text(encoding="utf-8"))
+    before_commands = merged["common"]["before_commands"]
+    assert "catmux_log_setup.sh" in before_commands[0]
+    assert "ROSOTACOM_CATMUX_LOG_DIR=/session/instances/run/logs/a/catmux" in before_commands[0]
+    assert before_commands[1] == "echo existing"

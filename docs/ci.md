@@ -40,7 +40,10 @@ Docker E2E is not collected for coverage.
 
 `just test-e2e-smoke` runs the local heartbeat smoke matrix through Docker. It
 is a required merge-gate job because `rosotacom` exists to orchestrate
-Docker-backed ROS communication sessions.
+Docker-backed ROS communication sessions. Each smoke run writes generated
+config, catmux pane logs, Docker logs when available, and the smoke verification
+log under `session-instances/`; collect that directory as the first debugging
+artifact when an E2E job fails.
 
 ## Nightly And Maintenance
 

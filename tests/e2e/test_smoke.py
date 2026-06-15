@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -102,3 +103,10 @@ def test_local_heartbeat_smoke_matrix_from_copied_example_project(
 
     for expected in EXPECTED_HEARTBEAT_CHECKS:
         assert expected in result.stdout
+
+    artifact_matches = re.findall(r"Smoke artifacts: (.+)", result.stdout)
+    assert artifact_matches
+    artifact_dir = Path(artifact_matches[-1].strip())
+    assert (artifact_dir / "config" / "a" / "plugin.yaml").is_file()
+    assert (artifact_dir / "config" / "b" / "plugin.yaml").is_file()
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -53,6 +54,8 @@ WS_DIR = RESOURCE_DIR / "ws"
 DEFAULT_ROS2DOCKER_CONFIG = RESOURCE_DIR / "ros2docker.json.example"
 EXAMPLE_PROJECT_DIR = RESOURCE_DIR / "examples"
 SESSION_CONFIG_CONTAINER_DIR = "/session/configs"
+SESSION_DEFINITION_CONTAINER_DIR = "/session/definitions"
+SESSION_INSTANCE_CONTAINER_DIR = "/session/instances"
 EXTERNAL_SESSION_CONTAINER_DIR = "/session/current"
 CONTAINER_DATA_DICT_PATH = "/data_dict.json"
 RUN_SESSION_CONTAINER_PATH = "/ws/session/creation/run_session.py"
@@ -86,6 +89,7 @@ class RuntimeConfig:
     session_configs_dir: Path | None
     data_dict: Path | None
     install_id: str
+    session_instances_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,19 @@ class ResolvedSession:
     host_dir: Path
     container_dir: str
     source: str
+
+
+@dataclass(frozen=True)
+class SessionInstance:
+    instance_id: str
+    host_dir: Path
+    container_dir: str
+    config_host_dir: Path
+    config_container_dir: str
+    logs_host_dir: Path
+    logs_container_dir: str
+    rosbags_host_dir: Path
+    rosbags_container_dir: str
 
 
 def _load_yaml_file(path: Path | None) -> dict[str, Any]:
@@ -154,6 +171,12 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         os.environ.get("ROSOTACOM_SESSION_CONFIGS_DIR"),
         cfg.get("session_configs_dir"),
     )
+    session_instances_dir_raw = _first_value(
+        getattr(args, "session_instances_dir", None),
+        os.environ.get("ROSOTACOM_SESSION_INSTANCES_DIR"),
+        cfg.get("session_instances_dir"),
+        "session-instances",
+    )
     data_dict_raw = _first_value(
         getattr(args, "data_dict", None),
         os.environ.get("ROSOTACOM_DATA_DICT"),
@@ -170,6 +193,7 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         session_configs_dir=_resolve_path(session_configs_dir_raw, config_base, must_exist=True),
         data_dict=_resolve_path(data_dict_raw, config_base, must_exist=True),
         install_id=_install_id(rosotacom_config),
+        session_instances_dir=_resolve_path(session_instances_dir_raw, config_base, must_exist=False),
     )
 
 
@@ -201,6 +225,167 @@ def _scoped_image_name(runtime: RuntimeConfig) -> str:
 
 def _container_name(remote_peer_name: str, runtime: RuntimeConfig) -> str:
     return _sanitize_docker_name(f"rosotacom_{runtime.install_id}_com_to_{remote_peer_name}")
+
+
+def _safe_path_token(value: str) -> str:
+    token = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value.strip())
+    token = token.strip("._-")
+    return token or "run"
+
+
+def _new_instance_id() -> str:
+    seed = f"{time.time_ns()}:{os.getpid()}:{Path.cwd()}"
+    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
+
+
+def _session_instances_root(runtime: RuntimeConfig) -> Path:
+    return (runtime.session_instances_dir or (Path.cwd() / "session-instances")).resolve()
+
+
+def _session_instance_slug(session: ResolvedSession, runtime: RuntimeConfig) -> str:
+    if runtime.session_configs_dir:
+        rel = _relative_to(session.host_dir, runtime.session_configs_dir)
+        if rel is not None:
+            return _safe_path_token(rel.as_posix().replace("/", "_"))
+    return _safe_path_token(session.host_dir.name)
+
+
+def _resolve_session_instance(
+    runtime: RuntimeConfig,
+    session: ResolvedSession,
+    instance_id: str | None = None,
+) -> SessionInstance:
+    root = _session_instances_root(runtime)
+    root.mkdir(parents=True, exist_ok=True)
+    session_slug = _session_instance_slug(session, runtime)
+    resolved_instance_id = _safe_path_token(instance_id or _new_instance_id())
+
+    if instance_id:
+        matches = sorted(root.glob(f"*/{session_slug}_*_{resolved_instance_id}"))
+        if matches:
+            host_dir = matches[-1].resolve()
+        else:
+            now = datetime.now()
+            host_dir = (
+                root
+                / now.strftime("%Y-%m-%d")
+                / (f"{session_slug}_{now.strftime('%Y-%m-%d_%H-%M-%S')}_{resolved_instance_id}")
+            )
+    else:
+        now = datetime.now()
+        host_dir = (
+            root
+            / now.strftime("%Y-%m-%d")
+            / (f"{session_slug}_{now.strftime('%Y-%m-%d_%H-%M-%S')}_{resolved_instance_id}")
+        )
+
+    host_dir.mkdir(parents=True, exist_ok=True)
+    config_host_dir = host_dir / "config"
+    logs_host_dir = host_dir / "logs"
+    rosbags_host_dir = host_dir / "rosbags"
+    for path in (config_host_dir, logs_host_dir, rosbags_host_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    rel = host_dir.resolve().relative_to(root.resolve())
+    container_dir = f"{SESSION_INSTANCE_CONTAINER_DIR}/{rel.as_posix()}"
+    return SessionInstance(
+        instance_id=resolved_instance_id,
+        host_dir=host_dir,
+        container_dir=container_dir,
+        config_host_dir=config_host_dir,
+        config_container_dir=f"{container_dir}/config",
+        logs_host_dir=logs_host_dir,
+        logs_container_dir=f"{container_dir}/logs",
+        rosbags_host_dir=rosbags_host_dir,
+        rosbags_container_dir=f"{container_dir}/rosbags",
+    )
+
+
+def _peer_catmux_log_container_dir(instance: SessionInstance, identity: str) -> str:
+    return f"{instance.logs_container_dir}/{_safe_path_token(identity)}/catmux"
+
+
+def _peer_rosbag_container_dir(instance: SessionInstance, identity: str) -> str:
+    return f"{instance.rosbags_container_dir}/{_safe_path_token(identity)}"
+
+
+def _peer_launcher_log(instance: SessionInstance, identity: str) -> Path:
+    return instance.logs_host_dir / _safe_path_token(identity) / "launcher.log"
+
+
+def _peer_docker_log(instance: SessionInstance, identity: str) -> Path:
+    return instance.logs_host_dir / _safe_path_token(identity) / "docker.log"
+
+
+def _append_log(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fp:
+        fp.write(text)
+        if not text.endswith("\n"):
+            fp.write("\n")
+
+
+def _effective_config_sha256(cfg: dict[str, Any]) -> str:
+    text = yaml.safe_dump(cfg, sort_keys=True, default_flow_style=False, allow_unicode=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _write_instance_manifest(
+    instance: SessionInstance,
+    session: ResolvedSession,
+    runtime: RuntimeConfig,
+    cfg: dict[str, Any],
+    *,
+    identity: str,
+    container_name: str,
+    mode: str,
+    peer_address: list[str],
+    overwrite_peers_via_remote_peer: str | None,
+) -> None:
+    manifest_path = instance.host_dir / "manifest.yaml"
+    manifest = _load_yaml_file(manifest_path)
+    now = datetime.now().isoformat(timespec="seconds")
+    if not manifest:
+        manifest = {
+            "schema_version": 1,
+            "created_at": now,
+            "instance_id": instance.instance_id,
+            "rosotacom_version": __version__,
+            "source_session_host_dir": str(session.host_dir),
+            "source_session_container_dir": session.container_dir,
+            "source": session.source,
+            "config_dir": str(instance.config_host_dir),
+            "logs_dir": str(instance.logs_host_dir),
+            "rosbags_dir": str(instance.rosbags_host_dir),
+            "rollout": None,
+            "starts": [],
+        }
+    manifest["updated_at"] = now
+    manifest["effective_config_sha256"] = _effective_config_sha256(cfg)
+    manifest.setdefault("starts", []).append(
+        {
+            "started_at": now,
+            "identity": identity,
+            "container_name": container_name,
+            "mode": mode,
+            "peer_address": list(peer_address),
+            "overwrite_peers_via_remote_peer": overwrite_peers_via_remote_peer,
+        }
+    )
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=True, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def _write_docker_log(container_name: str, instance: SessionInstance, identity: str) -> None:
+    try:
+        result = subprocess.run(["docker", "logs", container_name], text=True, capture_output=True, check=False)
+    except Exception:
+        return
+    logs = (result.stdout or "") + (result.stderr or "")
+    if logs:
+        _append_log(_peer_docker_log(instance, identity), logs)
 
 
 def _get_local_ipv4s() -> list[str]:
@@ -476,6 +661,9 @@ def _resolve_session(session_dir: str, runtime: RuntimeConfig) -> ResolvedSessio
     if raw.is_absolute():
         if str(raw).startswith("/ws/"):
             candidates.append((PROJECT_DIR / str(raw).lstrip("/"), "workspace"))
+        if str(raw).startswith(f"{SESSION_DEFINITION_CONTAINER_DIR}/") and runtime.session_configs_dir:
+            rel = Path(str(raw)[len(SESSION_DEFINITION_CONTAINER_DIR) :].lstrip("/"))
+            candidates.append((runtime.session_configs_dir / rel, "session_configs"))
         if str(raw).startswith(f"{SESSION_CONFIG_CONTAINER_DIR}/") and runtime.session_configs_dir:
             rel = Path(str(raw)[len(SESSION_CONFIG_CONTAINER_DIR) :].lstrip("/"))
             candidates.append((runtime.session_configs_dir / rel, "session_configs"))
@@ -496,7 +684,7 @@ def _resolve_session(session_dir: str, runtime: RuntimeConfig) -> ResolvedSessio
                 if cfg_rel is not None:
                     return ResolvedSession(
                         host_dir,
-                        f"{SESSION_CONFIG_CONTAINER_DIR}/{cfg_rel.as_posix()}",
+                        f"{SESSION_DEFINITION_CONTAINER_DIR}/{cfg_rel.as_posix()}",
                         "session_configs",
                     )
             return ResolvedSession(host_dir, EXTERNAL_SESSION_CONTAINER_DIR, source)
@@ -520,7 +708,12 @@ def _format_available_sessions(runtime: RuntimeConfig) -> str:
     )
 
 
-def _base_extra_run_args(runtime: RuntimeConfig, session: ResolvedSession, cfg: dict[str, Any]) -> list[str]:
+def _base_extra_run_args(
+    runtime: RuntimeConfig,
+    session: ResolvedSession,
+    cfg: dict[str, Any],
+    instance: SessionInstance,
+) -> list[str]:
     args: list[str] = []
     ros2docker_cfg = load_config(runtime.ros2docker_config)
 
@@ -530,13 +723,33 @@ def _base_extra_run_args(runtime: RuntimeConfig, session: ResolvedSession, cfg: 
         args.extend(
             [
                 "-v",
-                f"{runtime.session_configs_dir}:{SESSION_CONFIG_CONTAINER_DIR}",
+                f"{runtime.session_configs_dir}:{SESSION_DEFINITION_CONTAINER_DIR}:ro",
                 "-e",
-                f"SESSION_CONFIGS_DIR={SESSION_CONFIG_CONTAINER_DIR}",
+                f"SESSION_DEFINITIONS_DIR={SESSION_DEFINITION_CONTAINER_DIR}",
+                "-e",
+                f"SESSION_CONFIGS_DIR={SESSION_DEFINITION_CONTAINER_DIR}",
             ]
         )
     if session.container_dir == EXTERNAL_SESSION_CONTAINER_DIR:
-        args.extend(["-v", f"{session.host_dir}:{EXTERNAL_SESSION_CONTAINER_DIR}"])
+        args.extend(["-v", f"{session.host_dir}:{EXTERNAL_SESSION_CONTAINER_DIR}:ro"])
+    instances_root = _session_instances_root(runtime)
+    instances_root.mkdir(parents=True, exist_ok=True)
+    args.extend(
+        [
+            "-v",
+            f"{instances_root}:{SESSION_INSTANCE_CONTAINER_DIR}",
+            "-e",
+            f"ROSOTACOM_SESSION_INSTANCES_DIR={SESSION_INSTANCE_CONTAINER_DIR}",
+            "-e",
+            f"ROSOTACOM_INSTANCE_DIR={instance.container_dir}",
+            "-e",
+            f"ROSOTACOM_CONFIG_DIR={instance.config_container_dir}",
+            "-e",
+            f"ROSOTACOM_LOGS_DIR={instance.logs_container_dir}",
+            "-e",
+            f"ROSOTACOM_ROSBAGS_DIR={instance.rosbags_container_dir}",
+        ]
+    )
     if _contains_data_ref(cfg):
         data_dict = _load_host_data_dict(runtime)
         if not isinstance(data_dict, dict):
@@ -547,6 +760,7 @@ def _base_extra_run_args(runtime: RuntimeConfig, session: ResolvedSession, cfg: 
 
 def _session_command(
     session: ResolvedSession,
+    instance: SessionInstance,
     identity: str,
     *,
     force: bool,
@@ -555,7 +769,21 @@ def _session_command(
     peer_address_overrides: dict[str, str],
     attach_mode: str,
 ) -> list[str]:
-    parts = [RUN_SESSION_CONTAINER_PATH, "--session-dir", session.container_dir, "--identity", identity]
+    parts = [
+        RUN_SESSION_CONTAINER_PATH,
+        "--session-dir",
+        session.container_dir,
+        "--output-dir",
+        instance.config_container_dir,
+        "--instance-dir",
+        instance.container_dir,
+        "--catmux-log-dir",
+        _peer_catmux_log_container_dir(instance, identity),
+        "--rosbag-dir",
+        _peer_rosbag_container_dir(instance, identity),
+        "--identity",
+        identity,
+    ]
     if force:
         parts.append("--force")
     if rewrite_formatting:
@@ -636,11 +864,13 @@ def start_session(args: argparse.Namespace) -> str:
         print(f"Auto-selected identity: {identity}")
     remote_name = _remote_peer_name(cfg, identity)
     container_name = _container_name(remote_name, runtime)
+    instance = _resolve_session_instance(runtime, session, getattr(args, "instance_id", None))
     image_name = _scoped_image_name(runtime)
-    extra_run_args = _base_extra_run_args(runtime, session, cfg)
+    extra_run_args = _base_extra_run_args(runtime, session, cfg, instance)
     mode = _resolve_mode(args.mode)
     command = _session_command(
         session,
+        instance,
         identity,
         force=args.force,
         rewrite_formatting=args.rewrite_formatting,
@@ -650,6 +880,30 @@ def start_session(args: argparse.Namespace) -> str:
     )
 
     print("Command which will be run in container: " + shlex.join(command))
+    print(f"rosotacom session instance: {instance.host_dir}")
+    _append_log(
+        _peer_launcher_log(instance, identity),
+        "\n".join(
+            [
+                f"started_at: {datetime.now().isoformat(timespec='seconds')}",
+                f"container_name: {container_name}",
+                f"mode: {mode}",
+                "command: " + shlex.join(command),
+                "",
+            ]
+        ),
+    )
+    _write_instance_manifest(
+        instance,
+        session,
+        runtime,
+        cfg,
+        identity=identity,
+        container_name=container_name,
+        mode=mode,
+        peer_address=list(args.peer_address or []),
+        overwrite_peers_via_remote_peer=args.overwrite_peers_via_remote_peer,
+    )
     if args.force:
         _stop_container_name(container_name, runtime, quiet_missing=True)
 
@@ -668,6 +922,7 @@ def start_session(args: argparse.Namespace) -> str:
             command=command,
             interactive=False,
         )
+        _write_docker_log(container_name, instance, identity)
     else:
         ros2docker_build(config_file=runtime.ros2docker_config, override=common_override)
         ros2docker_run(
@@ -681,6 +936,7 @@ def start_session(args: argparse.Namespace) -> str:
             },
             extra_run_args=extra_run_args,
         )
+        _write_docker_log(container_name, instance, identity)
 
     print(f"rosotacom session started in container: {container_name}")
     return container_name
@@ -740,6 +996,15 @@ def _copy_example_resource_tree(source: Any, target: Path) -> None:
             destination.chmod(destination.stat().st_mode | 0o111)
 
 
+def _ensure_example_gitignore(target: Path) -> None:
+    gitignore = target / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    lines = existing.splitlines()
+    if "session-instances/" not in lines:
+        lines.append("session-instances/")
+    gitignore.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
 def examples_create_command(args: argparse.Namespace) -> int:
     target = Path(os.path.expandvars(os.path.expanduser(args.target))).resolve()
     if target.exists():
@@ -751,6 +1016,7 @@ def examples_create_command(args: argparse.Namespace) -> int:
             target.unlink()
     target.parent.mkdir(parents=True, exist_ok=True)
     _copy_example_resource_tree(_example_project_resource(), target)
+    _ensure_example_gitignore(target)
     print(f"Copied rosotacom examples to: {target}")
     print(f'Wire this shell with: eval "$(rosotacom setup-env {shlex.quote(str(target / "rosotacom.yaml"))})"')
     return 0
@@ -797,9 +1063,10 @@ def doctor(args: argparse.Namespace) -> int:
         line("OK", "install id", runtime.install_id)
         line("OK", "workspace mount", f"{WS_DIR} -> /ws")
         if runtime.session_configs_dir:
-            line("OK", "session configs", f"{runtime.session_configs_dir} -> {SESSION_CONFIG_CONTAINER_DIR}")
+            line("OK", "session definitions", f"{runtime.session_configs_dir} -> {SESSION_DEFINITION_CONTAINER_DIR}")
         else:
-            line("INFO", "session configs", "not configured")
+            line("INFO", "session definitions", "not configured")
+        line("OK", "session instances", f"{_session_instances_root(runtime)} -> {SESSION_INSTANCE_CONTAINER_DIR}")
         if runtime.data_dict:
             line("OK", "data dict", str(runtime.data_dict))
         else:
@@ -918,7 +1185,7 @@ def _smoke_rmw_env_value(cfg: dict[str, Any]) -> str | None:
     local_impl = rmw_spec.local.impl
     if local_impl is None:
         return None
-    return session_gen.RMW_ALIASES.get(local_impl, local_impl)
+    return str(session_gen.RMW_ALIASES.get(local_impl, local_impl))
 
 
 def _smoke_local_domain_id(cfg: dict[str, Any], receiver_peer_key: str) -> str | None:
@@ -936,11 +1203,11 @@ def _smoke_local_domain_id(cfg: dict[str, Any], receiver_peer_key: str) -> str |
     return str(session_gen._parse_optional_domain_id(domain_id, f"peer_settings.{receiver_peer_key}.domain_id"))
 
 
-def _smoke_local_config_commands(session: ResolvedSession, cfg: dict[str, Any], receiver_peer_key: str) -> list[str]:
+def _smoke_local_config_commands(config_container_dir: str, cfg: dict[str, Any], receiver_peer_key: str) -> list[str]:
     local = _smoke_rmw_spec(cfg).local
     if not local.dds_config:
         return []
-    config_file = f"{session.container_dir}/{receiver_peer_key}/local_dds.xml"
+    config_file = f"{config_container_dir}/{receiver_peer_key}/local_dds.xml"
     if local.impl == "cyclone":
         return [f"export CYCLONEDDS_URI={shlex.quote(f'file://{config_file}')}"]
     if local.impl == "fastdds":
@@ -948,7 +1215,7 @@ def _smoke_local_config_commands(session: ResolvedSession, cfg: dict[str, Any], 
     return []
 
 
-def _smoke_ros_setup(session: ResolvedSession, cfg: dict[str, Any], receiver_peer_key: str) -> str:
+def _smoke_ros_setup(config_container_dir: str, cfg: dict[str, Any], receiver_peer_key: str) -> str:
     commands = [
         'ros_distro="${ROS_DISTRO:-kilted}"',
         'source "/opt/ros/${ros_distro}/setup.bash"',
@@ -964,7 +1231,7 @@ def _smoke_ros_setup(session: ResolvedSession, cfg: dict[str, Any], receiver_pee
     local_domain_id = _smoke_local_domain_id(cfg, receiver_peer_key)
     if local_domain_id:
         commands.append(f"export ROS_DOMAIN_ID={shlex.quote(local_domain_id)}")
-    commands.extend(_smoke_local_config_commands(session, cfg, receiver_peer_key))
+    commands.extend(_smoke_local_config_commands(config_container_dir, cfg, receiver_peer_key))
     return " && ".join(commands)
 
 
@@ -975,6 +1242,14 @@ def smoke(args: argparse.Namespace) -> int:
     session_dir = args.session_dir or DEFAULT_SMOKE_SESSION
     runtime = _load_runtime_config(args)
     session = _resolve_session(session_dir, runtime)
+    instance_id = getattr(args, "instance_id", None) or _new_instance_id()
+    smoke_instance = _resolve_session_instance(runtime, session, instance_id)
+    smoke_log = smoke_instance.logs_host_dir / "smoke-verification.log"
+
+    def log_line(message: str) -> None:
+        print(message)
+        _append_log(smoke_log, message)
+
     peer_address_args = _smoke_peer_address_args(session, local_ip)
     peer_overrides = _parse_peer_address_overrides(peer_address_args)
     cfg = _effective_session_config(session.host_dir, runtime, peer_address_overrides=peer_overrides)
@@ -982,6 +1257,7 @@ def smoke(args: argparse.Namespace) -> int:
         "rosotacom_config": args.rosotacom_config,
         "ros2docker_config": args.ros2docker_config,
         "session_configs_dir": args.session_configs_dir,
+        "session_instances_dir": getattr(args, "session_instances_dir", None),
         "data_dict": args.data_dict,
         "session_dir": session_dir,
         "mode": "detached",
@@ -989,9 +1265,11 @@ def smoke(args: argparse.Namespace) -> int:
         "rewrite_formatting": False,
         "overwrite_peers_via_remote_peer": None,
         "peer_address": peer_address_args,
+        "instance_id": smoke_instance.instance_id,
     }
 
-    print(f"Starting local smoke test with PEER_ADDRESSES={', '.join(peer_address_args)}")
+    log_line(f"Starting local smoke test with PEER_ADDRESSES={', '.join(peer_address_args)}")
+    log_line(f"Smoke artifacts: {smoke_instance.host_dir}")
     a_container = None
     b_container = None
     try:
@@ -999,12 +1277,12 @@ def smoke(args: argparse.Namespace) -> int:
         b_container = start_session(argparse.Namespace(**common, identity="b", auto_identity=True))
 
         plugin_text = "\n".join(
-            (session.host_dir / peer / "plugin.yaml").read_text(encoding="utf-8") for peer in ("a", "b")
+            (smoke_instance.config_host_dir / peer / "plugin.yaml").read_text(encoding="utf-8") for peer in ("a", "b")
         )
         expected_addresses = {arg.split("=", 1)[1] for arg in peer_address_args}
         if any(address not in plugin_text for address in expected_addresses) or "data:" in plugin_text:
             raise RuntimeError("Smoke verification failed: generated plugin.yaml did not use literal CLI addresses.")
-        print("OK: generated plugin.yaml files use literal CLI addresses")
+        log_line("OK: generated plugin.yaml files use literal CLI addresses")
 
         checks = [
             (b_container, _smoke_inbound_bridge_topic(cfg, "a"), "a->b inbound bridge heartbeat", "b"),
@@ -1013,17 +1291,25 @@ def smoke(args: argparse.Namespace) -> int:
             (a_container, _smoke_heartbeat_topic(cfg, "b"), "b->a final heartbeat", "a"),
         ]
         for container_name, topic, label, receiver_peer_key in checks:
-            ros_setup = _smoke_ros_setup(session, cfg, receiver_peer_key)
+            ros_setup = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, receiver_peer_key)
             output = _wait_for_topic_hz(container_name, ros_setup, topic)
+            _append_log(smoke_log, f"\n--- {label} ({topic}) in {container_name} ---\n{output}")
             if "average rate" not in output:
                 raise RuntimeError(f"Smoke verification failed for {label} ({topic}) in {container_name}:\n{output}")
-            print(f"OK: {label} ({topic}) is publishing in {container_name}")
+            log_line(f"OK: {label} ({topic}) is publishing in {container_name}")
+    except Exception as exc:
+        _append_log(smoke_log, f"ERROR: {exc}")
+        raise
     finally:
+        for started_container, peer in [(a_container, "a"), (b_container, "b")]:
+            if started_container:
+                _write_docker_log(started_container, smoke_instance, peer)
         if not args.keep_running:
             runtime = _load_runtime_config(args)
             for started_container in [a_container, b_container]:
                 if started_container:
                     _stop_container_name(started_container, runtime)
+        print(f"Smoke artifacts: {smoke_instance.host_dir}")
     return 0
 
 
@@ -1031,6 +1317,7 @@ def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rosotacom-config", help="Path to rosotacom.yaml.")
     parser.add_argument("-f", "--ros2docker-config", help="Path to ros2docker JSON config.")
     parser.add_argument("--session-configs-dir", help="Host directory containing named session configs.")
+    parser.add_argument("--session-instances-dir", help="Host directory for generated session instances and logs.")
     parser.add_argument("--data-dict", help="Host data_dict.json path for data:<key> address expressions.")
 
 
@@ -1046,6 +1333,7 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rewrite-formatting", action="store_true")
     parser.add_argument("--overwrite-peers-via-remote-peer")
     parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
     parser.set_defaults(force=True, auto_identity=True)
 
 
@@ -1112,6 +1400,7 @@ def main(argv: list[str] | None = None) -> int:
     smoke_parser.add_argument("--local", action="store_true", default=True)
     smoke_parser.add_argument("--local-ip")
     smoke_parser.add_argument("--keep-running", action="store_true", help="Leave smoke-test containers running.")
+    smoke_parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
     smoke_parser.set_defaults(func=smoke)
 
     list_parser = subparsers.add_parser("list-sessions", help="List configured sessions.")

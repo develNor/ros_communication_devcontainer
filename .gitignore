@@ -2,6 +2,7 @@
 /.devcontainer/devcontainer.json
 /data_dict.json
 /ros2docker.json
+/session-instances/
 /zenoh.json5
 
 # ignore temporary data

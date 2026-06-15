@@ -53,10 +53,11 @@ Legacy global symlinks are still available when explicitly requested:
 
 ### Basic Setup
 
-`rosotacom` uses two layers of configuration:
+`rosotacom` uses three layers of configuration/runtime state:
 
-- A **project setup** file (`rosotacom.yaml`) points to host-local resources such as `ros2docker.json`, `sessions/`, and `data_dict.json`.
+- A **project setup** file (`rosotacom.yaml`) points to host-local resources such as `ros2docker.json`, static `sessions/`, ignored `session-instances/`, and `data_dict.json`.
 - A **session config** defines the communication behavior for one run: peers, addresses, topics, QoS, processing, and transport choices.
+- A **session instance** stores one concrete run: generated config, catmux pane logs, smoke debug output, and future rosbags.
 
 No `rosotacom.yaml` is discovered automatically. Wire one explicitly with a flag or with `ROSOTACOM_CONFIG`:
 
@@ -74,6 +75,7 @@ rosotacom.yaml
 ros2docker.json
 data_dict.json
 sessions/
+session-instances/
 scripts/
 ```
 
@@ -97,7 +99,7 @@ rosotacom start 1_heartbeat_cyclone-ota --identity a
 rosotacom start 1_heartbeat_cyclone-ota --identity b
 ```
 
-`rosotacom` reads the session input and creates generated files in that session directory, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`.
+`rosotacom` reads the static session input and creates generated files under `session-instances/<date>/<session>_<timestamp>_<id>/config/`, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`. Catmux pane output is logged under the same instance in `logs/<peer>/catmux/`.
 
 ## Usage Examples
 
@@ -117,7 +119,9 @@ rosotacom smoke
 
 The smoke test verifies both directions through the communication path: it waits
 for `/com/in/a/heartbeat_a` and `/heartbeat_a` in peer `b`, plus
-`/com/in/b/heartbeat_b` and `/heartbeat_b` in peer `a`.
+`/com/in/b/heartbeat_b` and `/heartbeat_b` in peer `a`. It prints the
+`session-instances/...` artifact path so failures can be inspected after the
+containers stop.
 
 Run the CI heartbeat smoke matrix locally:
 

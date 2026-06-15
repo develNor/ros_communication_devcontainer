@@ -5,4 +5,5 @@
 # `--rosotacom-config`.
 ros2docker_config: ros2docker.json
 session_configs_dir: sessions
+session_instances_dir: session-instances
 data_dict: data_dict.json

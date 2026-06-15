@@ -416,7 +416,10 @@ zen_qos:
 ```
 
 ### What gets generated
-For a session directory containing a session configuration input file, the generator typically produces:
+For a session configuration input file, `rosotacom start` writes generated files
+to the active runtime instance under `session-instances/<date>/<run>/config/`.
+The static `sessions/<name>/` definition/template directory is left unchanged.
+The generator typically produces:
 
 - `*_to_*_topics.txt` (topic list files per direction)
 - Per peer directory:

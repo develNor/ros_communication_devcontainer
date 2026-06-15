@@ -24,6 +24,7 @@ def test_source_checkout_rosotacom_yaml_loads() -> None:
 
     assert runtime.ros2docker_config == cli.EXAMPLE_PROJECT_DIR / "ros2docker.json"
     assert runtime.session_configs_dir == cli.EXAMPLE_PROJECT_DIR / "sessions"
+    assert runtime.session_instances_dir == PACKAGE_ROOT / "session-instances"
     assert runtime.data_dict == cli.EXAMPLE_PROJECT_DIR / "data_dict.json"
 
 
@@ -33,6 +34,7 @@ def test_packaged_example_setup_paths_are_relative_to_example_root() -> None:
     assert setup == {
         "ros2docker_config": "ros2docker.json",
         "session_configs_dir": "sessions",
+        "session_instances_dir": "session-instances",
         "data_dict": "data_dict.json",
     }
 

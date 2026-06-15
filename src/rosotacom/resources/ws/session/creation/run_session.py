@@ -242,6 +242,7 @@ def _apply_session_overrides(
 
 def _resolve_peer_dir(
     session_dir: str,
+    output_dir: Optional[str],
     identity: Optional[str],
     force: bool,
     rewrite_formatting: bool,
@@ -258,15 +259,19 @@ def _resolve_peer_dir(
       plus: --identity <peer_key>
     """
     if not os.path.isabs(session_dir):
-        base = os.environ.get("SESSION_CONFIGS_DIR")
-        if base:
+        for base in (os.environ.get("SESSION_DEFINITIONS_DIR"), os.environ.get("SESSION_CONFIGS_DIR")):
+            if not base:
+                continue
             candidate = os.path.join(base, session_dir)
             if os.path.isdir(candidate):
                 session_dir = candidate
+                break
 
     p = os.path.abspath(session_dir)
     if not os.path.isdir(p):
         raise RuntimeError(f"--session-dir must be a directory, got: {p}")
+    out = os.path.abspath(output_dir) if output_dir else p
+    os.makedirs(out, exist_ok=True)
 
     if not identity:
         raise RuntimeError(
@@ -300,22 +305,21 @@ def _resolve_peer_dir(
         overwrite_peers_via_remote_peer,
         peer_address,
     )
+    cfg_for_generation = cfg_override if cfg_override is not None else _load_session_config_input(param_yaml)
     session_gen.func(
         session_config_yaml=param_yaml,
         force=force,
         rewrite_formatting=rewrite_formatting,
-        session_config_obj=cfg_override,
-        output_dir=p,
-        write_resolved_definition=False if cfg_override is not None else None,
+        session_config_obj=cfg_for_generation,
+        output_dir=out,
+        write_resolved_definition=True,
     )
-    peer_dir = os.path.join(p, identity)
+    peer_dir = os.path.join(out, identity)
     spec_file = os.path.join(peer_dir, "session_specification.yaml")
     if not os.path.exists(spec_file):
         # Try to help with a quick "what identities exist" hint.
         try:
-            subdirs = sorted(
-                d for d in os.listdir(p) if os.path.isdir(os.path.join(p, d)) and not d.startswith(".")
-            )
+            subdirs = sorted(d for d in os.listdir(out) if os.path.isdir(os.path.join(out, d)) and not d.startswith("."))
         except Exception:
             subdirs = []
         hint = f" Available subdirs: {subdirs}" if subdirs else ""
@@ -326,6 +330,10 @@ def _resolve_peer_dir(
 def main(
     session_dir: str,
     identity: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    instance_dir: Optional[str] = None,
+    catmux_log_dir: Optional[str] = None,
+    rosbag_dir: Optional[str] = None,
     force: bool = False,
     rewrite_formatting: bool = False,
     overwrite_peers_via_remote_peer: Optional[str] = None,
@@ -335,6 +343,7 @@ def main(
 
     peer_dir = _resolve_peer_dir(
         session_dir,
+        output_dir,
         identity,
         force,
         rewrite_formatting,
@@ -343,7 +352,14 @@ def main(
     )
 
     # Ensure merged .session_readonly.yaml exists for catmux
-    create_session_yaml(peer_dir)
+    config_dir = output_dir or os.path.dirname(peer_dir)
+    create_session_yaml(
+        peer_dir,
+        instance_dir=instance_dir or os.environ.get("ROSOTACOM_INSTANCE_DIR"),
+        config_dir=config_dir,
+        catmux_log_dir=catmux_log_dir or os.environ.get("ROSOTACOM_CATMUX_LOG_DIR"),
+        rosbag_dir=rosbag_dir or os.environ.get("ROSOTACOM_ROSBAG_DIR"),
+    )
 
     # Define the command and arguments
     command = "catmux_create_session"
@@ -387,6 +403,22 @@ if __name__ == "__main__":
         "--session-dir",
         required=True,
         help="Directory containing session-definition.yaml or session-parametrization.yaml.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Directory where generated runtime session files are written.",
+    )
+    parser.add_argument(
+        "--instance-dir",
+        help="Runtime session instance directory.",
+    )
+    parser.add_argument(
+        "--catmux-log-dir",
+        help="Directory where catmux pane logs for this peer are written.",
+    )
+    parser.add_argument(
+        "--rosbag-dir",
+        help="Directory where rosbags for this peer should be written.",
     )
     parser.add_argument(
         "--identity",

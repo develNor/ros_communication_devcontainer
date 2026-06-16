@@ -1,7 +1,7 @@
 # ROS Communication DevContainer
 
-[![CI](https://github.com/develNor/rosotacom/actions/workflows/pr-merge-gate.yml/badge.svg?branch=main&event=push)](https://github.com/develNor/rosotacom/actions/workflows/pr-merge-gate.yml)
-[![Coverage](https://codecov.io/gh/develNor/rosotacom/branch/main/graph/badge.svg)](https://codecov.io/gh/develNor/rosotacom)
+[![CI](https://github.com/develNor/rosotacom/actions/workflows/pr-merge-gate.yml/badge.svg?branch=volatile&event=push)](https://github.com/develNor/rosotacom/actions/workflows/pr-merge-gate.yml)
+[![Coverage](https://codecov.io/gh/develNor/rosotacom/branch/volatile/graph/badge.svg)](https://codecov.io/gh/develNor/rosotacom)
 [![PyPI](https://img.shields.io/pypi/v/rosotacom.svg)](https://pypi.org/project/rosotacom/)
 [![Python](https://img.shields.io/pypi/pyversions/rosotacom.svg)](https://pypi.org/project/rosotacom/)
 [![License](https://img.shields.io/pypi/l/rosotacom.svg)](https://pypi.org/project/rosotacom/)

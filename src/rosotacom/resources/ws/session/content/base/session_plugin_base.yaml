@@ -276,7 +276,10 @@ windows:
         - if [ '${ota_domain_id}' != "None" ] && [ -n '${ota_domain_id}' ]; then export ROS_DOMAIN_ID='${ota_domain_id}'; fi
         - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4};; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
         - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip_key}' != "None" ] && [ -n '${ota_easy_mode_ip_key}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip_key}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
-        - export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}")
+        # For zenoh_ros2dds the OTA domain is loopback-only (zenoh is the inter-host
+        # transport), so confine discovery to localhost instead of statically peering
+        # the remote host — otherwise the OTA-domain DDS double-delivers alongside zenoh.
+        - if [ '${use_zenoh_ros2dds}' = "True" ] || [ '${use_zenoh_ros2dds}' = "true" ]; then export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST; else export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}"); fi
         - ros2 run com_py bridge_in --ros-args
             -p base_topic_files:=[${topic_list_paths_inbound}]
             -p local_name:=${local_name}
@@ -298,7 +301,10 @@ windows:
         - if [ '${ota_domain_id}' != "None" ] && [ -n '${ota_domain_id}' ]; then export ROS_DOMAIN_ID='${ota_domain_id}'; fi
         - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4};; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
         - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip_key}' != "None" ] && [ -n '${ota_easy_mode_ip_key}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip_key}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
-        - export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}")
+        # For zenoh_ros2dds the OTA domain is loopback-only (zenoh is the inter-host
+        # transport), so confine discovery to localhost instead of statically peering
+        # the remote host — otherwise the OTA-domain DDS double-delivers alongside zenoh.
+        - if [ '${use_zenoh_ros2dds}' = "True" ] || [ '${use_zenoh_ros2dds}' = "true" ]; then export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST; else export ROS_STATIC_PEERS=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}"); fi
         - ros2 run com_py bridge_out --ros-args
             -p base_topic_files:=[${topic_list_paths_outbound}]
             -p local_name:=${local_name}

@@ -2,7 +2,8 @@
 """rosotacom host CLI.
 
 This module owns rosotacom-specific concepts such as session config
-directories, data_dict wiring, multi-checkout names, and local smoke tests.
+directories, data_dict wiring, multi-checkout names, session instance
+lifecycle, and local smoke tests.
 ros2docker remains the generic Docker runner underneath.
 """
 

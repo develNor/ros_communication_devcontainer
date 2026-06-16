@@ -553,6 +553,33 @@ def test_native_zenoh_smoke_uses_distinct_loopback_addresses(tmp_path: Path) -> 
     assert rosotacom._smoke_peer_address_args(session, "127.0.0.1") == ["a=127.0.0.1", "b=127.0.0.2"]
 
 
+def test_fastdds_smoke_uses_distinct_loopback_addresses(tmp_path: Path) -> None:
+    session_dir = tmp_path / "sessions" / "1_heartbeat_fastdds"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "peers:",
+                "  a:",
+                "    address: data:machine_a_ip",
+                "  b:",
+                "    address: data:machine_b_ip",
+                "shared:",
+                "  rmw: fastdds",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    session = rosotacom.ResolvedSession(
+        session_dir,
+        "/session/definitions/1_heartbeat_fastdds",
+        "session_configs",
+    )
+
+    assert rosotacom._smoke_peer_address_args(session, "127.0.0.1") == ["a=127.0.0.1", "b=127.0.0.2"]
+
+
 def test_run_session_generates_into_instance_config_without_touching_static_source(tmp_path: Path) -> None:
     from session.creation import run_session
 

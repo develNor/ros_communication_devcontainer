@@ -12,5 +12,11 @@ peer_settings:
 
 shared:
   use_heartbeat: true
-  rmw: fastdds
+  rmw:
+    local:
+      fastdds:
+        config: fastdds_unicast.xml
+    ota:
+      fastdds:
+        config: fastdds_unicast.xml
   ota_domain_id: 48

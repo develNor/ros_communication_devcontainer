@@ -8,6 +8,8 @@ parameters:
   remote_name: b
 
   rmw_local: fastdds
+  local_config_template: fastdds_unicast.xml
+  local_config_file: ${peer_dir}/local_dds.xml
 
   in: true
   topic_list_paths_inbound: ${session_dir}/b_to_a_topics.txt
@@ -15,9 +17,16 @@ parameters:
   out: true
   topic_list_paths_outbound: ${session_dir}/a_to_b_topics.txt
 
+  use_domain_bridge: true
+  local_domain_id: 46
+  ota_domain_id: 48
+  domain_bridge_config_file: ${peer_dir}/domain_bridge.yaml
+
   rmw_ota: fastdds
   use_zenoh_rmw: false
   use_zenoh_ros2dds: false
+  ota_config_template: fastdds_unicast.xml
+  ota_config_file: ${peer_dir}/ota_dds.xml
 
   heartbeat: true
   heartbeat_out_topics: /heartbeat_a

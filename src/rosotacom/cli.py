@@ -1140,7 +1140,7 @@ def _smoke_needs_distinct_peer_addresses(session: ResolvedSession) -> bool:
     if not isinstance(shared, dict):
         return False
     rmw_spec = session_gen._parse_rmw_block(shared.get("rmw"), list(peers.keys()))
-    return bool(session_gen._is_native_zenoh_ota(rmw_spec.ota.impl))
+    return bool(session_gen._is_native_zenoh_ota(rmw_spec.ota.impl) or rmw_spec.ota.impl == "fastdds")
 
 
 def _smoke_peer_address_args(session: ResolvedSession, local_ip: str) -> list[str]:
@@ -1211,7 +1211,10 @@ def _smoke_local_config_commands(config_container_dir: str, cfg: dict[str, Any],
     if local.impl == "cyclone":
         return [f"export CYCLONEDDS_URI={shlex.quote(f'file://{config_file}')}"]
     if local.impl == "fastdds":
-        return [f"export FASTDDS_DEFAULT_PROFILES_FILE={shlex.quote(config_file)}"]
+        return [
+            f"export FASTDDS_DEFAULT_PROFILES_FILE={shlex.quote(config_file)}",
+            "export RMW_FASTRTPS_USE_QOS_FROM_XML=1",
+        ]
     return []
 
 

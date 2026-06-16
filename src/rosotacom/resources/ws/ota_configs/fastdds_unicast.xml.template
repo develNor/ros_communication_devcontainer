@@ -13,7 +13,7 @@
         <defaultUnicastLocatorList>
           <locator>
             <udpv4>
-              <address>127.0.0.1</address>
+              <address>#host_ip</address>
               <port>0</port>
             </udpv4>
           </locator>
@@ -23,7 +23,7 @@
           <metatrafficUnicastLocatorList>
             <locator>
               <udpv4>
-                <address>127.0.0.1</address>
+                <address>#host_ip</address>
                 <port>0</port>
               </udpv4>
             </locator>
@@ -32,16 +32,16 @@
           <initialPeersList>
             <locator>
               <udpv4>
-                <address>127.0.0.1</address>
+                <address>#host_ip</address>
                 <port>0</port>
               </udpv4>
             </locator>
-            <locator>
+            <!--peer-block--><locator>
               <udpv4>
-                <address>127.0.0.2</address>
+                <address>#peer</address>
                 <port>0</port>
               </udpv4>
-            </locator>
+            </locator><!--/peer-block-->
           </initialPeersList>
         </builtin>
 

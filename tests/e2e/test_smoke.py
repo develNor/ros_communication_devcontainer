@@ -21,14 +21,7 @@ HEARTBEAT_SMOKE_SESSIONS = [
     pytest.param("1_heartbeat_cyclone-ota", id="cyclone-ota"),
     pytest.param("1_heartbeat_zen-endpoints", id="zen-endpoints"),
     pytest.param("1_heartbeat_cyclone-local_zenoh-ros2dds-ota", id="cyclone-local-zenoh-ros2dds-ota"),
-    pytest.param(
-        "1_heartbeat_fastdds",
-        marks=pytest.mark.xfail(
-            reason="Strict heartbeat smoke currently fails at the a->b inbound bridge topic.",
-            strict=True,
-        ),
-        id="fastdds",
-    ),
+    pytest.param("1_heartbeat_fastdds", id="fastdds"),
     pytest.param(
         "1_heartbeat_fastdds-local_cyclone-ota",
         marks=pytest.mark.xfail(

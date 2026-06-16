@@ -13,6 +13,10 @@ peer_settings:
 shared:
   use_heartbeat: true
   rmw:
-    local: cyclone
-    ota: fastdds
+    local:
+      cyclone:
+        config: cyclonedds_minimal.xml
+    ota:
+      fastdds:
+        config: fastdds_unicast.xml
   ota_domain_id: 48

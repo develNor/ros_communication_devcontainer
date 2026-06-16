@@ -13,7 +13,9 @@ peer_settings:
 shared:
   use_heartbeat: true
   rmw:
-    local: fastdds
+    local:
+      fastdds:
+        config: fastdds_unicast.xml
     ota:
       cyclone:
         config: cyclonedds_minimal.xml

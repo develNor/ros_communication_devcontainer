@@ -755,6 +755,16 @@ def _render_session_dir(param_dir: str) -> str:
       session directory works when mounted into the container.
     """
     d = os.path.abspath(param_dir)
+
+    session_configs_root = os.environ.get("SESSION_CONFIGS_DIR")
+    if session_configs_root:
+        root = os.path.abspath(session_configs_root)
+        rel = os.path.relpath(d, root)
+        if rel == ".":
+            return "/session/configs"
+        if not rel.startswith(f"..{os.sep}") and rel != "..":
+            return f"/session/configs/{rel}"
+
     session_root = None
     cur = d
     while True:
@@ -927,6 +937,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             shared,
             {
                 "use_topic_monitor",
+                "use_status_overview",
                 "use_heartbeat",
                 "use_in",
                 "use_out",
@@ -939,6 +950,12 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "qos",
             },
         )
+        if (
+            "use_status_overview" in shared
+            and shared["use_status_overview"] is not None
+            and not isinstance(shared["use_status_overview"], bool)
+        ):
+            raise RuntimeError("shared.use_status_overview must be boolean if provided.")
         if "use_in" in shared and shared["use_in"] is not None and not isinstance(shared["use_in"], bool):
             raise RuntimeError("shared.use_in must be boolean if provided.")
         if "use_out" in shared and shared["use_out"] is not None and not isinstance(shared["use_out"], bool):
@@ -1188,6 +1205,168 @@ def _final_topic_type(entry: TopicEntry, pipe: Dict[str, Any]) -> str:
             f"Topic '{entry.base}' requires a 'type' when peer_settings.<peer>.domain_id/shared.ota_domain_id are used."
         )
     return msg_type
+
+
+def _build_status_pipeline_spec(
+    *,
+    local: str,
+    remote: str,
+    peer_name: Dict[str, str],
+    out_entries: List["TopicEntry"],
+    out_pipes: List[Dict[str, Any]],
+    in_entries: List["TopicEntry"],
+    in_pipes: List[Dict[str, Any]],
+    use_target_prefix: bool,
+    remote_uses_target_prefix: bool,
+    native_have_source_prefix: bool,
+    inbound_keep_source_prefix: bool,
+    local_domain_id: Optional[int],
+    ota_domain_id: Optional[int],
+    uses_domain_bridge: bool,
+    hb_topic: Dict[str, str],
+    use_heartbeat: bool,
+    out_enabled: bool,
+    in_enabled: bool,
+    final_topic_type,
+) -> str:
+    """
+    Build the per-peer pipeline_spec.yaml consumed by the status_overview node.
+
+    For each configured topic it enumerates the ordered, locally-observable
+    pipeline stages (Phase 1): outbound stages reach up to the /ota topic the
+    local peer publishes ("sent"); inbound stages cover the /ota topic the local
+    peer receives through to the republished application topic.
+
+    Stage topic names mirror the runtime resolution in topic_resolution.py so the
+    node can subscribe directly without recomputing names.
+    """
+    local_name = peer_name[local]
+    remote_name = peer_name[remote]
+
+    def _safe_type(entry: "TopicEntry", pipe: Dict[str, Any], fallback_base_type: bool = False) -> Optional[str]:
+        if fallback_base_type:
+            base_type = str(entry.msg_type or "").strip()
+            if base_type:
+                return base_type
+        try:
+            return final_topic_type(entry, pipe)
+        except Exception:
+            t = str(entry.msg_type or "").strip()
+            return t or None
+
+    def _expected_hz(pipe: Dict[str, Any]) -> Optional[float]:
+        if pipe.get("throttle") is not None:
+            return float(pipe["throttle"])
+        if pipe.get("trickle_hz") is not None:
+            return float(pipe["trickle_hz"])
+        return None
+
+    def _relay_in_local_topic(topic: str) -> str:
+        if inbound_keep_source_prefix:
+            return f"/{remote_name}{topic}"
+        return topic
+
+    topics: List[Dict[str, Any]] = []
+
+    # --- Outbound: local peer is the source ---
+    if out_enabled:
+        outbound_items: List[Tuple["TopicEntry", Dict[str, Any]]] = []
+        hb_local = hb_topic.get(local, "")
+        for e, p in zip(out_entries, out_pipes):
+            if use_heartbeat and hb_local and e.base == hb_local:
+                continue
+            outbound_items.append((e, p))
+        if use_heartbeat and hb_local:
+            hb_entry = TopicEntry(base=hb_local, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1)
+            hb_pipe = {"final": hb_local}
+            outbound_items.insert(0, (hb_entry, hb_pipe))
+
+        for e, p in outbound_items:
+            base = e.base
+            final = p.get("final", base)
+            forward_final = f"/to_{remote_name}{final}" if use_target_prefix else final
+            forward_ns = forward_final.lstrip("/")
+            app_native = f"/{local_name}{base}" if native_have_source_prefix else base
+            app_processed = f"/{local_name}{final}" if native_have_source_prefix else final
+
+            stages: List[Dict[str, Any]] = [
+                {"stage": "native", "topic": app_native, "domain": "local", "produced_by": "application"},
+            ]
+            if final != base:
+                stages.append(
+                    {"stage": "processed", "topic": app_processed, "domain": "local", "produced_by": "preprocessing"}
+                )
+            stages.append(
+                {"stage": "com_out", "topic": f"/com/out/{local_name}/{forward_ns}", "domain": "local", "produced_by": "relay_out"}
+            )
+            stages.append(
+                {"stage": "ota_sent", "topic": f"/ota/{local_name}/{forward_ns}", "domain": "ota", "produced_by": "bridge_out"}
+            )
+
+            topics.append(
+                {
+                    "base": base,
+                    "direction": "outbound",
+                    "source": local_name,
+                    "target": remote_name,
+                    "type": _safe_type(e, p),
+                    "expected_hz": _expected_hz(p),
+                    "stages": stages,
+                }
+            )
+
+    # --- Inbound: remote peer is the source, local peer is the target ---
+    if in_enabled:
+        inbound_items: List[Tuple["TopicEntry", Dict[str, Any]]] = []
+        hb_remote = hb_topic.get(remote, "")
+        for e, p in zip(in_entries, in_pipes):
+            if use_heartbeat and hb_remote and e.base == hb_remote:
+                continue
+            inbound_items.append((e, p))
+        if use_heartbeat and hb_remote:
+            hb_entry = TopicEntry(base=hb_remote, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1)
+            hb_pipe = {"final": hb_remote}
+            inbound_items.insert(0, (hb_entry, hb_pipe))
+
+        for e, p in inbound_items:
+            base = e.base
+            final = p.get("final", base)
+            forward_final = f"/to_{local_name}{final}" if remote_uses_target_prefix else final
+            forward_ns = forward_final.lstrip("/")
+            app_in = _relay_in_local_topic(final)
+
+            stages = [
+                {"stage": "ota_recv", "topic": f"/ota/{remote_name}/{forward_ns}", "domain": "ota", "produced_by": "transport"},
+                {"stage": "com_in", "topic": f"/com/in/{remote_name}/{forward_ns}", "domain": "local", "produced_by": "bridge_in"},
+                {"stage": "app_in", "topic": app_in, "domain": "local", "produced_by": "relay_in"},
+            ]
+            if final != base:
+                stages.append(
+                    {"stage": "native_in", "topic": _relay_in_local_topic(base), "domain": "local", "produced_by": "postprocessing"}
+                )
+
+            topics.append(
+                {
+                    "base": base,
+                    "direction": "inbound",
+                    "source": remote_name,
+                    "target": local_name,
+                    "type": _safe_type(e, p),
+                    "expected_hz": _expected_hz(p),
+                    "stages": stages,
+                }
+            )
+
+    spec: Dict[str, Any] = {
+        "schema_version": 1,
+        "peer": local_name,
+        "remote": remote_name,
+        "local_domain_id": local_domain_id,
+        "ota_domain_id": ota_domain_id,
+        "uses_domain_bridge": uses_domain_bridge,
+        "topics": topics,
+    }
+    return _yaml_canonical_dump(spec)
 
 
 def _dedup_topic_type_items(items: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
@@ -1498,6 +1677,7 @@ def func(
 
     # Optional shared toggles
     use_topic_monitor = bool(shared.get("use_topic_monitor", False))
+    use_status_overview = bool(shared.get("use_status_overview", False))
     use_heartbeat = bool(shared.get("use_heartbeat", False))
     shared_use_in = shared.get("use_in", None)
     shared_use_out = shared.get("use_out", None)
@@ -2037,6 +2217,7 @@ def func(
     per_peer_otaw_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
     per_peer_otau_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
     per_peer_domain_bridge_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
+    per_peer_status_spec_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
 
     def _prefix_with_source_name_if_needed(target_peer: str, source_peer: str, topic: str) -> str:
         ps = peer_settings_all.get(target_peer, {}) or {}
@@ -2343,6 +2524,38 @@ def func(
                 )
             )
 
+        if use_status_overview:
+            per_peer_status_spec_yaml[local] = _build_status_pipeline_spec(
+                local=local,
+                remote=remote,
+                peer_name=peer_name,
+                out_entries=out_entries,
+                out_pipes=out_pipes,
+                in_entries=in_entries,
+                in_pipes=in_pipes,
+                use_target_prefix=use_target_prefix,
+                remote_uses_target_prefix=remote_uses_target_prefix,
+                native_have_source_prefix=native_have_source_prefix,
+                inbound_keep_source_prefix=bool(inbound_cfg.get("keep_source_prefix", False)),
+                local_domain_id=peer_local_domain_id[local],
+                ota_domain_id=ota_domain_id,
+                uses_domain_bridge=_use_domain_bridge(local),
+                hb_topic=hb_topic,
+                use_heartbeat=use_heartbeat,
+                out_enabled=out_enabled,
+                in_enabled=in_enabled,
+                final_topic_type=_final_topic_type,
+            )
+            blocks.append(
+                PluginBlock(
+                    "status_overview",
+                    [
+                        ("status_overview", True),
+                        ("status_spec_file", "${peer_dir}/pipeline_spec.yaml"),
+                    ],
+                )
+            )
+
         if use_heartbeat:
             # Heartbeat topics are base topics, but may be explicitly targeted on outbound and/or source-prefixed on inbound.
             hb_out = hb_topic[local]
@@ -2585,6 +2798,8 @@ def func(
             generated.append((os.path.join(param_dir, p, "ota_unwrapper.yaml"), per_peer_otau_yaml[p] or ""))
         if per_peer_domain_bridge_yaml.get(p):
             generated.append((os.path.join(param_dir, p, "domain_bridge.yaml"), per_peer_domain_bridge_yaml[p] or ""))
+        if per_peer_status_spec_yaml.get(p):
+            generated.append((os.path.join(param_dir, p, "pipeline_spec.yaml"), per_peer_status_spec_yaml[p] or ""))
 
     _write_generated_files(generated, force=force, rewrite_formatting=rewrite_formatting)
 

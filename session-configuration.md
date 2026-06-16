@@ -78,8 +78,9 @@ Address expressions are explicit:
 
 ```yaml
 shared:
-  use_topic_monitor: false   # default false
-  use_heartbeat: false       # default false
+  use_topic_monitor: false    # default false
+  use_status_overview: false  # default false
+  use_heartbeat: false        # default false
 
   # Unified RMW configuration. Covers both the local ROS graph and the
   # over-the-air (OTA) bridge processes. See "RMW configuration" below.
@@ -286,6 +287,46 @@ Default heartbeat topic per peer: `/heartbeat_<com-name>`
 Override: `peer_settings.<peer>.heartbeat_topic`
 Placement in topic list: per direction via `shared.heartbeat_position` (default `prepend`).
 
+#### Status overview behavior
+If `use_status_overview: true`:
+- The generator emits a per-peer `pipeline_spec.yaml` enumerating, for each
+  configured topic, the ordered pipeline stages observable on that peer.
+- A `status_overview` node (catmux `STAT` window) tracks, per topic, the
+  furthest stage reached and the first stage that is missing/broken, plus live
+  metrics (last-message age, Hz, mean size, latency).
+- It writes, under `session-instances/.../logs/<peer>/status/`:
+  - `status.json` — machine-readable snapshot (source of truth), rewritten on a
+    short interval and on every state transition;
+  - `status.txt` — human-rendered table regenerated alongside the JSON;
+  - `events.jsonl` — append-only, one line per state transition.
+- Read it from the host with `rosotacom status [<session>] [--json] [--watch]`.
+
+Phase 1 observes only what the local peer's ROS graph exposes: outbound topics
+up to the `/ota` topic this peer publishes ("sent"), and inbound topics from the
+received `/ota` topic through the republished application topic. Remote-side
+confirmation is reserved for a later phase and reported as `unknown`. OTA-domain
+observation assumes same-host discovery of the OTA `ROS_DOMAIN_ID` (works for the
+bundled DDS / `zenoh_ros2dds` examples; native `rmw_zenoh` OTA is not observed in
+Phase 1).
+
+##### Phase 2 (planned, not implemented)
+
+Phase 1 is per-peer local observation. A complete end-to-end view
+(`source -> ... -> remote-republished`, including the remote's republish Hz and
+latency) requires the two peers to exchange compact per-topic status. The
+intended design, mirroring the bidirectional heartbeat path:
+
+- Each peer publishes a small per-topic status summary on a dedicated OTA topic
+  (e.g. `/ota/<peer>/__topic_status`, carried by the same transport), likely
+  backed by a new `com_msgs` message type.
+- The remote receives the source's "sent" view and the source receives the
+  remote's "received and republished" view, so each side can fill the
+  `remote_observation` field that Phase 1 leaves as `null` and render the full
+  pipeline locally.
+
+Until then, combine both peers' `status.json` files (read side by side by a
+human or an agent) to reconstruct the end-to-end picture.
+
 ### `peer_settings` (optional)
 
 ```yaml
@@ -416,7 +457,10 @@ zen_qos:
 ```
 
 ### What gets generated
-For a session directory containing a session configuration input file, the generator typically produces:
+For a session configuration input file, `rosotacom start` writes generated files
+to the active runtime instance under `session-instances/<date>/<run>/config/`.
+The static `sessions/<name>/` definition/template directory is left unchanged.
+The generator typically produces:
 
 - `*_to_*_topics.txt` (topic list files per direction)
 - Per peer directory:

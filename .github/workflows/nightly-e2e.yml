@@ -41,5 +41,5 @@ jobs:
       - name: Show Docker environment
         run: docker info
 
-      - name: Run full E2E
-        run: just test-e2e-fast
+      - name: Run heartbeat smoke matrix
+        run: just test-e2e-smoke

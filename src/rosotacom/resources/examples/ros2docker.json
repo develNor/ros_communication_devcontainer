@@ -9,7 +9,7 @@
 
   // Extra docker run arguments
   "run_args": [
-    "-e", "ROS_DOMAIN_ID=47",
+    "-e", "ROS_DOMAIN_ID=48",
     "-e", "BUILD_ROS2WS=1",
     "-e", "CHECK_ROS2WS_DEPENDENCIES=1",
     "--network", "host"
@@ -20,7 +20,9 @@
 
   // Build-time arguments — defaults shown; override if necessary
   "build_args": {
-    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp iw nload iftop iproute2 tshark",
+    "BASE_IMAGE": "osrf/ros:kilted-desktop-full-noble",
+    "DIGEST": "@sha256:29eb6f48bb06549aba004a7a4b12c00ece23b156731df12cf1f3c1ae1b0fd178",
+    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp iw nload iftop iproute2 tshark ros-kilted-domain-bridge",
     "PIP_PACKAGES":                  "numpy>=1.26,<2 lz4 pysnmp speedtest-cli psutil zstandard opencv-python"
   }
 }

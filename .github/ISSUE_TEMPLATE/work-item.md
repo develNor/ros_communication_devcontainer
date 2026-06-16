@@ -36,4 +36,4 @@ Describe the outcome this issue should achieve.
 - [ ] `just test-contract`
 - [ ] `just docs`
 - [ ] `just check`
-- [ ] `just test-e2e-fast`, if Docker/runtime behavior changed.
+- [ ] `just test-e2e-smoke`, if Docker/runtime behavior changed.

@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+
+# -- BEGIN LICENSE BLOCK ----------------------------------------------
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#    * Redistributions of source code must retain the above copyright
+#      notice, this list of conditions and the following disclaimer.
+#
+#    * Redistributions in binary form must reproduce the above copyright
+#      notice, this list of conditions and the following disclaimer in the
+#      documentation and/or other materials provided with the distribution.
+#
+#    * Neither the name of the {copyright_holder} nor the names of its
+#      contributors may be used to endorse or promote products derived from
+#      this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+# -- END LICENSE BLOCK ------------------------------------------------
+#
+# ---------------------------------------------------------------------
+# !\file
+#
+# \brief  rosotacom status / debugging overview node.
+#
+# Tracks, for every configured topic, the furthest pipeline stage it has
+# reached and the first stage that is missing/broken, plus live metrics
+# (last-message age, Hz, mean size, latency). Writes a machine-readable
+# status.json (source of truth), a rendered status.txt, and an append-only
+# events.jsonl (one line per state transition).
+#
+# Phase 1 observes only what the local peer's ROS graph exposes:
+#   * outbound topics up to the /ota topic this peer publishes ("sent")
+#   * inbound topics from the received /ota topic through the republished
+#     application topic.
+# End-to-end remote confirmation is reserved for a later phase; remote-side
+# fields are reported as "unknown".
+#
+# The pure classification/rollup/rendering logic lives in
+# status_overview_core (ROS-independent, unit-tested on the host); this file
+# wires it to live ROS graph observers (one per ROS domain).
+# ---------------------------------------------------------------------
+
+from __future__ import annotations
+
+import os
+import threading
+from typing import Dict, Optional
+
+import yaml
+
+import rclpy
+from rclpy.context import Context
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.serialization import serialize_message
+from rosidl_runtime_py.utilities import get_message
+
+from com_py.status_overview_core import (
+    StageObservation,
+    StatusAggregator,
+    collect_stage_topics,
+)
+
+
+class StageObserver(Node):
+    """
+    Observes a set of stage topics within a single ROS domain context.
+
+    Performs periodic graph introspection (publisher/subscriber counts) and
+    dynamically subscribes to topics that have a publisher, measuring size and
+    header-based latency per message.
+    """
+
+    def __init__(self, node_name: str, context: Optional[Context],
+                 topics: Dict[str, Optional[str]], refresh_interval_s: float):
+        super().__init__(node_name, context=context)
+        self.observations: Dict[str, StageObservation] = {
+            t: StageObservation(type_str=hint) for t, hint in topics.items()
+        }
+        self._refresh_interval_s = refresh_interval_s
+        self.create_timer(self._refresh_interval_s, self._refresh)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        try:
+            graph = {name: types for name, types in self.get_topic_names_and_types()}
+        except Exception:  # pragma: no cover - defensive
+            graph = {}
+
+        for topic, obs in self.observations.items():
+            try:
+                obs.pub_count = self.count_publishers(topic)
+                obs.sub_count = self.count_subscribers(topic)
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+            if obs.subscribed:
+                continue
+            type_str = obs.type_str
+            if not type_str:
+                graph_types = graph.get(topic)
+                type_str = graph_types[0] if graph_types else None
+            if not type_str or obs.pub_count == 0:
+                continue
+            try:
+                msg_class = get_message(type_str)
+            except Exception:
+                msg_class = None
+            if msg_class is None:
+                continue
+            qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10,
+            )
+            try:
+                self.create_subscription(msg_class, topic, self._make_cb(topic), qos)
+                obs.subscribed = True
+                obs.type_str = type_str
+            except Exception:  # pragma: no cover - defensive
+                continue
+
+    def _make_cb(self, topic: str):
+        def cb(msg):
+            try:
+                size = len(serialize_message(msg))
+            except Exception:
+                size = 0
+            delay_s: Optional[float] = None
+            header = getattr(msg, "header", None)
+            stamp = getattr(header, "stamp", None) if header is not None else None
+            if stamp is not None:
+                try:
+                    now = self.get_clock().now()
+                    msg_time = rclpy.time.Time.from_msg(stamp)
+                    d = (now - msg_time).nanoseconds / 1e9
+                    if -1.0 < d < 1000.0:  # guard unsynced clocks / zero stamps
+                        delay_s = d
+                except Exception:
+                    delay_s = None
+            self.observations[topic].record(size, delay_s)
+
+        return cb
+
+
+class StatusOverview(Node):
+    """Coordinator node: owns the local-domain observer, the aggregator timer,
+    and (when domains are split) a second observer running in the OTA context."""
+
+    def __init__(self) -> None:
+        super().__init__("status_overview")
+
+        self.declare_parameter("status_spec_file", "")
+        self.declare_parameter("output_dir", "")
+        self.declare_parameter("write_interval_s", 2.0)
+        self.declare_parameter("liveness_window_s", 3.0)
+        self.declare_parameter("stale_after_s", 3.0)
+        self.declare_parameter("refresh_interval_s", 5.0)
+        self.declare_parameter("delay_good_ms", 100.0)
+        self.declare_parameter("delay_bad_ms", 200.0)
+
+        spec_file = str(self.get_parameter("status_spec_file").value or "").strip()
+        output_dir = str(self.get_parameter("output_dir").value or "").strip()
+        if not spec_file:
+            raise ValueError("Parameter 'status_spec_file' is required")
+        if not output_dir:
+            output_dir = os.path.join(os.path.dirname(spec_file), "status")
+
+        with open(spec_file, "r", encoding="utf-8") as fp:
+            self.spec = yaml.safe_load(fp) or {}
+
+        self.write_interval_s = float(self.get_parameter("write_interval_s").value)
+        self.refresh_interval_s = float(self.get_parameter("refresh_interval_s").value)
+
+        local_domain_id = self.spec.get("local_domain_id")
+        ota_domain_id = self.spec.get("ota_domain_id")
+        need_ota_ctx = ota_domain_id is not None and ota_domain_id != local_domain_id
+
+        by_domain = collect_stage_topics(self.spec)
+
+        self._ota_context: Optional[Context] = None
+        self._ota_executor: Optional[MultiThreadedExecutor] = None
+        self._ota_thread: Optional[threading.Thread] = None
+        observers: Dict[str, StageObserver] = {}
+
+        # Local-domain observer shares this node's (default) context. When
+        # domains are not split, all stages are observed here.
+        local_topics = dict(by_domain.get("local", {}))
+        if not need_ota_ctx:
+            local_topics.update(by_domain.get("ota", {}))
+        self._local_observer = StageObserver(
+            "status_overview_local_obs", None, local_topics, self.refresh_interval_s
+        )
+        observers["local"] = self._local_observer
+
+        if need_ota_ctx:
+            self._ota_context = Context()
+            rclpy.init(context=self._ota_context, domain_id=int(ota_domain_id))
+            self._ota_observer = StageObserver(
+                "status_overview_ota_obs",
+                self._ota_context,
+                dict(by_domain.get("ota", {})),
+                self.refresh_interval_s,
+            )
+            observers["ota"] = self._ota_observer
+            self._ota_executor = MultiThreadedExecutor(num_threads=2, context=self._ota_context)
+            self._ota_executor.add_node(self._ota_observer)
+            self._ota_thread = threading.Thread(target=self._ota_executor.spin, daemon=True)
+            self._ota_thread.start()
+            self.get_logger().info(
+                f"status_overview: OTA observer running in domain {ota_domain_id}"
+            )
+
+        self.aggregator = StatusAggregator(
+            self.get_logger(),
+            self.spec,
+            output_dir,
+            observers,
+            liveness_window_s=float(self.get_parameter("liveness_window_s").value),
+            stale_after_s=float(self.get_parameter("stale_after_s").value),
+            delay_good_ms=float(self.get_parameter("delay_good_ms").value),
+            delay_bad_ms=float(self.get_parameter("delay_bad_ms").value),
+        )
+
+        self.create_timer(self.write_interval_s, self._on_write)
+        self.get_logger().info(
+            f"status_overview started: peer={self.spec.get('peer')} "
+            f"topics={len(self.spec.get('topics', []))} output={output_dir}"
+        )
+
+    def add_local_nodes(self, executor: MultiThreadedExecutor) -> None:
+        executor.add_node(self)
+        executor.add_node(self._local_observer)
+
+    def _on_write(self) -> None:
+        self.aggregator.write()
+
+    def shutdown(self) -> None:
+        if self._ota_executor is not None:
+            try:
+                self._ota_executor.shutdown()
+            except Exception:
+                pass
+        if self._ota_context is not None:
+            try:
+                self._ota_context.try_shutdown()
+            except Exception:
+                pass
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = StatusOverview()
+    executor = MultiThreadedExecutor(num_threads=4)
+    node.add_local_nodes(executor)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.shutdown()
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

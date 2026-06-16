@@ -40,4 +40,19 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     assert "ci-success" in merge_gate
     assert "just test-nondocker-cov" in merge_gate
     assert "just package" in merge_gate
-    assert "just test-e2e-fast" in merge_gate
+    assert "just test-e2e-smoke" in merge_gate
+
+
+def test_e2e_smoke_matrix_covers_all_heartbeat_rmw_examples() -> None:
+    e2e_smoke = (PACKAGE_ROOT / "tests" / "e2e" / "test_smoke.py").read_text(encoding="utf-8")
+
+    expected_sessions = [
+        "1_heartbeat_fastdds",
+        "1_heartbeat_cyclone-ota",
+        "1_heartbeat_zen-endpoints",
+        "1_heartbeat_fastdds-local_cyclone-ota",
+        "1_heartbeat_cyclone-local_fastdds-ota",
+        "1_heartbeat_cyclone-local_zenoh-ros2dds-ota",
+    ]
+    for session in expected_sessions:
+        assert session in e2e_smoke

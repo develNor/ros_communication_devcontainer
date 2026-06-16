@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, volatile]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
@@ -125,8 +125,16 @@ jobs:
       - name: Show Docker environment
         run: docker info
 
-      - name: Run fast E2E
-        run: just test-e2e-fast
+      - name: Run heartbeat smoke matrix
+        run: just test-e2e-smoke
+
+      - name: Upload smoke session artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: session-instances-smoke
+          path: session-instances/
+          if-no-files-found: ignore
 
   ci-success:
     name: ci-success

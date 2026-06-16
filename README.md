@@ -53,10 +53,11 @@ Legacy global symlinks are still available when explicitly requested:
 
 ### Basic Setup
 
-`rosotacom` uses two layers of configuration:
+`rosotacom` uses three layers of configuration/runtime state:
 
-- A **project setup** file (`rosotacom.yaml`) points to host-local resources such as `ros2docker.json`, `sessions/`, and `data_dict.json`.
+- A **project setup** file (`rosotacom.yaml`) points to host-local resources such as `ros2docker.json`, static `sessions/`, ignored `session-instances/`, and `data_dict.json`.
 - A **session config** defines the communication behavior for one run: peers, addresses, topics, QoS, processing, and transport choices.
+- A **session instance** stores one concrete run: generated config, catmux pane logs, smoke debug output, and future rosbags.
 
 No `rosotacom.yaml` is discovered automatically. Wire one explicitly with a flag or with `ROSOTACOM_CONFIG`:
 
@@ -74,6 +75,7 @@ rosotacom.yaml
 ros2docker.json
 data_dict.json
 sessions/
+session-instances/
 scripts/
 ```
 
@@ -91,13 +93,13 @@ Run `rosotacom` on each peer with the same active setup but a different identity
 
 ```bash
 # on peer "a"
-rosotacom start 1_heartbeat --identity a
+rosotacom start 1_heartbeat_cyclone-ota --identity a
 
 # on peer "b"
-rosotacom start 1_heartbeat --identity b
+rosotacom start 1_heartbeat_cyclone-ota --identity b
 ```
 
-`rosotacom` reads the session input and creates generated files in that session directory, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`.
+`rosotacom` reads the static session input and creates generated files under `session-instances/<date>/<session>_<timestamp>_<id>/config/`, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`. Catmux pane output is logged under the same instance in `logs/<peer>/catmux/`.
 
 ## Usage Examples
 
@@ -113,6 +115,50 @@ Run the local heartbeat smoke test:
 
 ```bash
 rosotacom smoke
+```
+
+The smoke test verifies both directions through the communication path: it waits
+for `/com/in/a/heartbeat_a` and `/heartbeat_a` in peer `b`, plus
+`/com/in/b/heartbeat_b` and `/heartbeat_b` in peer `a`. For each checked topic it
+also reports a `SMOKE_METRIC` line with the received rate (`hz`) and end-to-end
+latency (`delay_s`) so rate and latency regressions are visible. It prints the
+`session-instances/...` artifact path so failures (and the per-peer
+`logs/<peer>/catmux/...` pane output) can be inspected after the containers stop.
+
+### Live status / debugging overview
+
+Enable a continuously-updated, per-topic pipeline overview by setting
+`shared.use_status_overview: true` in the session definition (see the
+ready-made `1_heartbeat_status` example). For every configured topic it tracks
+where the topic currently is in the communication pipeline (furthest stage
+reached and the first stage that is missing/broken), plus last-message age, Hz,
+mean size, and latency.
+
+The running session writes, under
+`session-instances/.../logs/<peer>/status/`:
+
+- `status.json` — machine-readable snapshot (source of truth) for tools/agents,
+  refreshed on a short interval and on every state transition,
+- `status.txt` — a human-rendered table, and
+- `events.jsonl` — one line per state transition (when/where a topic stalled).
+
+Read it from the host with the `status` command:
+
+```bash
+rosotacom status 1_heartbeat_status            # human-readable table
+rosotacom status 1_heartbeat_status --json     # machine-readable, for tools/agents
+rosotacom status 1_heartbeat_status --watch    # live refresh
+```
+
+Phase 1 reports each peer's locally-observable stages (outbound up to the `/ota`
+topic this peer publishes; inbound from the received `/ota` topic through the
+republished application topic). Combine both peers' files for the full
+end-to-end picture; cross-peer confirmation is reserved for a later phase.
+
+Run the CI heartbeat smoke matrix locally:
+
+```bash
+just test-e2e-smoke
 ```
 
 Run the heartbeat example manually:
@@ -132,7 +178,12 @@ cd scripts/2_native_chatter/machine_a
 
 The `sessions/` directory contains the built-in session definitions:
 
-- `1_heartbeat`: minimal heartbeat exchange
+- `1_heartbeat_fastdds`: minimal heartbeat exchange over FastDDS
+- `1_heartbeat_cyclone-ota`: heartbeat with CycloneDDS OTA config
+- `1_heartbeat_zen-endpoints`: heartbeat with native Zenoh connected endpoints
+- `1_heartbeat_fastdds-local_cyclone-ota`: local FastDDS with CycloneDDS OTA config
+- `1_heartbeat_cyclone-local_fastdds-ota`: local CycloneDDS with FastDDS OTA
+- `1_heartbeat_cyclone-local_zenoh-ros2dds-ota`: local CycloneDDS with Zenoh-ROS2DDS OTA
 - `2_native_chatter`: bridge `/chatter` from `machine_b` to `machine_a`
 - `3_comp_occ_grid`: compressed occupancy grid over DDS
 - `4_comp_occ_grid_zen`: compressed occupancy grid through Zenoh

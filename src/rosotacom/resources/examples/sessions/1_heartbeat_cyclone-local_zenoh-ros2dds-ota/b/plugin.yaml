@@ -1,0 +1,37 @@
+parameters:
+  session_dir: /session/configs/1_heartbeat_cyclone-local_zenoh-ros2dds-ota
+  peer_dir: ${session_dir}/b
+
+  ip_local: data:machine_b_ip
+  local_name: b
+  ip_remote: data:machine_a_ip
+  remote_name: a
+
+  rmw_local: cyclone
+
+  in: true
+  topic_list_paths_inbound: ${session_dir}/a_to_b_topics.txt
+
+  out: true
+  topic_list_paths_outbound: ${session_dir}/b_to_a_topics.txt
+
+  use_domain_bridge: true
+  local_domain_id: 47
+  ota_domain_id: 48
+  domain_bridge_config_file: ${peer_dir}/domain_bridge.yaml
+
+  zen_pub_allow: /ota/b/.*
+  zen_sub_allow: /ota/a/.*
+  zen_transport: udp
+  zen_mode: router
+  zen_endpoint_role: connect
+  zen_main_ip: data:machine_a_ip
+  zen_main_port: 7447
+
+  rmw_ota: zenoh_ros2dds
+  use_zenoh_rmw: false
+  use_zenoh_ros2dds: true
+
+  heartbeat: true
+  heartbeat_out_topics: /heartbeat_b
+  heartbeat_in_topic: /heartbeat_a

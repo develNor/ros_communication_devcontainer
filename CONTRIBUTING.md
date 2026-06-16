@@ -31,19 +31,19 @@ just test-contract
 just test-nondocker-cov
 just docs
 just package
-just test-e2e-fast
+just test-e2e-smoke
 ```
 
 Before opening or updating a ready PR, run:
 
 ```bash
 just check
-just test-e2e-fast
+just test-e2e-smoke
 ```
 
 `just check` runs linting, type checking, host tests under coverage, docs checks,
-and package validation. `just test-e2e-fast` runs the required Docker-backed
-smoke test separately so failures are easier to inspect.
+and package validation. `just test-e2e-smoke` runs the required Docker-backed
+heartbeat smoke matrix separately so failures are easier to inspect.
 
 ## Branch And Merge Policy
 

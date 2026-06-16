@@ -30,4 +30,4 @@ Improve implementation quality while preserving the current public contract.
 - [ ] `just test-unit`
 - [ ] `just test-contract`
 - [ ] `just docs`
-- [ ] `just test-e2e-fast`, if Docker/runtime behavior changed.
+- [ ] `just test-e2e-smoke`, if Docker/runtime behavior changed.

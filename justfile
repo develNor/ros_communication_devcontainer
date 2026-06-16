@@ -37,8 +37,10 @@ coverage: test-nondocker-cov
 test-nondocker-cov:
 	{{python}} -m pytest -q tests/unit tests/contract --cov=rosotacom --cov-report=term-missing --cov-report=xml:coverage.xml
 
-test-e2e-fast:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e -m e2e
+test-e2e-smoke:
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -m e2e
+
+test-e2e-fast: test-e2e-smoke
 
 docs:
 	{{python}} -m pytest -q tests/contract/test_markdown_links.py tests/contract/test_readme_examples.py tests/contract/test_pytest_policy.py
@@ -72,7 +74,7 @@ _package-smoke:
 	    "py.typed",
 	    "resources/ros2docker.json.example",
 	    "resources/examples/rosotacom.yaml",
-	    "resources/examples/sessions/1_heartbeat/session-definition.yaml",
+	    "resources/examples/sessions/1_heartbeat_fastdds/session-definition.yaml",
 	    "resources/ws/session/creation/run_session.py",
 	    "resources/ws/ros2src/com_msgs/msg/Heartbeat.msg",
 	)

@@ -33,6 +33,7 @@ setup(
             'heartbeat_out_publisher = com_py.heartbeat_out_publisher:main',
             'heartbeat_in_monitor = com_py.heartbeat_in_monitor:main',
             'topic_monitor = com_py.topic_monitor:main',
+            'status_overview = com_py.status_overview:main',
             'bridge_in = com_py.bridge_in:main',
             'bridge_out = com_py.bridge_out:main',
             'relay_in = com_py.relay_in:main',

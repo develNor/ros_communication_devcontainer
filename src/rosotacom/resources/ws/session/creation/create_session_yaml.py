@@ -40,9 +40,32 @@
 import yaml
 import argparse
 import os
+import shlex
 import stat
 
-def main(peer_dir):
+
+def _logging_before_command(instance_dir=None, config_dir=None, catmux_log_dir=None, rosbag_dir=None):
+    exports = {
+        "ROSOTACOM_INSTANCE_DIR": instance_dir,
+        "ROSOTACOM_CONFIG_DIR": config_dir,
+        "ROSOTACOM_CATMUX_LOG_DIR": catmux_log_dir,
+        "ROSOTACOM_ROSBAG_DIR": rosbag_dir,
+    }
+    parts = [f"export {key}={shlex.quote(str(value))}" for key, value in exports.items() if value]
+    parts.append("source /ws/session/creation/catmux_log_setup.sh")
+    return "; ".join(parts)
+
+
+def _inject_logging_command(merged_config, logging_command):
+    common = merged_config.setdefault('common', {})
+    before_commands = common.get('before_commands') or []
+    if not isinstance(before_commands, list):
+        before_commands = [before_commands]
+    before_commands = [cmd for cmd in before_commands if cmd != logging_command]
+    common['before_commands'] = [logging_command, *before_commands]
+
+
+def main(peer_dir, instance_dir=None, config_dir=None, catmux_log_dir=None, rosbag_dir=None):
     spec_file = os.path.join(peer_dir, 'session_specification.yaml')
 
     with open(spec_file, 'r') as f:
@@ -80,6 +103,16 @@ def main(peer_dir):
     if parameters:
         merged_config['parameters'] = {**merged_config['parameters'], **parameters}
 
+    _inject_logging_command(
+        merged_config,
+        _logging_before_command(
+            instance_dir=instance_dir,
+            config_dir=config_dir,
+            catmux_log_dir=catmux_log_dir,
+            rosbag_dir=rosbag_dir,
+        ),
+    )
+
     # Output file path
     output_file = os.path.join(peer_dir, '.session_readonly.yaml')
 
@@ -97,6 +130,16 @@ def main(peer_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Merge multiple YAML plugin files into a full session configuration.")
     parser.add_argument('-p', '--peer-dir', required=True, help='Peer directory containing the session_specification.yaml file')
+    parser.add_argument('--instance-dir')
+    parser.add_argument('--config-dir')
+    parser.add_argument('--catmux-log-dir')
+    parser.add_argument('--rosbag-dir')
     args = parser.parse_args()
 
-    main(args.peer_dir)
+    main(
+        args.peer_dir,
+        instance_dir=args.instance_dir,
+        config_dir=args.config_dir,
+        catmux_log_dir=args.catmux_log_dir,
+        rosbag_dir=args.rosbag_dir,
+    )

@@ -22,7 +22,7 @@ ci-success
 ```
 
 The merge gate runs Python 3.10 through 3.14 non-Docker checks, package
-validation, and fast Docker smoke:
+validation, and the Docker heartbeat smoke matrix:
 
 ```bash
 just lint
@@ -30,7 +30,7 @@ just typecheck
 just test-nondocker-cov
 just docs
 just package
-just test-e2e-fast
+just test-e2e-smoke
 ```
 
 The Python 3.12 leg uploads `coverage.xml` to Codecov with the `nondocker` flag.
@@ -38,9 +38,12 @@ Docker E2E is not collected for coverage.
 
 ## Docker E2E
 
-`just test-e2e-fast` runs the local heartbeat smoke test through Docker. It is a
-required merge-gate job because `rosotacom` exists to orchestrate Docker-backed
-ROS communication sessions.
+`just test-e2e-smoke` runs the local heartbeat smoke matrix through Docker. It
+is a required merge-gate job because `rosotacom` exists to orchestrate
+Docker-backed ROS communication sessions. Each smoke run writes generated
+config, catmux pane logs, Docker logs when available, and the smoke verification
+log under `session-instances/`; collect that directory as the first debugging
+artifact when an E2E job fails.
 
 ## Nightly And Maintenance
 

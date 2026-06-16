@@ -7,8 +7,12 @@ peers:
 peer_settings:
   a:
     domain_id: 46
+    # inbound:
+    #   keep_source_prefix: true
   b:
     domain_id: 47
+    # inbound:
+    #   keep_source_prefix: true
 
 shared:
   use_heartbeat: true

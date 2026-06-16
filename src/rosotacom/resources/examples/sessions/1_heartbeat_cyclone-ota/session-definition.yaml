@@ -4,10 +4,22 @@ peers:
   b:
     address: "data:machine_b_ip"
 
+peer_settings:
+  a:
+    domain_id: 46
+    # inbound:
+    #   keep_source_prefix: true
+  b:
+    domain_id: 47
+    # inbound:
+    #   keep_source_prefix: true
+
 shared:
   use_heartbeat: true
   rmw:
-    local: cyclone
+    local:
+      cyclone:
+        config: cyclonedds_minimal.xml
     ota:
       cyclone:
         config: cyclonedds_minimal.xml

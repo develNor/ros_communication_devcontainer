@@ -473,8 +473,8 @@ def test_stop_list_doctor_and_smoke_host_flows(
     )
     (instance.config_host_dir / "a").mkdir(parents=True)
     (instance.config_host_dir / "b").mkdir()
-    (instance.config_host_dir / "a" / "plugin.yaml").write_text("127.0.0.1\n", encoding="utf-8")
-    (instance.config_host_dir / "b" / "plugin.yaml").write_text("127.0.0.1\n", encoding="utf-8")
+    (instance.config_host_dir / "a" / "plugin.yaml").write_text("10.137.0.2\n", encoding="utf-8")
+    (instance.config_host_dir / "b" / "plugin.yaml").write_text("10.137.0.3\n", encoding="utf-8")
     cfg = {"peers": {"a": {}, "b": {}}}
     stopped: list[str] = []
 
@@ -499,6 +499,8 @@ def test_stop_list_doctor_and_smoke_host_flows(
     assert "OK: ros2docker validation: config loads" in capsys.readouterr().out
 
     monkeypatch.setattr(rosotacom, "start_session", lambda args: f"container_{args.identity}")
+    monkeypatch.setattr(rosotacom, "_ensure_smoke_network", lambda: None)
+    monkeypatch.setattr(rosotacom, "_remove_smoke_network", lambda: None)
     monkeypatch.setattr(
         rosotacom,
         "_run_container_shell",
@@ -524,60 +526,20 @@ def test_stop_list_doctor_and_smoke_host_flows(
     assert stopped[-2:] == ["container_a", "container_b"]
 
 
-def test_native_zenoh_smoke_uses_distinct_loopback_addresses(tmp_path: Path) -> None:
-    session_dir = tmp_path / "sessions" / "1_heartbeat_zen-endpoints"
-    session_dir.mkdir(parents=True)
-    (session_dir / "session-definition.yaml").write_text(
-        "\n".join(
-            [
-                "peers:",
-                "  a:",
-                "    address: data:machine_a_ip",
-                "  b:",
-                "    address: data:machine_b_ip",
-                "shared:",
-                "  rmw:",
-                "    local: zenoh",
-                "    ota: zenoh_connect_endpoints",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    session = rosotacom.ResolvedSession(
-        session_dir,
-        "/session/definitions/1_heartbeat_zen-endpoints",
-        "session_configs",
-    )
-
-    assert rosotacom._smoke_peer_address_args(session, "127.0.0.1") == ["a=127.0.0.1", "b=127.0.0.2"]
+def test_smoke_peer_addresses_use_isolated_bridge_ips() -> None:
+    # Smoke isolates the two peers in their own network namespaces on a dedicated
+    # docker bridge with distinct IPs, instead of sharing the host loopback.
+    assert rosotacom._smoke_peer_address_args() == ["a=10.137.0.2", "b=10.137.0.3"]
+    assert rosotacom.SMOKE_PEER_IPS == {"a": "10.137.0.2", "b": "10.137.0.3"}
 
 
-def test_fastdds_smoke_uses_distinct_loopback_addresses(tmp_path: Path) -> None:
-    session_dir = tmp_path / "sessions" / "1_heartbeat_fastdds"
-    session_dir.mkdir(parents=True)
-    (session_dir / "session-definition.yaml").write_text(
-        "\n".join(
-            [
-                "peers:",
-                "  a:",
-                "    address: data:machine_a_ip",
-                "  b:",
-                "    address: data:machine_b_ip",
-                "shared:",
-                "  rmw: fastdds",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    session = rosotacom.ResolvedSession(
-        session_dir,
-        "/session/definitions/1_heartbeat_fastdds",
-        "session_configs",
-    )
-
-    assert rosotacom._smoke_peer_address_args(session, "127.0.0.1") == ["a=127.0.0.1", "b=127.0.0.2"]
+def test_isolated_network_run_args_swaps_host_networking() -> None:
+    base = ["-e", "ROS_DOMAIN_ID=48", "--network", "host"]
+    swapped = rosotacom._isolated_network_run_args(base, "rosotacom-smoke", "10.137.0.2")
+    assert "host" not in swapped
+    assert swapped == ["-e", "ROS_DOMAIN_ID=48", "--network", "rosotacom-smoke", "--ip", "10.137.0.2"]
+    # A config that already pins --network=... form is also replaced.
+    assert rosotacom._isolated_network_run_args(["--network=host"], "net", None) == ["--network", "net"]
 
 
 def test_run_session_generates_into_instance_config_without_touching_static_source(tmp_path: Path) -> None:

@@ -16,6 +16,3 @@ shared:
   rmw:
     local: cyclone
     ota: zenoh_ros2dds
-
-# - why here local ips?
-# - here hz is way to much

@@ -128,10 +128,11 @@ latency (`delay_s`) so rate and latency regressions are visible. It prints the
 ### Live status / debugging overview
 
 Enable a continuously-updated, per-topic pipeline overview by setting
-`shared.use_status_overview: true` in the session definition. For every
-configured topic it tracks where the topic currently is in the communication
-pipeline (furthest stage reached and the first stage that is missing/broken),
-plus last-message age, Hz, mean size, and latency.
+`shared.use_status_overview: true` in the session definition (see the
+ready-made `1_heartbeat_status` example). For every configured topic it tracks
+where the topic currently is in the communication pipeline (furthest stage
+reached and the first stage that is missing/broken), plus last-message age, Hz,
+mean size, and latency.
 
 The running session writes, under
 `session-instances/.../logs/<peer>/status/`:
@@ -144,9 +145,9 @@ The running session writes, under
 Read it from the host with the `status` command:
 
 ```bash
-rosotacom status 1_heartbeat_cyclone-ota            # human-readable table
-rosotacom status 1_heartbeat_cyclone-ota --json     # machine-readable, for tools/agents
-rosotacom status 1_heartbeat_cyclone-ota --watch    # live refresh
+rosotacom status 1_heartbeat_status            # human-readable table
+rosotacom status 1_heartbeat_status --json     # machine-readable, for tools/agents
+rosotacom status 1_heartbeat_status --watch    # live refresh
 ```
 
 Phase 1 reports each peer's locally-observable stages (outbound up to the `/ota`

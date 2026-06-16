@@ -1,0 +1,45 @@
+local_domain_id: 47
+ota_domain_id: 48
+peer: b
+remote: a
+schema_version: 1
+topics:
+- base: /heartbeat_b
+  direction: outbound
+  expected_hz: null
+  source: b
+  stages:
+  - domain: local
+    produced_by: application
+    stage: native
+    topic: /heartbeat_b
+  - domain: local
+    produced_by: relay_out
+    stage: com_out
+    topic: /com/out/b/heartbeat_b
+  - domain: ota
+    produced_by: bridge_out
+    stage: ota_sent
+    topic: /ota/b/heartbeat_b
+  target: a
+  type: com_msgs/msg/Heartbeat
+- base: /heartbeat_a
+  direction: inbound
+  expected_hz: null
+  source: a
+  stages:
+  - domain: ota
+    produced_by: transport
+    stage: ota_recv
+    topic: /ota/a/heartbeat_a
+  - domain: local
+    produced_by: bridge_in
+    stage: com_in
+    topic: /com/in/a/heartbeat_a
+  - domain: local
+    produced_by: relay_in
+    stage: app_in
+    topic: /heartbeat_a
+  target: b
+  type: com_msgs/msg/Heartbeat
+uses_domain_bridge: true

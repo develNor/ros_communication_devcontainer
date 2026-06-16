@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import importlib.resources as importlib_resources
 import importlib.util
+import json
 import os
 import re
 import shlex
@@ -867,6 +868,15 @@ def start_session(args: argparse.Namespace) -> str:
     instance = _resolve_session_instance(runtime, session, getattr(args, "instance_id", None))
     image_name = _scoped_image_name(runtime)
     extra_run_args = _base_extra_run_args(runtime, session, cfg, instance)
+    run_override: dict[str, object] = {}
+    network_name = getattr(args, "network_name", None)
+    if network_name:
+        base_run_args = load_config(runtime.ros2docker_config).get("run_args", []) or []
+        run_override["run_args"] = _isolated_network_run_args(
+            [str(arg) for arg in base_run_args],
+            network_name,
+            getattr(args, "network_ip", None),
+        )
     mode = _resolve_mode(args.mode)
     command = _session_command(
         session,
@@ -912,7 +922,7 @@ def start_session(args: argparse.Namespace) -> str:
         ros2docker_build(config_file=runtime.ros2docker_config, override=common_override)
         ros2docker_run(
             config_file=runtime.ros2docker_config,
-            override={**common_override, "run_type": "up"},
+            override={**common_override, "run_type": "up", **run_override},
             extra_run_args=extra_run_args,
         )
         _wait_for_container_ready(container_name)
@@ -933,6 +943,7 @@ def start_session(args: argparse.Namespace) -> str:
                 "command": command,
                 "tty": True,
                 "stdin_open": True,
+                **run_override,
             },
             extra_run_args=extra_run_args,
         )
@@ -1099,24 +1110,50 @@ def doctor(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+# `ros2 topic hz`/`delay` never exit on their own, so we sample them for a fixed
+# window via `timeout` and then SIGKILL, otherwise a slow rmw shutdown can keep
+# the probe alive. The outer docker-exec timeout must stay well above the sample
+# window plus the kill grace; on a loaded CI runner the original 12s outer budget
+# could expire on an otherwise-healthy probe whose rmw teardown was slow, which
+# aborted the whole smoke run instead of letting the caller retry.
+_TOPIC_PROBE_WINDOW_S = 8
+_TOPIC_PROBE_KILL_GRACE_S = 2
+_TOPIC_PROBE_EXEC_TIMEOUT_S = 25
+
+
+def _topic_probe_command(ros_setup: str, ros2_command: str) -> str:
+    sampler = f"timeout -k {_TOPIC_PROBE_KILL_GRACE_S} {_TOPIC_PROBE_WINDOW_S} {ros2_command}"
+    return f"{ros_setup} && {sampler} || true"
+
+
 def _run_container_shell(container_name: str, command: str, timeout_s: int = 30) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["docker", "exec", container_name, "bash", "-lc", command],
-        text=True,
-        capture_output=True,
-        timeout=timeout_s,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            ["docker", "exec", container_name, "bash", "-lc", command],
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # A docker-exec timeout must not abort the whole smoke run: callers poll
+        # and retry, so surface it as a non-fatal result with any partial output.
+        def _as_text(value: str | bytes | None) -> str:
+            if value is None:
+                return ""
+            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+
+        return subprocess.CompletedProcess(exc.cmd, 124, _as_text(exc.stdout), _as_text(exc.stderr))
 
 
-def _wait_for_topic_hz(container_name: str, ros_setup: str, topic: str, *, timeout_s: int = 60) -> str:
+def _wait_for_topic_hz(container_name: str, ros_setup: str, topic: str, *, timeout_s: int = 90) -> str:
     deadline = time.time() + timeout_s
     last_output = ""
     while time.time() < deadline:
         result = _run_container_shell(
             container_name,
-            f"{ros_setup} && timeout 8 ros2 topic hz {shlex.quote(topic)} || true",
-            timeout_s=12,
+            _topic_probe_command(ros_setup, f"ros2 topic hz {shlex.quote(topic)}"),
+            timeout_s=_TOPIC_PROBE_EXEC_TIMEOUT_S,
         )
         last_output = (result.stdout or "") + (result.stderr or "")
         if "average rate" in last_output:
@@ -1125,10 +1162,12 @@ def _wait_for_topic_hz(container_name: str, ros_setup: str, topic: str, *, timeo
     return last_output
 
 
-def _measure_topic_delay(container_name: str, ros_setup: str, topic: str, *, timeout_s: int = 12) -> str:
+def _measure_topic_delay(
+    container_name: str, ros_setup: str, topic: str, *, timeout_s: int = _TOPIC_PROBE_EXEC_TIMEOUT_S
+) -> str:
     result = _run_container_shell(
         container_name,
-        f"{ros_setup} && timeout 8 ros2 topic delay {shlex.quote(topic)} || true",
+        _topic_probe_command(ros_setup, f"ros2 topic delay {shlex.quote(topic)}"),
         timeout_s=timeout_s,
     )
     return (result.stdout or "") + (result.stderr or "")
@@ -1155,28 +1194,64 @@ def _smoke_metric_line(*, label: str, topic: str, container_name: str, hz: float
     )
 
 
-def _alternate_loopback_ip(local_ip: str) -> str:
-    if local_ip == "127.0.0.2":
-        return "127.0.0.3"
-    return "127.0.0.2"
+# Smoke runs both peers on a single host. Sharing the host loopback
+# (`--network host`) lets the two peers' local- and OTA-domain DDS participants
+# cross-match over `lo`, which intermittently produces duplicate delivery
+# (inflated heartbeat rates) or no delivery at all. Instead we give each peer its
+# own network namespace on a dedicated docker bridge with distinct IPs, mirroring
+# a real two-machine deployment so the transports stay isolated.
+SMOKE_NETWORK_NAME = "rosotacom-smoke"
+SMOKE_NETWORK_SUBNET = "10.137.0.0/24"
+SMOKE_PEER_IPS: dict[str, str] = {"a": "10.137.0.2", "b": "10.137.0.3"}
 
 
-def _smoke_needs_distinct_peer_addresses(session: ResolvedSession) -> bool:
-    cfg = _load_session_config_from_host(session.host_dir)
-    peers = cfg.get("peers")
-    if not isinstance(peers, dict):
-        return False
-    shared = cfg.get("shared", {}) or {}
-    if not isinstance(shared, dict):
-        return False
-    rmw_spec = session_gen._parse_rmw_block(shared.get("rmw"), list(peers.keys()))
-    return bool(session_gen._is_native_zenoh_ota(rmw_spec.ota.impl) or rmw_spec.ota.impl == "fastdds")
+def _smoke_peer_address_args() -> list[str]:
+    return [f"{peer}={ip}" for peer, ip in SMOKE_PEER_IPS.items()]
 
 
-def _smoke_peer_address_args(session: ResolvedSession, local_ip: str) -> list[str]:
-    if _smoke_needs_distinct_peer_addresses(session):
-        return [f"a={local_ip}", f"b={_alternate_loopback_ip(local_ip)}"]
-    return [f"a={local_ip}", f"b={local_ip}"]
+def _ensure_smoke_network() -> None:
+    # Recreate from a clean slate so a leftover network from a crashed run cannot
+    # cause a subnet-overlap failure on create.
+    _remove_smoke_network()
+    result = subprocess.run(
+        ["docker", "network", "create", "--subnet", SMOKE_NETWORK_SUBNET, SMOKE_NETWORK_NAME],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to create smoke network {SMOKE_NETWORK_NAME} ({SMOKE_NETWORK_SUBNET}): "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+
+
+def _remove_smoke_network() -> None:
+    subprocess.run(
+        ["docker", "network", "rm", SMOKE_NETWORK_NAME],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _isolated_network_run_args(run_args: list[str], network_name: str, ip: str | None) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(run_args):
+        token = run_args[i]
+        if token in ("--network", "--net"):
+            i += 2
+            continue
+        if token.startswith("--network=") or token.startswith("--net="):
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+    out.extend(["--network", network_name])
+    if ip:
+        out.extend(["--ip", ip])
+    return out
 
 
 def _smoke_heartbeat_topic(cfg: dict[str, Any], peer_key: str) -> str:
@@ -1271,7 +1346,6 @@ def _smoke_ros_setup(config_container_dir: str, cfg: dict[str, Any], receiver_pe
 def smoke(args: argparse.Namespace) -> int:
     if not args.local:
         raise RuntimeError("Only --local smoke mode is implemented.")
-    local_ip = args.local_ip or _default_local_ip()
     session_dir = args.session_dir or DEFAULT_SMOKE_SESSION
     runtime = _load_runtime_config(args)
     session = _resolve_session(session_dir, runtime)
@@ -1283,7 +1357,7 @@ def smoke(args: argparse.Namespace) -> int:
         print(message)
         _append_log(smoke_log, message)
 
-    peer_address_args = _smoke_peer_address_args(session, local_ip)
+    peer_address_args = _smoke_peer_address_args()
     peer_overrides = _parse_peer_address_overrides(peer_address_args)
     cfg = _effective_session_config(session.host_dir, runtime, peer_address_overrides=peer_overrides)
     common = {
@@ -1299,15 +1373,22 @@ def smoke(args: argparse.Namespace) -> int:
         "overwrite_peers_via_remote_peer": None,
         "peer_address": peer_address_args,
         "instance_id": smoke_instance.instance_id,
+        "network_name": SMOKE_NETWORK_NAME,
     }
 
     log_line(f"Starting local smoke test with PEER_ADDRESSES={', '.join(peer_address_args)}")
+    log_line(f"Smoke peers isolated on docker network {SMOKE_NETWORK_NAME} ({SMOKE_NETWORK_SUBNET})")
     log_line(f"Smoke artifacts: {smoke_instance.host_dir}")
     a_container = None
     b_container = None
     try:
-        a_container = start_session(argparse.Namespace(**common, identity="a", auto_identity=True))
-        b_container = start_session(argparse.Namespace(**common, identity="b", auto_identity=True))
+        _ensure_smoke_network()
+        a_container = start_session(
+            argparse.Namespace(**common, identity="a", auto_identity=True, network_ip=SMOKE_PEER_IPS["a"])
+        )
+        b_container = start_session(
+            argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=SMOKE_PEER_IPS["b"])
+        )
 
         plugin_text = "\n".join(
             (smoke_instance.config_host_dir / peer / "plugin.yaml").read_text(encoding="utf-8") for peer in ("a", "b")
@@ -1356,8 +1437,113 @@ def smoke(args: argparse.Namespace) -> int:
             for started_container in [a_container, b_container]:
                 if started_container:
                     _stop_container_name(started_container, runtime)
+            _remove_smoke_network()
         print(f"Smoke artifacts: {smoke_instance.host_dir}")
     return 0
+
+
+def _find_latest_instance_dir(runtime: RuntimeConfig, session: ResolvedSession, instance_id: str | None) -> Path:
+    root = _session_instances_root(runtime)
+    session_slug = _session_instance_slug(session, runtime)
+    if instance_id:
+        pattern = f"*/{session_slug}_*_{_safe_path_token(instance_id)}"
+    else:
+        pattern = f"*/{session_slug}_*"
+    matches = sorted(p for p in root.glob(pattern) if p.is_dir())
+    if not matches:
+        raise RuntimeError(
+            f"No session instance found for '{session.host_dir.name}' under {root}. "
+            "Start a session with shared.use_status_overview=true first."
+        )
+    return matches[-1].resolve()
+
+
+def _status_identities(logs_dir: Path, identity: str | None) -> list[str]:
+    if identity:
+        return [identity]
+    if not logs_dir.is_dir():
+        return []
+    found = []
+    for peer_dir in sorted(logs_dir.iterdir()):
+        if (peer_dir / "status" / "status.json").exists():
+            found.append(peer_dir.name)
+    return found
+
+
+def _render_status_for_identities(logs_dir: Path, identities: list[str], as_json: bool) -> str:
+    if as_json:
+        combined: dict[str, Any] = {}
+        for identity in identities:
+            json_path = logs_dir / identity / "status" / "status.json"
+            if json_path.exists():
+                combined[identity] = json.loads(json_path.read_text(encoding="utf-8"))
+        return json.dumps(combined, indent=2)
+
+    chunks: list[str] = []
+    for identity in identities:
+        status_dir = logs_dir / identity / "status"
+        txt_path = status_dir / "status.txt"
+        json_path = status_dir / "status.json"
+        if txt_path.exists():
+            chunks.append(txt_path.read_text(encoding="utf-8").rstrip())
+        elif json_path.exists():
+            snapshot = json.loads(json_path.read_text(encoding="utf-8"))
+            chunks.append(_render_status_text_fallback(snapshot))
+        else:
+            chunks.append(f"(no status.json yet for identity '{identity}')")
+    return "\n\n".join(chunks)
+
+
+def _render_status_text_fallback(snapshot: dict[str, Any]) -> str:
+    summary = snapshot.get("summary", {})
+    lines = [
+        f"rosotacom status  peer={snapshot.get('peer')} remote={snapshot.get('remote')}  "
+        f"{snapshot.get('generated_at')}",
+        f"summary: OK={summary.get('OK', 0)} PARTIAL={summary.get('PARTIAL', 0)} "
+        f"STALLED={summary.get('STALLED', 0)} ABSENT={summary.get('ABSENT', 0)}",
+        "",
+    ]
+    for topic in snapshot.get("topics", []):
+        arrow = "->" if topic.get("direction") == "outbound" else "<-"
+        lines.append(
+            f"[{topic.get('overall'):<7}] {arrow} {topic.get('base')}  "
+            f"(reached: {topic.get('reached_stage')}, blocked: {topic.get('blocked_at')})"
+        )
+        if topic.get("diagnosis"):
+            lines.append(f"    -> {topic['diagnosis']}")
+    return "\n".join(lines)
+
+
+def status(args: argparse.Namespace) -> int:
+    runtime = _load_runtime_config(args)
+    session = _resolve_session(args.session_dir or DEFAULT_SMOKE_SESSION, runtime)
+    instance_dir = _find_latest_instance_dir(runtime, session, getattr(args, "instance_id", None))
+    logs_dir = instance_dir / "logs"
+
+    def render_once() -> str:
+        identities = _status_identities(logs_dir, getattr(args, "identity", None))
+        if not identities:
+            return (
+                f"No status.json found under {logs_dir}.\n"
+                "Ensure the session was started with shared.use_status_overview=true "
+                "and has had time to initialize."
+            )
+        return _render_status_for_identities(logs_dir, identities, bool(getattr(args, "json", False)))
+
+    if not getattr(args, "watch", False):
+        print(render_once())
+        return 0
+
+    interval = max(0.5, float(getattr(args, "watch_interval", 2.0)))
+    try:
+        while True:
+            # Clear screen for a live view.
+            print("\033[2J\033[H", end="")
+            print(f"(watching {instance_dir.name}; refresh {interval}s; Ctrl-C to stop)\n")
+            print(render_once(), flush=True)
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
 
 
 def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
@@ -1413,7 +1599,7 @@ def list_sessions_command(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"start", "stop", "doctor", "smoke", "list-sessions", "examples", "setup-env"}
+    commands = {"start", "stop", "doctor", "smoke", "status", "list-sessions", "examples", "setup-env"}
     if not argv:
         argv = ["start"]
     elif argv[0] not in commands and not argv[0].startswith("-"):
@@ -1449,6 +1635,20 @@ def main(argv: list[str] | None = None) -> int:
     smoke_parser.add_argument("--keep-running", action="store_true", help="Leave smoke-test containers running.")
     smoke_parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
     smoke_parser.set_defaults(func=smoke)
+
+    status_parser = subparsers.add_parser(
+        "status", help="Show the live per-topic pipeline status for a session instance."
+    )
+    _add_common_config_args(status_parser)
+    status_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    status_parser.add_argument("--identity", help="Show only this peer identity (default: all available).")
+    status_parser.add_argument(
+        "--instance-id", help="Inspect a specific instance id (default: most recent for the session)."
+    )
+    status_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    status_parser.add_argument("--watch", action="store_true", help="Continuously refresh the view.")
+    status_parser.add_argument("--watch-interval", type=float, default=2.0, help="Watch refresh interval (s).")
+    status_parser.set_defaults(func=status)
 
     list_parser = subparsers.add_parser("list-sessions", help="List configured sessions.")
     _add_common_config_args(list_parser)

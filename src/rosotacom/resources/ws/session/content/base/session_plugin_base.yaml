@@ -55,6 +55,12 @@ parameters:
   tm_out_to_adressant: '""'
   tm_link_duration_buffer_s: 1.0
 
+  status_overview: false
+  status_spec_file: ${peer_dir}/pipeline_spec.yaml
+  status_write_interval_s: 2.0
+  status_liveness_window_s: 3.0
+  status_stale_after_s: 3.0
+
   network_monitor: false
 
   heartbeat: false
@@ -318,6 +324,18 @@ windows:
         - interface=$(ip -o addr | awk '/'${ip_local_resolved//./\\.}'\/[0-9]+/ {print $2; exit}')
         - ip_remote_resolved=$(/ws/session/content/get_data_dict_entries.py -k "${ip_remote}")
         - ros2 run com_py topic_monitor --ros-args -p sourcename:=${local_name} -p direction:=out -p to_adressant:='${tm_out_to_adressant}' -p ip_local:=${ip_local_resolved} -p ip_remote:=${ip_remote_resolved} -p interface:=${interface} -p link_duration_buffer_s:=${tm_link_duration_buffer_s}
+  - name: STAT
+    if: status_overview
+    splits:
+      - commands:
+        - status_out_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/status"
+        - mkdir -p "$status_out_dir"
+        - ros2 run com_py status_overview --ros-args
+            -p status_spec_file:=${status_spec_file}
+            -p output_dir:="$status_out_dir"
+            -p write_interval_s:=${status_write_interval_s}
+            -p liveness_window_s:=${status_liveness_window_s}
+            -p stale_after_s:=${status_stale_after_s}
   - name: NET
     if: network_monitor
     splits:

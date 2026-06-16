@@ -125,6 +125,35 @@ latency (`delay_s`) so rate and latency regressions are visible. It prints the
 `session-instances/...` artifact path so failures (and the per-peer
 `logs/<peer>/catmux/...` pane output) can be inspected after the containers stop.
 
+### Live status / debugging overview
+
+Enable a continuously-updated, per-topic pipeline overview by setting
+`shared.use_status_overview: true` in the session definition. For every
+configured topic it tracks where the topic currently is in the communication
+pipeline (furthest stage reached and the first stage that is missing/broken),
+plus last-message age, Hz, mean size, and latency.
+
+The running session writes, under
+`session-instances/.../logs/<peer>/status/`:
+
+- `status.json` — machine-readable snapshot (source of truth) for tools/agents,
+  refreshed on a short interval and on every state transition,
+- `status.txt` — a human-rendered table, and
+- `events.jsonl` — one line per state transition (when/where a topic stalled).
+
+Read it from the host with the `status` command:
+
+```bash
+rosotacom status 1_heartbeat_cyclone-ota            # human-readable table
+rosotacom status 1_heartbeat_cyclone-ota --json     # machine-readable, for tools/agents
+rosotacom status 1_heartbeat_cyclone-ota --watch    # live refresh
+```
+
+Phase 1 reports each peer's locally-observable stages (outbound up to the `/ota`
+topic this peer publishes; inbound from the received `/ota` topic through the
+republished application topic). Combine both peers' files for the full
+end-to-end picture; cross-peer confirmation is reserved for a later phase.
+
 Run the CI heartbeat smoke matrix locally:
 
 ```bash

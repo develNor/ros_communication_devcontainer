@@ -119,9 +119,11 @@ rosotacom smoke
 
 The smoke test verifies both directions through the communication path: it waits
 for `/com/in/a/heartbeat_a` and `/heartbeat_a` in peer `b`, plus
-`/com/in/b/heartbeat_b` and `/heartbeat_b` in peer `a`. It prints the
-`session-instances/...` artifact path so failures can be inspected after the
-containers stop.
+`/com/in/b/heartbeat_b` and `/heartbeat_b` in peer `a`. For each checked topic it
+also reports a `SMOKE_METRIC` line with the received rate (`hz`) and end-to-end
+latency (`delay_s`) so rate and latency regressions are visible. It prints the
+`session-instances/...` artifact path so failures (and the per-peer
+`logs/<peer>/catmux/...` pane output) can be inspected after the containers stop.
 
 Run the CI heartbeat smoke matrix locally:
 

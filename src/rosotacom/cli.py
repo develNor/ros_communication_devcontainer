@@ -1125,6 +1125,36 @@ def _wait_for_topic_hz(container_name: str, ros_setup: str, topic: str, *, timeo
     return last_output
 
 
+def _measure_topic_delay(container_name: str, ros_setup: str, topic: str, *, timeout_s: int = 12) -> str:
+    result = _run_container_shell(
+        container_name,
+        f"{ros_setup} && timeout 8 ros2 topic delay {shlex.quote(topic)} || true",
+        timeout_s=timeout_s,
+    )
+    return (result.stdout or "") + (result.stderr or "")
+
+
+def _parse_topic_hz_rate(output: str) -> float | None:
+    match = re.search(r"average rate:\s*([0-9]+(?:\.[0-9]+)?)", output)
+    return float(match.group(1)) if match else None
+
+
+def _parse_topic_delay_seconds(output: str) -> float | None:
+    match = re.search(r"average delay:\s*([0-9]+(?:\.[0-9]+)?)", output)
+    return float(match.group(1)) if match else None
+
+
+def _format_metric_value(value: float | None) -> str:
+    return "nan" if value is None else f"{value:.6g}"
+
+
+def _smoke_metric_line(*, label: str, topic: str, container_name: str, hz: float | None, delay_s: float | None) -> str:
+    return (
+        f"SMOKE_METRIC topic={topic} container={container_name} "
+        f"hz={_format_metric_value(hz)} delay_s={_format_metric_value(delay_s)} label={label!r}"
+    )
+
+
 def _alternate_loopback_ip(local_ip: str) -> str:
     if local_ip == "127.0.0.2":
         return "127.0.0.3"
@@ -1300,6 +1330,20 @@ def smoke(args: argparse.Namespace) -> int:
             if "average rate" not in output:
                 raise RuntimeError(f"Smoke verification failed for {label} ({topic}) in {container_name}:\n{output}")
             log_line(f"OK: {label} ({topic}) is publishing in {container_name}")
+
+            hz = _parse_topic_hz_rate(output)
+            delay_output = _measure_topic_delay(container_name, ros_setup, topic)
+            _append_log(smoke_log, f"\n--- delay {label} ({topic}) in {container_name} ---\n{delay_output}")
+            delay_s = _parse_topic_delay_seconds(delay_output)
+            log_line(
+                _smoke_metric_line(
+                    label=label,
+                    topic=topic,
+                    container_name=container_name,
+                    hz=hz,
+                    delay_s=delay_s,
+                )
+            )
     except Exception as exc:
         _append_log(smoke_log, f"ERROR: {exc}")
         raise

@@ -217,26 +217,28 @@ def _builtin_example_config() -> Path | None:
 
 
 def _resolve_project_config_source(args: argparse.Namespace) -> tuple[str | None, str | None]:
-    """Resolve which rosotacom.yaml is active and which layer it came from.
+    """Resolve which rosotacom.yaml is active and which scope it came from.
 
-    Precedence (highest first): explicit flag, ROSOTACOM_CONFIG env, cwd/ancestor
-    auto-discovery, machine-wide user default, packaged built-in example.
+    Precedence (highest first), in the shared shell/local/global vocabulary:
+    explicit ``--project`` flag, ``shell`` (ROSOTACOM_CONFIG env), ``local`` (a
+    rosotacom.yaml discovered upward from the cwd), ``global`` (machine-wide user
+    default), then the packaged ``built-in`` example.
     """
     flag = getattr(args, "rosotacom_config", None)
     if flag:
         return str(flag), "flag"
     env = os.environ.get("ROSOTACOM_CONFIG")
     if env:
-        return env, "env"
+        return env, "shell"
     discovered = _discover_project_config()
     if discovered:
-        return str(discovered), "cwd"
+        return str(discovered), "local"
     user = _user_config_project()
     if user:
         return str(user), "global"
     builtin = _builtin_example_config()
     if builtin:
-        return str(builtin), "builtin"
+        return str(builtin), "built-in"
     return None, None
 
 
@@ -1153,9 +1155,10 @@ def config_command(args: argparse.Namespace) -> int:
         if args.key != "project":
             raise RuntimeError(f"unknown config key: {args.key}")
         config = _require_project_file(args.value)
-        # --global persists machine-wide; --local (default) emits a shell export to
-        # eval in the current terminal. A child process cannot mutate the parent
-        # shell, so the per-terminal path stays an `eval "$(...)"` escape hatch.
+        # --global persists machine-wide; --shell (default) emits an export to eval
+        # in the current terminal. A child process cannot mutate the parent shell,
+        # so the per-terminal path stays an `eval "$(...)"` escape hatch. The third
+        # scope, "local", needs no command: just keep a rosotacom.yaml in the dir.
         if args.scope == "global":
             path = _write_user_project(config)
             print(f"Set global default project: {config}")
@@ -1187,13 +1190,13 @@ def config_command(args: argparse.Namespace) -> int:
         print(f"{label:>9}: {value}")
 
     line("flag", getattr(args, "rosotacom_config", None) or "-")
-    line("env", os.environ.get("ROSOTACOM_CONFIG") or "-")
-    line("cwd", str(_discover_project_config() or "-"))
+    line("shell", os.environ.get("ROSOTACOM_CONFIG") or "-")
+    line("local", str(_discover_project_config() or "-"))
     line("global", str(_user_config_project() or "-"))
-    line("builtin", str(_user_state_dir() / "example" / "rosotacom.yaml"))
+    line("built-in", str(_user_state_dir() / "example" / "rosotacom.yaml"))
     if raw:
         active = _resolve_path(raw, Path.cwd(), must_exist=True)
-        line("active", f"{active}  (source: {source})")
+        line("active", f"{active}  (scope: {source})")
     else:
         line("active", "none configured")
     return 0
@@ -1270,18 +1273,25 @@ def self_command(args: argparse.Namespace) -> int:
         venv_dir = _version_venv_dir(args.tag)
         _create_version_venv(venv_dir, spec)
         print(f"Installed {spec} into: {venv_dir}")
-        print(f"Select it with: rosotacom self use {args.tag} --global")
+        print(f"Make it the default:    rosotacom self use {args.tag}")
+        print(f'Use only this terminal: eval "$(rosotacom self shell {args.tag})"')
         return 0
 
     if action == "use":
+        # "use" = set the machine-wide default (re-point the ~/.local/bin shim).
         venv_dir = _resolve_self_venv(args, require_exists=True)
-        if args.scope == "global":
-            _link_global_shims(venv_dir)
-            _write_user_version(venv_dir)
-            print(f"Global rosotacom now points at: {venv_dir}")
-            print(f"  shims in {_user_bin_dir()} (ensure it is on your PATH)")
-        else:
-            print(f"source {shlex.quote(str(venv_dir / 'bin' / 'activate'))}")
+        _link_global_shims(venv_dir)
+        _write_user_version(venv_dir)
+        print(f"Global rosotacom now points at: {venv_dir}")
+        print(f"  shims in {_user_bin_dir()} (ensure it is on your PATH)")
+        return 0
+
+    if action == "shell":
+        # "shell" = use this version in the current terminal only, leaving the
+        # global default untouched. Activation is a shell action, so we print a
+        # line to eval/source (a child process cannot change the parent shell).
+        venv_dir = _resolve_self_venv(args, require_exists=True)
+        print(f"source {shlex.quote(str(venv_dir / 'bin' / 'activate'))}")
         return 0
 
     if action == "uninstall":
@@ -1961,7 +1971,7 @@ def main(argv: list[str] | None = None) -> int:
 
     setup_env_parser = subparsers.add_parser(
         "setup-env",
-        help="[deprecated] Alias for `config set project --local`. Print shell exports for a rosotacom.yaml.",
+        help="[deprecated] Alias for `config set project --shell`. Print shell exports for a rosotacom.yaml.",
     )
     setup_env_parser.add_argument("rosotacom_config", help="Path to rosotacom.yaml.")
     setup_env_parser.set_defaults(func=setup_env_command)
@@ -1969,7 +1979,9 @@ def main(argv: list[str] | None = None) -> int:
     config_parser = subparsers.add_parser("config", help="Inspect or set the active rosotacom project.")
     config_subparsers = config_parser.add_subparsers(dest="config_action", required=True)
 
-    config_set_parser = config_subparsers.add_parser("set", help="Set the active project (--global or --local).")
+    config_set_parser = config_subparsers.add_parser(
+        "set", help="Set the active project (--global, or --shell for this terminal)."
+    )
     config_set_parser.add_argument("key", choices=["project"])
     config_set_parser.add_argument("value", help="Path to rosotacom.yaml.")
     config_set_scope = config_set_parser.add_mutually_exclusive_group()
@@ -1981,19 +1993,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Persist as the machine-wide default for all terminals.",
     )
     config_set_scope.add_argument(
-        "--local",
+        "--shell",
         dest="scope",
         action="store_const",
-        const="local",
-        help="Print a shell export to eval in the current terminal (default).",
+        const="shell",
+        help="Print an export to eval in the current terminal only (default). "
+        "For a directory ('local') scope, just keep a rosotacom.yaml in it.",
     )
-    config_set_parser.set_defaults(func=config_command, scope="local")
+    config_set_parser.set_defaults(func=config_command, scope="shell")
 
     config_get_parser = config_subparsers.add_parser("get", help="Print the resolved active project path.")
     config_get_parser.add_argument("key", choices=["project"], nargs="?", default="project")
     config_get_parser.set_defaults(func=config_command)
 
-    config_show_parser = config_subparsers.add_parser("show", help="Show every project-selection layer and the winner.")
+    config_show_parser = config_subparsers.add_parser("show", help="Show every project-selection scope and the winner.")
     config_show_parser.set_defaults(func=config_command)
 
     config_unset_parser = config_subparsers.add_parser("unset", help="Clear the machine-wide default project.")
@@ -2011,33 +2024,21 @@ def main(argv: list[str] | None = None) -> int:
     self_parser = subparsers.add_parser("self", help="Install and select rosotacom versions.")
     self_subparsers = self_parser.add_subparsers(dest="self_action", required=True)
 
-    def _add_scope_group(p: argparse.ArgumentParser) -> None:
-        scope = p.add_mutually_exclusive_group()
-        scope.add_argument(
-            "--global",
-            dest="scope",
-            action="store_const",
-            const="global",
-            help="Point ~/.local/bin at this version for all terminals.",
-        )
-        scope.add_argument(
-            "--local",
-            dest="scope",
-            action="store_const",
-            const="local",
-            help="Print a `source .../activate` line for the current terminal (default).",
-        )
-        p.set_defaults(scope="local")
-
     self_install_parser = self_subparsers.add_parser("install", help="Install a release into a managed venv.")
     self_install_parser.add_argument("tag", help="PyPI release tag (e.g. 2.1.0) or 'latest'.")
     self_install_parser.set_defaults(func=self_command)
 
-    self_use_parser = self_subparsers.add_parser("use", help="Select an installed version (--global or --local).")
+    self_use_parser = self_subparsers.add_parser("use", help="Make a version the machine-wide default (PATH shim).")
     self_use_parser.add_argument("tag", nargs="?", help="A release tag previously installed.")
     self_use_parser.add_argument("--from-source", help="Use the .venv of a source checkout at this path.")
-    _add_scope_group(self_use_parser)
     self_use_parser.set_defaults(func=self_command)
+
+    self_shell_parser = self_subparsers.add_parser(
+        "shell", help="Use a version in THIS terminal only (prints a line to eval); global default untouched."
+    )
+    self_shell_parser.add_argument("tag", nargs="?", help="A release tag previously installed.")
+    self_shell_parser.add_argument("--from-source", help="Use the .venv of a source checkout at this path.")
+    self_shell_parser.set_defaults(func=self_command)
 
     self_list_parser = self_subparsers.add_parser("list", help="List managed versions and the global selection.")
     self_list_parser.set_defaults(func=self_command)

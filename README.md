@@ -35,39 +35,68 @@ This repository's main entrypoint for starting ROS communication sessions is
 the checkout-local `rosotacom` command. Each checkout owns its own `.venv`,
 so multiple rosotacom versions can coexist without global symlink drift.
 
+#### Scopes: `shell` vs `global`
+
+rosotacom selects both *which version runs* and *which project is active* using
+the same vocabulary (borrowed from `pyenv`):
+
+| Scope | Means | Needs `source`/`eval`? | How |
+|---|---|---|---|
+| **shell** | just this terminal | yes — only your shell can change its own env | activate a venv / an env var |
+| **local** | this directory | no | a file discovered upward (a `rosotacom.yaml`) |
+| **global** | the whole machine | no | a PATH shim / a config file |
+
+The reason `shell` needs `source`/`eval`: a child process (like `rosotacom` or
+`./setup`) can never change its parent shell's `PATH` or environment. `global`
+sidesteps that by dropping a shim into `~/.local/bin` (already on your PATH).
+
 #### Install
 
-The front-door is `./setup`: it installs a version and selects it, with one
-consistent `--global`/`--local` model (`--local` = this terminal, `--global` =
-all terminals).
+`./setup` installs a version and selects it. The default scope is **shell**, so
+it never touches your global `rosotacom`:
 
 ```bash
 cd /path/to/ros_communication_devcontainer
-./setup                         # auto: from-source + this terminal
-source .venv/bin/activate
+./setup                         # auto (from-source here); builds .venv, prints the activate line
+source .venv/bin/activate       # use it in THIS terminal
 rosotacom --version
 python -m rosotacom --version
 rosotacom doctor
 ```
 
-`./setup` also takes an explicit version and scope:
+Use `--global` for the no-`source`, available-everywhere path:
 
 ```bash
-./setup --from-source --global  # editable install, shimmed into ~/.local/bin
-./setup 2.1.0 --global          # a PyPI release, for all terminals
-./setup latest --local          # newest release, this terminal only
+./setup --global                # editable install + shim in ~/.local/bin (all terminals)
+./setup 2.1.0 --global          # a PyPI release, machine-wide
+./setup latest                  # newest release, this terminal only (prints activate line)
 ```
 
-Manage installed versions afterwards with `rosotacom self`:
+Manage versions afterwards with `rosotacom self`:
 
 ```bash
-rosotacom self list             # installed versions + the global selection
-rosotacom self use 2.1.0 --global
+rosotacom self install 2.2.0    # add a release (managed venv; global untouched)
+rosotacom self use 2.2.0        # make it the machine-wide default (re-point the shim)
+rosotacom self shell 2.2.0      # use it in THIS terminal only (prints an activate line)
+rosotacom self list             # installed versions; * marks the global default
 rosotacom self which
 ```
 
-`./install.sh` (optionally `--global-symlink`) remains the low-level source
-installer that `./setup --from-source` builds on.
+**Use case — try a new version without disturbing a pinned one.** Keep a
+production checkout/global on its commit, and smoke-test the newest commit in
+one terminal:
+
+```bash
+cd ~/checkouts/rosotacom-newest   # a checkout (or git worktree) at the new commit
+./install.sh                      # builds .venv here; global rosotacom UNCHANGED
+source .venv/bin/activate         # this terminal now runs the new commit
+rosotacom smoke                   # built-in example, zero config
+deactivate                        # back to your global/production rosotacom
+```
+
+`./install.sh` (optionally `--global-symlink`) is the low-level source installer
+that `./setup --from-source` builds on; on its own it never touches the global
+shim, which is what makes the workflow above safe.
 
 ### Basic Setup
 
@@ -77,15 +106,17 @@ installer that `./setup --from-source` builds on.
 - A **session config** defines the communication behavior for one run: peers, addresses, topics, QoS, processing, and transport choices.
 - A **session instance** stores one concrete run: generated config, catmux pane logs, smoke debug output, and future rosbags.
 
-`rosotacom` resolves the active `rosotacom.yaml` in this order (first wins):
+`rosotacom` resolves the active `rosotacom.yaml` by scope (first wins) — the same
+`shell` / `local` / `global` model as versions:
 
 1. `--project <path>` (alias of `--rosotacom-config`) on the command
-2. `ROSOTACOM_CONFIG` in the environment
-3. the nearest `rosotacom.yaml` discovered upward from the current directory
-4. a machine-wide default set with `rosotacom config set project ... --global`
+2. **shell** — `ROSOTACOM_CONFIG` in the environment
+3. **local** — the nearest `rosotacom.yaml` discovered upward from the cwd
+4. **global** — a machine-wide default (`rosotacom config set project ... --global`)
 5. a built-in example project, so a fresh install runs with zero setup
 
-So the simplest workflow is just to be in a project directory:
+So the simplest workflow is just to be in a project directory (the **local**
+scope — no command needed, just have the file):
 
 ```bash
 rosotacom examples create ./rosotacom_examples
@@ -96,12 +127,12 @@ rosotacom doctor                # picks up ./rosotacom.yaml automatically
 Inspect or pin the selection with `rosotacom config`:
 
 ```bash
-rosotacom config show                                            # every layer + the winner
+rosotacom config show                                            # every scope + the winner
 rosotacom config set project ./rosotacom.yaml --global           # machine-wide default
-eval "$(rosotacom config set project ./rosotacom.yaml --local)"  # this terminal only
+eval "$(rosotacom config set project ./rosotacom.yaml --shell)"  # this terminal only
 ```
 
-(`rosotacom setup-env ./rosotacom.yaml` is a deprecated alias for the `--local` form.)
+(`rosotacom setup-env ./rosotacom.yaml` is a deprecated alias for the `--shell` form.)
 
 The copied packaged example project uses this layout:
 

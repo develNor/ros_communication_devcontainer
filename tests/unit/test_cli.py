@@ -38,7 +38,7 @@ def test_cwd_rosotacom_yaml_is_auto_discovered(tmp_path: Path, monkeypatch: pyte
     runtime = rosotacom._load_runtime_config(argparse.Namespace())
 
     assert runtime.rosotacom_config == config
-    assert runtime.project_source == "cwd"
+    assert runtime.project_source == "local"
     assert runtime.ros2docker_config == tmp_path / "ros2docker.json"
     assert runtime.session_instances_dir == tmp_path / "session-instances"
 
@@ -69,7 +69,7 @@ def test_builtin_example_used_when_nothing_configured(tmp_path: Path, monkeypatc
     runtime = rosotacom._load_runtime_config(argparse.Namespace())
 
     builtin = (rosotacom._user_state_dir() / "example" / "rosotacom.yaml").resolve()
-    assert runtime.project_source == "builtin"
+    assert runtime.project_source == "built-in"
     assert runtime.rosotacom_config == builtin
     # The materialized built-in ships runnable sessions, so zero-config works.
     assert runtime.session_configs_dir is not None
@@ -90,11 +90,11 @@ def test_config_set_project_global_roundtrip(tmp_path: Path, monkeypatch: pytest
     assert rosotacom._user_config_project() is None
 
 
-def test_config_set_project_local_prints_export(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_config_set_project_shell_prints_export(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     config = tmp_path / "rosotacom.yaml"
     config.write_text("ros2docker_config: ros2docker.json\n", encoding="utf-8")
 
-    rosotacom.config_command(argparse.Namespace(config_action="set", key="project", value=str(config), scope="local"))
+    rosotacom.config_command(argparse.Namespace(config_action="set", key="project", value=str(config), scope="shell"))
 
     assert capsys.readouterr().out.strip() == f"export ROSOTACOM_CONFIG={rosotacom.shlex.quote(str(config))}"
 
@@ -108,10 +108,10 @@ def _fake_version_venv(tag: str) -> Path:
     return venv
 
 
-def test_self_use_global_links_shims_and_records(tmp_path: Path) -> None:
+def test_self_use_sets_global_default(tmp_path: Path) -> None:
     venv = _fake_version_venv("2.1.0")
 
-    rc = rosotacom.self_command(argparse.Namespace(self_action="use", tag="2.1.0", from_source=None, scope="global"))
+    rc = rosotacom.self_command(argparse.Namespace(self_action="use", tag="2.1.0", from_source=None))
 
     assert rc == 0
     bin_dir = rosotacom._user_bin_dir()
@@ -120,18 +120,21 @@ def test_self_use_global_links_shims_and_records(tmp_path: Path) -> None:
     assert rosotacom._global_version_dir() == venv
 
 
-def test_self_use_local_prints_activate(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_self_shell_prints_activate_without_touching_global(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     venv = _fake_version_venv("2.1.0")
 
-    rosotacom.self_command(argparse.Namespace(self_action="use", tag="2.1.0", from_source=None, scope="local"))
+    rosotacom.self_command(argparse.Namespace(self_action="shell", tag="2.1.0", from_source=None))
 
     expected = f"source {rosotacom.shlex.quote(str(venv / 'bin' / 'activate'))}"
     assert capsys.readouterr().out.strip() == expected
+    # shell scope must not change the global default
+    assert rosotacom._global_version_dir() is None
+    assert not (rosotacom._user_bin_dir() / "rosotacom").exists()
 
 
 def test_self_uninstall_removes_venv_and_shims(tmp_path: Path) -> None:
     venv = _fake_version_venv("2.1.0")
-    rosotacom.self_command(argparse.Namespace(self_action="use", tag="2.1.0", from_source=None, scope="global"))
+    rosotacom.self_command(argparse.Namespace(self_action="use", tag="2.1.0", from_source=None))
 
     rosotacom.self_command(argparse.Namespace(self_action="uninstall", tag="2.1.0"))
 
@@ -142,7 +145,7 @@ def test_self_uninstall_removes_venv_and_shims(tmp_path: Path) -> None:
 
 def test_self_use_unknown_tag_errors(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="self install"):
-        rosotacom.self_command(argparse.Namespace(self_action="use", tag="9.9.9", from_source=None, scope="local"))
+        rosotacom.self_command(argparse.Namespace(self_action="use", tag="9.9.9", from_source=None))
 
 
 def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -> None:

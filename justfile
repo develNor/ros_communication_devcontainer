@@ -8,8 +8,9 @@ venv:
 	python3 -m venv .venv
 	{{python}} -m pip install --upgrade pip
 
-setup:
-	./setup --from-source --local --dev
+setup: venv
+	{{python}} -m pip install -e ".[dev]"
+	{{python}} -m pre_commit install
 
 format:
 	{{python}} -m ruff check --fix .

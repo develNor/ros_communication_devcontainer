@@ -20,6 +20,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -162,8 +163,22 @@ def _user_config_file() -> Path:
     return _xdg_dir("XDG_CONFIG_HOME", ".config") / "rosotacom" / "config.yaml"
 
 
-def _user_state_dir() -> Path:
-    return _xdg_dir("XDG_STATE_HOME", ".local/state") / "rosotacom"
+def _runtime_dir() -> Path:
+    """A per-user, RAM-backed scratch dir for ephemeral runtime artifacts.
+
+    ``XDG_RUNTIME_DIR`` is tmpfs on Linux and auto-cleaned on logout, so it is the
+    correct home for generated session files (which must be real paths because
+    they are bind-mounted into the container) without touching ``$HOME``.
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base:
+        return Path(base) / "rosotacom"
+    uid = getattr(os, "getuid", lambda: os.getpid())()
+    return Path(tempfile.gettempdir()) / f"rosotacom-{uid}"
+
+
+def _builtin_instances_dir() -> Path:
+    return _runtime_dir() / "example" / "session-instances"
 
 
 def _discover_project_config(start: Path | None = None) -> Path | None:
@@ -189,21 +204,17 @@ def _user_config_project() -> Path | None:
 
 
 def _builtin_example_config() -> Path | None:
-    """Materialize the packaged example into the user state dir (once) and return it.
+    """Return the packaged example project's rosotacom.yaml, used in place.
 
     This is the zero-config fallback: a fresh install can run sessions with no
-    setup. The copy is writable (unlike the in-package resources) so its
-    ``data_dict.json`` and ``session-instances/`` work normally.
+    setup. Nothing is copied — the config, ``sessions/`` and ``data_dict.json``
+    are read-only (and mounted read-only). Only the writable runtime output is
+    redirected, to tmpfs; see ``_builtin_instances_dir`` and where
+    ``project_source == "built-in"`` overrides ``session_instances_dir``.
     """
-    target = _user_state_dir() / "example"
-    config = target / "rosotacom.yaml"
-    if config.is_file():
-        return config
-    try:
-        source = _example_project_resource()
-        _copy_example_resource_tree(source, target)
-    except (RuntimeError, OSError):
+    if not EXAMPLE_PROJECT_DIR.is_dir():
         return None
+    config = EXAMPLE_PROJECT_DIR / "rosotacom.yaml"
     return config if config.is_file() else None
 
 
@@ -267,13 +278,19 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
     if ros2docker_config is None:
         raise RuntimeError("ros2docker config could not be resolved.")
 
+    session_instances_dir = _resolve_path(session_instances_dir_raw, config_base, must_exist=False)
+    if project_source == "built-in":
+        # The packaged example is read-only; redirect only its writable runtime
+        # output to tmpfs so the built-in fallback never writes into $HOME.
+        session_instances_dir = _builtin_instances_dir()
+
     return RuntimeConfig(
         rosotacom_config=rosotacom_config,
         ros2docker_config=ros2docker_config,
         session_configs_dir=_resolve_path(session_configs_dir_raw, config_base, must_exist=True),
         data_dict=_resolve_path(data_dict_raw, config_base, must_exist=True),
         install_id=_install_id(rosotacom_config),
-        session_instances_dir=_resolve_path(session_instances_dir_raw, config_base, must_exist=False),
+        session_instances_dir=session_instances_dir,
         project_source=project_source,
     )
 
@@ -1184,7 +1201,7 @@ def config_command(args: argparse.Namespace) -> int:
     line("shell", os.environ.get("ROSOTACOM_CONFIG") or "-")
     line("local", str(_discover_project_config() or "-"))
     line("global", str(_user_config_project() or "-"))
-    line("built-in", str(_user_state_dir() / "example" / "rosotacom.yaml"))
+    line("built-in", str(_builtin_example_config() or "-"))
     if raw:
         active = _resolve_path(raw, Path.cwd(), must_exist=True)
         line("active", f"{active}  (scope: {source})")

@@ -21,12 +21,10 @@ def clear_config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "ROSOTACOM_DATA_DICT",
     ):
         monkeypatch.delenv(key, raising=False)
-    # Keep the global user config, version venvs, shims, and the built-in-example
-    # materialization out of the real $HOME so tests stay hermetic.
+    # Keep the global user config and the built-in-example materialization out of
+    # the real $HOME so tests stay hermetic.
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / ".state"))
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / ".data"))
-    monkeypatch.setenv("ROSOTACOM_BIN_DIR", str(tmp_path / ".bin"))
 
 
 def test_cwd_rosotacom_yaml_is_auto_discovered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,55 +95,6 @@ def test_config_set_project_shell_prints_export(tmp_path: Path, capsys: pytest.C
     rosotacom.config_command(argparse.Namespace(config_action="set", key="project", value=str(config), scope="shell"))
 
     assert capsys.readouterr().out.strip() == f"export ROSOTACOM_CONFIG={rosotacom.shlex.quote(str(config))}"
-
-
-def _fake_version_venv(tag: str) -> Path:
-    """Create a managed-version venv layout with stand-in console scripts."""
-    venv = rosotacom._version_venv_dir(tag)
-    (venv / "bin").mkdir(parents=True)
-    for name in (*rosotacom.SHIM_NAMES, "activate"):
-        (venv / "bin" / name).write_text("#!/bin/sh\n", encoding="utf-8")
-    return venv
-
-
-def test_self_use_sets_global_default(tmp_path: Path) -> None:
-    venv = _fake_version_venv("2.1.0")
-
-    rc = rosotacom.self_command(argparse.Namespace(self_action="use", tag="2.1.0", from_source=None))
-
-    assert rc == 0
-    bin_dir = rosotacom._user_bin_dir()
-    for name in rosotacom.SHIM_NAMES:
-        assert (bin_dir / name).resolve() == (venv / "bin" / name).resolve()
-    assert rosotacom._global_version_dir() == venv
-
-
-def test_self_shell_prints_activate_without_touching_global(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    venv = _fake_version_venv("2.1.0")
-
-    rosotacom.self_command(argparse.Namespace(self_action="shell", tag="2.1.0", from_source=None))
-
-    expected = f"source {rosotacom.shlex.quote(str(venv / 'bin' / 'activate'))}"
-    assert capsys.readouterr().out.strip() == expected
-    # shell scope must not change the global default
-    assert rosotacom._global_version_dir() is None
-    assert not (rosotacom._user_bin_dir() / "rosotacom").exists()
-
-
-def test_self_uninstall_removes_venv_and_shims(tmp_path: Path) -> None:
-    venv = _fake_version_venv("2.1.0")
-    rosotacom.self_command(argparse.Namespace(self_action="use", tag="2.1.0", from_source=None))
-
-    rosotacom.self_command(argparse.Namespace(self_action="uninstall", tag="2.1.0"))
-
-    assert not venv.exists()
-    assert not (rosotacom._user_bin_dir() / "rosotacom").exists()
-    assert rosotacom._global_version_dir() is None
-
-
-def test_self_use_unknown_tag_errors(tmp_path: Path) -> None:
-    with pytest.raises(RuntimeError, match="self install"):
-        rosotacom.self_command(argparse.Namespace(self_action="use", tag="9.9.9", from_source=None))
 
 
 def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -> None:

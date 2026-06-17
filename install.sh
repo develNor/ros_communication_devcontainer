@@ -61,7 +61,7 @@ echo "With no project nearby, rosotacom falls back to a built-in example, so"
 echo "'rosotacom smoke' works with zero setup. Pin a default with:"
 echo "  rosotacom config set project ./rosotacom.yaml --global"
 echo
-echo "Tip: './setup' wraps this installer and also selects releases (./setup 2.1.0 --global)."
+echo "For a released version instead of this checkout, use: pipx install rosotacom"
 echo "For contributor checks, install dev tooling with:"
 echo "  just setup"
 

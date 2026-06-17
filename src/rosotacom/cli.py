@@ -166,15 +166,6 @@ def _user_state_dir() -> Path:
     return _xdg_dir("XDG_STATE_HOME", ".local/state") / "rosotacom"
 
 
-def _user_data_dir() -> Path:
-    return _xdg_dir("XDG_DATA_HOME", ".local/share") / "rosotacom"
-
-
-def _user_bin_dir() -> Path:
-    raw = os.environ.get("ROSOTACOM_BIN_DIR")
-    return Path(raw) if raw else Path.home() / ".local" / "bin"
-
-
 def _discover_project_config(start: Path | None = None) -> Path | None:
     """Walk up from ``start`` (default cwd) for the nearest ``rosotacom.yaml``."""
     current = (start or Path.cwd()).resolve()
@@ -1202,137 +1193,6 @@ def config_command(args: argparse.Namespace) -> int:
     return 0
 
 
-# --- version management (`rosotacom self`) -----------------------------------
-
-SHIM_NAMES = ("rosotacom", "start_rosotacom", "stop_rosotacom")
-
-
-def _versions_dir() -> Path:
-    return _user_data_dir() / "versions"
-
-
-def _version_venv_dir(tag: str) -> Path:
-    return _versions_dir() / _safe_path_token(tag)
-
-
-def _link_global_shims(venv_dir: Path) -> Path:
-    """Point ~/.local/bin/{rosotacom,start_,stop_} at ``venv_dir``'s console scripts."""
-    bin_dir = _user_bin_dir()
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    for name in SHIM_NAMES:
-        link = bin_dir / name
-        if link.is_symlink() or link.exists():
-            link.unlink()
-        link.symlink_to(venv_dir / "bin" / name)
-    return bin_dir
-
-
-def _write_user_version(venv_dir: Path) -> Path:
-    path = _user_config_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    cfg = _load_yaml_file(path)
-    cfg["version"] = str(venv_dir)
-    path.write_text(yaml.safe_dump(cfg, default_flow_style=False, sort_keys=True), encoding="utf-8")
-    return path
-
-
-def _global_version_dir() -> Path | None:
-    raw = _load_yaml_file(_user_config_file()).get("version")
-    return Path(str(raw)) if raw else None
-
-
-def _create_version_venv(venv_dir: Path, spec: str) -> None:
-    venv_dir.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
-    pip = venv_dir / "bin" / "pip"
-    subprocess.run([str(pip), "install", "--upgrade", "pip"], check=True)
-    subprocess.run([str(pip), "install", spec], check=True)
-
-
-def _resolve_self_venv(args: argparse.Namespace, *, require_exists: bool) -> Path:
-    from_source = getattr(args, "from_source", None)
-    if from_source:
-        venv_dir = Path(os.path.expanduser(from_source)).resolve() / ".venv"
-        hint = "run `./setup --from-source` (or `./install.sh`) in that checkout first"
-    else:
-        tag = getattr(args, "tag", None)
-        if not tag:
-            raise RuntimeError("specify a release tag or --from-source <checkout>.")
-        venv_dir = _version_venv_dir(tag)
-        hint = f"run `rosotacom self install {tag}` first"
-    if require_exists and not (venv_dir / "bin" / "rosotacom").exists():
-        raise RuntimeError(f"no rosotacom found in {venv_dir}; {hint}.")
-    return venv_dir
-
-
-def self_command(args: argparse.Namespace) -> int:
-    action = args.self_action
-
-    if action == "install":
-        spec = "rosotacom" if args.tag == "latest" else f"rosotacom=={args.tag}"
-        venv_dir = _version_venv_dir(args.tag)
-        _create_version_venv(venv_dir, spec)
-        print(f"Installed {spec} into: {venv_dir}")
-        print(f"Make it the default:    rosotacom self use {args.tag}")
-        print(f'Use only this terminal: eval "$(rosotacom self shell {args.tag})"')
-        return 0
-
-    if action == "use":
-        # "use" = set the machine-wide default (re-point the ~/.local/bin shim).
-        venv_dir = _resolve_self_venv(args, require_exists=True)
-        _link_global_shims(venv_dir)
-        _write_user_version(venv_dir)
-        print(f"Global rosotacom now points at: {venv_dir}")
-        print(f"  shims in {_user_bin_dir()} (ensure it is on your PATH)")
-        return 0
-
-    if action == "shell":
-        # "shell" = use this version in the current terminal only, leaving the
-        # global default untouched. Activation is a shell action, so we print a
-        # line to eval/source (a child process cannot change the parent shell).
-        venv_dir = _resolve_self_venv(args, require_exists=True)
-        print(f"source {shlex.quote(str(venv_dir / 'bin' / 'activate'))}")
-        return 0
-
-    if action == "uninstall":
-        venv_dir = _version_venv_dir(args.tag)
-        if not venv_dir.exists():
-            print(f"Nothing to uninstall at: {venv_dir}")
-            return 0
-        if _global_version_dir() == venv_dir:
-            for name in SHIM_NAMES:
-                link = _user_bin_dir() / name
-                if link.is_symlink() or link.exists():
-                    link.unlink()
-            cfg = _load_yaml_file(_user_config_file())
-            cfg.pop("version", None)
-            _user_config_file().write_text(
-                yaml.safe_dump(cfg, default_flow_style=False, sort_keys=True), encoding="utf-8"
-            )
-        shutil.rmtree(venv_dir)
-        print(f"Uninstalled: {venv_dir}")
-        return 0
-
-    if action == "list":
-        active = _global_version_dir()
-        versions = _versions_dir()
-        rows = sorted(p for p in versions.iterdir() if p.is_dir()) if versions.is_dir() else []
-        if not rows:
-            print("No managed versions installed. Try: rosotacom self install latest")
-            return 0
-        for venv_dir in rows:
-            marker = "*" if active and active == venv_dir else " "
-            print(f"{marker} {venv_dir.name:20} {venv_dir}")
-        return 0
-
-    # action == "which"
-    resolved = shutil.which("rosotacom")
-    print(f"on PATH : {resolved or 'not found'}")
-    print(f"this run: {sys.executable} (rosotacom {__version__})")
-    print(f"global  : {_global_version_dir() or 'not set'}")
-    return 0
-
-
 def doctor(args: argparse.Namespace) -> int:
     runtime = None
     failures = 0
@@ -1906,7 +1766,6 @@ def main(argv: list[str] | None = None) -> int:
         "examples",
         "setup-env",
         "config",
-        "self",
     }
     if not argv:
         argv = ["start"]
@@ -2020,35 +1879,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Clear the machine-wide default (the only persisted scope).",
     )
     config_unset_parser.set_defaults(func=config_command)
-
-    self_parser = subparsers.add_parser("self", help="Install and select rosotacom versions.")
-    self_subparsers = self_parser.add_subparsers(dest="self_action", required=True)
-
-    self_install_parser = self_subparsers.add_parser("install", help="Install a release into a managed venv.")
-    self_install_parser.add_argument("tag", help="PyPI release tag (e.g. 2.1.0) or 'latest'.")
-    self_install_parser.set_defaults(func=self_command)
-
-    self_use_parser = self_subparsers.add_parser("use", help="Make a version the machine-wide default (PATH shim).")
-    self_use_parser.add_argument("tag", nargs="?", help="A release tag previously installed.")
-    self_use_parser.add_argument("--from-source", help="Use the .venv of a source checkout at this path.")
-    self_use_parser.set_defaults(func=self_command)
-
-    self_shell_parser = self_subparsers.add_parser(
-        "shell", help="Use a version in THIS terminal only (prints a line to eval); global default untouched."
-    )
-    self_shell_parser.add_argument("tag", nargs="?", help="A release tag previously installed.")
-    self_shell_parser.add_argument("--from-source", help="Use the .venv of a source checkout at this path.")
-    self_shell_parser.set_defaults(func=self_command)
-
-    self_list_parser = self_subparsers.add_parser("list", help="List managed versions and the global selection.")
-    self_list_parser.set_defaults(func=self_command)
-
-    self_which_parser = self_subparsers.add_parser("which", help="Show the active rosotacom binary and version.")
-    self_which_parser.set_defaults(func=self_command)
-
-    self_uninstall_parser = self_subparsers.add_parser("uninstall", help="Remove a managed release venv.")
-    self_uninstall_parser.add_argument("tag", help="A release tag previously installed.")
-    self_uninstall_parser.set_defaults(func=self_command)
 
     args = parser.parse_args(argv)
     try:

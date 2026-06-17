@@ -90,6 +90,11 @@ version manager.
 4. **global** — a machine-wide default (`rosotacom config set project ... --global`)
 5. a built-in example project, so a fresh install runs with zero setup
 
+The built-in example is used **in place** (read-only) and writes nothing to
+`$HOME`: its generated session output goes to a per-user tmpfs dir under
+`$XDG_RUNTIME_DIR` (printed on `start`/`smoke`), so it is ephemeral. For
+persistent, editable projects, create one with `rosotacom examples create`.
+
 So the simplest workflow is just to be in a project directory (the **local**
 scope — no command needed, just have the file):
 

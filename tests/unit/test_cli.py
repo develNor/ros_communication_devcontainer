@@ -21,10 +21,10 @@ def clear_config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "ROSOTACOM_DATA_DICT",
     ):
         monkeypatch.delenv(key, raising=False)
-    # Keep the global user config and the built-in-example materialization out of
-    # the real $HOME so tests stay hermetic.
+    # Keep the global user config and the built-in example's tmpfs instances dir
+    # off the real $HOME / runtime dir so tests stay hermetic.
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / ".state"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / ".run"))
 
 
 def test_cwd_rosotacom_yaml_is_auto_discovered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,11 +66,13 @@ def test_builtin_example_used_when_nothing_configured(tmp_path: Path, monkeypatc
 
     runtime = rosotacom._load_runtime_config(argparse.Namespace())
 
-    builtin = (rosotacom._user_state_dir() / "example" / "rosotacom.yaml").resolve()
     assert runtime.project_source == "built-in"
-    assert runtime.rosotacom_config == builtin
-    # The materialized built-in ships runnable sessions, so zero-config works.
-    assert runtime.session_configs_dir is not None
+    # The packaged example is used in place (read-only), not copied into $HOME.
+    assert runtime.rosotacom_config == (rosotacom.EXAMPLE_PROJECT_DIR / "rosotacom.yaml").resolve()
+    assert runtime.session_configs_dir is not None  # ships runnable sessions
+    # Only the writable runtime output is redirected, to tmpfs (no $HOME writes).
+    assert runtime.session_instances_dir == rosotacom._builtin_instances_dir()
+    assert str(runtime.session_instances_dir).startswith(str(tmp_path / ".run"))
 
 
 def test_config_set_project_global_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

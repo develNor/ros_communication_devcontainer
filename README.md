@@ -35,68 +35,42 @@ This repository's main entrypoint for starting ROS communication sessions is
 the checkout-local `rosotacom` command. Each checkout owns its own `.venv`,
 so multiple rosotacom versions can coexist without global symlink drift.
 
-#### Scopes: `shell` vs `global`
-
-rosotacom selects both *which version runs* and *which project is active* using
-the same vocabulary (borrowed from `pyenv`):
-
-| Scope | Means | Needs `source`/`eval`? | How |
-|---|---|---|---|
-| **shell** | just this terminal | yes — only your shell can change its own env | activate a venv / an env var |
-| **local** | this directory | no | a file discovered upward (a `rosotacom.yaml`) |
-| **global** | the whole machine | no | a PATH shim / a config file |
-
-The reason `shell` needs `source`/`eval`: a child process (like `rosotacom` or
-`./setup`) can never change its parent shell's `PATH` or environment. `global`
-sidesteps that by dropping a shim into `~/.local/bin` (already on your PATH).
-
 #### Install
 
-`./setup` installs a version and selects it. The default scope is **shell**, so
-it never touches your global `rosotacom`:
+Use a released version, or develop from a checkout — both with off-the-shelf
+tooling, nothing rosotacom-specific:
 
 ```bash
+# released version (recommended for users)
+pipx install rosotacom            # isolated, on PATH everywhere
+#   or: pip install --user rosotacom
+
+# from a source checkout (developers)
 cd /path/to/ros_communication_devcontainer
-./setup                         # auto (from-source here); builds .venv, prints the activate line
-source .venv/bin/activate       # use it in THIS terminal
+./install.sh                      # builds a checkout-local .venv
+source .venv/bin/activate         # use it in this terminal
+#   ./install.sh --global-symlink # optional: put it on PATH via ~/.local/bin
+
 rosotacom --version
 python -m rosotacom --version
 rosotacom doctor
 ```
 
-Use `--global` for the no-`source`, available-everywhere path:
+**Multiple versions / try-without-disturbing.** Because each checkout owns its
+own `.venv` and `./install.sh` never touches your PATH on its own, you can keep a
+pinned/production version in use while smoke-testing another in one terminal:
 
 ```bash
-./setup --global                # editable install + shim in ~/.local/bin (all terminals)
-./setup 2.1.0 --global          # a PyPI release, machine-wide
-./setup latest                  # newest release, this terminal only (prints activate line)
-```
-
-Manage versions afterwards with `rosotacom self`:
-
-```bash
-rosotacom self install 2.2.0    # add a release (managed venv; global untouched)
-rosotacom self use 2.2.0        # make it the machine-wide default (re-point the shim)
-rosotacom self shell 2.2.0      # use it in THIS terminal only (prints an activate line)
-rosotacom self list             # installed versions; * marks the global default
-rosotacom self which
-```
-
-**Use case — try a new version without disturbing a pinned one.** Keep a
-production checkout/global on its commit, and smoke-test the newest commit in
-one terminal:
-
-```bash
-cd ~/checkouts/rosotacom-newest   # a checkout (or git worktree) at the new commit
-./install.sh                      # builds .venv here; global rosotacom UNCHANGED
+cd ~/checkouts/rosotacom-newest   # a second checkout (or git worktree)
+./install.sh                      # builds .venv here; your other rosotacom is untouched
 source .venv/bin/activate         # this terminal now runs the new commit
 rosotacom smoke                   # built-in example, zero config
-deactivate                        # back to your global/production rosotacom
+deactivate                        # back to your usual rosotacom
 ```
 
-`./install.sh` (optionally `--global-symlink`) is the low-level source installer
-that `./setup --from-source` builds on; on its own it never touches the global
-shim, which is what makes the workflow above safe.
+For coexisting *released* versions, `pipx install rosotacom==2.2.0 --suffix=@2.2.0`
+gives you a `rosotacom@2.2.0` alongside the default — standard pipx, no bespoke
+version manager.
 
 ### Basic Setup
 
@@ -106,11 +80,12 @@ shim, which is what makes the workflow above safe.
 - A **session config** defines the communication behavior for one run: peers, addresses, topics, QoS, processing, and transport choices.
 - A **session instance** stores one concrete run: generated config, catmux pane logs, smoke debug output, and future rosbags.
 
-`rosotacom` resolves the active `rosotacom.yaml` by scope (first wins) — the same
-`shell` / `local` / `global` model as versions:
+`rosotacom` resolves the active `rosotacom.yaml` by scope (first wins), using the
+`shell` / `local` / `global` vocabulary from `pyenv`:
 
 1. `--project <path>` (alias of `--rosotacom-config`) on the command
-2. **shell** — `ROSOTACOM_CONFIG` in the environment
+2. **shell** — `ROSOTACOM_CONFIG` in the environment (needs `eval`, since only
+   your shell can change its own environment)
 3. **local** — the nearest `rosotacom.yaml` discovered upward from the cwd
 4. **global** — a machine-wide default (`rosotacom config set project ... --global`)
 5. a built-in example project, so a fresh install runs with zero setup

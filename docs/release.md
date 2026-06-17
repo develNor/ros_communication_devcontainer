@@ -15,7 +15,9 @@ Stable releases use tags in this form:
 vX.Y.Z
 ```
 
-Push the tag from the release commit after the release PR has merged.
+Tags are cut from `main`, which only carries multi-machine-proven commits
+promoted from `develop` (see [ci.md](ci.md) for the branch model). Push the tag
+from the chosen `main` commit.
 
 ## Release Notes
 

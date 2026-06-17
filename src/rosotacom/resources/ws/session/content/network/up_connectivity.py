@@ -333,7 +333,7 @@ if __name__ == "__main__":
         default="parallel",
         help="Choose 'parallel' (realistic: ping + bandwidth simultaneously) or 'sequential' (isolated)."
     )
-    parser.add_argument("--vpn-server", default="10.254.0.33",
+    parser.add_argument("--vpn-server", default="192.0.2.1",
                         help="Hostname/IP of the iperf3 server on the VPN.")
     parser.add_argument("--vpn-port", type=int, default=5201,
                         help="Port for the iperf3 VPN server.")

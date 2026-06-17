@@ -1,7 +1,23 @@
 # CI
 
 This repository keeps contributor checks aligned with `justfile` targets so the
-same commands can run locally and in GitHub Actions.
+same commands can run locally and in GitHub Actions. For how the test tiers fit
+together, see [testing.md](testing.md).
+
+## Branch model
+
+Work flows through one linear history in three tiers:
+
+- topic PRs are gated into **`develop`** by the merge gate below
+  (single-machine-proven);
+- **`develop`** is promoted to **`main`** by an external multi-machine suite
+  (multi-machine-proven); `main` is the default branch and the release line, and
+  is only ever advanced by that promotion, so it stays a fast-forward of
+  `develop`;
+- releases are tags `vX.Y.Z` cut from `main` (see [release.md](release.md)).
+
+The multi-machine tier is not part of this repository's public CI; it runs on an
+external runner described generically in [testing.md](testing.md).
 
 ## Pull Requests
 
@@ -13,7 +29,7 @@ just typecheck
 just test-unit
 ```
 
-Ready PRs, merge queue entries, and pushes to `main` run
+Ready PRs, merge queue entries, and pushes to `main` or `develop` run
 `.github/workflows/pr-merge-gate.yml`. The required aggregate branch protection
 check is:
 

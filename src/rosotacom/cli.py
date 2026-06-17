@@ -454,7 +454,7 @@ def _parse_remote_peer_override(override: str) -> tuple[str, str]:
     if sep != "=" or not peer_key or not remote_address_ref:
         raise RuntimeError(
             "--overwrite-peers-via-remote-peer must use '<peer_key>=<data_dict_key>', "
-            "for example 'b=tks-leitstand-02_tks' or 'b=data:tks-leitstand-02_tks'."
+            "for example 'b=machine_b_ip' or 'b=data:machine_b_ip'."
         )
     remote_data_key = parse_data_reference(remote_address_ref) or remote_address_ref
     return peer_key, remote_data_key

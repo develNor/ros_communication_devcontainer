@@ -43,16 +43,31 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     assert "just test-e2e-smoke" in merge_gate
 
 
-def test_e2e_smoke_matrix_covers_all_heartbeat_rmw_examples() -> None:
-    e2e_smoke = (PACKAGE_ROOT / "tests" / "e2e" / "test_smoke.py").read_text(encoding="utf-8")
+def test_session_test_tier_markers_drive_both_test_matrices() -> None:
+    """Every session declares test_tiers; the single-machine smoke matrix and the
+    multi-machine set are derived from those markers (the single source of truth),
+    so neither tier can silently drift. See docs/testing.md."""
+    from rosotacom.cli import session_test_markers, sessions_in_tier
 
-    expected_sessions = [
-        "1_heartbeat_fastdds",
+    markers = session_test_markers()  # raises if any session lacks valid markers
+    assert markers, "no example sessions found"
+
+    # Anti-drift guard: the heartbeat-RMW matrix is exactly the single-machine
+    # smoke set. Adding/removing an RMW example must update its marker accordingly.
+    assert set(sessions_in_tier("single_machine", {"ok"})) == {
         "1_heartbeat_cyclone-ota",
+        "1_heartbeat_fastdds",
         "1_heartbeat_zen-endpoints",
         "1_heartbeat_fastdds-local_cyclone-ota",
         "1_heartbeat_cyclone-local_fastdds-ota",
         "1_heartbeat_cyclone-local_zenoh-ros2dds-ota",
-    ]
-    for session in expected_sessions:
-        assert session in e2e_smoke
+    }
+
+    # cyclone-ota-tuned hides local topics on a shared domain (no per-peer domain
+    # split), so it is only provable multi-machine.
+    assert markers["1_heartbeat_cyclone-ota-tuned"] == {"single_machine": "na", "multi_machine": "required"}
+    assert "1_heartbeat_cyclone-ota-tuned" in sessions_in_tier("multi_machine", {"ok", "required"})
+
+    # The smoke test must derive its matrix from the markers, not hardcode it.
+    e2e_smoke = (PACKAGE_ROOT / "tests" / "e2e" / "test_smoke.py").read_text(encoding="utf-8")
+    assert 'sessions_in_tier("single_machine", {"ok"})' in e2e_smoke

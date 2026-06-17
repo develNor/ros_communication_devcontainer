@@ -36,10 +36,23 @@ only thing standing between a local topic and the wire. Some transport setups
 (e.g. single-domain CycloneDDS topic hiding, or a split-domain `domain_bridge`)
 are therefore **only meaningful multi-machine**.
 
+The single-machine smoke test still *runs* the isolation assertion (publishing a
+local-only topic and confirming it does not cross) — there the distinct domain
+IDs make it hold trivially, but it exercises the same assertion code that proves
+the real guarantee multi-machine, so the two tiers cannot diverge.
+
 ## Per-session capability marker
 
 Every session under `examples/sessions/<name>/` is meaningful in some tiers and
-not others. Declare that with a marker so coverage cannot silently drift:
+not others. Each `session-definition.yaml` declares this with a `test_tiers`
+block (the **single source of truth** — both tiers derive their session list
+from it, so coverage cannot silently drift):
+
+```yaml
+test_tiers:
+  single_machine: ok       # ok | na
+  multi_machine: required  # ok | required | na
+```
 
 | Marker | Meaning |
 |---|---|
@@ -47,12 +60,15 @@ not others. Declare that with a marker so coverage cannot silently drift:
 | `single_machine: na` | not meaningful on one host (skip in smoke) |
 | `multi_machine: ok` | valid across two hosts |
 | `multi_machine: required` | the behavior can *only* be proven across two hosts |
+| `multi_machine: na` | not exercised by the multi-machine suite |
 
-Today the single-machine smoke set is the heartbeat-RMW matrix in
-`tests/e2e/test_smoke.py`, guarded by
-`tests/contract/test_security_maintenance_config.py` so the list cannot drift
-unnoticed. When a session's tier coverage changes, update that matrix (and its
-multi-machine counterpart, below) in the same change.
+The single-machine smoke matrix (`tests/e2e/test_smoke.py`) is derived from the
+sessions marked `single_machine: ok`; the multi-machine set is derived from
+`multi_machine in {ok, required}`. `rosotacom.cli.session_test_markers()` /
+`sessions_in_tier()` read the markers, and
+`tests/contract/test_security_maintenance_config.py` guards both directions so a
+new or changed session must carry a valid marker. **To change a session's tier
+coverage, edit its `test_tiers` marker** — the matrices follow automatically.
 
 ## Multi-machine tier (external)
 
@@ -75,3 +91,16 @@ A multi-machine run, generically:
 The set of sessions a multi-machine runner exercises is the sessions marked
 `multi_machine: ok` or `multi_machine: required`. Keeping the markers in this
 repo lets any external runner derive its scenario list without hardcoding it.
+
+Both assertions in step 4 are the **same code** the single-machine smoke test
+runs. After starting each peer, the runner calls, per host over SSH:
+
+- `rosotacom verify --identity <peer>` — delivery of the crossed topics within
+  the shared rate/latency bounds;
+- `rosotacom probe-publish --identity a` then `rosotacom probe-check --identity b
+  --expect absent` — isolation (a local-only topic must not cross).
+
+These verbs probe inside the running session container, so the host itself needs
+no ROS environment. The bounds and the probe topic live in `rosotacom` (single
+source), so both tiers assert identically — only the transport (one loopback host
+vs. two hosts over the wire) differs.

@@ -1,3 +1,9 @@
+# Test-tier capability markers (see docs/testing.md). Split-domain zenoh bridge:
+# isolation is only meaningful across two hosts.
+test_tiers:
+  single_machine: ok
+  multi_machine: required
+
 peers:
   a:
     address: "data:machine_a_ip"

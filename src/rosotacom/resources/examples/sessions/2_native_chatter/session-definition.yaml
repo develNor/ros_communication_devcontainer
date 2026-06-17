@@ -1,3 +1,9 @@
+# Test-tier capability markers (see docs/testing.md). Teaching example, not part
+# of the automated test tiers yet.
+test_tiers:
+  single_machine: na
+  multi_machine: na
+
 peers:
   a:
     address: "data:machine_a_ip"

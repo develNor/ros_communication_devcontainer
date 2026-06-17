@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -233,6 +234,30 @@ def test_positional_session_defaults_to_start(monkeypatch: pytest.MonkeyPatch) -
     assert calls
     assert calls[0].session_dir == "1_heartbeat"
     assert calls[0].identity == "a"
+
+
+def test_new_verification_verbs_dispatch_not_wrapped_in_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression guard: verify/probe-* must be in main()'s command set, otherwise
+    # the "bare positional -> start" shim rewrites them as `start <verb> ...`.
+    seen: list[tuple[str, argparse.Namespace]] = []
+
+    def record(name: str) -> Callable[[argparse.Namespace], int]:
+        def _cmd(args: argparse.Namespace) -> int:
+            seen.append((name, args))
+            return 0
+
+        return _cmd
+
+    for name in ("verify_command", "probe_publish_command", "probe_check_command"):
+        monkeypatch.setattr(rosotacom, name, record(name))
+
+    assert rosotacom.main(["verify", "1_heartbeat", "--identity", "a"]) == 0
+    assert rosotacom.main(["probe-publish", "1_heartbeat", "--identity", "a"]) == 0
+    assert rosotacom.main(["probe-check", "1_heartbeat", "--identity", "b", "--expect", "absent"]) == 0
+
+    assert [n for n, _ in seen] == ["verify_command", "probe_publish_command", "probe_check_command"]
+    assert all(args.session_dir == "1_heartbeat" for _, args in seen)
+    assert seen[2][1].expect == "absent"
 
 
 def test_start_and_stop_compat_entrypoints_prefix_commands(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -566,11 +591,11 @@ def test_stop_list_doctor_and_smoke_host_flows(
     monkeypatch.setattr(rosotacom, "start_session", lambda args: f"container_{args.identity}")
     monkeypatch.setattr(rosotacom, "_ensure_smoke_network", lambda: None)
     monkeypatch.setattr(rosotacom, "_remove_smoke_network", lambda: None)
-    monkeypatch.setattr(
-        rosotacom,
-        "_run_container_shell",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "average rate: 1.0", ""),
-    )
+    # Smoke's per-container delivery + isolation verification is exercised
+    # end-to-end in tests/e2e; this unit test only drives the host flow
+    # (start/stop/network), so stub the shared verification helpers as passing.
+    monkeypatch.setattr(rosotacom, "_verify_received_topics", lambda *args, **kwargs: [])
+    monkeypatch.setattr(rosotacom, "_verify_isolation", lambda *args, **kwargs: [])
     assert (
         rosotacom.smoke(
             argparse.Namespace(

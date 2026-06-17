@@ -1,3 +1,9 @@
+# Test-tier capability markers (see docs/testing.md). Status-overview demo, not
+# part of the automated test tiers.
+test_tiers:
+  single_machine: na
+  multi_machine: na
+
 peers:
   a:
     address: "data:machine_a_ip"

@@ -894,6 +894,9 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             "shared",
             "peer_settings",
             "topics",
+            # Test-tier capability markers (single_machine/multi_machine). Consumed
+            # by the test suites (see docs/testing.md); ignored by generation.
+            "test_tiers",
         },
     )
 

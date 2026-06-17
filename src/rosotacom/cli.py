@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1512,6 +1513,232 @@ def _smoke_ros_setup(config_container_dir: str, cfg: dict[str, Any], receiver_pe
     return " && ".join(commands)
 
 
+# --- Shared verification primitives (used by `smoke` and the `verify`/`probe-*`
+# CLI verbs that the external multi-machine runner calls over SSH) --------------
+# Single source of truth for the heartbeat delivery bounds and the isolation
+# probe topic, so both test tiers assert the same thing. See docs/testing.md.
+VERIFY_HZ_MIN = 5.0
+VERIFY_HZ_MAX = 20.0
+VERIFY_MAX_DELAY_S = 1.0
+ISOLATION_PROBE_TOPIC = "/local_only"
+
+
+def _other_peer_key(cfg: dict[str, Any], identity: str) -> str:
+    peers = cfg.get("peers") or {}
+    if identity not in peers:
+        raise RuntimeError(f"--identity must be one of peers={sorted(peers)}")
+    return str(next(k for k in peers if k != identity))
+
+
+def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> list[tuple[str, str, bool]]:
+    """(topic, label, enforce_bounds) the receiver must get from the other peer:
+    the inbound-bridge topic (presence only) and the final remapped heartbeat
+    (presence + rate/latency bounds)."""
+    source = _other_peer_key(cfg, receiver_peer_key)
+    return [
+        (_smoke_inbound_bridge_topic(cfg, source), f"{source}->{receiver_peer_key} inbound bridge heartbeat", False),
+        (_smoke_heartbeat_topic(cfg, source), f"{source}->{receiver_peer_key} final heartbeat", True),
+    ]
+
+
+def _verify_received_topics(
+    container_name: str,
+    ros_setup: str,
+    cfg: dict[str, Any],
+    receiver_peer_key: str,
+    *,
+    hz_min: float = VERIFY_HZ_MIN,
+    hz_max: float = VERIFY_HZ_MAX,
+    max_delay_s: float = VERIFY_MAX_DELAY_S,
+    log_line: Callable[[str], None] = print,
+    detail_log: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Assert the receiver's crossed topics publish (and the final heartbeat does
+    so within rate/latency bounds). Emits the OK/SMOKE_METRIC lines smoke has
+    always produced; returns a list of failures (empty == all good)."""
+    errors: list[str] = []
+    for topic, label, enforce_bounds in _received_crossed_topics(cfg, receiver_peer_key):
+        output = _wait_for_topic_hz(container_name, ros_setup, topic)
+        if detail_log:
+            detail_log(f"\n--- {label} ({topic}) in {container_name} ---\n{output}")
+        if "average rate" not in output:
+            errors.append(f"{label} ({topic}) not publishing in {container_name}")
+            continue
+        log_line(f"OK: {label} ({topic}) is publishing in {container_name}")
+        hz = _parse_topic_hz_rate(output)
+        delay_output = _measure_topic_delay(container_name, ros_setup, topic)
+        if detail_log:
+            detail_log(f"\n--- delay {label} ({topic}) in {container_name} ---\n{delay_output}")
+        delay_s = _parse_topic_delay_seconds(delay_output)
+        log_line(_smoke_metric_line(label=label, topic=topic, container_name=container_name, hz=hz, delay_s=delay_s))
+        if enforce_bounds:
+            if hz is None or not (hz_min <= hz <= hz_max):
+                errors.append(f"{label} ({topic}) rate {hz} Hz outside [{hz_min}, {hz_max}] in {container_name}")
+            if delay_s is None or delay_s >= max_delay_s:
+                errors.append(f"{label} ({topic}) latency {delay_s}s >= {max_delay_s}s in {container_name}")
+    return errors
+
+
+def _publish_isolation_probe(
+    container_name: str, ros_setup: str, topic: str, *, rate: float = 5.0, duration: float = 30.0
+) -> None:
+    """Publish a local-only topic in the container's local application domain,
+    detached, for `duration` seconds (self-stops via `timeout`)."""
+    cmd = f"{ros_setup} && timeout {duration} ros2 topic pub {shlex.quote(topic)} std_msgs/msg/Empty '{{}}' -r {rate}"
+    subprocess.run(
+        ["docker", "exec", "-d", container_name, "bash", "-lc", cmd], capture_output=True, text=True, check=False
+    )
+
+
+def _stop_isolation_probe(container_name: str, topic: str) -> None:
+    """Stop any probe publisher for `topic` (so it cannot linger into a later
+    check or session teardown)."""
+    subprocess.run(
+        ["docker", "exec", container_name, "pkill", "-f", f"ros2 topic pub {topic}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _topic_present(container_name: str, ros_setup: str, topic: str) -> bool:
+    result = _run_container_shell(
+        container_name, f"{ros_setup} && timeout -k 2 8 ros2 topic list", timeout_s=_TOPIC_PROBE_EXEC_TIMEOUT_S
+    )
+    names = {ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip().startswith("/")}
+    return topic in names
+
+
+def _verify_isolation(
+    pub_container: str,
+    pub_setup: str,
+    check_container: str,
+    check_setup: str,
+    topic: str,
+    *,
+    log_line: Callable[[str], None] = print,
+) -> list[str]:
+    """Publish a local-only topic in pub_container's local domain and assert it
+    never appears in check_container's local domain."""
+    _publish_isolation_probe(pub_container, pub_setup, topic)
+    try:
+        live = False
+        for _ in range(8):
+            if _topic_present(pub_container, pub_setup, topic):
+                live = True
+                break
+            time.sleep(1)
+        if not live:
+            return [f"isolation check inconclusive: {topic} never advertised in {pub_container}"]
+        if _topic_present(check_container, check_setup, topic):
+            return [f"isolation breach: {topic} from {pub_container} leaked to {check_container}"]
+        log_line(f"OK: isolation holds ({topic} from {pub_container} not visible in {check_container})")
+        return []
+    finally:
+        _stop_isolation_probe(pub_container, topic)
+
+
+# --- Test-tier capability markers (single source of truth for both tiers) -----
+_VALID_SINGLE_MACHINE = {"ok", "na"}
+_VALID_MULTI_MACHINE = {"ok", "required", "na"}
+
+
+def _session_markers(session_host_dir: Path) -> dict[str, str]:
+    name = session_host_dir.name
+    cfg = _load_session_config_from_host(session_host_dir)
+    tiers = cfg.get("test_tiers")
+    if not isinstance(tiers, dict):
+        raise RuntimeError(f"{name}: missing 'test_tiers' mapping (see docs/testing.md)")
+    single, multi = tiers.get("single_machine"), tiers.get("multi_machine")
+    if single not in _VALID_SINGLE_MACHINE:
+        raise RuntimeError(f"{name}: test_tiers.single_machine={single!r} not in {sorted(_VALID_SINGLE_MACHINE)}")
+    if multi not in _VALID_MULTI_MACHINE:
+        raise RuntimeError(f"{name}: test_tiers.multi_machine={multi!r} not in {sorted(_VALID_MULTI_MACHINE)}")
+    return {"single_machine": single, "multi_machine": multi}
+
+
+def session_test_markers(sessions_dir: Path | None = None) -> dict[str, dict[str, str]]:
+    """Map session name -> {single_machine, multi_machine} for every session.
+    Defaults to the packaged example sessions (the repo's source of truth)."""
+    base = sessions_dir or (EXAMPLE_PROJECT_DIR / "sessions")
+    out: dict[str, dict[str, str]] = {}
+    for child in sorted(base.iterdir()):
+        if child.is_dir() and _is_session_dir(child):
+            out[child.name] = _session_markers(child)
+    return out
+
+
+def sessions_in_tier(tier: str, values: set[str], sessions_dir: Path | None = None) -> list[str]:
+    return [name for name, m in session_test_markers(sessions_dir).items() if m.get(tier) in values]
+
+
+def _running_instance_config_container_dir(
+    runtime: RuntimeConfig, session: ResolvedSession, instance_id: str | None
+) -> str:
+    """Container-side config dir of the session instance currently running on this
+    host (the instances root is bind-mounted at SESSION_INSTANCE_CONTAINER_DIR)."""
+    instance_dir = _find_latest_instance_dir(runtime, session, instance_id)
+    rel = instance_dir.relative_to(_session_instances_root(runtime))
+    return f"{SESSION_INSTANCE_CONTAINER_DIR}/{rel}/config"
+
+
+def _resolve_running_peer(args: argparse.Namespace, identity: str) -> tuple[str, str, dict[str, Any]]:
+    """Resolve (container, ros_setup, cfg) for `identity`'s already-running peer."""
+    runtime = _load_runtime_config(args)
+    session = _resolve_session(getattr(args, "session_dir", None) or DEFAULT_SMOKE_SESSION, runtime)
+    peer_overrides = _parse_peer_address_overrides(getattr(args, "peer_address", None))
+    cfg = _effective_session_config(session.host_dir, runtime, peer_address_overrides=peer_overrides)
+    containers = _identity_container_names(cfg, runtime, identity)
+    if not containers:
+        raise RuntimeError(f"No container resolved for identity {identity!r}")
+    config_container_dir = _running_instance_config_container_dir(runtime, session, getattr(args, "instance_id", None))
+    ros_setup = _smoke_ros_setup(config_container_dir, cfg, identity)
+    return containers[0], ros_setup, cfg
+
+
+def verify_command(args: argparse.Namespace) -> int:
+    """Assert an already-running peer receives its crossed topics within bounds."""
+    container, ros_setup, cfg = _resolve_running_peer(args, args.identity)
+    errors = _verify_received_topics(
+        container, ros_setup, cfg, args.identity, hz_min=args.hz_min, hz_max=args.hz_max, max_delay_s=args.max_delay
+    )
+    for err in errors:
+        print(f"VERIFY FAIL: {err}", file=sys.stderr)
+    if errors:
+        return 1
+    print(f"VERIFY OK: identity {args.identity} receives its crossed topics within bounds")
+    return 0
+
+
+def probe_publish_command(args: argparse.Namespace) -> int:
+    """Publish (or --stop) a local-only probe topic in a running peer's local domain."""
+    container, ros_setup, _ = _resolve_running_peer(args, args.identity)
+    if args.stop:
+        _stop_isolation_probe(container, args.topic)
+        print(f"Stopped probe publisher for {args.topic} in {container} (identity {args.identity})")
+        return 0
+    _publish_isolation_probe(container, ros_setup, args.topic, rate=args.rate, duration=args.duration)
+    # Block until the topic is actually advertised so a caller's subsequent
+    # absence check on the other peer is meaningful (not a false pass on a
+    # publisher that never came up).
+    for _ in range(10):
+        if _topic_present(container, ros_setup, args.topic):
+            print(f"Publishing {args.topic} in {container} (identity {args.identity}); advertised.")
+            return 0
+        time.sleep(1)
+    print(f"ERROR: {args.topic} did not advertise in {container} (identity {args.identity})", file=sys.stderr)
+    return 1
+
+
+def probe_check_command(args: argparse.Namespace) -> int:
+    """Assert a topic is present/absent in a running peer's local domain (isolation)."""
+    container, ros_setup, _ = _resolve_running_peer(args, args.identity)
+    present = _topic_present(container, ros_setup, args.topic)
+    state = "present" if present else "absent"
+    print(f"{args.topic} is {state} in {container} (identity {args.identity}); expected {args.expect}")
+    return 0 if present == (args.expect == "present") else 1
+
+
 def smoke(args: argparse.Namespace) -> int:
     if not args.local:
         raise RuntimeError("Only --local smoke mode is implemented.")
@@ -1567,33 +1794,23 @@ def smoke(args: argparse.Namespace) -> int:
             raise RuntimeError("Smoke verification failed: generated plugin.yaml did not use literal CLI addresses.")
         log_line("OK: generated plugin.yaml files use literal CLI addresses")
 
-        checks = [
-            (b_container, _smoke_inbound_bridge_topic(cfg, "a"), "a->b inbound bridge heartbeat", "b"),
-            (b_container, _smoke_heartbeat_topic(cfg, "a"), "a->b final heartbeat", "b"),
-            (a_container, _smoke_inbound_bridge_topic(cfg, "b"), "b->a inbound bridge heartbeat", "a"),
-            (a_container, _smoke_heartbeat_topic(cfg, "b"), "b->a final heartbeat", "a"),
-        ]
-        for container_name, topic, label, receiver_peer_key in checks:
-            ros_setup = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, receiver_peer_key)
-            output = _wait_for_topic_hz(container_name, ros_setup, topic)
-            _append_log(smoke_log, f"\n--- {label} ({topic}) in {container_name} ---\n{output}")
-            if "average rate" not in output:
-                raise RuntimeError(f"Smoke verification failed for {label} ({topic}) in {container_name}:\n{output}")
-            log_line(f"OK: {label} ({topic}) is publishing in {container_name}")
+        def detail(msg: str) -> None:
+            _append_log(smoke_log, msg)
 
-            hz = _parse_topic_hz_rate(output)
-            delay_output = _measure_topic_delay(container_name, ros_setup, topic)
-            _append_log(smoke_log, f"\n--- delay {label} ({topic}) in {container_name} ---\n{delay_output}")
-            delay_s = _parse_topic_delay_seconds(delay_output)
-            log_line(
-                _smoke_metric_line(
-                    label=label,
-                    topic=topic,
-                    container_name=container_name,
-                    hz=hz,
-                    delay_s=delay_s,
-                )
-            )
+        ros_setup_a = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "a")
+        ros_setup_b = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "b")
+        errors: list[str] = []
+        # Delivery: each peer must receive the other's crossed topics within bounds.
+        errors += _verify_received_topics(b_container, ros_setup_b, cfg, "b", log_line=log_line, detail_log=detail)
+        errors += _verify_received_topics(a_container, ros_setup_a, cfg, "a", log_line=log_line, detail_log=detail)
+        # Isolation: a local-only topic published on a must not cross to b. On a
+        # single host the distinct test domain IDs make this hold; it exercises the
+        # same assertion that proves the real OTA guarantee multi-machine.
+        errors += _verify_isolation(
+            a_container, ros_setup_a, b_container, ros_setup_b, ISOLATION_PROBE_TOPIC, log_line=log_line
+        )
+        if errors:
+            raise RuntimeError("Smoke verification failed:\n  - " + "\n  - ".join(errors))
     except Exception as exc:
         _append_log(smoke_log, f"ERROR: {exc}")
         raise
@@ -1779,6 +1996,9 @@ def main(argv: list[str] | None = None) -> int:
         "doctor",
         "smoke",
         "status",
+        "verify",
+        "probe-publish",
+        "probe-check",
         "list-sessions",
         "examples",
         "setup-env",
@@ -1833,6 +2053,50 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("--watch", action="store_true", help="Continuously refresh the view.")
     status_parser.add_argument("--watch-interval", type=float, default=2.0, help="Watch refresh interval (s).")
     status_parser.set_defaults(func=status)
+
+    # Verification verbs operate on an already-running session per identity, so the
+    # external multi-machine runner can call them over SSH (one peer per host) with
+    # the exact same logic the local smoke test uses.
+    verify_parser = subparsers.add_parser(
+        "verify", help="Assert a running peer receives its crossed topics within rate/latency bounds."
+    )
+    _add_common_config_args(verify_parser)
+    verify_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    verify_parser.add_argument("--identity", required=True)
+    verify_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    verify_parser.add_argument("--instance-id", help="Inspect a specific instance id (default: most recent).")
+    verify_parser.add_argument("--hz-min", type=float, default=VERIFY_HZ_MIN)
+    verify_parser.add_argument("--hz-max", type=float, default=VERIFY_HZ_MAX)
+    verify_parser.add_argument("--max-delay", type=float, default=VERIFY_MAX_DELAY_S)
+    verify_parser.set_defaults(func=verify_command)
+
+    probe_publish_parser = subparsers.add_parser(
+        "probe-publish", help="Publish a local-only probe topic in a running peer's local domain (isolation)."
+    )
+    _add_common_config_args(probe_publish_parser)
+    probe_publish_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    probe_publish_parser.add_argument("--identity", required=True)
+    probe_publish_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    probe_publish_parser.add_argument("--instance-id")
+    probe_publish_parser.add_argument("--topic", default=ISOLATION_PROBE_TOPIC)
+    probe_publish_parser.add_argument("--rate", type=float, default=5.0)
+    probe_publish_parser.add_argument("--duration", type=float, default=30.0)
+    probe_publish_parser.add_argument(
+        "--stop", action="store_true", help="Stop a running probe publisher instead of starting one."
+    )
+    probe_publish_parser.set_defaults(func=probe_publish_command)
+
+    probe_check_parser = subparsers.add_parser(
+        "probe-check", help="Assert a topic is present/absent in a running peer's local domain (isolation)."
+    )
+    _add_common_config_args(probe_check_parser)
+    probe_check_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    probe_check_parser.add_argument("--identity", required=True)
+    probe_check_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    probe_check_parser.add_argument("--instance-id")
+    probe_check_parser.add_argument("--topic", default=ISOLATION_PROBE_TOPIC)
+    probe_check_parser.add_argument("--expect", choices=["present", "absent"], default="absent")
+    probe_check_parser.set_defaults(func=probe_check_command)
 
     list_parser = subparsers.add_parser("list-sessions", help="List configured sessions.")
     _add_common_config_args(list_parser)

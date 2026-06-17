@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from rosotacom.cli import VERIFY_HZ_MAX, VERIFY_HZ_MIN, VERIFY_MAX_DELAY_S, sessions_in_tier
+
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = [
     pytest.mark.e2e,
@@ -17,13 +19,16 @@ pytestmark = [
     ),
 ]
 
+
+# The single-machine smoke matrix is derived from the per-session capability
+# markers (single_machine: ok) so it cannot drift from the source of truth; the
+# contract test guards both directions. See docs/testing.md.
+def _smoke_id(session_name: str) -> str:
+    return session_name.removeprefix("1_heartbeat_").replace("_", "-")
+
+
 HEARTBEAT_SMOKE_SESSIONS = [
-    pytest.param("1_heartbeat_cyclone-ota", id="cyclone-ota"),
-    pytest.param("1_heartbeat_zen-endpoints", id="zen-endpoints"),
-    pytest.param("1_heartbeat_cyclone-local_zenoh-ros2dds-ota", id="cyclone-local-zenoh-ros2dds-ota"),
-    pytest.param("1_heartbeat_fastdds", id="fastdds"),
-    pytest.param("1_heartbeat_fastdds-local_cyclone-ota", id="fastdds-local-cyclone-ota"),
-    pytest.param("1_heartbeat_cyclone-local_fastdds-ota", id="cyclone-local-fastdds-ota"),
+    pytest.param(name, id=_smoke_id(name)) for name in sessions_in_tier("single_machine", {"ok"})
 ]
 
 EXPECTED_HEARTBEAT_CHECKS = (
@@ -32,14 +37,17 @@ EXPECTED_HEARTBEAT_CHECKS = (
     "OK: a->b final heartbeat (/heartbeat_a)",
     "OK: b->a inbound bridge heartbeat (/com/in/b/heartbeat_b)",
     "OK: b->a final heartbeat (/heartbeat_b)",
+    # Isolation is now asserted in smoke too (local-only topic must not cross);
+    # container names vary, so match the stable prefix.
+    "OK: isolation holds (/local_only",
 )
 
 # Heartbeat publishers emit at 10 Hz; received rate should stay close to that.
+# The bounds are the shared single source of truth from rosotacom.
 EXPECTED_HEARTBEAT_HZ = 10.0
-HEARTBEAT_HZ_MIN = 5.0
-HEARTBEAT_HZ_MAX = 20.0
-# End-to-end heartbeat latency must stay well below one second.
-MAX_HEARTBEAT_DELAY_S = 1.0
+HEARTBEAT_HZ_MIN = VERIFY_HZ_MIN
+HEARTBEAT_HZ_MAX = VERIFY_HZ_MAX
+MAX_HEARTBEAT_DELAY_S = VERIFY_MAX_DELAY_S
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _ERROR_PATTERNS = (

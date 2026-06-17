@@ -1,10 +1,10 @@
 # ROS Communication DevContainer
 
-[![CI](https://github.com/develNor/rosotacom/actions/workflows/pr-merge-gate.yml/badge.svg?branch=develop&event=push)](https://github.com/develNor/rosotacom/actions/workflows/pr-merge-gate.yml)
-[![Coverage](https://codecov.io/gh/develNor/rosotacom/branch/develop/graph/badge.svg)](https://codecov.io/gh/develNor/rosotacom)
+[![CI](https://github.com/develNor/ros_communication_devcontainer/actions/workflows/pr-merge-gate.yml/badge.svg?branch=develop&event=push)](https://github.com/develNor/ros_communication_devcontainer/actions/workflows/pr-merge-gate.yml)
+[![Coverage](https://codecov.io/gh/develNor/ros_communication_devcontainer/branch/develop/graph/badge.svg)](https://codecov.io/gh/develNor/ros_communication_devcontainer)
 [![PyPI](https://img.shields.io/pypi/v/rosotacom.svg)](https://pypi.org/project/rosotacom/)
 [![Python](https://img.shields.io/pypi/pyversions/rosotacom.svg)](https://pypi.org/project/rosotacom/)
-[![License](https://img.shields.io/pypi/l/rosotacom.svg)](https://pypi.org/project/rosotacom/)
+[![License](https://img.shields.io/github/license/develNor/ros_communication_devcontainer.svg)](https://github.com/develNor/ros_communication_devcontainer/blob/HEAD/LICENSE.txt)
 
 The ROS Communication DevContainer is a Docker-based solution designed to streamline the bidirectional synchronization of ROS2 topics between two Linux machines. It provides built-in compression and routing capabilities for over-the-air (OTA) data transfer: selected topics are remapped into an OTA namespace and transmitted either via direct DDS (CycloneDDS) or through a Zenoh router. When desired, the session can also place local application nodes and OTA-facing bridge nodes into separate ROS 2 domain IDs and automatically generate a standard ROS 2 `domain_bridge` configuration for the `/com/...` boundary. This project aligns with the publication *“Scalable Remote Operation for Autonomous Vehicles: Integration of Cooperative Perception and Open Source Communication.”*
 

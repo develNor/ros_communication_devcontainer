@@ -54,10 +54,14 @@ echo "Try:"
 echo "  rosotacom --version"
 echo "  python -m rosotacom --version"
 echo "  rosotacom doctor"
-echo "  rosotacom examples create ./rosotacom_examples"
-echo "  eval \"\$(rosotacom setup-env ./rosotacom_examples/rosotacom.yaml)\""
-echo "  rosotacom smoke"
+echo "  rosotacom examples create ./rosotacom_examples && cd ./rosotacom_examples"
+echo "  rosotacom smoke    # ./rosotacom.yaml is auto-discovered from the current dir"
 echo
+echo "With no project nearby, rosotacom falls back to a built-in example, so"
+echo "'rosotacom smoke' works with zero setup. Pin a default with:"
+echo "  rosotacom config set project ./rosotacom.yaml --global"
+echo
+echo "Tip: './setup' wraps this installer and also selects releases (./setup 2.1.0 --global)."
 echo "For contributor checks, install dev tooling with:"
 echo "  just setup"
 

@@ -37,19 +37,37 @@ so multiple rosotacom versions can coexist without global symlink drift.
 
 #### Install
 
+The front-door is `./setup`: it installs a version and selects it, with one
+consistent `--global`/`--local` model (`--local` = this terminal, `--global` =
+all terminals).
+
 ```bash
-cd /path/to/ros_communication_devcontainer && ./install.sh
+cd /path/to/ros_communication_devcontainer
+./setup                         # auto: from-source + this terminal
 source .venv/bin/activate
 rosotacom --version
 python -m rosotacom --version
 rosotacom doctor
 ```
 
-Legacy global symlinks are still available when explicitly requested:
+`./setup` also takes an explicit version and scope:
 
 ```bash
-./install.sh --global-symlink
+./setup --from-source --global  # editable install, shimmed into ~/.local/bin
+./setup 2.1.0 --global          # a PyPI release, for all terminals
+./setup latest --local          # newest release, this terminal only
 ```
+
+Manage installed versions afterwards with `rosotacom self`:
+
+```bash
+rosotacom self list             # installed versions + the global selection
+rosotacom self use 2.1.0 --global
+rosotacom self which
+```
+
+`./install.sh` (optionally `--global-symlink`) remains the low-level source
+installer that `./setup --from-source` builds on.
 
 ### Basic Setup
 
@@ -59,14 +77,31 @@ Legacy global symlinks are still available when explicitly requested:
 - A **session config** defines the communication behavior for one run: peers, addresses, topics, QoS, processing, and transport choices.
 - A **session instance** stores one concrete run: generated config, catmux pane logs, smoke debug output, and future rosbags.
 
-No `rosotacom.yaml` is discovered automatically. Wire one explicitly with a flag or with `ROSOTACOM_CONFIG`:
+`rosotacom` resolves the active `rosotacom.yaml` in this order (first wins):
+
+1. `--project <path>` (alias of `--rosotacom-config`) on the command
+2. `ROSOTACOM_CONFIG` in the environment
+3. the nearest `rosotacom.yaml` discovered upward from the current directory
+4. a machine-wide default set with `rosotacom config set project ... --global`
+5. a built-in example project, so a fresh install runs with zero setup
+
+So the simplest workflow is just to be in a project directory:
 
 ```bash
 rosotacom examples create ./rosotacom_examples
 cd ./rosotacom_examples
-eval "$(rosotacom setup-env ./rosotacom.yaml)"
-rosotacom doctor
+rosotacom doctor                # picks up ./rosotacom.yaml automatically
 ```
+
+Inspect or pin the selection with `rosotacom config`:
+
+```bash
+rosotacom config show                                            # every layer + the winner
+rosotacom config set project ./rosotacom.yaml --global           # machine-wide default
+eval "$(rosotacom config set project ./rosotacom.yaml --local)"  # this terminal only
+```
+
+(`rosotacom setup-env ./rosotacom.yaml` is a deprecated alias for the `--local` form.)
 
 The copied packaged example project uses this layout:
 
@@ -103,12 +138,12 @@ rosotacom start 1_heartbeat_cyclone-ota --identity b
 
 ## Usage Examples
 
-Create and wire the example project first:
+Create the example project first (cwd discovery wires it automatically once you
+`cd` in):
 
 ```bash
 rosotacom examples create ./rosotacom_examples
 cd ./rosotacom_examples
-eval "$(rosotacom setup-env ./rosotacom.yaml)"
 ```
 
 Run the local heartbeat smoke test:

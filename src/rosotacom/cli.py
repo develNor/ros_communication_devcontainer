@@ -92,6 +92,7 @@ class RuntimeConfig:
     data_dict: Path | None
     install_id: str
     session_instances_dir: Path | None = None
+    project_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -152,12 +153,96 @@ def _install_id(scope_path: Path | None = None) -> str:
     return hashlib.sha1(str(scope).encode("utf-8")).hexdigest()[:8]
 
 
+def _xdg_dir(env_var: str, default_suffix: str) -> Path:
+    base = os.environ.get(env_var)
+    return Path(base) if base else Path.home() / default_suffix
+
+
+def _user_config_file() -> Path:
+    return _xdg_dir("XDG_CONFIG_HOME", ".config") / "rosotacom" / "config.yaml"
+
+
+def _user_state_dir() -> Path:
+    return _xdg_dir("XDG_STATE_HOME", ".local/state") / "rosotacom"
+
+
+def _user_data_dir() -> Path:
+    return _xdg_dir("XDG_DATA_HOME", ".local/share") / "rosotacom"
+
+
+def _user_bin_dir() -> Path:
+    raw = os.environ.get("ROSOTACOM_BIN_DIR")
+    return Path(raw) if raw else Path.home() / ".local" / "bin"
+
+
+def _discover_project_config(start: Path | None = None) -> Path | None:
+    """Walk up from ``start`` (default cwd) for the nearest ``rosotacom.yaml``."""
+    current = (start or Path.cwd()).resolve()
+    for directory in (current, *current.parents):
+        candidate = directory / "rosotacom.yaml"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _user_config_project() -> Path | None:
+    """Return the machine-wide default project from the user config file, if set."""
+    raw = _load_yaml_file(_user_config_file()).get("project")
+    if not raw:
+        return None
+    path = Path(os.path.expandvars(os.path.expanduser(str(raw))))
+    if not path.is_absolute():
+        path = _user_config_file().parent / path
+    path = path.resolve()
+    return path if path.is_file() else None
+
+
+def _builtin_example_config() -> Path | None:
+    """Materialize the packaged example into the user state dir (once) and return it.
+
+    This is the zero-config fallback: a fresh install can run sessions with no
+    setup. The copy is writable (unlike the in-package resources) so its
+    ``data_dict.json`` and ``session-instances/`` work normally.
+    """
+    target = _user_state_dir() / "example"
+    config = target / "rosotacom.yaml"
+    if config.is_file():
+        return config
+    try:
+        source = _example_project_resource()
+        _copy_example_resource_tree(source, target)
+    except (RuntimeError, OSError):
+        return None
+    return config if config.is_file() else None
+
+
+def _resolve_project_config_source(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """Resolve which rosotacom.yaml is active and which layer it came from.
+
+    Precedence (highest first): explicit flag, ROSOTACOM_CONFIG env, cwd/ancestor
+    auto-discovery, machine-wide user default, packaged built-in example.
+    """
+    flag = getattr(args, "rosotacom_config", None)
+    if flag:
+        return str(flag), "flag"
+    env = os.environ.get("ROSOTACOM_CONFIG")
+    if env:
+        return env, "env"
+    discovered = _discover_project_config()
+    if discovered:
+        return str(discovered), "cwd"
+    user = _user_config_project()
+    if user:
+        return str(user), "global"
+    builtin = _builtin_example_config()
+    if builtin:
+        return str(builtin), "builtin"
+    return None, None
+
+
 def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfig:
     args = args or argparse.Namespace()
-    rosotacom_config_raw = _first_value(
-        getattr(args, "rosotacom_config", None),
-        os.environ.get("ROSOTACOM_CONFIG"),
-    )
+    rosotacom_config_raw, project_source = _resolve_project_config_source(args)
     rosotacom_config = _resolve_path(rosotacom_config_raw, Path.cwd(), must_exist=True)
     config_base = rosotacom_config.parent if rosotacom_config else Path.cwd()
     cfg = _load_yaml_file(rosotacom_config)
@@ -196,6 +281,7 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         data_dict=_resolve_path(data_dict_raw, config_base, must_exist=True),
         install_id=_install_id(rosotacom_config),
         session_instances_dir=_resolve_path(session_instances_dir_raw, config_base, must_exist=False),
+        project_source=project_source,
     )
 
 
@@ -1030,15 +1116,210 @@ def examples_create_command(args: argparse.Namespace) -> int:
     _copy_example_resource_tree(_example_project_resource(), target)
     _ensure_example_gitignore(target)
     print(f"Copied rosotacom examples to: {target}")
-    print(f'Wire this shell with: eval "$(rosotacom setup-env {shlex.quote(str(target / "rosotacom.yaml"))})"')
+    print(f"Use it by entering the directory (auto-discovered):  cd {shlex.quote(str(target))}")
+    print(f"Or pin it everywhere:  rosotacom config set project {shlex.quote(str(target / 'rosotacom.yaml'))} --global")
     return 0
 
 
-def setup_env_command(args: argparse.Namespace) -> int:
-    config = _resolve_path(args.rosotacom_config, Path.cwd(), must_exist=True)
+def _require_project_file(raw: str | None) -> Path:
+    config = _resolve_path(raw, Path.cwd(), must_exist=True)
     if not config or not config.is_file():
-        raise RuntimeError(f"rosotacom config must be a file: {args.rosotacom_config}")
+        raise RuntimeError(f"rosotacom config must be a file: {raw}")
+    return config
+
+
+def _print_project_export(config: Path) -> None:
     print(f"export ROSOTACOM_CONFIG={shlex.quote(str(config))}")
+
+
+def setup_env_command(args: argparse.Namespace) -> int:
+    _print_project_export(_require_project_file(args.rosotacom_config))
+    return 0
+
+
+def _write_user_project(config: Path) -> Path:
+    """Persist the machine-wide default project to the user config file."""
+    path = _user_config_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = _load_yaml_file(path)
+    cfg["project"] = str(config)
+    path.write_text(yaml.safe_dump(cfg, default_flow_style=False, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def config_command(args: argparse.Namespace) -> int:
+    action = args.config_action
+    if action == "set":
+        if args.key != "project":
+            raise RuntimeError(f"unknown config key: {args.key}")
+        config = _require_project_file(args.value)
+        # --global persists machine-wide; --local (default) emits a shell export to
+        # eval in the current terminal. A child process cannot mutate the parent
+        # shell, so the per-terminal path stays an `eval "$(...)"` escape hatch.
+        if args.scope == "global":
+            path = _write_user_project(config)
+            print(f"Set global default project: {config}")
+            print(f"  written to {path}")
+        else:
+            _print_project_export(config)
+        return 0
+
+    if action == "unset":
+        path = _user_config_file()
+        cfg = _load_yaml_file(path)
+        if cfg.pop("project", None) is None:
+            print("No global default project was set.")
+            return 0
+        if cfg:
+            path.write_text(yaml.safe_dump(cfg, default_flow_style=False, sort_keys=True), encoding="utf-8")
+        else:
+            path.unlink()
+        print("Cleared global default project.")
+        return 0
+
+    # action in {"get", "show"}
+    raw, source = _resolve_project_config_source(args)
+    if action == "get":
+        print(str(_resolve_path(raw, Path.cwd(), must_exist=True)) if raw else "")
+        return 0
+
+    def line(label: str, value: str) -> None:
+        print(f"{label:>9}: {value}")
+
+    line("flag", getattr(args, "rosotacom_config", None) or "-")
+    line("env", os.environ.get("ROSOTACOM_CONFIG") or "-")
+    line("cwd", str(_discover_project_config() or "-"))
+    line("global", str(_user_config_project() or "-"))
+    line("builtin", str(_user_state_dir() / "example" / "rosotacom.yaml"))
+    if raw:
+        active = _resolve_path(raw, Path.cwd(), must_exist=True)
+        line("active", f"{active}  (source: {source})")
+    else:
+        line("active", "none configured")
+    return 0
+
+
+# --- version management (`rosotacom self`) -----------------------------------
+
+SHIM_NAMES = ("rosotacom", "start_rosotacom", "stop_rosotacom")
+
+
+def _versions_dir() -> Path:
+    return _user_data_dir() / "versions"
+
+
+def _version_venv_dir(tag: str) -> Path:
+    return _versions_dir() / _safe_path_token(tag)
+
+
+def _link_global_shims(venv_dir: Path) -> Path:
+    """Point ~/.local/bin/{rosotacom,start_,stop_} at ``venv_dir``'s console scripts."""
+    bin_dir = _user_bin_dir()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name in SHIM_NAMES:
+        link = bin_dir / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(venv_dir / "bin" / name)
+    return bin_dir
+
+
+def _write_user_version(venv_dir: Path) -> Path:
+    path = _user_config_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cfg = _load_yaml_file(path)
+    cfg["version"] = str(venv_dir)
+    path.write_text(yaml.safe_dump(cfg, default_flow_style=False, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def _global_version_dir() -> Path | None:
+    raw = _load_yaml_file(_user_config_file()).get("version")
+    return Path(str(raw)) if raw else None
+
+
+def _create_version_venv(venv_dir: Path, spec: str) -> None:
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+    pip = venv_dir / "bin" / "pip"
+    subprocess.run([str(pip), "install", "--upgrade", "pip"], check=True)
+    subprocess.run([str(pip), "install", spec], check=True)
+
+
+def _resolve_self_venv(args: argparse.Namespace, *, require_exists: bool) -> Path:
+    from_source = getattr(args, "from_source", None)
+    if from_source:
+        venv_dir = Path(os.path.expanduser(from_source)).resolve() / ".venv"
+        hint = "run `./setup --from-source` (or `./install.sh`) in that checkout first"
+    else:
+        tag = getattr(args, "tag", None)
+        if not tag:
+            raise RuntimeError("specify a release tag or --from-source <checkout>.")
+        venv_dir = _version_venv_dir(tag)
+        hint = f"run `rosotacom self install {tag}` first"
+    if require_exists and not (venv_dir / "bin" / "rosotacom").exists():
+        raise RuntimeError(f"no rosotacom found in {venv_dir}; {hint}.")
+    return venv_dir
+
+
+def self_command(args: argparse.Namespace) -> int:
+    action = args.self_action
+
+    if action == "install":
+        spec = "rosotacom" if args.tag == "latest" else f"rosotacom=={args.tag}"
+        venv_dir = _version_venv_dir(args.tag)
+        _create_version_venv(venv_dir, spec)
+        print(f"Installed {spec} into: {venv_dir}")
+        print(f"Select it with: rosotacom self use {args.tag} --global")
+        return 0
+
+    if action == "use":
+        venv_dir = _resolve_self_venv(args, require_exists=True)
+        if args.scope == "global":
+            _link_global_shims(venv_dir)
+            _write_user_version(venv_dir)
+            print(f"Global rosotacom now points at: {venv_dir}")
+            print(f"  shims in {_user_bin_dir()} (ensure it is on your PATH)")
+        else:
+            print(f"source {shlex.quote(str(venv_dir / 'bin' / 'activate'))}")
+        return 0
+
+    if action == "uninstall":
+        venv_dir = _version_venv_dir(args.tag)
+        if not venv_dir.exists():
+            print(f"Nothing to uninstall at: {venv_dir}")
+            return 0
+        if _global_version_dir() == venv_dir:
+            for name in SHIM_NAMES:
+                link = _user_bin_dir() / name
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+            cfg = _load_yaml_file(_user_config_file())
+            cfg.pop("version", None)
+            _user_config_file().write_text(
+                yaml.safe_dump(cfg, default_flow_style=False, sort_keys=True), encoding="utf-8"
+            )
+        shutil.rmtree(venv_dir)
+        print(f"Uninstalled: {venv_dir}")
+        return 0
+
+    if action == "list":
+        active = _global_version_dir()
+        versions = _versions_dir()
+        rows = sorted(p for p in versions.iterdir() if p.is_dir()) if versions.is_dir() else []
+        if not rows:
+            print("No managed versions installed. Try: rosotacom self install latest")
+            return 0
+        for venv_dir in rows:
+            marker = "*" if active and active == venv_dir else " "
+            print(f"{marker} {venv_dir.name:20} {venv_dir}")
+        return 0
+
+    # action == "which"
+    resolved = shutil.which("rosotacom")
+    print(f"on PATH : {resolved or 'not found'}")
+    print(f"this run: {sys.executable} (rosotacom {__version__})")
+    print(f"global  : {_global_version_dir() or 'not set'}")
     return 0
 
 
@@ -1068,9 +1349,9 @@ def doctor(args: argparse.Namespace) -> int:
     try:
         runtime = _load_runtime_config(args)
         if runtime.rosotacom_config:
-            line("OK", "rosotacom config", str(runtime.rosotacom_config))
+            line("OK", "rosotacom config", f"{runtime.rosotacom_config} (source: {runtime.project_source})")
         else:
-            line("INFO", "rosotacom config", "not configured; use --rosotacom-config or ROSOTACOM_CONFIG")
+            line("INFO", "rosotacom config", "not configured; use --project or `rosotacom config set`")
         line("OK", "ros2docker config", str(runtime.ros2docker_config))
         line("OK", "install id", runtime.install_id)
         line("OK", "workspace mount", f"{WS_DIR} -> /ws")
@@ -1548,7 +1829,12 @@ def status(args: argparse.Namespace) -> int:
 
 
 def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--rosotacom-config", help="Path to rosotacom.yaml.")
+    parser.add_argument(
+        "--rosotacom-config",
+        "--project",
+        dest="rosotacom_config",
+        help="Path to rosotacom.yaml (overrides cwd discovery and the global default).",
+    )
     parser.add_argument("-f", "--ros2docker-config", help="Path to ros2docker JSON config.")
     parser.add_argument("--session-configs-dir", help="Host directory containing named session configs.")
     parser.add_argument("--session-instances-dir", help="Host directory for generated session instances and logs.")
@@ -1600,7 +1886,18 @@ def list_sessions_command(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {"start", "stop", "doctor", "smoke", "status", "list-sessions", "examples", "setup-env"}
+    commands = {
+        "start",
+        "stop",
+        "doctor",
+        "smoke",
+        "status",
+        "list-sessions",
+        "examples",
+        "setup-env",
+        "config",
+        "self",
+    }
     if not argv:
         argv = ["start"]
     elif argv[0] not in commands and not argv[0].startswith("-"):
@@ -1662,9 +1959,95 @@ def main(argv: list[str] | None = None) -> int:
     examples_create_parser.add_argument("--force", action="store_true", help="Replace the target if it exists.")
     examples_create_parser.set_defaults(func=examples_create_command)
 
-    setup_env_parser = subparsers.add_parser("setup-env", help="Print shell exports for a rosotacom setup file.")
+    setup_env_parser = subparsers.add_parser(
+        "setup-env",
+        help="[deprecated] Alias for `config set project --local`. Print shell exports for a rosotacom.yaml.",
+    )
     setup_env_parser.add_argument("rosotacom_config", help="Path to rosotacom.yaml.")
     setup_env_parser.set_defaults(func=setup_env_command)
+
+    config_parser = subparsers.add_parser("config", help="Inspect or set the active rosotacom project.")
+    config_subparsers = config_parser.add_subparsers(dest="config_action", required=True)
+
+    config_set_parser = config_subparsers.add_parser("set", help="Set the active project (--global or --local).")
+    config_set_parser.add_argument("key", choices=["project"])
+    config_set_parser.add_argument("value", help="Path to rosotacom.yaml.")
+    config_set_scope = config_set_parser.add_mutually_exclusive_group()
+    config_set_scope.add_argument(
+        "--global",
+        dest="scope",
+        action="store_const",
+        const="global",
+        help="Persist as the machine-wide default for all terminals.",
+    )
+    config_set_scope.add_argument(
+        "--local",
+        dest="scope",
+        action="store_const",
+        const="local",
+        help="Print a shell export to eval in the current terminal (default).",
+    )
+    config_set_parser.set_defaults(func=config_command, scope="local")
+
+    config_get_parser = config_subparsers.add_parser("get", help="Print the resolved active project path.")
+    config_get_parser.add_argument("key", choices=["project"], nargs="?", default="project")
+    config_get_parser.set_defaults(func=config_command)
+
+    config_show_parser = config_subparsers.add_parser("show", help="Show every project-selection layer and the winner.")
+    config_show_parser.set_defaults(func=config_command)
+
+    config_unset_parser = config_subparsers.add_parser("unset", help="Clear the machine-wide default project.")
+    config_unset_parser.add_argument("key", choices=["project"], nargs="?", default="project")
+    config_unset_parser.add_argument(
+        "--global",
+        dest="scope",
+        action="store_const",
+        const="global",
+        default="global",
+        help="Clear the machine-wide default (the only persisted scope).",
+    )
+    config_unset_parser.set_defaults(func=config_command)
+
+    self_parser = subparsers.add_parser("self", help="Install and select rosotacom versions.")
+    self_subparsers = self_parser.add_subparsers(dest="self_action", required=True)
+
+    def _add_scope_group(p: argparse.ArgumentParser) -> None:
+        scope = p.add_mutually_exclusive_group()
+        scope.add_argument(
+            "--global",
+            dest="scope",
+            action="store_const",
+            const="global",
+            help="Point ~/.local/bin at this version for all terminals.",
+        )
+        scope.add_argument(
+            "--local",
+            dest="scope",
+            action="store_const",
+            const="local",
+            help="Print a `source .../activate` line for the current terminal (default).",
+        )
+        p.set_defaults(scope="local")
+
+    self_install_parser = self_subparsers.add_parser("install", help="Install a release into a managed venv.")
+    self_install_parser.add_argument("tag", help="PyPI release tag (e.g. 2.1.0) or 'latest'.")
+    self_install_parser.set_defaults(func=self_command)
+
+    self_use_parser = self_subparsers.add_parser("use", help="Select an installed version (--global or --local).")
+    self_use_parser.add_argument("tag", nargs="?", help="A release tag previously installed.")
+    self_use_parser.add_argument("--from-source", help="Use the .venv of a source checkout at this path.")
+    _add_scope_group(self_use_parser)
+    self_use_parser.set_defaults(func=self_command)
+
+    self_list_parser = self_subparsers.add_parser("list", help="List managed versions and the global selection.")
+    self_list_parser.set_defaults(func=self_command)
+
+    self_which_parser = self_subparsers.add_parser("which", help="Show the active rosotacom binary and version.")
+    self_which_parser.set_defaults(func=self_command)
+
+    self_uninstall_parser = self_subparsers.add_parser("uninstall", help="Remove a managed release venv.")
+    self_uninstall_parser.add_argument("tag", help="A release tag previously installed.")
+    self_uninstall_parser.set_defaults(func=self_command)
 
     args = parser.parse_args(argv)
     try:

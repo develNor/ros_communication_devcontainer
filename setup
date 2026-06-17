@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# rosotacom front-door: install a version and select it, with one consistent
+# `--global`/`--local` model. See `./setup --help`.
+#
+# Usage:
+#   ./setup [VERSION] [--global|--local] [--dev]
+#
+# VERSION (pick one; default = auto):
+#   --from-source   editable install of THIS checkout (developer mode)
+#   <tag>           a PyPI release, e.g. 2.1.0
+#   latest          the newest PyPI release
+#   (auto)          --from-source when run inside a checkout, else latest
+#
+# SELECTION (default = --local):
+#   --local         usable in THIS terminal (prints a `source .../activate` line)
+#   --global        usable in ALL terminals (shims in ~/.local/bin)
+#
+#   --dev           also install dev tooling (.[dev] + pre-commit); source only
+#
+# Env: VENV_DIR, ROSOTACOM_BIN_DIR, XDG_DATA_HOME honored as elsewhere.
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+version=""          # "", "--from-source", "latest", or a tag
+scope="local"
+dev=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --from-source) version="--from-source" ;;
+    --global) scope="global" ;;
+    --local) scope="local" ;;
+    --dev) dev=true ;;
+    -h|--help) sed -n '4,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --*) echo "ERROR: unknown option: $arg" >&2; exit 2 ;;
+    *)
+      if [[ -n "$version" && "$version" != "--from-source" ]]; then
+        echo "ERROR: multiple versions given: $version and $arg" >&2; exit 2
+      fi
+      version="$arg" ;;
+  esac
+done
+
+# Auto-detect source vs release when no version was requested.
+if [[ -z "$version" ]]; then
+  if [[ -f "$SCRIPT_DIR/pyproject.toml" ]]; then version="--from-source"; else version="latest"; fi
+fi
+
+bin_dir="${ROSOTACOM_BIN_DIR:-$HOME/.local/bin}"
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+
+install_from_source() {
+  if [[ "$scope" == "global" ]]; then
+    "$SCRIPT_DIR/install.sh" --global-symlink
+  else
+    "$SCRIPT_DIR/install.sh"
+  fi
+  local venv="${VENV_DIR:-$SCRIPT_DIR/.venv}"
+  if [[ "$dev" == true ]]; then
+    "$venv/bin/python" -m pip install -e "$SCRIPT_DIR[dev]"
+    "$venv/bin/pre-commit" install || true
+  fi
+  echo
+  if [[ "$scope" == "global" ]]; then
+    echo "Global rosotacom shims installed in: $bin_dir (ensure it is on your PATH)"
+  else
+    echo "Activate this terminal with:"
+    echo "  source \"$venv/bin/activate\""
+  fi
+}
+
+install_release() {
+  local tag="$version" spec="rosotacom"
+  [[ "$tag" != "latest" ]] && spec="rosotacom==$tag"
+  local venv="$data_home/rosotacom/versions/$tag"
+  python3 -m venv "$venv"
+  "$venv/bin/python" -m pip install --upgrade pip
+  "$venv/bin/python" -m pip install "$spec"
+  # Reuse the CLI's own shim/activate logic for selection.
+  if [[ "$scope" == "global" ]]; then
+    "$venv/bin/rosotacom" self use "$tag" --global
+  else
+    echo
+    echo "Activate this terminal with:"
+    echo "  source \"$venv/bin/activate\""
+  fi
+}
+
+if [[ "$version" == "--from-source" ]]; then
+  install_from_source
+else
+  install_release
+fi

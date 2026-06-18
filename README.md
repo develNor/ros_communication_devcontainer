@@ -58,6 +58,24 @@ python -m rosotacom --version
 rosotacom doctor
 ```
 
+Enable command, option, and configured session-name completion once per shell:
+
+```bash
+# zsh: add this line to ~/.zshrc
+eval "$(rosotacom completion zsh)"
+
+# bash: add this line to ~/.bashrc
+eval "$(rosotacom completion bash)"
+```
+
+After reloading the shell, `rosotacom <TAB><TAB>` lists commands,
+`rosotacom smoke <TAB><TAB>` lists sessions from the active project, and a
+prefix such as `rosotacom smoke 1<TAB>` expands to `1_heartbeat`. The same
+session completion is available for `start`, `stop`, `status`, `test`, and the
+probe commands; absolute and relative session-directory paths still complete
+normally. Running `rosotacom completion` without a shell argument infers bash
+or zsh from `$SHELL`.
+
 **Multiple versions / try-without-disturbing.** Because each checkout owns its
 own `.venv` and `./install.sh` never touches your PATH on its own, you can keep a
 pinned/production version in use while smoke-testing another in one terminal:

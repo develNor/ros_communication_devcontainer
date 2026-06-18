@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -196,6 +197,73 @@ def test_session_name_resolves_through_configured_sessions_dir(tmp_path: Path) -
     assert resolved.host_dir == session.resolve()
     assert resolved.container_dir == "/session/definitions/1_heartbeat"
     assert resolved.source == "session_configs"
+
+
+def test_session_name_completion_uses_active_project_and_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = tmp_path / "sessions"
+    for name in ("1_heartbeat", "1_heartbeat_status", "2_native_chatter"):
+        session = sessions / name
+        session.mkdir(parents=True)
+        (session / "session-definition.yaml").write_text("peers: {}\n", encoding="utf-8")
+    (sessions / "not_a_session").mkdir()
+    (tmp_path / "ros2docker.json").write_text('{"image_name": "completion"}\n', encoding="utf-8")
+    config = tmp_path / "rosotacom.yaml"
+    config.write_text(
+        "ros2docker_config: ros2docker.json\nsession_configs_dir: sessions\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    completions = rosotacom._session_name_completer("1_", argparse.Namespace())
+
+    assert completions == {
+        "1_heartbeat": "configured session",
+        "1_heartbeat_status": "configured session",
+    }
+
+    external = tmp_path / "external_session"
+    external.mkdir()
+    path_completions = rosotacom._session_name_completer("./ext", argparse.Namespace())
+
+    assert path_completions["./external_session/"] == "session directory"
+
+
+def test_completion_command_emits_shell_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+
+    assert rosotacom.completion_command(argparse.Namespace(shell=None)) == 0
+
+    output = capsys.readouterr().out
+    assert "_python_argcomplete" in output
+    assert "rosotacom" in output
+
+
+def test_argcomplete_protocol_returns_session_prefix_matches() -> None:
+    line = "rosotacom smoke 1_"
+    env = {
+        **os.environ,
+        "_ARGCOMPLETE": "1",
+        "_ARGCOMPLETE_IFS": "\v",
+        "_ARGCOMPLETE_SUPPRESS_SPACE": "1",
+        "COMP_LINE": line,
+        "COMP_POINT": str(len(line)),
+    }
+
+    result = subprocess.run(
+        ["bash", "-c", f"{rosotacom.shlex.quote(sys.executable)} -m rosotacom 8>&1"],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.stdout.split("\v") == ["1_heartbeat", "1_heartbeat_status"]
 
 
 def test_local_check_derives_from_domains_and_allows_opt_out(tmp_path: Path) -> None:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """rosotacom host CLI.
 
 This module owns rosotacom-specific concepts such as session config
@@ -29,7 +30,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
 
+import argcomplete
 import yaml
+from argcomplete.completers import DirectoriesCompleter
 
 from . import __version__
 
@@ -822,6 +825,31 @@ def _format_available_sessions(runtime: RuntimeConfig) -> str:
         "`rosotacom examples create ./rosotacom_examples` and wire them with "
         '`eval "$(rosotacom setup-env ./rosotacom_examples/rosotacom.yaml)"`.'
     )
+
+
+def _session_names(runtime: RuntimeConfig) -> list[str]:
+    if not runtime.session_configs_dir or not runtime.session_configs_dir.is_dir():
+        return []
+    return [
+        path.name for path in sorted(runtime.session_configs_dir.iterdir()) if path.is_dir() and _is_session_dir(path)
+    ]
+
+
+def _session_name_completer(
+    prefix: str,
+    parsed_args: argparse.Namespace,
+    **_: Any,
+) -> dict[str, str]:
+    """Complete session names from the project selected by the arguments parsed so far."""
+    completions: dict[str, str] = {}
+    if prefix.startswith((".", "~", os.sep)) or os.sep in prefix:
+        completions.update({path: "session directory" for path in DirectoriesCompleter()(prefix)})
+    try:
+        runtime = _load_runtime_config(parsed_args)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return completions
+    completions.update({name: "configured session" for name in _session_names(runtime) if name.startswith(prefix)})
+    return completions
 
 
 def _base_extra_run_args(
@@ -2415,10 +2443,16 @@ def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-dict", help="Host data_dict.json path for data:<key> address expressions.")
 
 
+def _add_session_arg(parser: argparse.ArgumentParser, *args: str, **kwargs: Any) -> argparse.Action:
+    action = parser.add_argument(*args, **kwargs)
+    cast(Any, action).completer = _session_name_completer
+    return action
+
+
 def _add_start_args(parser: argparse.ArgumentParser) -> None:
     _add_common_config_args(parser)
-    parser.add_argument("session_dir_positional", nargs="?")
-    parser.add_argument("-s", "--session-dir", dest="session_dir")
+    _add_session_arg(parser, "session_dir_positional", nargs="?")
+    _add_session_arg(parser, "-s", "--session-dir", dest="session_dir")
     parser.add_argument("--identity")
     parser.add_argument("--mode", choices=["auto", "attach", "detached"], default="auto")
     parser.add_argument("--no-auto-identity", dest="auto_identity", action="store_false")
@@ -2458,6 +2492,14 @@ def list_sessions_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def completion_command(args: argparse.Namespace) -> int:
+    shell = args.shell or Path(os.environ.get("SHELL", "bash")).name
+    if shell not in {"bash", "zsh"}:
+        raise RuntimeError(f"Could not infer a supported shell from {shell!r}; pass `bash` or `zsh` explicitly.")
+    print(argcomplete.shellcode(["rosotacom"], shell=shell))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     commands = {
@@ -2475,6 +2517,7 @@ def main(argv: list[str] | None = None) -> int:
         "examples",
         "setup-env",
         "config",
+        "completion",
     }
     if not argv:
         argv = ["start"]
@@ -2491,8 +2534,8 @@ def main(argv: list[str] | None = None) -> int:
 
     stop_parser = subparsers.add_parser("stop", help="Stop rosotacom containers for a session.")
     _add_common_config_args(stop_parser)
-    stop_parser.add_argument("session_dir_positional", nargs="?")
-    stop_parser.add_argument("-s", "--session-dir", dest="session_dir")
+    _add_session_arg(stop_parser, "session_dir_positional", nargs="?")
+    _add_session_arg(stop_parser, "-s", "--session-dir", dest="session_dir")
     stop_parser.add_argument("--identity")
     stop_parser.add_argument("--auto-identity", action="store_true")
     stop_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
@@ -2505,7 +2548,7 @@ def main(argv: list[str] | None = None) -> int:
 
     smoke_parser = subparsers.add_parser("smoke", help="Run a local smoke test.")
     _add_common_config_args(smoke_parser)
-    smoke_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    _add_session_arg(smoke_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     smoke_parser.add_argument("--local", action="store_true", default=True)
     smoke_parser.add_argument("--local-ip")
     smoke_parser.add_argument("--keep-running", action="store_true", help="Leave smoke-test containers running.")
@@ -2516,7 +2559,7 @@ def main(argv: list[str] | None = None) -> int:
         "status", help="Show the live per-topic pipeline status for a session instance."
     )
     _add_common_config_args(status_parser)
-    status_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    _add_session_arg(status_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     status_parser.add_argument("--identity", help="Show only this peer identity (default: all available).")
     status_parser.add_argument(
         "--instance-id", help="Inspect a specific instance id (default: most recent for the session)."
@@ -2530,7 +2573,7 @@ def main(argv: list[str] | None = None) -> int:
         "test", help="Assert a running/recent session meets its status + per-topic expect contract."
     )
     _add_common_config_args(test_parser)
-    test_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    _add_session_arg(test_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     test_parser.add_argument("--instance-id", help="Evaluate a specific instance id (default: most recent).")
     test_parser.add_argument("--timeout", type=float, default=30.0, help="Seconds to wait for status to settle.")
     test_parser.add_argument("--interval", type=float, default=2.0, help="Polling interval while waiting (s).")
@@ -2540,7 +2583,7 @@ def main(argv: list[str] | None = None) -> int:
         "probe-publish", help="Publish a local-only probe topic in a running peer's local domain (isolation)."
     )
     _add_common_config_args(probe_publish_parser)
-    probe_publish_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    _add_session_arg(probe_publish_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     probe_publish_parser.add_argument("--identity", required=True)
     probe_publish_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
     probe_publish_parser.add_argument("--instance-id")
@@ -2556,7 +2599,7 @@ def main(argv: list[str] | None = None) -> int:
         "probe-check", help="Assert a topic is present/absent in a running peer's local domain (isolation)."
     )
     _add_common_config_args(probe_check_parser)
-    probe_check_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    _add_session_arg(probe_check_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     probe_check_parser.add_argument("--identity", required=True)
     probe_check_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
     probe_check_parser.add_argument("--instance-id")
@@ -2569,7 +2612,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Start/stop synthetic local app publishers for OTA example verification.",
     )
     _add_common_config_args(publish_test_topics_parser)
-    publish_test_topics_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    _add_session_arg(publish_test_topics_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     publish_test_topics_parser.add_argument("--identity", required=True)
     publish_test_topics_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
     publish_test_topics_parser.add_argument("--instance-id")
@@ -2642,6 +2685,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     config_unset_parser.set_defaults(func=config_command)
 
+    completion_parser = subparsers.add_parser(
+        "completion",
+        help="Print shell code that enables command and session-name tab completion.",
+    )
+    completion_parser.add_argument(
+        "shell",
+        choices=["bash", "zsh"],
+        nargs="?",
+        help="Shell syntax to emit (default: infer from $SHELL).",
+    )
+    completion_parser.set_defaults(func=completion_command)
+
+    argcomplete.autocomplete(parser)
     args = parser.parse_args(argv)
     try:
         return int(args.func(args) or 0)

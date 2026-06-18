@@ -67,3 +67,19 @@ def test_evaluate_reports_aggregates_across_peers() -> None:
     bad = {"peer": "a", "topics": [_topic("/x", "inbound", "ABSENT", [])]}
     failures = evaluate_reports({"a": bad, "b": OK_REPORT}, {})
     assert len(failures) == 1 and "ABSENT" in failures[0]
+
+
+def test_bad_quality_on_final_stage_fails_even_when_delivered() -> None:
+    # The status overview now classifies stages against `expect`; a delivered
+    # (overall OK) topic whose final stage is quality BAD violates its contract.
+    bad_stage = {
+        "stage": "app_in",
+        "hz": 3.0,
+        "latency_ms": 5.0,
+        "state": "FLOWING",
+        "quality": "BAD",
+        "quality_reason": "hz",
+    }
+    report = {"peer": "b", "topics": [_topic("/heartbeat_a", "inbound", "OK", [bad_stage])]}
+    failures = evaluate_report(report, {})
+    assert len(failures) == 1 and "contract violated" in failures[0] and "hz" in failures[0]

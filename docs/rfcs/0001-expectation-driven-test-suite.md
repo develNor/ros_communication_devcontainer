@@ -144,8 +144,16 @@ per-session marker.
   asserts delivery + `expect`. Exit non-zero on any failure.
 - Unit tests for the evaluator; validated end-to-end against a live local session.
 
+**Landed since (PR closing the live loop)**
+- Per-topic `expect` flows into the `pipeline_spec` and the status overview now
+  classifies each stage against it (`status_overview_core._classify_quality`); the
+  contract is surfaced in `status.json` (`quality` / `expect`).
+- `rosotacom test` leans on that verdict: a delivered topic whose final stage is
+  `quality: BAD` fails (in addition to the raw-metric check).
+
 **Follow-ups**
-- Generalize `topic_monitor` to consume `expect` for live warnings.
+- Heartbeat `expect` (it has no `topics:` entry — likely `shared.heartbeat.expect`)
+  and feeding the same contract to `heartbeat_in_monitor`.
 - Marker migration (drop `multi_machine`; derive/`local_check`).
 - Examples curation + generated RMW matrix; `tests/sessions/` split.
 - Wire the manual full-suite promotion gate; fold `verify` into `rosotacom test`.

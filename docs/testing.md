@@ -20,7 +20,7 @@ This project separates two things that are easy to conflate:
 | host / unit | `tests/unit` | no | none | draft + ready PR |
 | contract | `tests/contract` | no | none | ready PR (merge gate) |
 | single-machine e2e (smoke) | `tests/e2e` | yes | loopback | merge gate + nightly |
-| multi-machine e2e | *external* | yes | two hosts over a real link | external runner |
+| OTA e2e | *external* | yes | two hosts over a real link | operator-started external gate |
 
 `just lint typecheck test-nondocker-cov docs package` plus `just test-e2e-smoke`
 is the full pre-merge suite; `just check` runs everything except the Docker
@@ -75,10 +75,13 @@ sessions marked `single_machine: ok`; the multi-machine set is derived from
 new or changed session must carry a valid marker. **To change a session's tier
 coverage, edit its `test_tiers` marker** — the matrices follow automatically.
 
-## Multi-machine tier (external)
+## OTA tier (external)
 
 Multi-machine tests need a real two-host link, which public CI cannot provide,
-so they run on an **external runner** that supplies the hosts. That runner is
+so a repository operator may run them on an **external runner** that supplies
+the hosts. This is a deliberate promotion gate, not a per-commit trigger: an
+operator explicitly selects the candidate, starts the suite, reviews the
+evidence, and separately confirms any branch promotion. The runner is
 parameterized purely by **host addresses / SSH targets** — it does not live in
 this repository, and this repository carries no host names, addresses, or
 network details.
@@ -93,7 +96,7 @@ A multi-machine run, generically:
    local-only probe topic published on A never appears on B (isolation),
 5. collects each host's `session-instances/` logs.
 
-The set of sessions a multi-machine runner exercises is the sessions marked
+The set of sessions an OTA runner exercises is the sessions marked
 `multi_machine: ok` or `multi_machine: required`. Keeping the markers in this
 repo lets any external runner derive its scenario list without hardcoding it.
 

@@ -47,31 +47,37 @@ heartbeat smoke matrix separately so failures are easier to inspect.
 
 ## Branch And Merge Policy
 
-`main` is protected. Do not push directly to `main`.
+Do not push directly to a protected branch.
 
-All changes must go through a pull request. Start each change from an up-to-date
-`origin/main` topic branch:
+All changes must go through a pull request. Repositories using this shared
+codebase may use a development branch before the `main` release line. Start each
+change from the repository's current default branch:
 
 ```bash
 git fetch --prune
-git switch -c <type>/<short-topic> origin/main
+git remote set-head origin --auto
+git switch -c <type>/<short-topic> origin/HEAD
 ```
 
 Keep the change small and coherent. Update tests, README, docs, examples, and
 packaging metadata when CLI, config, package, Docker, or public runtime behavior
 changes.
 
+Moving validated development work to `main` is a deliberate maintainer action.
+It may require an external OTA gate supplied by the repository operator; it is
+not triggered by an arbitrary commit in this repository.
+
 ## CI Policy
 
-The required merge gate for `main` is:
+The required merge gate for protected development and release branches is:
 
 ```text
 ci-success
 ```
 
-Draft PRs run lightweight checks. Ready PRs, pushes to `main`, and merge queue
-entries run the full gate: Python 3.10 through 3.14 non-Docker checks, coverage,
-package validation, and Docker smoke.
+Draft PRs run lightweight checks. Ready PRs, pushes to `main` or `develop`, and
+merge queue entries run the full gate: Python 3.10 through 3.14 non-Docker
+checks, coverage, package validation, and Docker smoke.
 
 Codecov uses the uploaded `nondocker` report. Docker E2E remains behavioral
 validation and is not collected for coverage.
@@ -86,7 +92,7 @@ Releases are built from tags in the form `vX.Y.Z`. Release PRs must include
 `docs/release-notes/vX.Y.Z.md`, copied from
 [docs/release-notes/TEMPLATE.md](docs/release-notes/TEMPLATE.md).
 
-After the release PR has merged:
+After the release PR has merged to `main`, verify the exact commit and then:
 
 ```bash
 git switch main
@@ -96,5 +102,9 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-Tag pushes publish to PyPI through Trusted Publishing and create a GitHub
-Release. Manual release workflow dispatch publishes to TestPyPI.
+Tag pushes validate, publish through the repository's configured Trusted
+Publisher, and create a GitHub Release. Before any downstream repository sync,
+maintainers must review the resulting release workflow, deployment, artifacts,
+and release notes. Downstream synchronization is never implied by creating the
+tag. Manual release-workflow dispatch validates and builds only; it does not
+publish.

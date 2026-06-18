@@ -632,6 +632,115 @@ def test_isolated_network_run_args_swaps_host_networking() -> None:
     assert rosotacom._isolated_network_run_args(["--network=host"], "net", None) == ["--network", "net"]
 
 
+def test_smoke_crossed_topics_include_native_chatter_direction() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "2_native_chatter" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    specs_a = rosotacom._received_crossed_topics(cfg, "a")
+    specs_b = rosotacom._received_crossed_topics(cfg, "b")
+
+    assert [(s.topic, s.label, s.publish_topic, s.publish_type) for s in specs_a] == [
+        ("/com/in/b/chatter", "b->a inbound bridge topic", None, None),
+        ("/chatter", "b->a final topic", "/chatter", "std_msgs/msg/String"),
+    ]
+    assert specs_b == []
+    assert [(s.source_peer_key, s.receiver_peer_key, s.publish_topic) for s in rosotacom._smoke_publish_specs(cfg)] == [
+        ("b", "a", "/chatter")
+    ]
+    assert "export ROS_DOMAIN_ID=46" in rosotacom._smoke_ros_setup("/config", cfg, "a")
+    assert "export ROS_DOMAIN_ID=47" in rosotacom._smoke_ros_setup("/config", cfg, "b")
+
+
+def test_smoke_crossed_topics_keep_heartbeat_labels() -> None:
+    cfg = {"peers": {"a": {}, "b": {}}, "shared": {"use_heartbeat": True}}
+
+    assert [(s.topic, s.label, s.enforce_bounds) for s in rosotacom._received_crossed_topics(cfg, "b")] == [
+        ("/com/in/a/heartbeat_a", "a->b inbound bridge heartbeat", False),
+        ("/heartbeat_a", "a->b final heartbeat", True),
+    ]
+
+
+def test_smoke_crossed_topics_include_compressed_occupancy_grid_pipeline() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "3_comp_occ_grid" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    specs = rosotacom._received_crossed_topics(cfg, "a")
+    costmap_specs = [s for s in specs if "costmap" in s.topic]
+
+    assert [(s.topic, s.label) for s in costmap_specs] == [
+        ("/com/in/b/costmap/costmap/restamped/bz2", "b->a inbound bridge topic"),
+        ("/costmap/costmap/restamped", "b->a final topic"),
+    ]
+    final = costmap_specs[-1]
+    assert final.publish_topic == "/costmap/costmap"
+    assert final.publish_type == "nav_msgs/msg/OccupancyGrid"
+    assert final.publish_rate == 3.0
+    assert (final.hz_min, final.hz_max, final.max_delay_s) == (1.0, 5.0, 0.5)
+    assert final.enforce_bounds
+    assert "width: 4" in rosotacom._smoke_publish_message(final.publish_type)
+
+
+def test_smoke_crossed_topics_include_zenoh_compressed_occupancy_grid_pipeline() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "4_comp_occ_grid_zen" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, "a") if "costmap" in s.topic]
+
+    assert [(s.topic, s.label) for s in specs] == [
+        ("/com/in/b/costmap/costmap/restamped/bz2", "b->a inbound bridge topic"),
+        ("/costmap/costmap/restamped", "b->a final topic"),
+    ]
+    assert specs[-1].publish_type == "nav_msgs/msg/OccupancyGrid"
+
+
+@pytest.mark.parametrize(
+    ("session_name", "receiver", "expected_topics"),
+    [
+        (
+            "5_sized_payload",
+            "b",
+            ["/com/in/a/size_test_a/ota_stamped", "/size_test_a"],
+        ),
+        (
+            "6_sized_payload_zen",
+            "b",
+            ["/com/in/a/size_test_a", "/size_test_a"],
+        ),
+    ],
+)
+def test_smoke_crossed_topics_include_sized_payload_pipelines(
+    session_name: str,
+    receiver: str,
+    expected_topics: list[str],
+) -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / session_name / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, receiver) if "size_test" in s.topic]
+
+    assert [s.topic for s in specs] == expected_topics
+    final = specs[-1]
+    assert final.publish_topic == "/size_test_a"
+    assert final.publish_type == "com_msgs/msg/SizedPayload"
+    assert final.expected_size == 66000
+    command = rosotacom._smoke_publisher_command(final, "source ros", 180.0)
+    assert "ros2 run com_py sized_publisher" in command
+    assert "-p topic:=/size_test_a" in command
+    assert "-p size:=66000" in command
+
+
 def test_run_session_generates_into_instance_config_without_touching_static_source(tmp_path: Path) -> None:
     from session.creation import run_session
 

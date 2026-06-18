@@ -27,8 +27,24 @@ def _smoke_id(session_name: str) -> str:
     return session_name.removeprefix("1_heartbeat_").replace("_", "-")
 
 
+SMOKE_SESSIONS = sessions_in_tier("single_machine", {"ok"})
 HEARTBEAT_SMOKE_SESSIONS = [
-    pytest.param(name, id=_smoke_id(name)) for name in sessions_in_tier("single_machine", {"ok"})
+    pytest.param(name, id=_smoke_id(name)) for name in SMOKE_SESSIONS if name.startswith("1_heartbeat_")
+]
+NATIVE_CHATTER_SMOKE_SESSIONS = [
+    pytest.param(name, id="native-chatter") for name in SMOKE_SESSIONS if name == "2_native_chatter"
+]
+COMP_OCC_GRID_SMOKE_SESSIONS = [
+    pytest.param(name, id="compressed-occupancy-grid") for name in SMOKE_SESSIONS if name == "3_comp_occ_grid"
+]
+ZEN_COMP_OCC_GRID_SMOKE_SESSIONS = [
+    pytest.param(name, id="compressed-occupancy-grid-zenoh") for name in SMOKE_SESSIONS if name == "4_comp_occ_grid_zen"
+]
+SIZED_PAYLOAD_SMOKE_SESSIONS = [
+    pytest.param(name, id="sized-payload-fastdds") for name in SMOKE_SESSIONS if name == "5_sized_payload"
+]
+ZEN_SIZED_PAYLOAD_SMOKE_SESSIONS = [
+    pytest.param(name, id="sized-payload-zenoh") for name in SMOKE_SESSIONS if name == "6_sized_payload_zen"
 ]
 
 EXPECTED_HEARTBEAT_CHECKS = (
@@ -40,6 +56,42 @@ EXPECTED_HEARTBEAT_CHECKS = (
     # Isolation is now asserted in smoke too (local-only topic must not cross);
     # container names vary, so match the stable prefix.
     "OK: isolation holds (/local_only",
+)
+EXPECTED_NATIVE_CHATTER_CHECKS = (
+    "OK: generated plugin.yaml files use literal CLI addresses",
+    "OK: smoke publisher b->a /chatter (std_msgs/msg/String) is advertising",
+    "OK: b->a inbound bridge topic (/com/in/b/chatter)",
+    "OK: b->a final topic (/chatter)",
+    "OK: isolation holds (/local_only",
+)
+EXPECTED_COMP_OCC_GRID_CHECKS = (
+    *EXPECTED_HEARTBEAT_CHECKS,
+    "OK: smoke publisher b->a /costmap/costmap (nav_msgs/msg/OccupancyGrid) is advertising",
+    "OK: b->a inbound bridge topic (/com/in/b/costmap/costmap/restamped/bz2)",
+    "OK: b->a final topic (/costmap/costmap/restamped)",
+)
+EXPECTED_WRAPPED_SIZED_PAYLOAD_CHECKS = (
+    "OK: generated plugin.yaml files use literal CLI addresses",
+    "OK: smoke publisher a->b /size_test_a (com_msgs/msg/SizedPayload) is advertising",
+    "OK: smoke publisher b->a /size_test_b (com_msgs/msg/SizedPayload) is advertising",
+    "OK: a->b inbound bridge topic (/com/in/a/size_test_a/ota_stamped)",
+    "OK: a->b final topic (/size_test_a)",
+    "OK: a->b final topic (/size_test_a) preserves SizedPayload size 66000",
+    "OK: b->a inbound bridge topic (/com/in/b/size_test_b/ota_stamped)",
+    "OK: b->a final topic (/size_test_b)",
+    "OK: b->a final topic (/size_test_b) preserves SizedPayload size 66000",
+    "OK: isolation holds (/local_only",
+)
+EXPECTED_ZEN_SIZED_PAYLOAD_CHECKS = (
+    *EXPECTED_HEARTBEAT_CHECKS,
+    "OK: smoke publisher a->b /size_test_a (com_msgs/msg/SizedPayload) is advertising",
+    "OK: smoke publisher b->a /size_test_b (com_msgs/msg/SizedPayload) is advertising",
+    "OK: a->b inbound bridge topic (/com/in/a/size_test_a)",
+    "OK: a->b final topic (/size_test_a)",
+    "OK: a->b final topic (/size_test_a) preserves SizedPayload size 66000",
+    "OK: b->a inbound bridge topic (/com/in/b/size_test_b)",
+    "OK: b->a final topic (/size_test_b)",
+    "OK: b->a final topic (/size_test_b) preserves SizedPayload size 66000",
 )
 
 # Heartbeat publishers emit at 10 Hz; received rate should stay close to that.
@@ -189,6 +241,35 @@ def _assert_heartbeat_rate_and_latency_within_bounds(session_name: str, stdout: 
     )
 
 
+def _assert_metric_present(session_name: str, stdout: str, *, topic: str, label: str) -> None:
+    matches = [m for m in _parse_metrics(stdout) if m["topic"] == topic and m["label"] == label]
+    assert matches, f"no metric for {label} ({topic}) in smoke output for {session_name}:\n{stdout}"
+    assert any(isinstance(m["hz"], float) for m in matches), (
+        f"no publishing rate for {label} ({topic}) in smoke output for {session_name}:\n{stdout}"
+    )
+
+
+def _assert_metric_within_bounds(
+    session_name: str,
+    stdout: str,
+    *,
+    topic: str,
+    label: str,
+    hz_min: float,
+    hz_max: float,
+    max_delay_s: float,
+) -> None:
+    matches = [m for m in _parse_metrics(stdout) if m["topic"] == topic and m["label"] == label]
+    assert matches, f"no metric for {label} ({topic}) in smoke output for {session_name}:\n{stdout}"
+    metric = matches[-1]
+    assert isinstance(metric["hz"], float) and hz_min <= metric["hz"] <= hz_max, (
+        f"{label} ({topic}) rate {metric['hz']} outside [{hz_min}, {hz_max}] for {session_name}"
+    )
+    assert isinstance(metric["delay_s"], float) and metric["delay_s"] < max_delay_s, (
+        f"{label} ({topic}) delay {metric['delay_s']} >= {max_delay_s}s for {session_name}"
+    )
+
+
 @pytest.mark.parametrize("session_name", HEARTBEAT_SMOKE_SESSIONS)
 def test_local_heartbeat_smoke_matrix_from_copied_example_project(
     copied_example_project: Path,
@@ -206,3 +287,141 @@ def test_local_heartbeat_smoke_matrix_from_copied_example_project(
 
     _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
     _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+
+
+@pytest.mark.parametrize("session_name", NATIVE_CHATTER_SMOKE_SESSIONS)
+def test_local_native_chatter_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_NATIVE_CHATTER_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    assert (artifact_dir / "config" / "a" / "plugin.yaml").is_file()
+    assert (artifact_dir / "config" / "b" / "plugin.yaml").is_file()
+    assert (artifact_dir / "config" / "b_to_a_topics.txt").read_text(encoding="utf-8").strip() == "/chatter"
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_metric_present(session_name, result.stdout, topic="/chatter", label="b->a final topic")
+
+
+@pytest.mark.parametrize("session_name", COMP_OCC_GRID_SMOKE_SESSIONS)
+def test_local_compressed_occupancy_grid_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_COMP_OCC_GRID_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    config_dir = artifact_dir / "config"
+    assert (config_dir / "b_to_a_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_b",
+        "/costmap/costmap/restamped/bz2",
+    ]
+    assert "costmap/costmap/restamped" in (config_dir / "b" / "compression.yaml").read_text(encoding="utf-8")
+    assert "costmap/costmap/restamped/bz2" in (config_dir / "a" / "decompression.yaml").read_text(encoding="utf-8")
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+    _assert_metric_within_bounds(
+        session_name,
+        result.stdout,
+        topic="/costmap/costmap/restamped",
+        label="b->a final topic",
+        hz_min=1.0,
+        hz_max=5.0,
+        max_delay_s=0.5,
+    )
+
+
+@pytest.mark.parametrize("session_name", ZEN_COMP_OCC_GRID_SMOKE_SESSIONS)
+def test_local_zenoh_compressed_occupancy_grid_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_COMP_OCC_GRID_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    config_dir = artifact_dir / "config"
+    assert (config_dir / "b_to_a_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_b",
+        "/costmap/costmap/restamped/bz2",
+    ]
+    assert "use_zenoh_ros2dds: true" in (config_dir / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert 'priority: "data"' in (config_dir / "b" / "plugin.yaml").read_text(encoding="utf-8")
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+    _assert_metric_present(
+        session_name,
+        result.stdout,
+        topic="/costmap/costmap/restamped",
+        label="b->a final topic",
+    )
+
+
+@pytest.mark.parametrize("session_name", SIZED_PAYLOAD_SMOKE_SESSIONS)
+def test_local_wrapped_sized_payload_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_WRAPPED_SIZED_PAYLOAD_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    config_dir = artifact_dir / "config"
+    assert (config_dir / "a_to_b_topics.txt").read_text(encoding="utf-8").strip() == "/size_test_a/ota_stamped"
+    assert (config_dir / "b_to_a_topics.txt").read_text(encoding="utf-8").strip() == "/size_test_b/ota_stamped"
+    assert "size_test_a" in (config_dir / "a" / "ota_wrapper.yaml").read_text(encoding="utf-8")
+    assert "size_test_b/ota_stamped" in (config_dir / "a" / "ota_unwrapper.yaml").read_text(encoding="utf-8")
+    assert "size_test_b" in (config_dir / "b" / "ota_wrapper.yaml").read_text(encoding="utf-8")
+    assert "size_test_a/ota_stamped" in (config_dir / "b" / "ota_unwrapper.yaml").read_text(encoding="utf-8")
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_metric_present(session_name, result.stdout, topic="/size_test_a", label="a->b final topic")
+    _assert_metric_present(session_name, result.stdout, topic="/size_test_b", label="b->a final topic")
+
+
+@pytest.mark.parametrize("session_name", ZEN_SIZED_PAYLOAD_SMOKE_SESSIONS)
+def test_local_zenoh_sized_payload_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_ZEN_SIZED_PAYLOAD_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    config_dir = artifact_dir / "config"
+    assert (config_dir / "a_to_b_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_a",
+        "/size_test_a",
+    ]
+    assert (config_dir / "b_to_a_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_b",
+        "/size_test_b",
+    ]
+    assert "use_zenoh_ros2dds: true" in (config_dir / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert 'priority: "data"' in (config_dir / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+    _assert_metric_present(session_name, result.stdout, topic="/size_test_a", label="a->b final topic")
+    _assert_metric_present(session_name, result.stdout, topic="/size_test_b", label="b->a final topic")

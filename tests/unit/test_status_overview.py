@@ -499,3 +499,17 @@ def test_pipeline_spec_carries_per_topic_expect(tmp_path: Path) -> None:
     spec = yaml.safe_load((tmp_path / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
     by_dir = {(t["base"], t["direction"]): t for t in spec["topics"]}
     assert by_dir[("/costmap", "inbound")]["expect"] == {"hz": {"min": 1, "max": 5}, "latency_ms": {"max": 500}}
+
+
+def test_pipeline_spec_carries_heartbeat_expect(tmp_path: Path) -> None:
+    import yaml
+
+    cfg = _heartbeat_cfg()
+    contract = {"hz": {"min": 8, "max": 12}, "latency_ms": {"max": 200}}
+    cfg["shared"]["heartbeat"] = {"expect": contract}
+    generator.func(session_config_obj=cfg, output_dir=str(tmp_path), force=True)
+    spec = yaml.safe_load((tmp_path / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
+    by_dir = {(t["base"], t["direction"]): t for t in spec["topics"]}
+    # The contract applies to both the locally-published and the received heartbeat.
+    assert by_dir[("/heartbeat_a", "outbound")]["expect"] == contract
+    assert by_dir[("/heartbeat_b", "inbound")]["expect"] == contract

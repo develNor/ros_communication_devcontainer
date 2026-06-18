@@ -10,7 +10,7 @@
     "-v", "./external_session.yaml:/external_session.yaml",
     "-v", "../../../ws:/ws",
     "-e", "RMW_IMPLEMENTATION=rmw_fastrtps_cpp",
-    "-e", "ROS_DOMAIN_ID=47",
+    "-e", "ROS_DOMAIN_ID=46",
     "-e", "BUILD_ROS2WS=1"
   ],
 

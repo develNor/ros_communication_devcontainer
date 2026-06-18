@@ -210,7 +210,7 @@ never creates an additional OTA payload subscription. Combine both peers' files
 for the full end-to-end picture; cross-peer confirmation is reserved for a later
 phase.
 
-Run the CI heartbeat smoke matrix locally:
+Run the CI single-machine smoke matrix locally:
 
 ```bash
 just test-e2e-smoke

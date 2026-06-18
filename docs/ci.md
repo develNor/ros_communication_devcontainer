@@ -40,7 +40,7 @@ ci-success
 ```
 
 The merge gate runs Python 3.10 through 3.14 non-Docker checks, package
-validation, and the Docker heartbeat smoke matrix:
+validation, and the Docker single-machine smoke matrix:
 
 Python 3.10–3.14 are supported for the host CLI; Python 3.12 is the reference
 interpreter for packaging and Docker E2E jobs.
@@ -59,7 +59,7 @@ Docker E2E is not collected for coverage.
 
 ## Docker E2E
 
-`just test-e2e-smoke` runs the local heartbeat smoke matrix through Docker. It
+`just test-e2e-smoke` runs the local single-machine smoke matrix through Docker. It
 is a required merge-gate job because `rosotacom` exists to orchestrate
 Docker-backed ROS communication sessions. Each smoke run writes generated
 config, catmux pane logs, Docker logs when available, and the smoke verification

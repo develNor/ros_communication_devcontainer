@@ -43,7 +43,7 @@ just test-e2e-smoke
 
 `just check` runs linting, type checking, host tests under coverage, docs checks,
 and package validation. `just test-e2e-smoke` runs the required Docker-backed
-heartbeat smoke matrix separately so failures are easier to inspect.
+single-machine smoke matrix separately so failures are easier to inspect.
 
 ## Branch And Merge Policy
 

@@ -1739,6 +1739,44 @@ def probe_check_command(args: argparse.Namespace) -> int:
     return 0 if present == (args.expect == "present") else 1
 
 
+def test_command(args: argparse.Namespace) -> int:
+    """Assert a running/recent session meets its status + per-topic `expect` contract.
+
+    Reads each peer's self-reported status.json (the live status overview) for the
+    most recent instance and checks every crossed topic was delivered and meets its
+    declared hz/latency expectations. Orchestration (bringing the session up) is the
+    caller's job (e.g. `smoke` or the multi-machine harness)."""
+    from . import status_eval  # local import: the package's lazy __getattr__ makes a top-level one re-entrant
+
+    runtime = _load_runtime_config(args)
+    session = _resolve_session(getattr(args, "session_dir", None) or DEFAULT_SMOKE_SESSION, runtime)
+    cfg = _effective_session_config(session.host_dir, runtime)
+    instance_dir = _find_latest_instance_dir(runtime, session, getattr(args, "instance_id", None))
+    logs_dir = instance_dir / "logs"
+
+    reports: dict[str, Any] = {}
+    for peer_dir in sorted(p for p in logs_dir.iterdir() if p.is_dir()):
+        status_json = peer_dir / "status" / "status.json"
+        if status_json.exists():
+            reports[peer_dir.name] = json.loads(status_json.read_text(encoding="utf-8"))
+    if not reports:
+        print(
+            f"rosotacom test: no status.json under {logs_dir}. Start the session with "
+            "shared.use_status_overview=true first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    failures = status_eval.evaluate_reports(reports, status_eval.expectations_from_cfg(cfg))
+    for failure in failures:
+        print(f"TEST FAIL: {failure}", file=sys.stderr)
+    if failures:
+        return 1
+    topic_count = sum(len(r.get("topics", [])) for r in reports.values())
+    print(f"TEST OK: {len(reports)} peer(s), {topic_count} topic(s) meet status + expectations")
+    return 0
+
+
 def smoke(args: argparse.Namespace) -> int:
     if not args.local:
         raise RuntimeError("Only --local smoke mode is implemented.")
@@ -1996,6 +2034,7 @@ def main(argv: list[str] | None = None) -> int:
         "doctor",
         "smoke",
         "status",
+        "test",
         "verify",
         "probe-publish",
         "probe-check",
@@ -2053,6 +2092,14 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("--watch", action="store_true", help="Continuously refresh the view.")
     status_parser.add_argument("--watch-interval", type=float, default=2.0, help="Watch refresh interval (s).")
     status_parser.set_defaults(func=status)
+
+    test_parser = subparsers.add_parser(
+        "test", help="Assert a running/recent session meets its status + per-topic expect contract."
+    )
+    _add_common_config_args(test_parser)
+    test_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    test_parser.add_argument("--instance-id", help="Evaluate a specific instance id (default: most recent).")
+    test_parser.set_defaults(func=test_command)
 
     # Verification verbs operate on an already-running session per identity, so the
     # external multi-machine runner can call them over SSH (one peer per host) with

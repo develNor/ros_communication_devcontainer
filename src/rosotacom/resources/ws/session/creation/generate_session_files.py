@@ -196,11 +196,9 @@ def _parse_rmw_side(value: Any, ctx: str, *, is_local: bool) -> RmwSideSpec:
         )
 
     if len(value) != 1:
-        raise RuntimeError(
-            f"{ctx} mapping must have exactly one key (the RMW name); got {sorted(value.keys())}."
-        )
+        raise RuntimeError(f"{ctx} mapping must have exactly one key (the RMW name); got {sorted(value.keys())}.")
 
-    (impl_raw, cfg_raw), = value.items()
+    ((impl_raw, cfg_raw),) = value.items()
     if not isinstance(impl_raw, str) or not impl_raw.strip():
         raise RuntimeError(f"{ctx} key must be a non-empty string (the RMW name).")
     impl = impl_raw.strip()
@@ -280,9 +278,7 @@ def _parse_rmw_side(value: Any, ctx: str, *, is_local: bool) -> RmwSideSpec:
 def _validate_rmw_impl(impl: str, ctx: str, *, is_local: bool) -> None:
     if is_local:
         if impl == "zenoh_ros2dds":
-            raise RuntimeError(
-                f"{ctx}: 'zenoh_ros2dds' is OTA-only and cannot be used as the local RMW."
-            )
+            raise RuntimeError(f"{ctx}: 'zenoh_ros2dds' is OTA-only and cannot be used as the local RMW.")
         if impl == _ZENOH_CONNECT_ENDPOINTS:
             raise RuntimeError(
                 f"{ctx}: '{_ZENOH_CONNECT_ENDPOINTS}' is OTA-only; use local: zenoh for native rmw_zenoh_cpp."
@@ -290,9 +286,7 @@ def _validate_rmw_impl(impl: str, ctx: str, *, is_local: bool) -> None:
         # Everything else (including raw rmw strings) is permitted for local.
     else:
         if impl not in _OTA_SHORTS:
-            raise RuntimeError(
-                f"{ctx} must be one of {sorted(_OTA_SHORTS)}; got {impl!r}."
-            )
+            raise RuntimeError(f"{ctx} must be one of {sorted(_OTA_SHORTS)}; got {impl!r}.")
 
 
 def _parse_rmw_block(value: Any, peer_keys: List[str]) -> RmwSpec:
@@ -315,15 +309,11 @@ def _parse_rmw_block(value: Any, peer_keys: List[str]) -> RmwSpec:
         return RmwSpec(local=RmwSideSpec(impl=short), ota=RmwSideSpec(impl=short))
 
     if not isinstance(value, dict):
-        raise RuntimeError(
-            f"shared.rmw must be a string or a mapping with {{local, ota}} keys; got {type(value)}."
-        )
+        raise RuntimeError(f"shared.rmw must be a string or a mapping with {{local, ota}} keys; got {type(value)}.")
 
     extra = set(value.keys()) - {"local", "ota"}
     if extra:
-        raise RuntimeError(
-            f"shared.rmw contains unsupported keys {sorted(extra)}. Allowed: ['local', 'ota']."
-        )
+        raise RuntimeError(f"shared.rmw contains unsupported keys {sorted(extra)}. Allowed: ['local', 'ota'].")
 
     spec = RmwSpec(
         local=_parse_rmw_side(value.get("local"), "shared.rmw.local", is_local=True),
@@ -387,6 +377,7 @@ def _parse_optional_domain_id(value: Any, field_name: str) -> Optional[int]:
 # ---------------------------
 # IO + normalization helpers
 # ---------------------------
+
 
 def _read_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
@@ -620,6 +611,7 @@ def _write_generated_files(generated: List[Tuple[str, str]], force: bool, rewrit
 # Session config logic
 # ---------------------------
 
+
 def _resolve_session_template_path(param_dir: str, template_path: str) -> str:
     """
     Resolve a session template path:
@@ -691,9 +683,7 @@ def _parse_session_config_template_spec(param: Dict[str, Any], param_dir: str) -
         )
 
     if not isinstance(spec, dict):
-        raise RuntimeError(
-            "load_template must be a mapping with keys {filepath, parameters}. "
-        )
+        raise RuntimeError("load_template must be a mapping with keys {filepath, parameters}. ")
 
     filepath = spec.get("filepath")
     session_template_fs = _resolve_session_template_path(param_dir, filepath)
@@ -721,8 +711,7 @@ def _build_vars_map_from_template(cfg_raw: Dict[str, Any], provided_params: Dict
     extra = sorted([k for k in (provided_params or {}).keys() if k not in input_params])
     if extra:
         raise RuntimeError(
-            "session-config provides unknown parameters not declared in the session template "
-            f"input_parameters: {extra}"
+            f"session-config provides unknown parameters not declared in the session template input_parameters: {extra}"
         )
 
     missing_required: List[str] = []
@@ -916,7 +905,11 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             raise RuntimeError(f"peers.{peer_key}.address is required")
         if not isinstance(peer_obj["address"], str) or not peer_obj["address"].strip():
             raise RuntimeError(f"peers.{peer_key}.address must be a non-empty string")
-        if "com-name" in peer_obj and peer_obj["com-name"] is not None and not isinstance(peer_obj["com-name"], (str, int, float, bool)):
+        if (
+            "com-name" in peer_obj
+            and peer_obj["com-name"] is not None
+            and not isinstance(peer_obj["com-name"], (str, int, float, bool))
+        ):
             raise RuntimeError(f"peers.{peer_key}.com-name must be a scalar if provided")
 
     # shared is optional
@@ -931,9 +924,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
         }
         for legacy, replacement in _LEGACY_SHARED_KEYS.items():
             if legacy in shared:
-                raise RuntimeError(
-                    f"shared.{legacy} is no longer supported. Use {replacement} instead."
-                )
+                raise RuntimeError(f"shared.{legacy} is no longer supported. Use {replacement} instead.")
 
         _assert_allowed_keys(
             "shared",
@@ -992,9 +983,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
         peer_keys = list(peers.keys())
         extra_peers = sorted([k for k in peer_settings.keys() if k not in peer_keys])
         if extra_peers:
-            raise RuntimeError(
-                f"peer_settings contains unsupported peer keys {extra_peers}. Known peers: {peer_keys}"
-            )
+            raise RuntimeError(f"peer_settings contains unsupported peer keys {extra_peers}. Known peers: {peer_keys}")
         for p, ps in peer_settings.items():
             ps = _assert_mapping(ps, f"peer_settings.{p}")
             _assert_allowed_keys(
@@ -1024,18 +1013,29 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 if isinstance(item, str):
                     continue
                 if isinstance(item, dict):
-                    _assert_allowed_keys(f"topics.{dir_key}[{i}]", item, {"topic", "type", "processing", "qos", "zen_qos"})
+                    # `expect` declares the topic's intended delivered behavior
+                    # (hz/latency/loss). It is consumed by the status overview and
+                    # by `rosotacom test`; generation otherwise ignores it.
+                    _assert_allowed_keys(
+                        f"topics.{dir_key}[{i}]", item, {"topic", "type", "processing", "qos", "zen_qos", "expect"}
+                    )
                     if "topic" not in item or not isinstance(item["topic"], str) or not item["topic"].strip():
                         raise RuntimeError(f"topics.{dir_key}[{i}].topic must be a non-empty string.")
                     if "type" in item and item["type"] is not None:
                         if not isinstance(item["type"], str) or not item["type"].strip():
                             raise RuntimeError(f"topics.{dir_key}[{i}].type must be a non-empty string if provided.")
-                    if "processing" in item and item["processing"] is not None and not isinstance(item["processing"], dict):
+                    if (
+                        "processing" in item
+                        and item["processing"] is not None
+                        and not isinstance(item["processing"], dict)
+                    ):
                         raise RuntimeError(f"topics.{dir_key}[{i}].processing must be a mapping.")
                     if "qos" in item and item["qos"] is not None and not isinstance(item["qos"], dict):
                         raise RuntimeError(f"topics.{dir_key}[{i}].qos must be a mapping.")
                     if "zen_qos" in item and item["zen_qos"] is not None and not isinstance(item["zen_qos"], dict):
                         raise RuntimeError(f"topics.{dir_key}[{i}].zen_qos must be a mapping.")
+                    if "expect" in item and item["expect"] is not None and not isinstance(item["expect"], dict):
+                        raise RuntimeError(f"topics.{dir_key}[{i}].expect must be a mapping.")
                     continue
                 raise RuntimeError(f"Unsupported topic entry at topics.{dir_key}[{i}]: {type(item)}")
 
@@ -1116,17 +1116,13 @@ def _render_plugin_yaml(blocks: List[PluginBlock]) -> str:
 
 
 def _render_session_spec(base_plugin_path: str) -> str:
-    return _ensure_trailing_newline(
-        "session_plugins:\n"
-        "  - ./plugin.yaml\n"
-        f"  - {base_plugin_path}\n"
-    )
+    return _ensure_trailing_newline(f"session_plugins:\n  - ./plugin.yaml\n  - {base_plugin_path}\n")
 
 
 def _render_regex_list(key: str, topics: List[str]) -> str:
     lines = [f"{key}:\n"]
     for t in topics:
-        lines.append(f"  - topic_regex: \"^{t}$\"\n")
+        lines.append(f'  - topic_regex: "^{t}$"\n')
     return _ensure_trailing_newline("".join(lines))
 
 
@@ -1280,7 +1276,9 @@ def _build_status_pipeline_spec(
                 continue
             outbound_items.append((e, p))
         if use_heartbeat and hb_local:
-            hb_entry = TopicEntry(base=hb_local, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1)
+            hb_entry = TopicEntry(
+                base=hb_local, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1
+            )
             hb_pipe = {"final": hb_local}
             outbound_items.insert(0, (hb_entry, hb_pipe))
 
@@ -1300,10 +1298,20 @@ def _build_status_pipeline_spec(
                     {"stage": "processed", "topic": app_processed, "domain": "local", "produced_by": "preprocessing"}
                 )
             stages.append(
-                {"stage": "com_out", "topic": f"/com/out/{local_name}/{forward_ns}", "domain": "local", "produced_by": "relay_out"}
+                {
+                    "stage": "com_out",
+                    "topic": f"/com/out/{local_name}/{forward_ns}",
+                    "domain": "local",
+                    "produced_by": "relay_out",
+                }
             )
             stages.append(
-                {"stage": "ota_sent", "topic": f"/ota/{local_name}/{forward_ns}", "domain": "ota", "produced_by": "bridge_out"}
+                {
+                    "stage": "ota_sent",
+                    "topic": f"/ota/{local_name}/{forward_ns}",
+                    "domain": "ota",
+                    "produced_by": "bridge_out",
+                }
             )
 
             topics.append(
@@ -1327,7 +1335,9 @@ def _build_status_pipeline_spec(
                 continue
             inbound_items.append((e, p))
         if use_heartbeat and hb_remote:
-            hb_entry = TopicEntry(base=hb_remote, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1)
+            hb_entry = TopicEntry(
+                base=hb_remote, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1
+            )
             hb_pipe = {"final": hb_remote}
             inbound_items.insert(0, (hb_entry, hb_pipe))
 
@@ -1339,13 +1349,28 @@ def _build_status_pipeline_spec(
             app_in = _relay_in_local_topic(final)
 
             stages = [
-                {"stage": "ota_recv", "topic": f"/ota/{remote_name}/{forward_ns}", "domain": "ota", "produced_by": "transport"},
-                {"stage": "com_in", "topic": f"/com/in/{remote_name}/{forward_ns}", "domain": "local", "produced_by": "bridge_in"},
+                {
+                    "stage": "ota_recv",
+                    "topic": f"/ota/{remote_name}/{forward_ns}",
+                    "domain": "ota",
+                    "produced_by": "transport",
+                },
+                {
+                    "stage": "com_in",
+                    "topic": f"/com/in/{remote_name}/{forward_ns}",
+                    "domain": "local",
+                    "produced_by": "bridge_in",
+                },
                 {"stage": "app_in", "topic": app_in, "domain": "local", "produced_by": "relay_in"},
             ]
             if final != base:
                 stages.append(
-                    {"stage": "native_in", "topic": _relay_in_local_topic(base), "domain": "local", "produced_by": "postprocessing"}
+                    {
+                        "stage": "native_in",
+                        "topic": _relay_in_local_topic(base),
+                        "domain": "local",
+                        "produced_by": "postprocessing",
+                    }
                 )
 
             topics.append(
@@ -1568,6 +1593,7 @@ def _compute_pipeline(
 # Main
 # ---------------------------
 
+
 def func(
     session_config_yaml: str = "",
     force: bool = False,
@@ -1588,9 +1614,7 @@ def func(
 
     if session_config_obj is not None:
         if not isinstance(session_config_obj, dict):
-            raise RuntimeError(
-                f"session_config_obj must be a mapping, got {type(session_config_obj)}"
-            )
+            raise RuntimeError(f"session_config_obj must be a mapping, got {type(session_config_obj)}")
         vars_map = {}
         cfg = dict(session_config_obj)
         template_mode = False
@@ -1697,9 +1721,7 @@ def func(
     # If both are set for the same peer and disagree, that's an error — either the
     # user meant the shortcut (drop the per-peer value) or they meant to override it
     # (drop the shared one), but silently letting them diverge would hide mistakes.
-    shared_local_domain_id = _parse_optional_domain_id(
-        shared.get("local_domain_id"), "shared.local_domain_id"
-    )
+    shared_local_domain_id = _parse_optional_domain_id(shared.get("local_domain_id"), "shared.local_domain_id")
     peer_local_domain_id: Dict[str, Optional[int]] = {}
     for p in peer_keys:
         per_peer = _parse_optional_domain_id(
@@ -1784,10 +1806,12 @@ def func(
             items.append(("local_config_template", side.dds_config))
             items.append(("local_config_file", "${peer_dir}/local_dds.xml"))
             if side.impl == "fastdds" and side.dds_config == "fastdds_easy_mode.xml":
-                items.append((
-                    "local_easy_mode_ip_key",
-                    side.dds_easy_mode_ip_key or peer_ip[peer_keys[0]],
-                ))
+                items.append(
+                    (
+                        "local_easy_mode_ip_key",
+                        side.dds_easy_mode_ip_key or peer_ip[peer_keys[0]],
+                    )
+                )
         return items
 
     def _build_ota_rmw_items() -> List[Tuple[str, Any]]:
@@ -1806,10 +1830,12 @@ def func(
             items.append(("ota_config_template", ota.dds_config))
             items.append(("ota_config_file", "${peer_dir}/ota_dds.xml"))
             if ota.impl == "fastdds" and ota.dds_config == "fastdds_easy_mode.xml":
-                items.append((
-                    "ota_easy_mode_ip_key",
-                    ota.dds_easy_mode_ip_key or peer_ip[peer_keys[0]],
-                ))
+                items.append(
+                    (
+                        "ota_easy_mode_ip_key",
+                        ota.dds_easy_mode_ip_key or peer_ip[peer_keys[0]],
+                    )
+                )
         return items
 
     def _build_zenoh_block(
@@ -1883,9 +1909,7 @@ def func(
             )
         src, dst = parts[0], parts[1]
         if src not in peer_ip or dst not in peer_ip:
-            raise RuntimeError(
-                f"topics key '{k}' refers to unknown peer(s) '{src}'/'{dst}'. Known peers: {peer_keys}"
-            )
+            raise RuntimeError(f"topics key '{k}' refers to unknown peer(s) '{src}'/'{dst}'. Known peers: {peer_keys}")
         if (src, dst) in direction_key_for:
             raise RuntimeError(f"Duplicate topics direction for {src}_to_{dst}.")
         direction_key_for[(src, dst)] = k
@@ -1895,7 +1919,9 @@ def func(
     # - force in/out unless user explicitly disabled them (then error)
     if use_heartbeat:
         if shared_use_in is False or shared_use_out is False:
-            raise RuntimeError("shared.use_heartbeat=true requires in/out. Remove shared.use_in/use_out overrides or set both to true.")
+            raise RuntimeError(
+                "shared.use_heartbeat=true requires in/out. Remove shared.use_in/use_out overrides or set both to true."
+            )
         if shared_use_in is None:
             shared_use_in = True
         if shared_use_out is None:
@@ -1959,9 +1985,7 @@ def func(
             elif peer_local_domain_id[local] is not None:
                 # Still export ROS_DOMAIN_ID for the peer's local graph even
                 # if no domain bridging is active.
-                blocks.append(
-                    PluginBlock("domain", [("local_domain_id", peer_local_domain_id[local])])
-                )
+                blocks.append(PluginBlock("domain", [("local_domain_id", peer_local_domain_id[local])]))
             blocks.append(PluginBlock("rmw", _build_ota_rmw_items()))
             if use_topic_monitor:
                 blocks.append(PluginBlock("topic_monitor", [("topic_monitor", True)]))
@@ -2094,7 +2118,9 @@ def func(
         key_expr_path = "/".join(parts)
         return f"ota/{peer_name[publisher_peer]}/{key_expr_path}"
 
-    def _zenoh_qos_pub_block(entries_and_pipes: List[Tuple[TopicEntry, Dict[str, Any]]], publisher_peer: str) -> Optional[YamlBlockScalar]:
+    def _zenoh_qos_pub_block(
+        entries_and_pipes: List[Tuple[TopicEntry, Dict[str, Any]]], publisher_peer: str
+    ) -> Optional[YamlBlockScalar]:
         items: List[Tuple[str, Dict[str, Any]]] = []
         for e, p in entries_and_pipes:
             if not e.zen_qos:
@@ -2105,7 +2131,9 @@ def func(
             allowed = {"priority", "express"}
             extra = sorted([k for k in zq.keys() if k not in allowed])
             if extra:
-                raise RuntimeError(f"zen_qos for topic '{e.base}' has unsupported keys {extra}. Allowed: {sorted(allowed)}")
+                raise RuntimeError(
+                    f"zen_qos for topic '{e.base}' has unsupported keys {extra}. Allowed: {sorted(allowed)}"
+                )
             priority_raw = zq.get("priority")
             if priority_raw is None:
                 raise RuntimeError("zen_qos.priority is required when zen_qos is provided.")
@@ -2134,12 +2162,7 @@ def func(
             if cfg.get("express"):
                 parts_cfg.append("express: true")
             cfg_inline = "{ " + ", ".join(parts_cfg) + " }"
-            rendered_entries.append(
-                "{\n"
-                f'  key_exprs: [ "{key_expr}" ],\n'
-                f"  config: {cfg_inline}\n"
-                "}"
-            )
+            rendered_entries.append(f'{{\n  key_exprs: [ "{key_expr}" ],\n  config: {cfg_inline}\n}}')
 
         # Join as a comma-separated list of objects (as expected by zenoh.json5.template)
         content = ",\n".join(rendered_entries)
@@ -2224,7 +2247,9 @@ def func(
 
     def _prefix_with_source_name_if_needed(target_peer: str, source_peer: str, topic: str) -> str:
         ps = peer_settings_all.get(target_peer, {}) or {}
-        keep_source = bool((ps.get("inbound", {}) or {}).get("keep_source_prefix", False)) if isinstance(ps, dict) else False
+        keep_source = (
+            bool((ps.get("inbound", {}) or {}).get("keep_source_prefix", False)) if isinstance(ps, dict) else False
+        )
         prefix = f"/{peer_name[source_peer]}" if keep_source else ""
         return f"{prefix}{topic}"
 
@@ -2250,7 +2275,8 @@ def func(
         # and republishes at a fixed rate for visualization software.
         trickle_in_items = [
             (_prefix_with_source_name_if_needed(local, remote, p["final"]), p["trickle_hz"])
-            for p in in_pipes if p["trickle_hz"] is not None
+            for p in in_pipes
+            if p["trickle_hz"] is not None
         ]
         trickle_all_topics = _dedup_keep_order([t for t, _ in trickle_in_items])
         # Use the first configured rate (all trickle topics share a single timer).
@@ -2367,7 +2393,9 @@ def func(
         ps_remote = peer_settings_all.get(remote, {}) or {}
         ps_remote = ps_remote if isinstance(ps_remote, dict) else {}
         remote_outbound = (ps_remote.get("outbound", {}) or {}) if isinstance(ps_remote, dict) else {}
-        remote_outbound_target = (remote_outbound.get("target_prefix", {}) or {}) if isinstance(remote_outbound, dict) else {}
+        remote_outbound_target = (
+            (remote_outbound.get("target_prefix", {}) or {}) if isinstance(remote_outbound, dict) else {}
+        )
         remote_uses_target_prefix = bool(remote_outbound_target.get("use_target_prefix", False))
 
         # ---------------------------
@@ -2384,7 +2412,9 @@ def func(
             )
         native_have_source_prefix = outbound_source_cfg.get("native_have_source_prefix", False)
         if not isinstance(native_have_source_prefix, bool):
-            raise RuntimeError(f"peer_settings.{local}.outbound.source_prefix.native_have_source_prefix must be boolean.")
+            raise RuntimeError(
+                f"peer_settings.{local}.outbound.source_prefix.native_have_source_prefix must be boolean."
+            )
 
         # Target prefix:
         # - native_have_outgoing_target_prefix defaults to use_target_prefix
@@ -2392,7 +2422,9 @@ def func(
         use_target_prefix = outbound_target_cfg.get("use_target_prefix", False)
         if not isinstance(use_target_prefix, bool):
             raise RuntimeError(f"peer_settings.{local}.outbound.target_prefix.use_target_prefix must be boolean.")
-        native_have_outgoing_target_prefix = outbound_target_cfg.get("native_have_outgoing_target_prefix", use_target_prefix)
+        native_have_outgoing_target_prefix = outbound_target_cfg.get(
+            "native_have_outgoing_target_prefix", use_target_prefix
+        )
         if not isinstance(native_have_outgoing_target_prefix, bool):
             raise RuntimeError(
                 f"peer_settings.{local}.outbound.target_prefix.native_have_outgoing_target_prefix must be boolean."
@@ -2423,7 +2455,9 @@ def func(
 
         # IN: only if inbound direction exists (or explicitly requested, in which case error if missing)
         in_list = dir_topic_list.get((remote, local), []) if in_dir_key else []
-        in_list_with_types = dir_topic_list_with_types.get((remote, local), []) if use_domain_bridge and in_dir_key else []
+        in_list_with_types = (
+            dir_topic_list_with_types.get((remote, local), []) if use_domain_bridge and in_dir_key else []
+        )
         in_enabled = bool(shared_use_in) if shared_use_in is not None else (len(in_list) > 0)
         if in_enabled and not in_dir_key:
             raise RuntimeError(f"shared.use_in=true but no inbound topics direction '{remote}_to_{local}' is defined.")
@@ -2445,10 +2479,14 @@ def func(
 
         # OUT: only if outbound direction exists (or explicitly requested, in which case error if missing)
         out_list = dir_topic_list.get((local, remote), []) if out_dir_key else []
-        out_list_with_types = dir_topic_list_with_types.get((local, remote), []) if use_domain_bridge and out_dir_key else []
+        out_list_with_types = (
+            dir_topic_list_with_types.get((local, remote), []) if use_domain_bridge and out_dir_key else []
+        )
         out_enabled = bool(shared_use_out) if shared_use_out is not None else (len(out_list) > 0)
         if out_enabled and not out_dir_key:
-            raise RuntimeError(f"shared.use_out=true but no outbound topics direction '{local}_to_{remote}' is defined.")
+            raise RuntimeError(
+                f"shared.use_out=true but no outbound topics direction '{local}_to_{remote}' is defined."
+            )
         if out_dir_key:
             out_items: List[Tuple[str, Any]] = [
                 ("out", out_enabled),
@@ -2500,9 +2538,7 @@ def func(
                 )
         elif peer_local_domain_id[local] is not None:
             # No domain bridging but the peer still has a pinned ROS_DOMAIN_ID.
-            blocks.append(
-                PluginBlock("domain", [("local_domain_id", peer_local_domain_id[local])])
-            )
+            blocks.append(PluginBlock("domain", [("local_domain_id", peer_local_domain_id[local])]))
 
         zen_block = _build_zenoh_block(
             local,
@@ -2521,9 +2557,11 @@ def func(
             blocks.append(
                 PluginBlock(
                     "topic_monitor",
-                    ([("topic_monitor", True)]
-                     + ([("tm_in_to_adressant", tm_in_to)] if tm_in_to is not None else [])
-                     + ([("tm_out_to_adressant", tm_out_to)] if tm_out_to is not None else [])),
+                    (
+                        [("topic_monitor", True)]
+                        + ([("tm_in_to_adressant", tm_in_to)] if tm_in_to is not None else [])
+                        + ([("tm_out_to_adressant", tm_out_to)] if tm_out_to is not None else [])
+                    ),
                 )
             )
 
@@ -2765,7 +2803,9 @@ def func(
 
         per_peer_plugin[local] = _render_plugin_yaml(blocks)
 
-    qos_yaml = _render_qos_yaml(shared.get("qos", {}) if isinstance(shared, dict) else {}, qos_overrides) if write_qos else ""
+    qos_yaml = (
+        _render_qos_yaml(shared.get("qos", {}) if isinstance(shared, dict) else {}, qos_overrides) if write_qos else ""
+    )
 
     # session_specification.yaml
     session_spec_yaml = _render_session_spec(base_plugin_path)

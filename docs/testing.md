@@ -1,5 +1,10 @@
 # Testing
 
+> **Note:** an expectation-driven, OTA-first rework of this model is proposed in
+> `docs/rfcs/0001-expectation-driven-test-suite.md` (per-topic `expect` contracts,
+> `rosotacom test` reading the session self-report, fewer markers). This document
+> describes the model in effect today.
+
 This project separates two things that are easy to conflate:
 
 - **Examples** exist to *teach a user* how to run a session. They live in

@@ -30,3 +30,8 @@ topics:
       processing:
         restamp_if: true
         compress: true
+      # Declared behavioral contract: read by the status overview (live warnings)
+      # and asserted by `rosotacom test`. See docs/rfcs/0001-expectation-driven-test-suite.md.
+      expect:
+        hz: { min: 1, max: 5 }
+        latency_ms: { max: 500 }

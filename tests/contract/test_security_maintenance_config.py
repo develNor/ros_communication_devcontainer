@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 DEPENDABOT_PATH = PACKAGE_ROOT / ".github" / "dependabot.yml"
 IMAGE_SCAN_PATH = PACKAGE_ROOT / ".github" / "workflows" / "image-scan.yml"
 MERGE_GATE_PATH = PACKAGE_ROOT / ".github" / "workflows" / "pr-merge-gate.yml"
+FULL_E2E_PATH = PACKAGE_ROOT / ".github" / "workflows" / "nightly-e2e.yml"
 RELEASE_PATH = PACKAGE_ROOT / ".github" / "workflows" / "release.yml"
 
 
@@ -44,6 +47,15 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     assert "just test-e2e-smoke" in merge_gate
 
 
+def test_full_e2e_workflow_is_manual_promotion_support_not_scheduled() -> None:
+    full_e2e = FULL_E2E_PATH.read_text(encoding="utf-8")
+
+    assert "name: Manual Full E2E" in full_e2e
+    assert "workflow_dispatch:" in full_e2e
+    assert "schedule:" not in full_e2e
+    assert "ROSOTACOM_RUN_FULL_E2E=1" in full_e2e
+
+
 def test_release_publishes_only_for_a_version_tag_via_repository_configuration() -> None:
     release = RELEASE_PATH.read_text(encoding="utf-8")
 
@@ -58,49 +70,43 @@ def test_release_publishes_only_for_a_version_tag_via_repository_configuration()
     assert "https://test.pypi.org" not in release
 
 
-def test_session_test_tier_markers_drive_both_test_matrices() -> None:
-    """Every session declares test_tiers; the single-machine smoke matrix and the
-    multi-machine set are derived from those markers (the single source of truth),
-    so neither tier can silently drift. See docs/testing.md."""
-    from rosotacom.cli import session_test_markers, sessions_in_tier
+def test_local_check_derivation_and_generated_rmw_matrix_drive_test_configs() -> None:
+    """The old two-axis markers are gone: OTA membership is default, while local
+    smoke eligibility is derived from per-peer domains unless a config opts out
+    with local_check: false. See docs/testing.md."""
+    from rosotacom.cli import local_check_sessions, ota_suite_sessions, session_local_checks
 
-    markers = session_test_markers()  # raises if any session lacks valid markers
-    assert markers, "no example sessions found"
+    examples_dir = PACKAGE_ROOT / "src" / "rosotacom" / "resources" / "examples" / "sessions"
+    rmw_matrix_dir = PACKAGE_ROOT / "tests" / "sessions" / "rmw_matrix"
 
-    # Anti-drift guard: these examples are exactly the single-machine smoke set.
-    # Adding/removing an example must update its marker accordingly.
-    assert set(sessions_in_tier("single_machine", {"ok"})) == {
-        "1_heartbeat_cyclone-ota",
-        "1_heartbeat_fastdds",
-        "1_heartbeat_zen-endpoints",
-        "1_heartbeat_fastdds-local_cyclone-ota",
-        "1_heartbeat_cyclone-local_fastdds-ota",
-        "1_heartbeat_cyclone-local_zenoh-ros2dds-ota",
+    session_files = [
+        *examples_dir.glob("*/session-definition.yaml"),
+        *rmw_matrix_dir.glob("*/session-definition.yaml"),
+    ]
+    for session_file in session_files:
+        assert "test_tiers:" not in session_file.read_text(encoding="utf-8")
+
+    assert set(local_check_sessions(examples_dir)) == {
+        "1_heartbeat",
+        "1_heartbeat_status",
         "2_native_chatter",
         "3_comp_occ_grid",
         "4_comp_occ_grid_zen",
         "5_sized_payload",
         "6_sized_payload_zen",
     }
+    assert set(ota_suite_sessions(examples_dir)) == set(local_check_sessions(examples_dir))
 
-    # cyclone-ota-tuned hides local topics on a shared domain (no per-peer domain
-    # split), so it is only provable multi-machine.
-    assert markers["1_heartbeat_cyclone-ota-tuned"] == {"single_machine": "na", "multi_machine": "required"}
-    assert set(sessions_in_tier("multi_machine", {"ok", "required"})) == {
-        "1_heartbeat_cyclone-local_fastdds-ota",
-        "1_heartbeat_cyclone-local_zenoh-ros2dds-ota",
-        "1_heartbeat_cyclone-ota",
-        "1_heartbeat_cyclone-ota-tuned",
-        "1_heartbeat_fastdds",
-        "1_heartbeat_fastdds-local_cyclone-ota",
-        "1_heartbeat_zen-endpoints",
-        "2_native_chatter",
-        "3_comp_occ_grid",
-        "4_comp_occ_grid_zen",
-        "5_sized_payload",
-        "6_sized_payload_zen",
-    }
+    rmw_local = session_local_checks(rmw_matrix_dir)
+    assert rmw_local["1_heartbeat_cyclone-ota-tuned"] is False
+    assert set(local_check_sessions(rmw_matrix_dir)) == set(rmw_local) - {"1_heartbeat_cyclone-ota-tuned"}
+    assert set(ota_suite_sessions(rmw_matrix_dir)) == set(rmw_local)
 
-    # The smoke test must derive its matrix from the markers, not hardcode it.
+    subprocess.run(
+        [sys.executable, str(PACKAGE_ROOT / "tests" / "sessions" / "generate_rmw_matrix.py"), "--check"],
+        check=True,
+    )
+
     e2e_smoke = (PACKAGE_ROOT / "tests" / "e2e" / "test_smoke.py").read_text(encoding="utf-8")
-    assert 'sessions_in_tier("single_machine", {"ok"})' in e2e_smoke
+    assert "local_check_sessions()" in e2e_smoke
+    assert "ROSOTACOM_RUN_FULL_E2E" in e2e_smoke

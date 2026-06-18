@@ -9,7 +9,7 @@ project setup, reusable session configs, and helper scripts.
 rosotacom examples create ./rosotacom_examples
 cd ./rosotacom_examples
 eval "$(rosotacom setup-env ./rosotacom.yaml)"
-rosotacom start 1_heartbeat_cyclone-ota --identity a
+rosotacom start 1_heartbeat --identity a
 ```
 
 In another terminal on the same host:
@@ -17,14 +17,14 @@ In another terminal on the same host:
 ```bash
 cd ./rosotacom_examples
 eval "$(rosotacom setup-env ./rosotacom.yaml)"
-rosotacom start 1_heartbeat_cyclone-ota --identity b
+rosotacom start 1_heartbeat --identity b
 ```
 
 Stop each side when done:
 
 ```bash
-rosotacom stop 1_heartbeat_cyclone-ota --identity a
-rosotacom stop 1_heartbeat_cyclone-ota --identity b
+rosotacom stop 1_heartbeat --identity a
+rosotacom stop 1_heartbeat --identity b
 docker ps --filter name=rosotacom   # optional: confirm cleanup
 ```
 

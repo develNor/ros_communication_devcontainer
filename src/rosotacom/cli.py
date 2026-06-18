@@ -63,7 +63,7 @@ SESSION_INSTANCE_CONTAINER_DIR = "/session/instances"
 EXTERNAL_SESSION_CONTAINER_DIR = "/session/current"
 CONTAINER_DATA_DICT_PATH = "/data_dict.json"
 RUN_SESSION_CONTAINER_PATH = "/ws/session/creation/run_session.py"
-DEFAULT_SMOKE_SESSION = "1_heartbeat_cyclone-ota"
+DEFAULT_SMOKE_SESSION = "1_heartbeat"
 
 ws_creation_dir = WS_DIR / "session" / "creation"
 session_gen_path = ws_creation_dir / "generate_session_files.py"
@@ -1642,13 +1642,12 @@ def _smoke_ros_setup(config_container_dir: str, cfg: dict[str, Any], receiver_pe
     return " && ".join(commands)
 
 
-# --- Shared verification primitives (used by `smoke` and the `verify`/`probe-*`
-# CLI verbs that the external multi-machine runner calls over SSH) --------------
+# --- Shared smoke/probe primitives -------------------------------------------
 # Single source of truth for the heartbeat delivery bounds and the isolation
-# probe topic, so both test tiers assert the same thing. See docs/testing.md.
-VERIFY_HZ_MIN = 5.0
-VERIFY_HZ_MAX = 20.0
-VERIFY_MAX_DELAY_S = 1.0
+# probe topic used by local smoke and by external OTA harnesses.
+SMOKE_HZ_MIN = 5.0
+SMOKE_HZ_MAX = 20.0
+SMOKE_MAX_DELAY_S = 1.0
 ISOLATION_PROBE_TOPIC = "/local_only"
 
 
@@ -1745,9 +1744,9 @@ def _verify_received_topics(
     cfg: dict[str, Any],
     receiver_peer_key: str,
     *,
-    hz_min: float = VERIFY_HZ_MIN,
-    hz_max: float = VERIFY_HZ_MAX,
-    max_delay_s: float = VERIFY_MAX_DELAY_S,
+    hz_min: float = SMOKE_HZ_MIN,
+    hz_max: float = SMOKE_HZ_MAX,
+    max_delay_s: float = SMOKE_MAX_DELAY_S,
     log_line: Callable[[str], None] = print,
     detail_log: Callable[[str], None] | None = None,
 ) -> list[str]:
@@ -1968,38 +1967,84 @@ def _verify_isolation(
         _stop_isolation_probe(pub_container, topic)
 
 
-# --- Test-tier capability markers (single source of truth for both tiers) -----
-_VALID_SINGLE_MACHINE = {"ok", "na"}
-_VALID_MULTI_MACHINE = {"ok", "required", "na"}
+# --- Local-check derivation ---------------------------------------------------
 
 
-def _session_markers(session_host_dir: Path) -> dict[str, str]:
-    name = session_host_dir.name
+def _session_local_check(session_host_dir: Path) -> bool:
+    """Whether a session is eligible for one-host smoke.
+
+    OTA is the default suite membership. The only per-session axis left here is
+    whether local smoke can fake the two peers with distinct local ROS domains.
+    A config may explicitly opt out with ``local_check: false``; otherwise it is
+    derived from per-peer domain IDs.
+    """
     cfg = _load_session_config_from_host(session_host_dir)
-    tiers = cfg.get("test_tiers")
-    if not isinstance(tiers, dict):
-        raise RuntimeError(f"{name}: missing 'test_tiers' mapping (see docs/testing.md)")
-    single, multi = tiers.get("single_machine"), tiers.get("multi_machine")
-    if single not in _VALID_SINGLE_MACHINE:
-        raise RuntimeError(f"{name}: test_tiers.single_machine={single!r} not in {sorted(_VALID_SINGLE_MACHINE)}")
-    if multi not in _VALID_MULTI_MACHINE:
-        raise RuntimeError(f"{name}: test_tiers.multi_machine={multi!r} not in {sorted(_VALID_MULTI_MACHINE)}")
-    return {"single_machine": single, "multi_machine": multi}
+    name = session_host_dir.name
+    if "test_tiers" in cfg:
+        raise RuntimeError(f"{name}: test_tiers is retired; remove it or use local_check: false for opt-outs.")
+
+    explicit = cfg.get("local_check")
+    if explicit is not None:
+        if not isinstance(explicit, bool):
+            raise RuntimeError(f"{name}: local_check must be a boolean when provided.")
+        return explicit
+
+    peers = cfg.get("peers")
+    if not isinstance(peers, dict) or not peers:
+        raise RuntimeError(f"{name}: peers must be a non-empty mapping.")
+    shared = cfg.get("shared", {}) or {}
+    if not isinstance(shared, dict):
+        raise RuntimeError(f"{name}: shared must be a mapping when provided.")
+    peer_settings = cfg.get("peer_settings", {}) or {}
+    if not isinstance(peer_settings, dict):
+        raise RuntimeError(f"{name}: peer_settings must be a mapping when provided.")
+
+    shared_domain = session_gen._parse_optional_domain_id(shared.get("local_domain_id"), "shared.local_domain_id")
+    domains: list[int] = []
+    for peer_key in peers:
+        settings = peer_settings.get(peer_key, {}) or {}
+        if not isinstance(settings, dict):
+            raise RuntimeError(f"{name}: peer_settings.{peer_key} must be a mapping when provided.")
+        per_peer = session_gen._parse_optional_domain_id(
+            settings.get("domain_id"),
+            f"peer_settings.{peer_key}.domain_id",
+        )
+        domain = per_peer if per_peer is not None else shared_domain
+        if domain is None:
+            return False
+        domains.append(domain)
+    return len(set(domains)) == len(domains)
 
 
-def session_test_markers(sessions_dir: Path | None = None) -> dict[str, dict[str, str]]:
-    """Map session name -> {single_machine, multi_machine} for every session.
-    Defaults to the packaged example sessions (the repo's source of truth)."""
+def session_local_checks(sessions_dir: Path | None = None) -> dict[str, bool]:
+    """Map session name -> local smoke eligibility for every session."""
     base = sessions_dir or (EXAMPLE_PROJECT_DIR / "sessions")
-    out: dict[str, dict[str, str]] = {}
+    out: dict[str, bool] = {}
     for child in sorted(base.iterdir()):
         if child.is_dir() and _is_session_dir(child):
-            out[child.name] = _session_markers(child)
+            out[child.name] = _session_local_check(child)
     return out
 
 
-def sessions_in_tier(tier: str, values: set[str], sessions_dir: Path | None = None) -> list[str]:
-    return [name for name, m in session_test_markers(sessions_dir).items() if m.get(tier) in values]
+def local_check_sessions(sessions_dir: Path | None = None) -> list[str]:
+    return [name for name, enabled in session_local_checks(sessions_dir).items() if enabled]
+
+
+def ota_suite_sessions(sessions_dir: Path | None = None) -> list[str]:
+    """All non-experimental sessions in a directory.
+
+    Test-configs are OTA candidates by default; local smoke eligibility is only
+    the fast-check lens on top.
+    """
+    base = sessions_dir or (EXAMPLE_PROJECT_DIR / "sessions")
+    out: list[str] = []
+    for child in sorted(base.iterdir()):
+        if not (child.is_dir() and _is_session_dir(child)):
+            continue
+        cfg = _load_session_config_from_host(child)
+        if not bool(cfg.get("experimental", False)):
+            out.append(child.name)
+    return out
 
 
 def _running_instance_config_container_dir(
@@ -2024,20 +2069,6 @@ def _resolve_running_peer(args: argparse.Namespace, identity: str) -> tuple[str,
     config_container_dir = _running_instance_config_container_dir(runtime, session, getattr(args, "instance_id", None))
     ros_setup = _smoke_ros_setup(config_container_dir, cfg, identity)
     return containers[0], ros_setup, cfg
-
-
-def verify_command(args: argparse.Namespace) -> int:
-    """Assert an already-running peer receives its crossed topics within bounds."""
-    container, ros_setup, cfg = _resolve_running_peer(args, args.identity)
-    errors = _verify_received_topics(
-        container, ros_setup, cfg, args.identity, hz_min=args.hz_min, hz_max=args.hz_max, max_delay_s=args.max_delay
-    )
-    for err in errors:
-        print(f"VERIFY FAIL: {err}", file=sys.stderr)
-    if errors:
-        return 1
-    print(f"VERIFY OK: identity {args.identity} receives its crossed topics within bounds")
-    return 0
 
 
 def probe_publish_command(args: argparse.Namespace) -> int:
@@ -2103,6 +2134,15 @@ def publish_test_topics_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_status_reports(logs_dir: Path) -> dict[str, Any]:
+    reports: dict[str, Any] = {}
+    for peer_dir in sorted(p for p in logs_dir.iterdir() if p.is_dir()):
+        status_json = peer_dir / "status" / "status.json"
+        if status_json.exists():
+            reports[peer_dir.name] = json.loads(status_json.read_text(encoding="utf-8"))
+    return reports
+
+
 def test_command(args: argparse.Namespace) -> int:
     """Assert a running/recent session meets its status + per-topic `expect` contract.
 
@@ -2117,12 +2157,25 @@ def test_command(args: argparse.Namespace) -> int:
     cfg = _effective_session_config(session.host_dir, runtime)
     instance_dir = _find_latest_instance_dir(runtime, session, getattr(args, "instance_id", None))
     logs_dir = instance_dir / "logs"
-
+    deadline = time.time() + max(0.0, float(getattr(args, "timeout", 30.0)))
+    interval = max(0.5, float(getattr(args, "interval", 2.0)))
+    expect_by_topic = status_eval.expectations_from_cfg(cfg)
     reports: dict[str, Any] = {}
-    for peer_dir in sorted(p for p in logs_dir.iterdir() if p.is_dir()):
-        status_json = peer_dir / "status" / "status.json"
-        if status_json.exists():
-            reports[peer_dir.name] = json.loads(status_json.read_text(encoding="utf-8"))
+    failures: list[str] = []
+
+    while True:
+        reports = _load_status_reports(logs_dir) if logs_dir.is_dir() else {}
+        if reports:
+            failures = status_eval.evaluate_reports(reports, expect_by_topic)
+            if not failures:
+                topic_count = sum(len(r.get("topics", [])) for r in reports.values())
+                print(f"TEST OK: {len(reports)} peer(s), {topic_count} topic(s) meet status + expectations")
+                return 0
+
+        if time.time() >= deadline:
+            break
+        time.sleep(interval)
+
     if not reports:
         print(
             f"rosotacom test: no status.json under {logs_dir}. Start the session with "
@@ -2131,14 +2184,9 @@ def test_command(args: argparse.Namespace) -> int:
         )
         return 1
 
-    failures = status_eval.evaluate_reports(reports, status_eval.expectations_from_cfg(cfg))
     for failure in failures:
         print(f"TEST FAIL: {failure}", file=sys.stderr)
-    if failures:
-        return 1
-    topic_count = sum(len(r.get("topics", [])) for r in reports.values())
-    print(f"TEST OK: {len(reports)} peer(s), {topic_count} topic(s) meet status + expectations")
-    return 0
+    return 1
 
 
 def smoke(args: argparse.Namespace) -> int:
@@ -2215,6 +2263,21 @@ def smoke(args: argparse.Namespace) -> int:
         errors += _verify_isolation(
             a_container, ros_setup_a, b_container, ros_setup_b, ISOLATION_PROBE_TOPIC, log_line=log_line
         )
+        test_rc = test_command(
+            argparse.Namespace(
+                rosotacom_config=args.rosotacom_config,
+                ros2docker_config=args.ros2docker_config,
+                session_configs_dir=args.session_configs_dir,
+                session_instances_dir=getattr(args, "session_instances_dir", None),
+                data_dict=args.data_dict,
+                session_dir=session_dir,
+                instance_id=smoke_instance.instance_id,
+                timeout=45.0,
+                interval=2.0,
+            )
+        )
+        if test_rc != 0:
+            errors.append("rosotacom test failed for the session self-report")
         if errors:
             raise RuntimeError("Smoke verification failed:\n  - " + "\n  - ".join(errors))
     except Exception as exc:
@@ -2404,7 +2467,7 @@ def main(argv: list[str] | None = None) -> int:
         "smoke",
         "status",
         "test",
-        "verify",
+        "verify",  # retired; keep guarded so it is not rewritten as `start verify`.
         "probe-publish",
         "probe-check",
         "publish-test-topics",
@@ -2469,23 +2532,9 @@ def main(argv: list[str] | None = None) -> int:
     _add_common_config_args(test_parser)
     test_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     test_parser.add_argument("--instance-id", help="Evaluate a specific instance id (default: most recent).")
+    test_parser.add_argument("--timeout", type=float, default=30.0, help="Seconds to wait for status to settle.")
+    test_parser.add_argument("--interval", type=float, default=2.0, help="Polling interval while waiting (s).")
     test_parser.set_defaults(func=test_command)
-
-    # Verification verbs operate on an already-running session per identity, so the
-    # external multi-machine runner can call them over SSH (one peer per host) with
-    # the exact same logic the local smoke test uses.
-    verify_parser = subparsers.add_parser(
-        "verify", help="Assert a running peer receives its crossed topics within rate/latency bounds."
-    )
-    _add_common_config_args(verify_parser)
-    verify_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
-    verify_parser.add_argument("--identity", required=True)
-    verify_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
-    verify_parser.add_argument("--instance-id", help="Inspect a specific instance id (default: most recent).")
-    verify_parser.add_argument("--hz-min", type=float, default=VERIFY_HZ_MIN)
-    verify_parser.add_argument("--hz-max", type=float, default=VERIFY_HZ_MAX)
-    verify_parser.add_argument("--max-delay", type=float, default=VERIFY_MAX_DELAY_S)
-    verify_parser.set_defaults(func=verify_command)
 
     probe_publish_parser = subparsers.add_parser(
         "probe-publish", help="Publish a local-only probe topic in a running peer's local domain (isolation)."

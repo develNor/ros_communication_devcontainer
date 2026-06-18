@@ -886,11 +886,17 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             "shared",
             "peer_settings",
             "topics",
-            # Test-tier capability markers (single_machine/multi_machine). Consumed
-            # by the test suites (see docs/testing.md); ignored by generation.
-            "test_tiers",
+            # Test-suite annotations. `local_check` is the one-host fast-check
+            # opt-out; OTA suite membership is default unless `experimental` is
+            # true. Both are ignored by generation.
+            "local_check",
+            "experimental",
         },
     )
+    if "local_check" in cfg and cfg["local_check"] is not None and not isinstance(cfg["local_check"], bool):
+        raise RuntimeError("local_check must be boolean if provided.")
+    if "experimental" in cfg and cfg["experimental"] is not None and not isinstance(cfg["experimental"], bool):
+        raise RuntimeError("experimental must be boolean if provided.")
 
     peers = _assert_mapping(cfg.get("peers"), "peers")
     if not peers:

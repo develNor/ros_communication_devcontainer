@@ -1,8 +1,3 @@
-# Test-tier capability markers (see docs/testing.md).
-test_tiers:
-  single_machine: ok
-  multi_machine: ok
-
 peers:
   a:
     address: "data:machine_a_ip"
@@ -16,6 +11,7 @@ peer_settings:
     domain_id: 47
 
 shared:
+  use_status_overview: true
   # Active variant: fastdds shortcut (sets both local and OTA RMW implementations).
   rmw: fastdds
   ota_domain_id: 48

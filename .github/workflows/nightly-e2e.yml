@@ -1,9 +1,12 @@
-name: Nightly E2E
+name: Manual Full E2E
 
 on:
-  schedule:
-    - cron: "37 2 * * *"
   workflow_dispatch:
+    inputs:
+      full-rmw-matrix:
+        description: "Run the generated heartbeat RMW matrix in addition to curated examples"
+        required: false
+        default: "true"
 
 permissions:
   contents: read
@@ -14,7 +17,7 @@ concurrency:
 
 jobs:
   full-e2e:
-    name: full-e2e
+    name: manual-full-e2e
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -41,5 +44,9 @@ jobs:
       - name: Show Docker environment
         run: docker info
 
-      - name: Run single-machine smoke matrix
+      - name: Run local smoke slice
         run: just test-e2e-smoke
+
+      - name: Run generated RMW matrix
+        if: github.event.inputs.full-rmw-matrix != 'false'
+        run: ROSOTACOM_RUN_E2E=1 ROSOTACOM_RUN_FULL_E2E=1 .venv/bin/python -m pytest -q tests/e2e/test_smoke.py -m e2e

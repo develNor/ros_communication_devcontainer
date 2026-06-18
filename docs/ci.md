@@ -17,9 +17,9 @@ but one stable release line:
 - releases are tags `vX.Y.Z` cut from `main` (see [release.md](release.md)).
 
 The OTA tier is not part of this repository's public CI. An operator-supplied
-external runner may provide it as a manual promotion gate, as described
-generically in [testing.md](testing.md). A commit, mirror update, or green public
-CI run does not by itself authorize an external runner or a `main` promotion.
+external runner provides it as a manual promotion gate, as described generically
+in [testing.md](testing.md). A commit, mirror update, or green public CI run does
+not by itself authorize an external runner or a `main` promotion.
 
 ## Pull Requests
 
@@ -66,12 +66,13 @@ config, catmux pane logs, Docker logs when available, and the smoke verification
 log under `session-instances/`; collect that directory as the first debugging
 artifact when an E2E job fails.
 
-## Scheduled And Maintenance Checks
+## Manual And Maintenance Checks
 
-`.github/workflows/nightly-e2e.yml` runs Docker E2E on a schedule and by manual
-dispatch on GitHub-hosted infrastructure. It is not the private OTA promotion
-gate. `.github/workflows/image-scan.yml` builds the default communication image
-and uploads an advisory Trivy report.
+`.github/workflows/nightly-e2e.yml` is now manual-only despite the historical
+file name. It can run the local smoke slice plus the generated RMW matrix on
+GitHub-hosted infrastructure, but it is not the private OTA promotion gate.
+`.github/workflows/image-scan.yml` builds the default communication image and
+uploads an advisory Trivy report.
 
 Dependabot is configured for weekly grouped GitHub Actions and Python dependency
 updates.

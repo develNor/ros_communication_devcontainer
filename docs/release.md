@@ -16,7 +16,9 @@ vX.Y.Z
 ```
 
 Tags are cut from a deliberately selected and validated `main` commit (see
-[ci.md](ci.md) for the branch model). Push the tag from that exact commit.
+[ci.md](ci.md) for the branch model). Before promoting a candidate to `main`, a
+maintainer should record the manual full-suite gate result described in
+[testing.md](testing.md). Push the tag from that exact commit.
 
 ## Release Notes
 

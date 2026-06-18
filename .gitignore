@@ -23,3 +23,9 @@ examples/sessions/**/b/**
 examples/sessions/**/a_to_b_topics.txt
 examples/sessions/**/b_to_a_topics.txt
 examples/sessions/**/qos.yaml
+src/rosotacom/resources/examples/sessions/**/a/**
+src/rosotacom/resources/examples/sessions/**/b/**
+src/rosotacom/resources/examples/sessions/**/a_to_b_topics.txt
+src/rosotacom/resources/examples/sessions/**/b_to_a_topics.txt
+src/rosotacom/resources/examples/sessions/**/qos.yaml
+src/rosotacom/resources/examples/session-instances/

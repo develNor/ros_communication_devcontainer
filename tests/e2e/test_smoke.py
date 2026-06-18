@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from rosotacom.cli import VERIFY_HZ_MAX, VERIFY_HZ_MIN, VERIFY_MAX_DELAY_S, sessions_in_tier
+from rosotacom.cli import (
+    EXAMPLE_PROJECT_DIR,
+    SMOKE_HZ_MAX,
+    SMOKE_HZ_MIN,
+    SMOKE_MAX_DELAY_S,
+    local_check_sessions,
+)
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = [
@@ -20,16 +26,18 @@ pytestmark = [
 ]
 
 
-# The single-machine smoke matrix is derived from the per-session capability
-# markers (single_machine: ok) so it cannot drift from the source of truth; the
-# contract test guards both directions. See docs/testing.md.
+# The single-machine smoke matrix is derived from local-check eligibility so it
+# cannot drift from the source of truth. Transport combinations live in
+# tests/sessions/rmw_matrix and are opt-in for the manual full-suite gate.
 def _smoke_id(session_name: str) -> str:
     return session_name.removeprefix("1_heartbeat_").replace("_", "-")
 
 
-SMOKE_SESSIONS = sessions_in_tier("single_machine", {"ok"})
+RMW_MATRIX_DIR = PACKAGE_ROOT / "tests" / "sessions" / "rmw_matrix"
+
+SMOKE_SESSIONS = local_check_sessions()
 HEARTBEAT_SMOKE_SESSIONS = [
-    pytest.param(name, id=_smoke_id(name)) for name in SMOKE_SESSIONS if name.startswith("1_heartbeat_")
+    pytest.param(name, id=_smoke_id(name)) for name in SMOKE_SESSIONS if name.startswith("1_heartbeat")
 ]
 NATIVE_CHATTER_SMOKE_SESSIONS = [
     pytest.param(name, id="native-chatter") for name in SMOKE_SESSIONS if name == "2_native_chatter"
@@ -97,9 +105,9 @@ EXPECTED_ZEN_SIZED_PAYLOAD_CHECKS = (
 # Heartbeat publishers emit at 10 Hz; received rate should stay close to that.
 # The bounds are the shared single source of truth from rosotacom.
 EXPECTED_HEARTBEAT_HZ = 10.0
-HEARTBEAT_HZ_MIN = VERIFY_HZ_MIN
-HEARTBEAT_HZ_MAX = VERIFY_HZ_MAX
-MAX_HEARTBEAT_DELAY_S = VERIFY_MAX_DELAY_S
+HEARTBEAT_HZ_MIN = SMOKE_HZ_MIN
+HEARTBEAT_HZ_MAX = SMOKE_HZ_MAX
+MAX_HEARTBEAT_DELAY_S = SMOKE_MAX_DELAY_S
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _ERROR_PATTERNS = (
@@ -138,6 +146,25 @@ def copied_example_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
     project = tmp_path_factory.mktemp("rosotacom") / "examples"
 
     _run([sys.executable, "-m", "rosotacom", "examples", "create", str(project)], timeout=60)
+    return project
+
+
+@pytest.fixture(scope="session")
+def rmw_matrix_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    project = tmp_path_factory.mktemp("rosotacom") / "rmw-matrix"
+    project.mkdir()
+    (project / "rosotacom.yaml").write_text(
+        "\n".join(
+            [
+                f"ros2docker_config: {EXAMPLE_PROJECT_DIR / 'ros2docker.json'}",
+                f"session_configs_dir: {RMW_MATRIX_DIR}",
+                f"data_dict: {EXAMPLE_PROJECT_DIR / 'data_dict.json'}",
+                "session_instances_dir: session-instances",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     return project
 
 
@@ -276,6 +303,32 @@ def test_local_heartbeat_smoke_matrix_from_copied_example_project(
     session_name: str,
 ) -> None:
     result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_HEARTBEAT_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    assert (artifact_dir / "config" / "a" / "plugin.yaml").is_file()
+    assert (artifact_dir / "config" / "b" / "plugin.yaml").is_file()
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+
+
+@pytest.mark.skipif(
+    os.environ.get("ROSOTACOM_RUN_FULL_E2E") != "1",
+    reason="Full RMW matrix smoke requires ROSOTACOM_RUN_FULL_E2E=1.",
+)
+@pytest.mark.parametrize(
+    "session_name",
+    [pytest.param(name, id=_smoke_id(name)) for name in local_check_sessions(RMW_MATRIX_DIR)],
+)
+def test_full_rmw_heartbeat_smoke_matrix(
+    rmw_matrix_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(rmw_matrix_project, session_name), timeout=900)
 
     for expected in EXPECTED_HEARTBEAT_CHECKS:
         assert expected in result.stdout

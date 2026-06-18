@@ -1,8 +1,3 @@
-# Test-tier capability markers (see docs/testing.md).
-test_tiers:
-  single_machine: ok
-  multi_machine: ok
-
 peers:
   a:
     address: "data:machine_a_ip"
@@ -18,6 +13,7 @@ peer_settings:
 shared:
   use_topic_monitor: true
   use_heartbeat: false
+  use_status_overview: true
   ota_domain_id: 48
   rmw: fastdds
 

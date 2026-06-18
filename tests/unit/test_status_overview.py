@@ -513,3 +513,22 @@ def test_pipeline_spec_carries_heartbeat_expect(tmp_path: Path) -> None:
     # The contract applies to both the locally-published and the received heartbeat.
     assert by_dir[("/heartbeat_a", "outbound")]["expect"] == contract
     assert by_dir[("/heartbeat_b", "inbound")]["expect"] == contract
+
+
+def test_heartbeat_monitor_thresholds_overridden_from_expect(tmp_path: Path) -> None:
+    # latency/loss from shared.heartbeat.expect override the heartbeat_in_monitor
+    # status thresholds (delay_bad_ms / loss3_bad_pct).
+    cfg = _heartbeat_cfg()
+    cfg["shared"]["heartbeat"] = {"expect": {"latency_ms": {"max": 150}, "loss_pct": {"max": 3}}}
+    generator.func(session_config_obj=cfg, output_dir=str(tmp_path), force=True)
+    plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert "heartbeat_delay_bad_ms: 150.0" in plugin
+    assert "heartbeat_loss3_bad_pct: 3.0" in plugin
+
+
+def test_heartbeat_monitor_thresholds_default_without_expect(tmp_path: Path) -> None:
+    generator.func(session_config_obj=_heartbeat_cfg(), output_dir=str(tmp_path), force=True)
+    plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    # No override emitted -> the plugin base template defaults apply.
+    assert "heartbeat_delay_bad_ms" not in plugin
+    assert "heartbeat_loss3_bad_pct" not in plugin

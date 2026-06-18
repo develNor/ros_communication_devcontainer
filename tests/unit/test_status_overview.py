@@ -408,3 +408,94 @@ def test_status_cli_json_output(tmp_path: Path, capsys: pytest.CaptureFixture[st
     payload = json.loads(out)
     assert "a" in payload
     assert payload["a"]["topics"][0]["base"] == "/heartbeat_a"
+
+
+# ---------------------------------------------------------------------------
+# per-topic `expect` -> live classification + spec
+# ---------------------------------------------------------------------------
+
+
+def _quality(tmp_path: Path, m: dict, expected_hz, expect) -> tuple:
+    agg = _build({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path)
+    return agg._classify_quality(m, expected_hz, expect)
+
+
+def test_classify_quality_hz_outside_expect_range_is_bad(tmp_path: Path) -> None:
+    assert _quality(tmp_path, {"hz": 3.0, "last_delay_s": 0.01}, None, {"hz": {"min": 5, "max": 20}}) == (
+        core.BAD,
+        "hz",
+    )
+    assert _quality(tmp_path, {"hz": 25.0, "last_delay_s": 0.01}, None, {"hz": {"max": 20}}) == (core.BAD, "hz")
+
+
+def test_classify_quality_latency_over_expect_max_is_bad(tmp_path: Path) -> None:
+    assert _quality(tmp_path, {"hz": 10.0, "last_delay_s": 0.25}, None, {"latency_ms": {"max": 200}}) == (
+        core.BAD,
+        "latency",
+    )
+
+
+def test_classify_quality_within_expect_is_good(tmp_path: Path) -> None:
+    expect = {"hz": {"min": 5, "max": 20}, "latency_ms": {"max": 200}}
+    assert _quality(tmp_path, {"hz": 10.0, "last_delay_s": 0.01}, None, expect) == (core.GOOD, None)
+
+
+def test_classify_quality_without_expect_uses_expected_hz_heuristic(tmp_path: Path) -> None:
+    assert _quality(tmp_path, {"hz": 4.0, "last_delay_s": 0.01}, 10.0, None) == (core.BAD, "hz")
+
+
+def test_build_snapshot_applies_per_topic_expect(tmp_path: Path) -> None:
+    # Full node path: a spec topic carrying `expect` is classified against it and
+    # the contract is surfaced in the snapshot.
+    now = 100.0
+    spec = _outbound_spec()
+    spec["topics"][0]["expect"] = {"hz": {"min": 5, "max": 20}}
+    local = _FakeObserver()
+    ota = _FakeObserver()
+    local.observations["/heartbeat_a"] = _obs(pub=1, last_msg_at=now)  # ~0.33 Hz, below min 5
+    local.observations["/com/out/a/heartbeat_a"] = _obs(pub=1, last_msg_at=now)
+    ota.observations["/ota/a/heartbeat_a"] = _obs(pub=1, graph_only=True)
+
+    agg = core.StatusAggregator(
+        logger=None,
+        spec=spec,
+        output_dir=str(tmp_path),
+        observers_by_domain={"local": local, "ota": ota},
+        liveness_window_s=3.0,
+        stale_after_s=3.0,
+    )
+    snap = agg.build_snapshot(now_mono=now)
+    assert snap["topics"][0]["expect"] == {"hz": {"min": 5, "max": 20}}
+    native = {s["stage"]: s for s in snap["topics"][0]["stages"]}["native"]
+    assert native["quality"] == core.BAD
+    assert native["quality_reason"] == "hz"
+
+
+def test_pipeline_spec_carries_per_topic_expect(tmp_path: Path) -> None:
+    import yaml
+
+    cfg = {
+        "peers": {"a": {"address": "127.0.0.1"}, "b": {"address": "127.0.0.1"}},
+        "peer_settings": {"a": {"domain_id": 46}, "b": {"domain_id": 47}},
+        "shared": {
+            "use_status_overview": True,
+            "rmw": {
+                "local": {"cyclone": {"config": "cyclonedds_minimal.xml"}},
+                "ota": {"cyclone": {"config": "cyclonedds_minimal.xml"}},
+            },
+            "ota_domain_id": 48,
+        },
+        "topics": {
+            "b_to_a": [
+                {
+                    "topic": "/costmap",
+                    "type": "nav_msgs/msg/OccupancyGrid",
+                    "expect": {"hz": {"min": 1, "max": 5}, "latency_ms": {"max": 500}},
+                }
+            ]
+        },
+    }
+    generator.func(session_config_obj=cfg, output_dir=str(tmp_path), force=True)
+    spec = yaml.safe_load((tmp_path / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
+    by_dir = {(t["base"], t["direction"]): t for t in spec["topics"]}
+    assert by_dir[("/costmap", "inbound")]["expect"] == {"hz": {"min": 1, "max": 5}, "latency_ms": {"max": 500}}

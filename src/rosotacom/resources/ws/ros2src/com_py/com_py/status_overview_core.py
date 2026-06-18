@@ -158,7 +158,7 @@ class StatusAggregator:
 
     # -- classification --
     def classify_stage(self, stage: Dict[str, Any], expected_hz: Optional[float],
-                       now_mono: float) -> Dict[str, Any]:
+                       now_mono: float, expect: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         obs = self._obs_for(stage)
         result: Dict[str, Any] = {
             "stage": stage["stage"],
@@ -206,7 +206,7 @@ class StatusAggregator:
             return result
 
         result["state"] = FLOWING
-        quality, reason = self._classify_quality(m, expected_hz)
+        quality, reason = self._classify_quality(m, expected_hz, expect)
         result["quality"] = quality
         result["quality_reason"] = reason
         return result
@@ -258,15 +258,33 @@ class StatusAggregator:
             if source is not None and source["state"] in (FLOWING, STALE):
                 self._copy_inferred_activity(stage_result, source)
 
-    def _classify_quality(self, m: Dict[str, Any], expected_hz: Optional[float]) -> Tuple[str, Optional[str]]:
+    def _classify_quality(
+        self, m: Dict[str, Any], expected_hz: Optional[float], expect: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, Optional[str]]:
+        expect = expect or {}
+        hz_exp = expect.get("hz") or {}
+        lat_exp = expect.get("latency_ms") or {}
+
+        # Latency: a declared `expect.latency_ms.max` overrides the global bad
+        # threshold; the good band stays the default so a tight contract still
+        # surfaces a DEGRADED before BAD where it makes sense.
+        bad_lat = float(lat_exp["max"]) if "max" in lat_exp else self._delay_bad_ms
         delay_ms = (m["last_delay_s"] * 1000.0) if m["last_delay_s"] is not None else None
         if delay_ms is not None:
-            if delay_ms >= self._delay_bad_ms:
+            if delay_ms >= bad_lat:
                 return BAD, "latency"
             if delay_ms > self._delay_good_ms:
                 return DEGRADED, "latency"
-        if expected_hz and expected_hz > 0:
-            hz = m["hz"]
+
+        # Hz: a declared `expect.hz` {min,max} is a hard contract; otherwise fall
+        # back to the derived expected_hz heuristic.
+        hz = m["hz"]
+        if "min" in hz_exp or "max" in hz_exp:
+            if "min" in hz_exp and hz < float(hz_exp["min"]):
+                return BAD, "hz"
+            if "max" in hz_exp and hz > float(hz_exp["max"]):
+                return BAD, "hz"
+        elif expected_hz and expected_hz > 0:
             if hz < 0.5 * expected_hz:
                 return BAD, "hz"
             if hz < 0.8 * expected_hz:
@@ -364,8 +382,9 @@ class StatusAggregator:
 
         for topic_spec in self._spec.get("topics", []):
             expected_hz = topic_spec.get("expected_hz")
+            expect = topic_spec.get("expect")
             stage_results = [
-                self.classify_stage(stage, expected_hz, now_mono)
+                self.classify_stage(stage, expected_hz, now_mono, expect)
                 for stage in topic_spec.get("stages", [])
             ]
             self.infer_graph_only_ota_stages(topic_spec, stage_results)
@@ -379,6 +398,7 @@ class StatusAggregator:
                     "target": topic_spec.get("target"),
                     "type": topic_spec.get("type"),
                     "expected_hz": expected_hz,
+                    "expect": expect,
                     "overall": roll["overall"],
                     "reached_stage": roll["reached_stage"],
                     "blocked_at": roll["blocked_at"],

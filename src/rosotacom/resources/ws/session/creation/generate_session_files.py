@@ -85,6 +85,9 @@ class TopicEntry:
     qos: Optional[Dict[str, Any]]
     zen_qos: Optional[Dict[str, Any]]
     index: int
+    # Declared behavioral contract (hz/latency_ms/loss_pct), surfaced into the
+    # status pipeline spec so the live status overview classifies against it.
+    expect: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1062,6 +1065,7 @@ def _topic_entries(cfg: Dict[str, Any], direction: str) -> List[TopicEntry]:
                     qos=item.get("qos"),
                     zen_qos=item.get("zen_qos"),
                     index=i,
+                    expect=item.get("expect"),
                 )
             )
         else:
@@ -1322,6 +1326,7 @@ def _build_status_pipeline_spec(
                     "target": remote_name,
                     "type": _safe_type(e, p),
                     "expected_hz": _expected_hz(p),
+                    "expect": e.expect,
                     "stages": stages,
                 }
             )
@@ -1381,6 +1386,7 @@ def _build_status_pipeline_spec(
                     "target": local_name,
                     "type": _safe_type(e, p),
                     "expected_hz": _expected_hz(p),
+                    "expect": e.expect,
                     "stages": stages,
                 }
             )

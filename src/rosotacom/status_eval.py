@@ -65,14 +65,20 @@ def evaluate_report(report: dict[str, Any], expect_by_topic: dict[str, dict[str,
             diag = topic.get("diagnosis")
             failures.append(f"[{peer}] {base}: status {overall}" + (f" ({diag})" if diag else ""))
             continue
-        # Expectations are about delivered behavior, observed on the inbound side.
+        stage = _final_stage(topic)
+        # Lean on the session's own verdict: the status overview now classifies
+        # each stage against the topic's `expect`, so a BAD stage means the
+        # delivered behavior violates the declared contract.
+        if stage and stage.get("quality") == "BAD":
+            reason = stage.get("quality_reason")
+            detail = f": {reason}" if reason else ""
+            failures.append(f"[{peer}] {base}: contract violated (quality BAD{detail})")
+            continue
+        # Belt-and-suspenders: also assert raw metrics against `expect` directly,
+        # for a precise message and independence from the monitor's thresholds.
         expect = expect_by_topic.get(base)
-        if expect and topic.get("direction") == "inbound":
-            stage = _final_stage(topic)
-            if stage is None:
-                failures.append(f"[{peer}] {base}: no observable stage to check expectations")
-            else:
-                failures += _check_expect(peer, base, stage, expect)
+        if expect and topic.get("direction") == "inbound" and stage is not None:
+            failures += _check_expect(peer, base, stage, expect)
     return failures
 
 

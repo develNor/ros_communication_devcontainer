@@ -301,13 +301,14 @@ If `use_status_overview: true`:
   - `events.jsonl` — append-only, one line per state transition.
 - Read it from the host with `rosotacom status [<session>] [--json] [--watch]`.
 
-Phase 1 observes only what the local peer's ROS graph exposes: outbound topics
-up to the `/ota` topic this peer publishes ("sent"), and inbound topics from the
-received `/ota` topic through the republished application topic. Remote-side
-confirmation is reserved for a later phase and reported as `unknown`. OTA-domain
-observation assumes same-host discovery of the OTA `ROS_DOMAIN_ID` (works for the
-bundled DDS / `zenoh_ros2dds` examples; native `rmw_zenoh` OTA is not observed in
-Phase 1).
+Phase 1 samples local-domain stages directly. OTA-domain observation is
+graph-only: the status node never subscribes to OTA payload topics, so enabling
+the overview cannot create an additional OTA data stream. OTA activity is
+inferred from the adjacent local stage plus publisher discovery and is marked as
+inferred in the status output. Remote-side confirmation is reserved for a later
+phase and reported as `unknown`. OTA graph observation assumes same-host
+discovery of the OTA `ROS_DOMAIN_ID` (works for the bundled DDS /
+`zenoh_ros2dds` examples; native `rmw_zenoh` OTA is not observed in Phase 1).
 
 ##### Phase 2 (planned, not implemented)
 

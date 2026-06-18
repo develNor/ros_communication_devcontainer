@@ -24,6 +24,7 @@ shared:
   use_heartbeat: true
   # Maintain a continuously-updated per-topic pipeline status overview
   # (status.json / status.txt / events.jsonl under logs/<peer>/status/).
+  # OTA stages are graph-only; this does not add OTA payload subscriptions.
   # Inspect it from the host with: rosotacom status 1_heartbeat_status
   use_status_overview: true
   rmw:

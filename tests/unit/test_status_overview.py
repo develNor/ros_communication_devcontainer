@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WS = REPO_ROOT / "src" / "rosotacom" / "resources" / "ws"
 GENERATOR_PY = WS / "session" / "creation" / "generate_session_files.py"
 STATUS_CORE_PY = WS / "ros2src" / "com_py" / "com_py" / "status_overview_core.py"
+STATUS_NODE_PY = WS / "ros2src" / "com_py" / "com_py" / "status_overview.py"
 
 
 def _load_module(path: Path, name: str) -> ModuleType:
@@ -109,6 +110,14 @@ def test_use_status_overview_must_be_bool() -> None:
         generator._validate_session_template_cfg(cfg)
 
 
+def test_ota_observer_is_graph_only() -> None:
+    """Regression: status monitoring must never create an OTA DataReader."""
+    source = STATUS_NODE_PY.read_text(encoding="utf-8")
+    assert "subscribe_to_messages=False" in source
+    assert "if not self._subscribe_to_messages:" in source
+    assert 'local_topics.update(by_domain.get("ota"' not in source
+
+
 # ---------------------------------------------------------------------------
 # state classification + rollup
 # ---------------------------------------------------------------------------
@@ -160,8 +169,13 @@ def _build(observers: dict, output_dir: Path) -> core.StatusAggregator:
     )
 
 
-def _obs(pub: int = 0, last_msg_at: float | None = None) -> core.StageObservation:
-    o = core.StageObservation()
+def _obs(
+    pub: int = 0,
+    last_msg_at: float | None = None,
+    *,
+    graph_only: bool = False,
+) -> core.StageObservation:
+    o = core.StageObservation(graph_only=graph_only)
     o.pub_count = pub
     o.sub_count = 1 if pub else 0
     if last_msg_at is not None:
@@ -175,7 +189,7 @@ def test_rollup_ok_when_all_stages_flow(tmp_path: Path) -> None:
     ota = _FakeObserver()
     local.observations["/heartbeat_a"] = _obs(pub=1, last_msg_at=now)
     local.observations["/com/out/a/heartbeat_a"] = _obs(pub=1, last_msg_at=now)
-    ota.observations["/ota/a/heartbeat_a"] = _obs(pub=1, last_msg_at=now)
+    ota.observations["/ota/a/heartbeat_a"] = _obs(pub=1, graph_only=True)
 
     agg = _build({"local": local, "ota": ota}, tmp_path)
     snap = agg.build_snapshot(now_mono=now)
@@ -184,7 +198,60 @@ def test_rollup_ok_when_all_stages_flow(tmp_path: Path) -> None:
     assert topic["reached_stage"] == "ota_sent"
     assert topic["blocked_at"] is None
     assert "Phase 1" in topic["diagnosis"]
+    ota_stage = {s["stage"]: s for s in topic["stages"]}["ota_sent"]
+    assert ota_stage["state"] == core.FLOWING
+    assert ota_stage["observation"] == "graph"
+    assert ota_stage["inferred_from"] == "/com/out/a/heartbeat_a"
+    assert ota_stage["messages_total"] == 1
     assert snap["summary"]["OK"] == 1
+
+
+def test_inbound_ota_receipt_is_inferred_from_com_in(tmp_path: Path) -> None:
+    now = 100.0
+    spec = {
+        "peer": "a",
+        "remote": "b",
+        "topics": [
+            {
+                "base": "/heartbeat_b",
+                "direction": "inbound",
+                "stages": [
+                    {
+                        "stage": "ota_recv",
+                        "topic": "/ota/b/heartbeat_b",
+                        "domain": "ota",
+                    },
+                    {
+                        "stage": "com_in",
+                        "topic": "/com/in/b/heartbeat_b",
+                        "domain": "local",
+                    },
+                    {
+                        "stage": "app_in",
+                        "topic": "/heartbeat_b",
+                        "domain": "local",
+                    },
+                ],
+            }
+        ],
+    }
+    local = _FakeObserver()
+    ota = _FakeObserver()
+    ota.observations["/ota/b/heartbeat_b"] = _obs(pub=1, graph_only=True)
+    local.observations["/com/in/b/heartbeat_b"] = _obs(pub=1, last_msg_at=now)
+    local.observations["/heartbeat_b"] = _obs(pub=1, last_msg_at=now)
+
+    agg = core.StatusAggregator(
+        logger=None,
+        spec=spec,
+        output_dir=str(tmp_path),
+        observers_by_domain={"local": local, "ota": ota},
+    )
+    topic = agg.build_snapshot(now_mono=now)["topics"][0]
+    ota_stage = {s["stage"]: s for s in topic["stages"]}["ota_recv"]
+    assert topic["overall"] == core.OK
+    assert ota_stage["state"] == core.FLOWING
+    assert ota_stage["inferred_from"] == "/com/in/b/heartbeat_b"
 
 
 def test_rollup_partial_identifies_first_broken_stage(tmp_path: Path) -> None:
@@ -247,7 +314,7 @@ def test_write_produces_artifacts_and_transition_events(tmp_path: Path) -> None:
     ota = _FakeObserver()
     local.observations["/heartbeat_a"] = _obs(pub=1, last_msg_at=now)
     local.observations["/com/out/a/heartbeat_a"] = _obs(pub=1, last_msg_at=now)
-    ota.observations["/ota/a/heartbeat_a"] = _obs(pub=0)
+    ota.observations["/ota/a/heartbeat_a"] = _obs(pub=0, graph_only=True)
 
     agg = _build({"local": local, "ota": ota}, tmp_path)
     # First write establishes baseline (no transition events emitted).
@@ -257,7 +324,7 @@ def test_write_produces_artifacts_and_transition_events(tmp_path: Path) -> None:
     assert not (tmp_path / "events.jsonl").exists()
 
     # Now the ota stage starts flowing -> overall changes -> one event row.
-    ota.observations["/ota/a/heartbeat_a"] = _obs(pub=1, last_msg_at=now)
+    ota.observations["/ota/a/heartbeat_a"] = _obs(pub=1, graph_only=True)
     assert agg.write(now_mono=now) == 1
     events_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(events_text) == 1

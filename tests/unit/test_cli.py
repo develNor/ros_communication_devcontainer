@@ -248,14 +248,20 @@ def test_new_verification_verbs_dispatch_not_wrapped_in_start(monkeypatch: pytes
 
         return _cmd
 
-    for name in ("verify_command", "probe_publish_command", "probe_check_command"):
+    for name in ("verify_command", "probe_publish_command", "probe_check_command", "publish_test_topics_command"):
         monkeypatch.setattr(rosotacom, name, record(name))
 
     assert rosotacom.main(["verify", "1_heartbeat", "--identity", "a"]) == 0
     assert rosotacom.main(["probe-publish", "1_heartbeat", "--identity", "a"]) == 0
     assert rosotacom.main(["probe-check", "1_heartbeat", "--identity", "b", "--expect", "absent"]) == 0
+    assert rosotacom.main(["publish-test-topics", "1_heartbeat", "--identity", "b"]) == 0
 
-    assert [n for n, _ in seen] == ["verify_command", "probe_publish_command", "probe_check_command"]
+    assert [n for n, _ in seen] == [
+        "verify_command",
+        "probe_publish_command",
+        "probe_check_command",
+        "publish_test_topics_command",
+    ]
     assert all(args.session_dir == "1_heartbeat" for _, args in seen)
     assert seen[2][1].expect == "absent"
 
@@ -650,8 +656,60 @@ def test_smoke_crossed_topics_include_native_chatter_direction() -> None:
     assert [(s.source_peer_key, s.receiver_peer_key, s.publish_topic) for s in rosotacom._smoke_publish_specs(cfg)] == [
         ("b", "a", "/chatter")
     ]
+    assert [
+        (s.source_peer_key, s.receiver_peer_key, s.publish_topic)
+        for s in rosotacom._smoke_publish_specs(cfg, source_peer_key="b")
+    ] == [("b", "a", "/chatter")]
+    assert rosotacom._smoke_publish_specs(cfg, source_peer_key="a") == []
     assert "export ROS_DOMAIN_ID=46" in rosotacom._smoke_ros_setup("/config", cfg, "a")
     assert "export ROS_DOMAIN_ID=47" in rosotacom._smoke_ros_setup("/config", cfg, "b")
+
+
+def test_publish_test_topics_command_starts_and_stops_identity_publishers(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "2_native_chatter" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    started: list[tuple[str, float | None]] = []
+    stopped: list[str] = []
+
+    monkeypatch.setattr(rosotacom, "_resolve_running_peer", lambda args, identity: ("container_b", "source ros", cfg))
+
+    def fake_start(
+        containers: dict[str, str],
+        ros_setups: dict[str, str],
+        cfg: dict[str, object],
+        **kwargs: object,
+    ) -> list[rosotacom.SmokeTopicSpec]:
+        started.append((containers["b"], kwargs.get("duration") if isinstance(kwargs.get("duration"), float) else None))
+        return rosotacom._smoke_publish_specs(cfg, source_peer_key="b")
+
+    def fake_stop(containers: dict[str, str], specs: list[rosotacom.SmokeTopicSpec]) -> None:
+        stopped.extend([containers[s.source_peer_key] for s in specs])
+
+    monkeypatch.setattr(rosotacom, "_start_smoke_topic_publishers", fake_start)
+    monkeypatch.setattr(rosotacom, "_stop_smoke_topic_publishers", fake_stop)
+
+    assert (
+        rosotacom.publish_test_topics_command(
+            argparse.Namespace(identity="b", duration=42.0, stop=False, session_dir="2_native_chatter")
+        )
+        == 0
+    )
+    assert started == [("container_b", 42.0)]
+    assert "Started 1 test topic publisher" in capsys.readouterr().out
+
+    assert (
+        rosotacom.publish_test_topics_command(
+            argparse.Namespace(identity="b", duration=42.0, stop=True, session_dir="2_native_chatter")
+        )
+        == 0
+    )
+    assert stopped == ["container_b"]
 
 
 def test_smoke_crossed_topics_keep_heartbeat_labels() -> None:

@@ -86,7 +86,20 @@ def test_session_test_tier_markers_drive_both_test_matrices() -> None:
     # cyclone-ota-tuned hides local topics on a shared domain (no per-peer domain
     # split), so it is only provable multi-machine.
     assert markers["1_heartbeat_cyclone-ota-tuned"] == {"single_machine": "na", "multi_machine": "required"}
-    assert "1_heartbeat_cyclone-ota-tuned" in sessions_in_tier("multi_machine", {"ok", "required"})
+    assert set(sessions_in_tier("multi_machine", {"ok", "required"})) == {
+        "1_heartbeat_cyclone-local_fastdds-ota",
+        "1_heartbeat_cyclone-local_zenoh-ros2dds-ota",
+        "1_heartbeat_cyclone-ota",
+        "1_heartbeat_cyclone-ota-tuned",
+        "1_heartbeat_fastdds",
+        "1_heartbeat_fastdds-local_cyclone-ota",
+        "1_heartbeat_zen-endpoints",
+        "2_native_chatter",
+        "3_comp_occ_grid",
+        "4_comp_occ_grid_zen",
+        "5_sized_payload",
+        "6_sized_payload_zen",
+    }
 
     # The smoke test must derive its matrix from the markers, not hardcode it.
     e2e_smoke = (PACKAGE_ROOT / "tests" / "e2e" / "test_smoke.py").read_text(encoding="utf-8")

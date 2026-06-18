@@ -2,4 +2,5 @@ recursive-include src/rosotacom/resources *
 include src/rosotacom/py.typed
 
 exclude .gitignore
-global-exclude __pycache__ *.py[cod] .DS_Store
+prune src/rosotacom/resources/examples/session-instances
+global-exclude __pycache__ *.py[cod] .DS_Store .session_readonly.yaml

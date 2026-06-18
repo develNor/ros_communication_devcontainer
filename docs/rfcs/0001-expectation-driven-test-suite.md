@@ -1,6 +1,6 @@
 # RFC 0001 — Expectation-driven, OTA-first test suite
 
-**Status:** Draft · **Scope:** test/example architecture · supersedes the marker
+**Status:** Implemented · **Scope:** test/example architecture · supersedes the marker
 model in `docs/testing.md`
 
 ## Summary
@@ -12,8 +12,9 @@ Separate **examples** (few, curated, teaching) from **test-configs** (exhaustive
 generated), and run the full suite as a **manual gate before promotion** rather
 than on every commit.
 
-This PR lands the load-bearing slice (the `expect` schema + `rosotacom test`
-reading the session's self-report); the rest is specified here for follow-ups.
+The implementation now includes the `expect` schema, `rosotacom test` reading the
+session self-report, marker migration, curated examples, generated RMW
+test-configs, and the manual full-suite promotion gate.
 
 ## Motivation
 
@@ -63,7 +64,7 @@ topics:
       expect:
         hz:         { min: 1, max: 5 }    # formalizes today's "2–5hz (OK)" comments
         latency_ms: { max: 300 }
-        loss_pct:   { max: 5 }            # (planned)
+        loss_pct:   { max: 5 }            # heartbeat payloads only
 ```
 
 It belongs in the user-facing `session-definition.yaml` because it has a **runtime
@@ -134,17 +135,15 @@ harness first).
 `main`** (decision 4). Cadence membership is a framework/dir decision, not another
 per-session marker.
 
-## What this PR prototypes vs. what is planned
+## Implementation status
 
-**This PR**
+**Implemented**
 - `expect` accepted on topic entries (`generate_session_files.py` validator; ignored
   by generation).
 - `status_eval.py`: pure evaluator of `status.json` against `expect`.
 - `rosotacom test [session]`: reads the latest instance's per-peer `status.json` and
   asserts delivery + `expect`. Exit non-zero on any failure.
 - Unit tests for the evaluator; validated end-to-end against a live local session.
-
-**Landed since (PR closing the live loop)**
 - Per-topic `expect` flows into the `pipeline_spec` and the status overview now
   classifies each stage against it (`status_overview_core._classify_quality`); the
   contract is surfaced in `status.json` (`quality` / `expect`).
@@ -154,11 +153,14 @@ per-session marker.
   and the dedicated `heartbeat_in_monitor`: its `delay_bad_ms` / `loss3_bad_pct`
   come from `latency_ms.max` / `loss_pct.max`, and `expected_hz` tracks the
   publish rate. This is also where `loss_pct` is enforced.
-
-**Follow-ups**
-- Marker migration (drop `multi_machine`; derive/`local_check`).
-- Examples curation + generated RMW matrix; `tests/sessions/` split.
-- Wire the manual full-suite promotion gate; fold `verify` into `rosotacom test`.
+- The two-axis `test_tiers` marker is retired. OTA membership is default; the
+  local fast-check is derived from per-peer domains, with `local_check: false`
+  available for OTA-only exceptions.
+- The transport-specific heartbeat directories moved out of packaged examples
+  into the generated `tests/sessions/rmw_matrix` test-config set.
+- `verify` is retired. Delivery uses `rosotacom test`; local-only isolation stays
+  a framework probe via `probe-publish` / `probe-check`.
+- The full suite is a manual promotion gate rather than a scheduled job.
 
 **Not feasible as written**
 - `loss_pct` for *non-heartbeat* topics: ROS 2 messages carry no sequence number

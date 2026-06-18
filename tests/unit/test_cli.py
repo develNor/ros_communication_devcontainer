@@ -158,7 +158,7 @@ def test_examples_create_copies_project_and_refuses_overwrite(
     assert (target / "ros2docker.json").is_file()
     assert (target / "data_dict.json").is_file()
     assert "session-instances/" in (target / ".gitignore").read_text(encoding="utf-8")
-    assert (target / "sessions" / "1_heartbeat_fastdds" / "session-definition.yaml").is_file()
+    assert (target / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
     assert not (target / "__init__.py").exists()
     assert "Copied rosotacom examples" in capsys.readouterr().out
 
@@ -196,6 +196,63 @@ def test_session_name_resolves_through_configured_sessions_dir(tmp_path: Path) -
     assert resolved.host_dir == session.resolve()
     assert resolved.container_dir == "/session/definitions/1_heartbeat"
     assert resolved.source == "session_configs"
+
+
+def test_local_check_derives_from_domains_and_allows_opt_out(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    derived = sessions / "derived"
+    derived.mkdir(parents=True)
+    derived.joinpath("session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "peers:",
+                "  a: { address: 127.0.0.1 }",
+                "  b: { address: 127.0.0.1 }",
+                "peer_settings:",
+                "  a: { domain_id: 46 }",
+                "  b: { domain_id: 47 }",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    opted_out = sessions / "opted_out"
+    opted_out.mkdir()
+    opted_out.joinpath("session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "local_check: false",
+                "peers:",
+                "  a: { address: 127.0.0.1 }",
+                "  b: { address: 127.0.0.1 }",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    shared_domain = sessions / "shared_domain"
+    shared_domain.mkdir()
+    shared_domain.joinpath("session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "peers:",
+                "  a: { address: 127.0.0.1 }",
+                "  b: { address: 127.0.0.1 }",
+                "shared:",
+                "  local_domain_id: 46",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert rosotacom.session_local_checks(sessions) == {
+        "derived": True,
+        "opted_out": False,
+        "shared_domain": False,
+    }
+    assert rosotacom.local_check_sessions(sessions) == ["derived"]
+    assert set(rosotacom.ota_suite_sessions(sessions)) == {"derived", "opted_out", "shared_domain"}
 
 
 def test_example_loopback_data_dict_resolves() -> None:
@@ -236,8 +293,8 @@ def test_positional_session_defaults_to_start(monkeypatch: pytest.MonkeyPatch) -
     assert calls[0].identity == "a"
 
 
-def test_new_verification_verbs_dispatch_not_wrapped_in_start(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Regression guard: verify/probe-* must be in main()'s command set, otherwise
+def test_probe_verbs_dispatch_not_wrapped_in_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression guard: probe-* must be in main()'s command set, otherwise
     # the "bare positional -> start" shim rewrites them as `start <verb> ...`.
     seen: list[tuple[str, argparse.Namespace]] = []
 
@@ -248,22 +305,20 @@ def test_new_verification_verbs_dispatch_not_wrapped_in_start(monkeypatch: pytes
 
         return _cmd
 
-    for name in ("verify_command", "probe_publish_command", "probe_check_command", "publish_test_topics_command"):
+    for name in ("probe_publish_command", "probe_check_command", "publish_test_topics_command"):
         monkeypatch.setattr(rosotacom, name, record(name))
 
-    assert rosotacom.main(["verify", "1_heartbeat", "--identity", "a"]) == 0
     assert rosotacom.main(["probe-publish", "1_heartbeat", "--identity", "a"]) == 0
     assert rosotacom.main(["probe-check", "1_heartbeat", "--identity", "b", "--expect", "absent"]) == 0
     assert rosotacom.main(["publish-test-topics", "1_heartbeat", "--identity", "b"]) == 0
 
     assert [n for n, _ in seen] == [
-        "verify_command",
         "probe_publish_command",
         "probe_check_command",
         "publish_test_topics_command",
     ]
     assert all(args.session_dir == "1_heartbeat" for _, args in seen)
-    assert seen[2][1].expect == "absent"
+    assert seen[1][1].expect == "absent"
 
 
 def test_start_and_stop_compat_entrypoints_prefix_commands(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -602,6 +657,7 @@ def test_stop_list_doctor_and_smoke_host_flows(
     # (start/stop/network), so stub the shared verification helpers as passing.
     monkeypatch.setattr(rosotacom, "_verify_received_topics", lambda *args, **kwargs: [])
     monkeypatch.setattr(rosotacom, "_verify_isolation", lambda *args, **kwargs: [])
+    monkeypatch.setattr(rosotacom, "test_command", lambda args: 0)
     assert (
         rosotacom.smoke(
             argparse.Namespace(

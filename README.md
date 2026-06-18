@@ -141,10 +141,10 @@ Run `rosotacom` on each peer with the same active setup but a different identity
 
 ```bash
 # on peer "a"
-rosotacom start 1_heartbeat_cyclone-ota --identity a
+rosotacom start 1_heartbeat --identity a
 
 # on peer "b"
-rosotacom start 1_heartbeat_cyclone-ota --identity b
+rosotacom start 1_heartbeat --identity b
 ```
 
 `rosotacom` reads the static session input and creates generated files under `session-instances/<date>/<session>_<timestamp>_<id>/config/`, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`. Catmux pane output is logged under the same instance in `logs/<peer>/catmux/`.
@@ -168,7 +168,7 @@ rosotacom smoke
 To smoke-test one specific configured session locally, pass its name:
 
 ```bash
-rosotacom smoke 1_heartbeat_cyclone-ota
+rosotacom smoke 1_heartbeat
 ```
 
 The smoke test verifies both directions through the communication path: it waits
@@ -231,19 +231,18 @@ cd scripts/2_native_chatter/machine_a
 ./run_communication.sh
 ```
 
-The `sessions/` directory contains the built-in session definitions:
+The `sessions/` directory contains curated built-in session definitions:
 
-- `1_heartbeat_fastdds`: minimal heartbeat exchange over FastDDS
-- `1_heartbeat_cyclone-ota`: heartbeat with CycloneDDS OTA config
-- `1_heartbeat_zen-endpoints`: heartbeat with native Zenoh connected endpoints
-- `1_heartbeat_fastdds-local_cyclone-ota`: local FastDDS with CycloneDDS OTA config
-- `1_heartbeat_cyclone-local_fastdds-ota`: local CycloneDDS with FastDDS OTA
-- `1_heartbeat_cyclone-local_zenoh-ros2dds-ota`: local CycloneDDS with Zenoh-ROS2DDS OTA
+- `1_heartbeat`: minimal heartbeat exchange
+- `1_heartbeat_status`: heartbeat exchange with the live status overview enabled
 - `2_native_chatter`: bridge `/chatter` from `machine_b` to `machine_a`
 - `3_comp_occ_grid`: compressed occupancy grid over DDS
 - `4_comp_occ_grid_zen`: compressed occupancy grid through Zenoh
 - `5_sized_payload`: sized payload test over DDS
 - `6_sized_payload_zen`: sized payload test through Zenoh
+
+Transport-combination coverage lives under `tests/sessions/rmw_matrix` and is
+generated from `tests/sessions/generate_rmw_matrix.py`.
 
 ## Development
 

@@ -74,7 +74,7 @@ _package-smoke:
 	    "py.typed",
 	    "resources/ros2docker.json.example",
 	    "resources/examples/rosotacom.yaml",
-	    "resources/examples/sessions/1_heartbeat_fastdds/session-definition.yaml",
+	    "resources/examples/sessions/1_heartbeat/session-definition.yaml",
 	    "resources/ws/session/creation/run_session.py",
 	    "resources/ws/ros2src/com_msgs/msg/Heartbeat.msg",
 	)

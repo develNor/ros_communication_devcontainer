@@ -9,7 +9,7 @@ import rosotacom.cli as cli
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_packaged_resources_include_cli_marker_examples_and_runtime_workspace() -> None:
+def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> None:
     package = resources.files("rosotacom")
 
     expected = (
@@ -19,8 +19,8 @@ def test_packaged_resources_include_cli_marker_examples_and_runtime_workspace() 
         "resources/examples/.gitignore",
         "resources/examples/ros2docker.json",
         "resources/examples/data_dict.json",
-        "resources/examples/sessions/1_heartbeat_fastdds/session-definition.yaml",
-        "resources/examples/sessions/1_heartbeat_fastdds/a/domain_bridge.yaml",
+        "resources/examples/sessions/1_heartbeat/session-definition.yaml",
+        "resources/examples/sessions/1_heartbeat_status/session-definition.yaml",
         "resources/ws/session/creation/run_session.py",
         "resources/ws/session/creation/catmux_log_setup.sh",
         "resources/ws/session/creation/strip_ansi.py",

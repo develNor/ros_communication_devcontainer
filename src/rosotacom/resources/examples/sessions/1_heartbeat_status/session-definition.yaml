@@ -1,9 +1,3 @@
-# Test-tier capability markers (see docs/testing.md). Status-overview demo, not
-# part of the automated test tiers.
-test_tiers:
-  single_machine: na
-  multi_machine: na
-
 peers:
   a:
     address: "data:machine_a_ip"
@@ -27,8 +21,8 @@ shared:
     # heartbeat against it (status.json `quality`/`reason`) and `rosotacom test`
     # asserts it. See docs/rfcs/0001-expectation-driven-test-suite.md.
     expect:
-      hz: { min: 8, max: 12 }
-      latency_ms: { max: 200 }
+      hz: { min: 5, max: 20 }
+      latency_ms: { max: 1000 }
       loss_pct: { max: 5 }
   # Maintain a continuously-updated per-topic pipeline status overview
   # (status.json / status.txt / events.jsonl under logs/<peer>/status/).

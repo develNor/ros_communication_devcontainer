@@ -40,6 +40,9 @@ ci-success
 The merge gate runs Python 3.10 through 3.14 non-Docker checks, package
 validation, and the Docker heartbeat smoke matrix:
 
+Python 3.10–3.14 are supported for the host CLI; Python 3.12 is the reference
+interpreter for packaging and Docker E2E jobs.
+
 ```bash
 just lint
 just typecheck

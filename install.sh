@@ -45,9 +45,26 @@ python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install "$ROS2DOCKER_SPEC"
 "$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR"
 
+cat >> "$VENV_DIR/bin/activate" <<'EOF'
+
+# >>> rosotacom shell completion >>>
+# Completion follows the rosotacom executable currently selected by PATH, so
+# activating another checkout automatically switches completion to that version.
+case $- in
+  *i*)
+    if [ -n "${ZSH_VERSION:-}" ]; then
+      eval "$("$VIRTUAL_ENV/bin/rosotacom" completion zsh)"
+    elif [ -n "${BASH_VERSION:-}" ]; then
+      eval "$("$VIRTUAL_ENV/bin/rosotacom" completion bash)"
+    fi
+    ;;
+esac
+# <<< rosotacom shell completion <<<
+EOF
+
 echo "Installed rosotacom into: $VENV_DIR"
 echo
-echo "Activate it with:"
+echo "Activate it (including shell completion) with:"
 echo "  source \"$VENV_DIR/bin/activate\""
 echo
 echo "Try:"

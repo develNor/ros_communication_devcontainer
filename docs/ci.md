@@ -6,18 +6,20 @@ together, see [testing.md](testing.md).
 
 ## Branch model
 
-Work flows through one linear history in three tiers:
+This shared codebase is used by repositories with different default branches,
+but one stable release line:
 
-- topic PRs are gated into **`develop`** by the merge gate below
-  (single-machine-proven);
-- **`develop`** is promoted to **`main`** by an external multi-machine suite
-  (multi-machine-proven); `main` is the default branch and the release line, and
-  is only ever advanced by that promotion, so it stays a fast-forward of
-  `develop`;
+- topic PRs are gated into the repository's active development branch by the
+  GitHub checks below;
+- **`main`** is the stable release line;
+- moving development work to `main` is a deliberate maintainer operation and
+  may require an external OTA gate;
 - releases are tags `vX.Y.Z` cut from `main` (see [release.md](release.md)).
 
-The multi-machine tier is not part of this repository's public CI; it runs on an
-external runner described generically in [testing.md](testing.md).
+The OTA tier is not part of this repository's public CI. An operator-supplied
+external runner may provide it as a manual promotion gate, as described
+generically in [testing.md](testing.md). A commit, mirror update, or green public
+CI run does not by itself authorize an external runner or a `main` promotion.
 
 ## Pull Requests
 
@@ -64,11 +66,12 @@ config, catmux pane logs, Docker logs when available, and the smoke verification
 log under `session-instances/`; collect that directory as the first debugging
 artifact when an E2E job fails.
 
-## Nightly And Maintenance
+## Scheduled And Maintenance Checks
 
 `.github/workflows/nightly-e2e.yml` runs Docker E2E on a schedule and by manual
-dispatch. `.github/workflows/image-scan.yml` builds the default communication
-image and uploads an advisory Trivy report.
+dispatch on GitHub-hosted infrastructure. It is not the private OTA promotion
+gate. `.github/workflows/image-scan.yml` builds the default communication image
+and uploads an advisory Trivy report.
 
 Dependabot is configured for weekly grouped GitHub Actions and Python dependency
 updates.

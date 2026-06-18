@@ -686,6 +686,61 @@ def test_smoke_crossed_topics_include_compressed_occupancy_grid_pipeline() -> No
     assert "width: 4" in rosotacom._smoke_publish_message(final.publish_type)
 
 
+def test_smoke_crossed_topics_include_zenoh_compressed_occupancy_grid_pipeline() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "4_comp_occ_grid_zen" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, "a") if "costmap" in s.topic]
+
+    assert [(s.topic, s.label) for s in specs] == [
+        ("/com/in/b/costmap/costmap/restamped/bz2", "b->a inbound bridge topic"),
+        ("/costmap/costmap/restamped", "b->a final topic"),
+    ]
+    assert specs[-1].publish_type == "nav_msgs/msg/OccupancyGrid"
+
+
+@pytest.mark.parametrize(
+    ("session_name", "receiver", "expected_topics"),
+    [
+        (
+            "5_sized_payload",
+            "b",
+            ["/com/in/a/size_test_a/ota_stamped", "/size_test_a"],
+        ),
+        (
+            "6_sized_payload_zen",
+            "b",
+            ["/com/in/a/size_test_a", "/size_test_a"],
+        ),
+    ],
+)
+def test_smoke_crossed_topics_include_sized_payload_pipelines(
+    session_name: str,
+    receiver: str,
+    expected_topics: list[str],
+) -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / session_name / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, receiver) if "size_test" in s.topic]
+
+    assert [s.topic for s in specs] == expected_topics
+    final = specs[-1]
+    assert final.publish_topic == "/size_test_a"
+    assert final.publish_type == "com_msgs/msg/SizedPayload"
+    assert final.expected_size == 66000
+    command = rosotacom._smoke_publisher_command(final, "source ros", 180.0)
+    assert "ros2 run com_py sized_publisher" in command
+    assert "-p topic:=/size_test_a" in command
+    assert "-p size:=66000" in command
+
+
 def test_run_session_generates_into_instance_config_without_touching_static_source(tmp_path: Path) -> None:
     from session.creation import run_session
 

@@ -6,6 +6,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 DEPENDABOT_PATH = PACKAGE_ROOT / ".github" / "dependabot.yml"
 IMAGE_SCAN_PATH = PACKAGE_ROOT / ".github" / "workflows" / "image-scan.yml"
 MERGE_GATE_PATH = PACKAGE_ROOT / ".github" / "workflows" / "pr-merge-gate.yml"
+RELEASE_PATH = PACKAGE_ROOT / ".github" / "workflows" / "release.yml"
 
 
 def test_dependabot_groups_weekly_actions_and_python_updates() -> None:
@@ -43,6 +44,20 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     assert "just test-e2e-smoke" in merge_gate
 
 
+def test_release_publishes_only_for_a_version_tag_via_repository_configuration() -> None:
+    release = RELEASE_PATH.read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in release
+    assert "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" in release
+    assert "repository-url: ${{ vars.PYPI_PUBLISH_URL }}" in release
+    assert "PYPI_PUBLISH_URL is not configured" in release
+    assert "PYPI_PUBLISH_URL must be an HTTPS endpoint" in release
+    assert "name: release" in release
+    assert "publish-testpypi" not in release
+    assert "https://upload.pypi.org" not in release
+    assert "https://test.pypi.org" not in release
+
+
 def test_session_test_tier_markers_drive_both_test_matrices() -> None:
     """Every session declares test_tiers; the single-machine smoke matrix and the
     multi-machine set are derived from those markers (the single source of truth),
@@ -63,6 +78,9 @@ def test_session_test_tier_markers_drive_both_test_matrices() -> None:
         "1_heartbeat_cyclone-local_zenoh-ros2dds-ota",
         "2_native_chatter",
         "3_comp_occ_grid",
+        "4_comp_occ_grid_zen",
+        "5_sized_payload",
+        "6_sized_payload_zen",
     }
 
     # cyclone-ota-tuned hides local topics on a shared domain (no per-peer domain

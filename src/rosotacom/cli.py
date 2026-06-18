@@ -131,6 +131,7 @@ class SmokeTopicSpec:
     hz_min: float | None = None
     hz_max: float | None = None
     max_delay_s: float | None = None
+    expected_size: int | None = None
 
 
 def _load_yaml_file(path: Path | None) -> dict[str, Any]:
@@ -1730,6 +1731,7 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
                         hz_min=expect_hz_min,
                         hz_max=expect_hz_max,
                         max_delay_s=expect_max_delay_s,
+                        expected_size=66000 if entry.msg_type == "com_msgs/msg/SizedPayload" else None,
                     ),
                 ]
             )
@@ -1769,6 +1771,14 @@ def _verify_received_topics(
             detail_log(f"\n--- delay {label} ({topic}) in {container_name} ---\n{delay_output}")
         delay_s = _parse_topic_delay_seconds(delay_output)
         log_line(_smoke_metric_line(label=label, topic=topic, container_name=container_name, hz=hz, delay_s=delay_s))
+        if spec.expected_size is not None:
+            received_size = _received_sized_payload_size(container_name, ros_setup, topic)
+            if received_size != spec.expected_size:
+                errors.append(
+                    f"{label} ({topic}) payload size {received_size} != {spec.expected_size} in {container_name}"
+                )
+            else:
+                log_line(f"OK: {label} ({topic}) preserves SizedPayload size {received_size} in {container_name}")
         if spec.enforce_bounds:
             effective_hz_min = hz_min if spec.use_default_bounds else spec.hz_min
             effective_hz_max = hz_max if spec.use_default_bounds else spec.hz_max
@@ -1793,6 +1803,32 @@ def _smoke_publish_message(msg_type: str) -> str:
             "data: [0, 0, 0, 0, 0, 25, 50, 0, 0, 50, 100, 0, -1, -1, -1, -1]}"
         )
     raise RuntimeError(f"Smoke cannot synthesize a publisher for message type {msg_type!r}.")
+
+
+def _smoke_publisher_command(spec: SmokeTopicSpec, ros_setup: str, duration: float) -> str:
+    assert spec.publish_topic is not None and spec.publish_type is not None
+    if spec.publish_type == "com_msgs/msg/SizedPayload":
+        size = spec.expected_size or 66000
+        return (
+            f"{ros_setup} && timeout {duration} ros2 run com_py sized_publisher --ros-args "
+            f"-p topic:={shlex.quote(spec.publish_topic)} -p size:={size} -p rate:={spec.publish_rate}"
+        )
+    message = _smoke_publish_message(spec.publish_type)
+    return (
+        f"{ros_setup} && timeout {duration} ros2 topic pub -r {spec.publish_rate} "
+        f"{shlex.quote(spec.publish_topic)} {shlex.quote(spec.publish_type)} "
+        f"{shlex.quote(message)}"
+    )
+
+
+def _received_sized_payload_size(container_name: str, ros_setup: str, topic: str) -> int | None:
+    command = (
+        f"{ros_setup} && timeout -k 2 15 ros2 topic echo "
+        f"{shlex.quote(topic)} com_msgs/msg/SizedPayload --once --field size"
+    )
+    result = _run_container_shell(container_name, command, timeout_s=_TOPIC_PROBE_EXEC_TIMEOUT_S)
+    match = re.search(r"(?m)^\s*(\d+)\s*$", (result.stdout or "") + (result.stderr or ""))
+    return int(match.group(1)) if match else None
 
 
 def _smoke_publish_specs(cfg: dict[str, Any]) -> list[SmokeTopicSpec]:
@@ -1826,12 +1862,7 @@ def _start_smoke_topic_publishers(
         assert spec.publish_topic is not None and spec.publish_type is not None
         container = containers[spec.source_peer_key]
         ros_setup = ros_setups[spec.source_peer_key]
-        message = _smoke_publish_message(spec.publish_type)
-        cmd = (
-            f"{ros_setup} && timeout {duration} ros2 topic pub -r {spec.publish_rate} "
-            f"{shlex.quote(spec.publish_topic)} {shlex.quote(spec.publish_type)} "
-            f"{shlex.quote(message)}"
-        )
+        cmd = _smoke_publisher_command(spec, ros_setup, duration)
         subprocess.run(
             ["docker", "exec", "-d", container, "bash", "-lc", cmd],
             capture_output=True,
@@ -1863,8 +1894,12 @@ def _stop_smoke_topic_publishers(containers: dict[str, str], specs: list[SmokeTo
         container = containers.get(spec.source_peer_key)
         if not container:
             continue
+        if spec.publish_type == "com_msgs/msg/SizedPayload":
+            pattern = f"sized_publisher.*topic:={spec.publish_topic}"
+        else:
+            pattern = f"ros2 topic pub.*{spec.publish_topic}"
         subprocess.run(
-            ["docker", "exec", container, "pkill", "-f", f"ros2 topic pub {spec.publish_topic}"],
+            ["docker", "exec", container, "pkill", "-f", pattern],
             capture_output=True,
             text=True,
             check=False,

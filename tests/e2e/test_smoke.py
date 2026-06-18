@@ -37,6 +37,15 @@ NATIVE_CHATTER_SMOKE_SESSIONS = [
 COMP_OCC_GRID_SMOKE_SESSIONS = [
     pytest.param(name, id="compressed-occupancy-grid") for name in SMOKE_SESSIONS if name == "3_comp_occ_grid"
 ]
+ZEN_COMP_OCC_GRID_SMOKE_SESSIONS = [
+    pytest.param(name, id="compressed-occupancy-grid-zenoh") for name in SMOKE_SESSIONS if name == "4_comp_occ_grid_zen"
+]
+SIZED_PAYLOAD_SMOKE_SESSIONS = [
+    pytest.param(name, id="sized-payload-fastdds") for name in SMOKE_SESSIONS if name == "5_sized_payload"
+]
+ZEN_SIZED_PAYLOAD_SMOKE_SESSIONS = [
+    pytest.param(name, id="sized-payload-zenoh") for name in SMOKE_SESSIONS if name == "6_sized_payload_zen"
+]
 
 EXPECTED_HEARTBEAT_CHECKS = (
     "OK: generated plugin.yaml files use literal CLI addresses",
@@ -60,6 +69,29 @@ EXPECTED_COMP_OCC_GRID_CHECKS = (
     "OK: smoke publisher b->a /costmap/costmap (nav_msgs/msg/OccupancyGrid) is advertising",
     "OK: b->a inbound bridge topic (/com/in/b/costmap/costmap/restamped/bz2)",
     "OK: b->a final topic (/costmap/costmap/restamped)",
+)
+EXPECTED_WRAPPED_SIZED_PAYLOAD_CHECKS = (
+    "OK: generated plugin.yaml files use literal CLI addresses",
+    "OK: smoke publisher a->b /size_test_a (com_msgs/msg/SizedPayload) is advertising",
+    "OK: smoke publisher b->a /size_test_b (com_msgs/msg/SizedPayload) is advertising",
+    "OK: a->b inbound bridge topic (/com/in/a/size_test_a/ota_stamped)",
+    "OK: a->b final topic (/size_test_a)",
+    "OK: a->b final topic (/size_test_a) preserves SizedPayload size 66000",
+    "OK: b->a inbound bridge topic (/com/in/b/size_test_b/ota_stamped)",
+    "OK: b->a final topic (/size_test_b)",
+    "OK: b->a final topic (/size_test_b) preserves SizedPayload size 66000",
+    "OK: isolation holds (/local_only",
+)
+EXPECTED_ZEN_SIZED_PAYLOAD_CHECKS = (
+    *EXPECTED_HEARTBEAT_CHECKS,
+    "OK: smoke publisher a->b /size_test_a (com_msgs/msg/SizedPayload) is advertising",
+    "OK: smoke publisher b->a /size_test_b (com_msgs/msg/SizedPayload) is advertising",
+    "OK: a->b inbound bridge topic (/com/in/a/size_test_a)",
+    "OK: a->b final topic (/size_test_a)",
+    "OK: a->b final topic (/size_test_a) preserves SizedPayload size 66000",
+    "OK: b->a inbound bridge topic (/com/in/b/size_test_b)",
+    "OK: b->a final topic (/size_test_b)",
+    "OK: b->a final topic (/size_test_b) preserves SizedPayload size 66000",
 )
 
 # Heartbeat publishers emit at 10 Hz; received rate should stay close to that.
@@ -308,3 +340,88 @@ def test_local_compressed_occupancy_grid_smoke_from_copied_example_project(
         hz_max=5.0,
         max_delay_s=0.5,
     )
+
+
+@pytest.mark.parametrize("session_name", ZEN_COMP_OCC_GRID_SMOKE_SESSIONS)
+def test_local_zenoh_compressed_occupancy_grid_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_COMP_OCC_GRID_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    config_dir = artifact_dir / "config"
+    assert (config_dir / "b_to_a_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_b",
+        "/costmap/costmap/restamped/bz2",
+    ]
+    assert "use_zenoh_ros2dds: true" in (config_dir / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert 'priority: "data"' in (config_dir / "b" / "plugin.yaml").read_text(encoding="utf-8")
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+    _assert_metric_present(
+        session_name,
+        result.stdout,
+        topic="/costmap/costmap/restamped",
+        label="b->a final topic",
+    )
+
+
+@pytest.mark.parametrize("session_name", SIZED_PAYLOAD_SMOKE_SESSIONS)
+def test_local_wrapped_sized_payload_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_WRAPPED_SIZED_PAYLOAD_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    config_dir = artifact_dir / "config"
+    assert (config_dir / "a_to_b_topics.txt").read_text(encoding="utf-8").strip() == "/size_test_a/ota_stamped"
+    assert (config_dir / "b_to_a_topics.txt").read_text(encoding="utf-8").strip() == "/size_test_b/ota_stamped"
+    assert "size_test_a" in (config_dir / "a" / "ota_wrapper.yaml").read_text(encoding="utf-8")
+    assert "size_test_b/ota_stamped" in (config_dir / "a" / "ota_unwrapper.yaml").read_text(encoding="utf-8")
+    assert "size_test_b" in (config_dir / "b" / "ota_wrapper.yaml").read_text(encoding="utf-8")
+    assert "size_test_a/ota_stamped" in (config_dir / "b" / "ota_unwrapper.yaml").read_text(encoding="utf-8")
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_metric_present(session_name, result.stdout, topic="/size_test_a", label="a->b final topic")
+    _assert_metric_present(session_name, result.stdout, topic="/size_test_b", label="b->a final topic")
+
+
+@pytest.mark.parametrize("session_name", ZEN_SIZED_PAYLOAD_SMOKE_SESSIONS)
+def test_local_zenoh_sized_payload_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_ZEN_SIZED_PAYLOAD_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    config_dir = artifact_dir / "config"
+    assert (config_dir / "a_to_b_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_a",
+        "/size_test_a",
+    ]
+    assert (config_dir / "b_to_a_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_b",
+        "/size_test_b",
+    ]
+    assert "use_zenoh_ros2dds: true" in (config_dir / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert 'priority: "data"' in (config_dir / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+    _assert_metric_present(session_name, result.stdout, topic="/size_test_a", label="a->b final topic")
+    _assert_metric_present(session_name, result.stdout, topic="/size_test_b", label="b->a final topic")

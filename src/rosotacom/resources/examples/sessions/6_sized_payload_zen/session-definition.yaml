@@ -1,7 +1,6 @@
-# Test-tier capability markers (see docs/testing.md). Teaching example, not part
-# of the automated test tiers yet.
+# Test-tier capability markers (see docs/testing.md).
 test_tiers:
-  single_machine: na
+  single_machine: ok
   multi_machine: na
 
 peers:

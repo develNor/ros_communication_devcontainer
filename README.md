@@ -196,10 +196,11 @@ rosotacom status 1_heartbeat_status --json     # machine-readable, for tools/age
 rosotacom status 1_heartbeat_status --watch    # live refresh
 ```
 
-Phase 1 reports each peer's locally-observable stages (outbound up to the `/ota`
-topic this peer publishes; inbound from the received `/ota` topic through the
-republished application topic). Combine both peers' files for the full
-end-to-end picture; cross-peer confirmation is reserved for a later phase.
+Phase 1 samples local-domain stages directly. OTA stages are graph-only and
+their activity is inferred from adjacent local flow, so the status overview
+never creates an additional OTA payload subscription. Combine both peers' files
+for the full end-to-end picture; cross-peer confirmation is reserved for a later
+phase.
 
 Run the CI heartbeat smoke matrix locally:
 

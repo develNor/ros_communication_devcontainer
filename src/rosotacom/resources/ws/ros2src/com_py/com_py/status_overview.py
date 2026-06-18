@@ -40,9 +40,9 @@
 # events.jsonl (one line per state transition).
 #
 # Phase 1 observes only what the local peer's ROS graph exposes:
-#   * outbound topics up to the /ota topic this peer publishes ("sent")
-#   * inbound topics from the received /ota topic through the republished
-#     application topic.
+#   * local-domain stages are sampled directly for live metrics
+#   * OTA-domain stages use graph metadata only and never create DataReaders;
+#     activity is inferred from the adjacent local stage where possible
 # End-to-end remote confirmation is reserved for a later phase; remote-side
 # fields are reported as "unknown".
 #
@@ -78,18 +78,22 @@ class StageObserver(Node):
     """
     Observes a set of stage topics within a single ROS domain context.
 
-    Performs periodic graph introspection (publisher/subscriber counts) and
-    dynamically subscribes to topics that have a publisher, measuring size and
-    header-based latency per message.
+    Performs periodic graph introspection (publisher/subscriber counts). For
+    local-domain topics it also dynamically subscribes to measure size and
+    header-based latency. OTA observers are graph-only so status monitoring can
+    never create an additional OTA payload stream.
     """
 
     def __init__(self, node_name: str, context: Optional[Context],
-                 topics: Dict[str, Optional[str]], refresh_interval_s: float):
+                 topics: Dict[str, Optional[str]], refresh_interval_s: float,
+                 *, subscribe_to_messages: bool = True):
         super().__init__(node_name, context=context)
         self.observations: Dict[str, StageObservation] = {
-            t: StageObservation(type_str=hint) for t, hint in topics.items()
+            t: StageObservation(type_str=hint, graph_only=not subscribe_to_messages)
+            for t, hint in topics.items()
         }
         self._refresh_interval_s = refresh_interval_s
+        self._subscribe_to_messages = subscribe_to_messages
         self.create_timer(self._refresh_interval_s, self._refresh)
         self._refresh()
 
@@ -106,6 +110,8 @@ class StageObserver(Node):
             except Exception:  # pragma: no cover - defensive
                 pass
 
+            if not self._subscribe_to_messages:
+                continue
             if obs.subscribed:
                 continue
             type_str = obs.type_str
@@ -193,34 +199,48 @@ class StatusOverview(Node):
         self._ota_context: Optional[Context] = None
         self._ota_executor: Optional[MultiThreadedExecutor] = None
         self._ota_thread: Optional[threading.Thread] = None
+        self._ota_observer: Optional[StageObserver] = None
+        self._ota_observer_uses_separate_context = False
         observers: Dict[str, StageObserver] = {}
 
-        # Local-domain observer shares this node's (default) context. When
-        # domains are not split, all stages are observed here.
+        # Local-domain stages are sampled for payload metrics.
         local_topics = dict(by_domain.get("local", {}))
-        if not need_ota_ctx:
-            local_topics.update(by_domain.get("ota", {}))
         self._local_observer = StageObserver(
             "status_overview_local_obs", None, local_topics, self.refresh_interval_s
         )
         observers["local"] = self._local_observer
 
-        if need_ota_ctx:
-            self._ota_context = Context()
-            rclpy.init(context=self._ota_context, domain_id=int(ota_domain_id))
+        # OTA stages always have a distinct graph-only observer, even if the
+        # local and OTA domain IDs are equal. This makes the no-OTA-DataReader
+        # guarantee independent of session topology.
+        ota_topics = dict(by_domain.get("ota", {}))
+        if ota_topics:
+            ota_context: Optional[Context] = None
+            if need_ota_ctx:
+                self._ota_context = Context()
+                rclpy.init(context=self._ota_context, domain_id=int(ota_domain_id))
+                ota_context = self._ota_context
+                self._ota_observer_uses_separate_context = True
             self._ota_observer = StageObserver(
                 "status_overview_ota_obs",
-                self._ota_context,
-                dict(by_domain.get("ota", {})),
+                ota_context,
+                ota_topics,
                 self.refresh_interval_s,
+                subscribe_to_messages=False,
             )
             observers["ota"] = self._ota_observer
-            self._ota_executor = MultiThreadedExecutor(num_threads=2, context=self._ota_context)
-            self._ota_executor.add_node(self._ota_observer)
-            self._ota_thread = threading.Thread(target=self._ota_executor.spin, daemon=True)
-            self._ota_thread.start()
+            if self._ota_observer_uses_separate_context:
+                self._ota_executor = MultiThreadedExecutor(
+                    num_threads=2, context=self._ota_context
+                )
+                self._ota_executor.add_node(self._ota_observer)
+                self._ota_thread = threading.Thread(
+                    target=self._ota_executor.spin, daemon=True
+                )
+                self._ota_thread.start()
             self.get_logger().info(
-                f"status_overview: OTA observer running in domain {ota_domain_id}"
+                f"status_overview: graph-only OTA observer running in domain "
+                f"{ota_domain_id} (no payload subscriptions)"
             )
 
         self.aggregator = StatusAggregator(
@@ -243,6 +263,11 @@ class StatusOverview(Node):
     def add_local_nodes(self, executor: MultiThreadedExecutor) -> None:
         executor.add_node(self)
         executor.add_node(self._local_observer)
+        if (
+            self._ota_observer is not None
+            and not self._ota_observer_uses_separate_context
+        ):
+            executor.add_node(self._ota_observer)
 
     def _on_write(self) -> None:
         self.aggregator.write()

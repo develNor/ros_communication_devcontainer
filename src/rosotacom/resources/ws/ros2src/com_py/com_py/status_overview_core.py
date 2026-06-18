@@ -73,6 +73,7 @@ class StageObservation:
     """Live observation of a single stage topic within one ROS domain."""
 
     type_str: Optional[str] = None
+    graph_only: bool = False
     subscribed: bool = False
     pub_count: int = 0
     sub_count: int = 0
@@ -175,6 +176,8 @@ class StatusAggregator:
             "state": ABSENT,
             "quality": None,
             "quality_reason": None,
+            "observation": "graph" if obs is not None and obs.graph_only else "payload",
+            "inferred_from": None,
         }
         if obs is None:
             return result
@@ -207,6 +210,53 @@ class StatusAggregator:
         result["quality"] = quality
         result["quality_reason"] = reason
         return result
+
+    @staticmethod
+    def _copy_inferred_activity(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+        """Copy payload-derived activity while retaining OTA graph counts/topic."""
+        for key in (
+            "hz",
+            "mean_size_bytes",
+            "latency_ms",
+            "age_s",
+            "last_message_wall",
+            "messages_total",
+            "state",
+            "quality",
+            "quality_reason",
+        ):
+            target[key] = source[key]
+        target["inferred_from"] = source["topic"]
+
+    def infer_graph_only_ota_stages(
+        self, topic_spec: Dict[str, Any], stage_results: List[Dict[str, Any]]
+    ) -> None:
+        """
+        Infer OTA activity without creating an OTA DataReader.
+
+        Outbound activity requires both an OTA publisher endpoint and flowing
+        input at the preceding local stage. Inbound receipt is proven by flow at
+        the following local stage, which can only exist after the OTA sample has
+        passed through bridge_in/domain_bridge.
+        """
+        direction = topic_spec.get("direction")
+        for idx, stage_result in enumerate(stage_results):
+            if (
+                stage_result.get("domain") != "ota"
+                or stage_result.get("observation") != "graph"
+            ):
+                continue
+
+            source: Optional[Dict[str, Any]] = None
+            if direction == "outbound":
+                if stage_result["publishers"] == 0 or idx == 0:
+                    continue
+                source = stage_results[idx - 1]
+            elif direction == "inbound" and idx + 1 < len(stage_results):
+                source = stage_results[idx + 1]
+
+            if source is not None and source["state"] in (FLOWING, STALE):
+                self._copy_inferred_activity(stage_result, source)
 
     def _classify_quality(self, m: Dict[str, Any], expected_hz: Optional[float]) -> Tuple[str, Optional[str]]:
         delay_ms = (m["last_delay_s"] * 1000.0) if m["last_delay_s"] is not None else None
@@ -270,7 +320,14 @@ class StatusAggregator:
                 )
 
         if topic_spec.get("direction") == "outbound" and overall == OK:
-            diagnosis += " | sent to transport; remote delivery not observed locally (Phase 1)"
+            diagnosis += " | OTA activity inferred locally; remote delivery not observed (Phase 1)"
+
+        inferred = [s for s in stage_results if s.get("inferred_from")]
+        if inferred:
+            detail = ", ".join(
+                f"{s['stage']} from {s['inferred_from']}" for s in inferred
+            )
+            diagnosis += f" | inferred without OTA payload subscription: {detail}"
 
         return {
             "overall": overall,
@@ -287,6 +344,11 @@ class StatusAggregator:
         if st == ABSENT:
             return f"{producer} is not producing {topic} (no publisher)"
         if st == IDLE:
+            if stage_result.get("observation") == "graph":
+                return (
+                    f"{topic} has a publisher; payload is intentionally not "
+                    "subscribed and adjacent local flow is not observed"
+                )
             return f"{topic} has a publisher but no messages observed yet"
         if st == STALE:
             return f"{topic} stopped receiving messages"
@@ -306,6 +368,7 @@ class StatusAggregator:
                 self.classify_stage(stage, expected_hz, now_mono)
                 for stage in topic_spec.get("stages", [])
             ]
+            self.infer_graph_only_ota_stages(topic_spec, stage_results)
             roll = self.rollup(topic_spec, stage_results)
             counts[roll["overall"]] = counts.get(roll["overall"], 0) + 1
             topics_out.append(
@@ -394,7 +457,11 @@ class StatusAggregator:
             )
             for st in t["stages"]:
                 state = st["state"]
-                if state == FLOWING and st.get("quality") and st["quality"] != GOOD:
+                if st.get("inferred_from"):
+                    state = f"{state}/INFERRED"
+                elif st.get("observation") == "graph":
+                    state = f"{state}/GRAPH"
+                elif state == FLOWING and st.get("quality") and st["quality"] != GOOD:
                     state = f"{state}/{st['quality']}"
                 metric = ""
                 if st["state"] in (FLOWING, STALE):
@@ -405,6 +472,8 @@ class StatusAggregator:
                         parts.append(f"{st['mean_size_bytes']:.0f}B")
                     if st["age_s"] is not None:
                         parts.append(f"age {st['age_s']:.1f}s")
+                    if st.get("inferred_from"):
+                        parts.append(f"from {st['inferred_from']}")
                     metric = "  " + " ".join(parts)
                 lines.append(
                     f"    {st['stage']:<10} {state:<14} "

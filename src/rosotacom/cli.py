@@ -1831,13 +1831,15 @@ def _received_sized_payload_size(container_name: str, ros_setup: str, topic: str
     return int(match.group(1)) if match else None
 
 
-def _smoke_publish_specs(cfg: dict[str, Any]) -> list[SmokeTopicSpec]:
+def _smoke_publish_specs(cfg: dict[str, Any], source_peer_key: str | None = None) -> list[SmokeTopicSpec]:
     peers = cfg.get("peers") or {}
     specs: list[SmokeTopicSpec] = []
     seen: set[tuple[str, str, str]] = set()
     for receiver in peers:
         for spec in _received_crossed_topics(cfg, str(receiver)):
             if not spec.publish_topic:
+                continue
+            if source_peer_key is not None and spec.source_peer_key != source_peer_key:
                 continue
             if not spec.publish_type:
                 raise RuntimeError(f"Smoke topic {spec.publish_topic!r} requires a message type.")
@@ -1856,9 +1858,10 @@ def _start_smoke_topic_publishers(
     *,
     log_line: Callable[[str], None] = print,
     duration: float = 180.0,
+    source_peer_key: str | None = None,
 ) -> list[SmokeTopicSpec]:
     started: list[SmokeTopicSpec] = []
-    for spec in _smoke_publish_specs(cfg):
+    for spec in _smoke_publish_specs(cfg, source_peer_key=source_peer_key):
         assert spec.publish_topic is not None and spec.publish_type is not None
         container = containers[spec.source_peer_key]
         ros_setup = ros_setups[spec.source_peer_key]
@@ -2064,6 +2067,40 @@ def probe_check_command(args: argparse.Namespace) -> int:
     state = "present" if present else "absent"
     print(f"{args.topic} is {state} in {container} (identity {args.identity}); expected {args.expect}")
     return 0 if present == (args.expect == "present") else 1
+
+
+def publish_test_topics_command(args: argparse.Namespace) -> int:
+    """Start or stop synthetic local app publishers for the peer's crossed topics.
+
+    The external OTA harness uses this to exercise non-heartbeat example sessions
+    with the same topic payloads that local smoke uses. Heartbeat-only sessions
+    are a clean no-op because their plugins already self-publish heartbeats.
+    """
+    container, ros_setup, cfg = _resolve_running_peer(args, args.identity)
+    specs = _smoke_publish_specs(cfg, source_peer_key=args.identity)
+    if args.stop:
+        _stop_smoke_topic_publishers({args.identity: container}, specs)
+        print(f"Stopped {len(specs)} test topic publisher(s) in {container} (identity {args.identity})")
+        return 0
+
+    if not specs:
+        print(f"No synthetic test topic publishers needed for identity {args.identity}")
+        return 0
+
+    try:
+        started = _start_smoke_topic_publishers(
+            {args.identity: container},
+            {args.identity: ros_setup},
+            cfg,
+            duration=args.duration,
+            source_peer_key=args.identity,
+        )
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Started {len(started)} test topic publisher(s) in {container} (identity {args.identity})")
+    return 0
 
 
 def test_command(args: argparse.Namespace) -> int:
@@ -2370,6 +2407,7 @@ def main(argv: list[str] | None = None) -> int:
         "verify",
         "probe-publish",
         "probe-check",
+        "publish-test-topics",
         "list-sessions",
         "examples",
         "setup-env",
@@ -2476,6 +2514,21 @@ def main(argv: list[str] | None = None) -> int:
     probe_check_parser.add_argument("--topic", default=ISOLATION_PROBE_TOPIC)
     probe_check_parser.add_argument("--expect", choices=["present", "absent"], default="absent")
     probe_check_parser.set_defaults(func=probe_check_command)
+
+    publish_test_topics_parser = subparsers.add_parser(
+        "publish-test-topics",
+        help="Start/stop synthetic local app publishers for OTA example verification.",
+    )
+    _add_common_config_args(publish_test_topics_parser)
+    publish_test_topics_parser.add_argument("session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    publish_test_topics_parser.add_argument("--identity", required=True)
+    publish_test_topics_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    publish_test_topics_parser.add_argument("--instance-id")
+    publish_test_topics_parser.add_argument("--duration", type=float, default=180.0)
+    publish_test_topics_parser.add_argument(
+        "--stop", action="store_true", help="Stop running synthetic test topic publishers."
+    )
+    publish_test_topics_parser.set_defaults(func=publish_test_topics_command)
 
     list_parser = subparsers.add_parser("list-sessions", help="List configured sessions.")
     _add_common_config_args(list_parser)

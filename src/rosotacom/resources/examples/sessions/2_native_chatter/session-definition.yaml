@@ -1,7 +1,7 @@
 # Test-tier capability markers (see docs/testing.md).
 test_tiers:
   single_machine: ok
-  multi_machine: na
+  multi_machine: ok
 
 peers:
   a:

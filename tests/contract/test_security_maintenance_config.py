@@ -52,7 +52,7 @@ def test_release_publishes_only_for_a_version_tag_via_repository_configuration()
     assert "repository-url: ${{ vars.PYPI_PUBLISH_URL }}" in release
     assert "PYPI_PUBLISH_URL is not configured" in release
     assert "PYPI_PUBLISH_URL must be an HTTPS endpoint" in release
-    assert "name: release" in release
+    assert "name: Release" in release
     assert "publish-testpypi" not in release
     assert "https://upload.pypi.org" not in release
     assert "https://test.pypi.org" not in release

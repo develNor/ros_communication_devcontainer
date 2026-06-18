@@ -1,0 +1,10 @@
+schema_version: 1
+session: 2_native_chatter
+
+applications:
+  a:
+    - name: native_application
+      ros2docker_config: ../../scripts/2_native_chatter/machine_a/external.ros2docker.json
+  b:
+    - name: native_application
+      ros2docker_config: ../../scripts/2_native_chatter/machine_b/external.ros2docker.json

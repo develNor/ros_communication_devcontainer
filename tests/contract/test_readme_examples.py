@@ -24,6 +24,7 @@ def test_source_checkout_rosotacom_yaml_loads() -> None:
 
     assert runtime.ros2docker_config == cli.EXAMPLE_PROJECT_DIR / "ros2docker.json"
     assert runtime.session_configs_dir == cli.EXAMPLE_PROJECT_DIR / "sessions"
+    assert runtime.scenario_configs_dir == cli.EXAMPLE_PROJECT_DIR / "scenarios"
     assert runtime.session_instances_dir == PACKAGE_ROOT / "session-instances"
     assert runtime.data_dict == cli.EXAMPLE_PROJECT_DIR / "data_dict.json"
 
@@ -34,6 +35,7 @@ def test_packaged_example_setup_paths_are_relative_to_example_root() -> None:
     assert setup == {
         "ros2docker_config": "ros2docker.json",
         "session_configs_dir": "sessions",
+        "scenario_configs_dir": "scenarios",
         "session_instances_dir": "session-instances",
         "data_dict": "data_dict.json",
     }
@@ -43,5 +45,19 @@ def test_packaged_example_project_contains_documented_heartbeat_session() -> Non
     readme = (PACKAGE_ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "`1_heartbeat`" in readme
+    assert "rosotacom scenario start 2_native_chatter" in readme
     assert (cli.EXAMPLE_PROJECT_DIR / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
+    assert (cli.EXAMPLE_PROJECT_DIR / "scenarios" / "2_native_chatter" / "scenario-definition.yaml").is_file()
     assert (cli.EXAMPLE_PROJECT_DIR / "scripts" / "1_heartbeat" / "run_machine_a.sh").is_file()
+
+
+def test_packaged_native_chatter_scenario_and_application_configs_load() -> None:
+    runtime = cli._load_runtime_config(
+        argparse.Namespace(rosotacom_config=str(cli.EXAMPLE_PROJECT_DIR / "rosotacom.yaml"))
+    )
+    resolved = cli._resolve_scenario("2_native_chatter", runtime)
+
+    definition = cli._load_scenario_definition(resolved)
+
+    assert definition.session == "2_native_chatter"
+    assert set(definition.applications) == {"a", "b"}

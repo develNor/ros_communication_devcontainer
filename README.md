@@ -29,6 +29,7 @@ The ROS Communication DevContainer is a Docker-based solution designed to stream
   for versioned Python packages this may be named like `python3.14-venv`)
 - `ros2docker` v0.1.2 or newer. The local installer below installs the pinned
   supported range into this checkout's virtual environment.
+- `tmux` for the optional `rosotacom scenario` orchestration commands
 - Machines connected to the same network (VPN or local WLAN)
 
 ### Convenience CLI: `rosotacom`
@@ -106,10 +107,11 @@ version manager.
 
 ### Basic Setup
 
-`rosotacom` uses three layers of configuration/runtime state:
+`rosotacom` uses four layers of configuration/runtime state:
 
 - A **project setup** file (`rosotacom.yaml`) points to host-local resources such as `ros2docker.json`, static `sessions/`, ignored `session-instances/`, and `data_dict.json`.
 - A **session config** defines the communication behavior for one run: peers, addresses, topics, QoS, processing, and transport choices.
+- An optional **scenario config** composes one communication session with identity-specific local application containers.
 - A **session instance** stores one concrete run: generated config, catmux pane logs, smoke debug output, and future rosbags.
 
 `rosotacom` resolves the active `rosotacom.yaml` by scope (first wins), using the
@@ -153,6 +155,7 @@ rosotacom.yaml
 ros2docker.json
 data_dict.json
 sessions/
+scenarios/
 session-instances/
 scripts/
 ```
@@ -178,6 +181,38 @@ rosotacom start 1_heartbeat --identity b
 ```
 
 `rosotacom` reads the static session input and creates generated files under `session-instances/<date>/<session>_<timestamp>_<id>/config/`, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`. Catmux pane output is logged under the same instance in `logs/<peer>/catmux/`.
+
+### Complete use cases with scenarios
+
+A session intentionally describes only the communication contract. When a use
+case also needs a local ROS application, rosbag, or ROS command, define a
+scenario above it:
+
+```yaml
+schema_version: 1
+session: 2_native_chatter
+
+applications:
+  a:
+    - name: native_application
+      ros2docker_config: ../../scripts/2_native_chatter/machine_a/external.ros2docker.json
+  b:
+    - name: native_application
+      ros2docker_config: ../../scripts/2_native_chatter/machine_b/external.ros2docker.json
+```
+
+Start one identity's communication and local application together:
+
+```bash
+rosotacom scenario start 2_native_chatter --identity a
+rosotacom scenario attach 2_native_chatter --identity a
+rosotacom scenario stop 2_native_chatter --identity a
+```
+
+The outer view uses an isolated host tmux server. Its prefix remains `Ctrl-b`;
+send the inner container-side catmux prefix with `Ctrl-b Ctrl-b`. Detaching from
+the outer tmux does not stop the use case. `scenario stop` owns cleanup of the
+application containers, communication container, and outer tmux session.
 
 ## Usage Examples
 
@@ -253,13 +288,15 @@ Run the heartbeat example manually:
 ./scripts/1_heartbeat/run_machine_b.sh
 ```
 
-For examples with external application containers, use the matching machine script directory. Example:
+Example 2 is the pilot for one-command scenario orchestration:
 
 ```bash
-cd scripts/2_native_chatter/machine_a
-./run_external.py
-./run_communication.sh
+rosotacom scenario start 2_native_chatter --identity a
 ```
+
+The existing `run_external.py` and `run_communication.sh` helpers remain
+available as a compatibility fallback. Examples 3–6 continue to use those
+helpers for now.
 
 The `sessions/` directory contains curated built-in session definitions:
 

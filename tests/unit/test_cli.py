@@ -19,6 +19,7 @@ def clear_config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "ROSOTACOM_CONFIG",
         "ROSOTACOM_ROS2DOCKER_CONFIG",
         "ROSOTACOM_SESSION_CONFIGS_DIR",
+        "ROSOTACOM_SCENARIO_CONFIGS_DIR",
         "ROSOTACOM_SESSION_INSTANCES_DIR",
         "ROSOTACOM_DATA_DICT",
     ):
@@ -105,12 +106,14 @@ def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -
     (tmp_path / "ros2docker.json").write_text('{"image_name": "test"}\n', encoding="utf-8")
     (tmp_path / "data_dict.json").write_text('{"machine_a_ip": "127.0.0.1"}\n', encoding="utf-8")
     (tmp_path / "sessions").mkdir()
+    (tmp_path / "scenarios").mkdir()
     config = tmp_path / "rosotacom.yaml"
     config.write_text(
         "\n".join(
             [
                 "ros2docker_config: ros2docker.json",
                 "session_configs_dir: sessions",
+                "scenario_configs_dir: scenarios",
                 "session_instances_dir: session-instances",
                 "data_dict: data_dict.json",
                 "",
@@ -124,6 +127,7 @@ def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -
     assert runtime.rosotacom_config == config
     assert runtime.ros2docker_config == tmp_path / "ros2docker.json"
     assert runtime.session_configs_dir == tmp_path / "sessions"
+    assert runtime.scenario_configs_dir == tmp_path / "scenarios"
     assert runtime.session_instances_dir == tmp_path / "session-instances"
     assert runtime.data_dict == tmp_path / "data_dict.json"
 
@@ -160,6 +164,7 @@ def test_examples_create_copies_project_and_refuses_overwrite(
     assert (target / "data_dict.json").is_file()
     assert "session-instances/" in (target / ".gitignore").read_text(encoding="utf-8")
     assert (target / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
+    assert (target / "scenarios" / "2_native_chatter" / "scenario-definition.yaml").is_file()
     assert not (target / "__init__.py").exists()
     assert "Copied rosotacom examples" in capsys.readouterr().out
 
@@ -229,6 +234,220 @@ def test_session_name_completion_uses_active_project_and_prefix(
     path_completions = rosotacom._session_name_completer("./ext", argparse.Namespace())
 
     assert path_completions["./external_session/"] == "session directory"
+
+
+def _write_test_scenario_project(tmp_path: Path) -> tuple[rosotacom.RuntimeConfig, rosotacom.ResolvedScenario]:
+    sessions = tmp_path / "sessions"
+    session = sessions / "demo"
+    session.mkdir(parents=True)
+    session.joinpath("session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "peers:",
+                "  a: { address: 127.0.0.1 }",
+                "  b: { address: 127.0.0.1 }",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    app_dir = tmp_path / "apps"
+    app_dir.mkdir()
+    for identity in ("a", "b"):
+        app_dir.joinpath(f"{identity}.json").write_text(
+            "\n".join(
+                [
+                    "{",
+                    f'  "container_name": "{identity}_app",',
+                    '  "run_type": "command",',
+                    '  "command": ["true"]',
+                    "}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    scenario_dir = tmp_path / "scenarios" / "demo"
+    scenario_dir.mkdir(parents=True)
+    scenario_dir.joinpath("scenario-definition.yaml").write_text(
+        "\n".join(
+            [
+                "schema_version: 1",
+                "session: demo",
+                "applications:",
+                "  a:",
+                "    - name: local_app",
+                "      ros2docker_config: ../../apps/a.json",
+                "  b:",
+                "    - name: local_app",
+                "      ros2docker_config: ../../apps/b.json",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    runtime = rosotacom.RuntimeConfig(
+        rosotacom_config=tmp_path / "rosotacom.yaml",
+        ros2docker_config=rosotacom.DEFAULT_ROS2DOCKER_CONFIG,
+        session_configs_dir=sessions,
+        data_dict=None,
+        install_id="test",
+        session_instances_dir=tmp_path / "session-instances",
+        scenario_configs_dir=tmp_path / "scenarios",
+    )
+    return runtime, rosotacom._resolve_scenario("demo", runtime)
+
+
+def test_scenario_definition_resolves_and_validates_strictly(tmp_path: Path) -> None:
+    runtime, resolved = _write_test_scenario_project(tmp_path)
+
+    definition = rosotacom._load_scenario_definition(resolved)
+
+    assert definition.session == "demo"
+    assert definition.applications["a"][0].name == "local_app"
+    assert definition.applications["a"][0].ros2docker_config == tmp_path / "apps" / "a.json"
+    assert rosotacom._scenario_names(runtime) == ["demo"]
+    assert rosotacom._scenario_container_name(runtime, "demo", "a", "local_app") == (
+        "rosotacom_test_scenario_demo_a_local_app"
+    )
+    assert rosotacom._scenario_application_image_name(runtime, definition.applications["a"][0]) == "ros2docker-test"
+
+    resolved.definition_path.write_text(
+        "schema_version: 1\nsession: demo\napplications: {}\nunknown: true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="Unsupported keys"):
+        rosotacom._load_scenario_definition(resolved)
+
+
+def test_scenario_name_completion_uses_active_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    (tmp_path / "ros2docker.json").write_text('{"image_name": "completion"}\n', encoding="utf-8")
+    runtime.rosotacom_config.write_text(
+        "\n".join(
+            [
+                "ros2docker_config: ros2docker.json",
+                "session_configs_dir: sessions",
+                "scenario_configs_dir: scenarios",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert rosotacom._scenario_name_completer("de", argparse.Namespace()) == {"demo": "configured scenario"}
+
+
+def test_scenario_tmux_commands_keep_ctrl_b_and_log_each_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, resolved = _write_test_scenario_project(tmp_path)
+    definition = rosotacom._load_scenario_definition(resolved)
+    session = rosotacom._resolve_session("demo", runtime)
+    instance = rosotacom._resolve_session_instance(runtime, session, "tmux")
+    calls: list[list[str]] = []
+    pane_number = 0
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal pane_number
+        calls.append(command)
+        if "new-session" in command or "split-window" in command:
+            pane_number += 1
+            return subprocess.CompletedProcess(command, 0, f"%{pane_number}\n", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(rosotacom.subprocess, "run", fake_run)
+
+    tmux_session = rosotacom._create_scenario_tmux(
+        runtime,
+        resolved,
+        definition,
+        instance,
+        "a",
+        definition.applications["a"],
+        argparse.Namespace(
+            force=True,
+            rewrite_formatting=False,
+            overwrite_peers_via_remote_peer=None,
+            peer_address=[],
+        ),
+    )
+
+    assert tmux_session == "demo-a"
+    assert all(command[:3] == ["tmux", "-L", "rosotacom-test"] for command in calls)
+    assert any(command[-2:] == ["prefix", "C-b"] for command in calls if "set-option" in command)
+    assert any(command[-3:] == ["prefix", "C-b", "send-prefix"] for command in calls if "bind-key" in command)
+    assert any("inner catmux: C-b C-b" in part for command in calls for part in command)
+    assert any("rosotacom start demo --identity a --mode attach" in " ".join(command) for command in calls)
+    assert any("scenario _run-application demo" in " ".join(command) for command in calls)
+    assert (instance.logs_host_dir / "a" / "scenario").is_dir()
+
+
+def test_start_and_stop_scenario_manage_manifest_and_component_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, resolved = _write_test_scenario_project(tmp_path)
+    definition = rosotacom._load_scenario_definition(resolved)
+    session = rosotacom._resolve_session("demo", runtime)
+    cfg = {"peers": {"a": {}, "b": {}}}
+    instance = rosotacom._resolve_session_instance(runtime, session, "managed")
+    calls: list[str] = []
+
+    context = (runtime, resolved, definition, session, cfg, "a", definition.applications["a"])
+    monkeypatch.setattr(rosotacom, "_require_ros2docker", lambda: None)
+    monkeypatch.setattr(rosotacom, "_require_tmux", lambda: None)
+    monkeypatch.setattr(rosotacom, "_resolve_scenario_context", lambda args: context)
+    monkeypatch.setattr(rosotacom, "_tmux_session_exists", lambda runtime, name: False)
+    monkeypatch.setattr(rosotacom, "_resolve_session_instance", lambda *args, **kwargs: instance)
+    monkeypatch.setattr(rosotacom, "_remote_peer_name", lambda cfg, identity: "b")
+    monkeypatch.setattr(
+        rosotacom, "_create_scenario_tmux", lambda *args, **kwargs: calls.append("tmux-start") or "demo-a"
+    )
+    monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "detached")
+
+    args = argparse.Namespace(
+        scenario="demo",
+        identity="a",
+        force=True,
+        mode="detached",
+        instance_id="managed",
+    )
+    assert rosotacom.start_scenario(args) == 0
+    manifest = yaml.safe_load((instance.host_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    run = manifest["scenario_runs"]["demo:a"]
+    assert run["tmux_session"] == "demo-a"
+    assert run["communication_container"] == "rosotacom_test_com_to_b"
+    assert run["applications"][0]["container_name"] == "rosotacom_test_scenario_demo_a_local_app"
+    assert run["applications"][0]["image_name"] == "ros2docker-test"
+    assert calls == ["tmux-start"]
+
+    monkeypatch.setattr(
+        rosotacom,
+        "_stop_scenario_application",
+        lambda *args, **kwargs: calls.append("application-stop") or True,
+    )
+    monkeypatch.setattr(
+        rosotacom,
+        "_stop_container_name",
+        lambda *args, **kwargs: calls.append("communication-stop") or True,
+    )
+    monkeypatch.setattr(
+        rosotacom,
+        "_kill_scenario_tmux",
+        lambda *args, **kwargs: calls.append("tmux-stop") or True,
+    )
+    monkeypatch.setattr(rosotacom, "_find_latest_scenario_instance", lambda *args, **kwargs: instance.host_dir)
+
+    assert rosotacom.stop_scenario(args) == 0
+    assert calls[-3:] == ["application-stop", "communication-stop", "tmux-stop"]
+    stopped_manifest = yaml.safe_load((instance.host_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    assert stopped_manifest["scenario_runs"]["demo:a"]["stopped_at"]
 
 
 def test_completion_command_emits_shell_registration(

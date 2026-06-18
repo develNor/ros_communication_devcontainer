@@ -98,6 +98,7 @@ class RuntimeConfig:
     install_id: str
     session_instances_dir: Path | None = None
     project_source: str | None = None
+    scenario_configs_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,26 @@ class ResolvedSession:
     host_dir: Path
     container_dir: str
     source: str
+
+
+@dataclass(frozen=True)
+class ResolvedScenario:
+    name: str
+    host_dir: Path
+    definition_path: Path
+    source: str
+
+
+@dataclass(frozen=True)
+class ScenarioApplication:
+    name: str
+    ros2docker_config: Path
+
+
+@dataclass(frozen=True)
+class ScenarioDefinition:
+    session: str
+    applications: dict[str, tuple[ScenarioApplication, ...]]
 
 
 @dataclass(frozen=True)
@@ -283,6 +304,11 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         os.environ.get("ROSOTACOM_SESSION_CONFIGS_DIR"),
         cfg.get("session_configs_dir"),
     )
+    scenario_configs_dir_raw = _first_value(
+        getattr(args, "scenario_configs_dir", None),
+        os.environ.get("ROSOTACOM_SCENARIO_CONFIGS_DIR"),
+        cfg.get("scenario_configs_dir"),
+    )
     session_instances_dir_raw = _first_value(
         getattr(args, "session_instances_dir", None),
         os.environ.get("ROSOTACOM_SESSION_INSTANCES_DIR"),
@@ -313,6 +339,7 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         install_id=_install_id(rosotacom_config),
         session_instances_dir=session_instances_dir,
         project_source=project_source,
+        scenario_configs_dir=_resolve_path(scenario_configs_dir_raw, config_base, must_exist=True),
     )
 
 
@@ -331,8 +358,10 @@ def _sanitize_docker_name(name: str) -> str:
 def _scoped_image_name(runtime: RuntimeConfig) -> str:
     _require_ros2docker()
     config = load_config(runtime.ros2docker_config)
-    base = str(config.get("image_name") or "ros-communication")
-    suffix = runtime.install_id
+    return _scoped_image_name_from_base(str(config.get("image_name") or "ros-communication"), runtime.install_id)
+
+
+def _scoped_image_name_from_base(base: str, suffix: str) -> str:
     if base.endswith(f"-{suffix}"):
         return base
     last = base.rsplit("/", 1)[-1]
@@ -491,6 +520,80 @@ def _write_instance_manifest(
             "overwrite_peers_via_remote_peer": overwrite_peers_via_remote_peer,
         }
     )
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=True, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def _write_scenario_manifest(
+    instance: SessionInstance,
+    session: ResolvedSession,
+    runtime: RuntimeConfig,
+    cfg: dict[str, Any],
+    resolved: ResolvedScenario,
+    *,
+    identity: str,
+    communication_container: str,
+    applications: tuple[ScenarioApplication, ...],
+    tmux_session: str,
+) -> None:
+    manifest_path = instance.host_dir / "manifest.yaml"
+    manifest = _load_yaml_file(manifest_path)
+    now = datetime.now().isoformat(timespec="seconds")
+    if not manifest:
+        manifest = {
+            "schema_version": 1,
+            "created_at": now,
+            "instance_id": instance.instance_id,
+            "rosotacom_version": __version__,
+            "source_session_host_dir": str(session.host_dir),
+            "source_session_container_dir": session.container_dir,
+            "source": session.source,
+            "config_dir": str(instance.config_host_dir),
+            "logs_dir": str(instance.logs_host_dir),
+            "rosbags_dir": str(instance.rosbags_host_dir),
+            "rollout": None,
+            "starts": [],
+        }
+    run_key = f"{resolved.name}:{identity}"
+    manifest["updated_at"] = now
+    manifest["effective_config_sha256"] = _effective_config_sha256(cfg)
+    scenario_runs = manifest.setdefault("scenario_runs", {})
+    scenario_runs[run_key] = {
+        "started_at": now,
+        "stopped_at": None,
+        "scenario": resolved.name,
+        "identity": identity,
+        "source_definition": str(resolved.definition_path),
+        "tmux_socket": _scenario_tmux_socket(runtime),
+        "tmux_session": tmux_session,
+        "communication_container": communication_container,
+        "applications": [
+            {
+                "name": application.name,
+                "ros2docker_config": str(application.ros2docker_config),
+                "container_name": _scenario_container_name(runtime, resolved.name, identity, application.name),
+                "image_name": _scenario_application_image_name(runtime, application),
+            }
+            for application in applications
+        ],
+    }
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=True, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def _mark_scenario_stopped(instance_dir: Path, scenario_name: str, identity: str) -> None:
+    manifest_path = instance_dir / "manifest.yaml"
+    manifest = _load_yaml_file(manifest_path)
+    run = (manifest.get("scenario_runs") or {}).get(f"{scenario_name}:{identity}")
+    if not isinstance(run, dict):
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    run["stopped_at"] = now
+    manifest["updated_at"] = now
     manifest_path.write_text(
         yaml.safe_dump(manifest, sort_keys=True, default_flow_style=False, allow_unicode=True),
         encoding="utf-8",
@@ -852,6 +955,370 @@ def _session_name_completer(
     return completions
 
 
+def _is_scenario_dir(path: Path) -> bool:
+    return (path / "scenario-definition.yaml").is_file()
+
+
+def _resolve_scenario(scenario_name: str, runtime: RuntimeConfig) -> ResolvedScenario:
+    raw = Path(os.path.expandvars(os.path.expanduser(scenario_name)))
+    candidates: list[tuple[Path, str]] = []
+    if raw.is_absolute():
+        candidates.append((raw, "absolute"))
+    else:
+        candidates.append((Path.cwd() / raw, "cwd"))
+        if runtime.scenario_configs_dir:
+            candidates.append((runtime.scenario_configs_dir / raw, "scenario_configs"))
+
+    for candidate, source in candidates:
+        if candidate.is_file() and candidate.name == "scenario-definition.yaml":
+            host_dir = candidate.parent.resolve()
+            return ResolvedScenario(host_dir.name, host_dir, candidate.resolve(), source)
+        if _is_scenario_dir(candidate):
+            host_dir = candidate.resolve()
+            return ResolvedScenario(host_dir.name, host_dir, host_dir / "scenario-definition.yaml", source)
+
+    available = _format_available_scenarios(runtime)
+    raise RuntimeError(
+        f"scenario must be a directory containing scenario-definition.yaml, got: {scenario_name}\n{available}"
+    )
+
+
+def _scenario_names(runtime: RuntimeConfig) -> list[str]:
+    if not runtime.scenario_configs_dir or not runtime.scenario_configs_dir.is_dir():
+        return []
+    return [
+        path.name for path in sorted(runtime.scenario_configs_dir.iterdir()) if path.is_dir() and _is_scenario_dir(path)
+    ]
+
+
+def _format_available_scenarios(runtime: RuntimeConfig) -> str:
+    names = _scenario_names(runtime)
+    if names:
+        return "Configured scenarios:\n  - " + "\n  - ".join(names)
+    return "No configured scenarios found. Set scenario_configs_dir in rosotacom.yaml."
+
+
+def _scenario_name_completer(
+    prefix: str,
+    parsed_args: argparse.Namespace,
+    **_: Any,
+) -> dict[str, str]:
+    completions: dict[str, str] = {}
+    if prefix.startswith((".", "~", os.sep)) or os.sep in prefix:
+        completions.update({path: "scenario directory" for path in DirectoriesCompleter()(prefix)})
+    try:
+        runtime = _load_runtime_config(parsed_args)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return completions
+    completions.update({name: "configured scenario" for name in _scenario_names(runtime) if name.startswith(prefix)})
+    return completions
+
+
+def _load_scenario_definition(resolved: ResolvedScenario) -> ScenarioDefinition:
+    raw = _load_yaml_file(resolved.definition_path)
+    allowed_root = {"schema_version", "session", "applications"}
+    extra_root = sorted(set(raw) - allowed_root)
+    if extra_root:
+        raise RuntimeError(
+            f"Unsupported keys in scenario-definition root: {extra_root}. Allowed keys: {sorted(allowed_root)}"
+        )
+    if raw.get("schema_version") != 1:
+        raise RuntimeError("scenario-definition.yaml requires schema_version: 1.")
+
+    session = raw.get("session")
+    if not isinstance(session, str) or not session.strip():
+        raise RuntimeError("scenario-definition.yaml requires a non-empty string 'session'.")
+
+    raw_applications = raw.get("applications")
+    if not isinstance(raw_applications, dict) or not raw_applications:
+        raise RuntimeError("scenario-definition.yaml requires a non-empty 'applications' mapping.")
+
+    applications: dict[str, tuple[ScenarioApplication, ...]] = {}
+    for identity, entries in raw_applications.items():
+        if not isinstance(identity, str) or not identity.strip():
+            raise RuntimeError("scenario application identity keys must be non-empty strings.")
+        if not isinstance(entries, list):
+            raise RuntimeError(f"scenario applications.{identity} must be a list.")
+        seen_names: set[str] = set()
+        parsed_entries: list[ScenarioApplication] = []
+        for index, entry in enumerate(entries):
+            context = f"scenario applications.{identity}[{index}]"
+            if not isinstance(entry, dict):
+                raise RuntimeError(f"{context} must be a mapping.")
+            allowed_entry = {"name", "ros2docker_config"}
+            extra_entry = sorted(set(entry) - allowed_entry)
+            if extra_entry:
+                raise RuntimeError(
+                    f"Unsupported keys in {context}: {extra_entry}. Allowed keys: {sorted(allowed_entry)}"
+                )
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimeError(f"{context}.name must be a non-empty string.")
+            name = name.strip()
+            if name in seen_names:
+                raise RuntimeError(f"Duplicate application name '{name}' for identity '{identity}'.")
+            config_raw = entry.get("ros2docker_config")
+            if not isinstance(config_raw, str) or not config_raw.strip():
+                raise RuntimeError(f"{context}.ros2docker_config must be a non-empty string.")
+            config_path = _resolve_path(config_raw, resolved.host_dir, must_exist=True)
+            assert config_path is not None
+            if not config_path.is_file():
+                raise RuntimeError(f"{context}.ros2docker_config must resolve to a file: {config_path}")
+            load_config(config_path)
+            seen_names.add(name)
+            parsed_entries.append(ScenarioApplication(name=name, ros2docker_config=config_path))
+        applications[identity] = tuple(parsed_entries)
+
+    return ScenarioDefinition(session=session.strip(), applications=applications)
+
+
+def _scenario_application(
+    definition: ScenarioDefinition,
+    identity: str,
+    application_name: str,
+) -> ScenarioApplication:
+    for application in definition.applications.get(identity, ()):
+        if application.name == application_name:
+            return application
+    raise RuntimeError(f"Unknown scenario application '{application_name}' for identity '{identity}'.")
+
+
+def _scenario_container_name(
+    runtime: RuntimeConfig,
+    scenario_name: str,
+    identity: str,
+    application_name: str,
+) -> str:
+    base = _sanitize_docker_name(
+        f"rosotacom_{runtime.install_id}_scenario_{scenario_name}_{identity}_{application_name}"
+    )
+    if len(base) <= 120:
+        return base
+    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
+    return f"{base[:109]}_{digest}"
+
+
+def _scenario_application_image_name(runtime: RuntimeConfig, application: ScenarioApplication) -> str:
+    config = load_config(application.ros2docker_config, resolve_run_args=False)
+    base = str(config.get("image_name") or "ros2docker")
+    return _scoped_image_name_from_base(base, runtime.install_id)
+
+
+def _scenario_tmux_socket(runtime: RuntimeConfig) -> str:
+    return f"rosotacom-{runtime.install_id}"
+
+
+def _scenario_tmux_session(scenario_name: str, identity: str) -> str:
+    return _safe_path_token(f"{scenario_name}-{identity}")
+
+
+def _tmux_command(runtime: RuntimeConfig, *args: str) -> list[str]:
+    return ["tmux", "-L", _scenario_tmux_socket(runtime), *args]
+
+
+def _require_tmux() -> None:
+    if not shutil.which("tmux"):
+        raise RuntimeError("Scenario orchestration requires host tmux. Install tmux and retry.")
+
+
+def _tmux_session_exists(runtime: RuntimeConfig, session_name: str) -> bool:
+    if not shutil.which("tmux"):
+        return False
+    result = subprocess.run(
+        _tmux_command(runtime, "has-session", "-t", session_name),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _runtime_cli_args(runtime: RuntimeConfig) -> list[str]:
+    args: list[str] = []
+    if runtime.rosotacom_config:
+        args.extend(["--rosotacom-config", str(runtime.rosotacom_config)])
+    args.extend(["--ros2docker-config", str(runtime.ros2docker_config)])
+    if runtime.session_configs_dir:
+        args.extend(["--session-configs-dir", str(runtime.session_configs_dir)])
+    if runtime.scenario_configs_dir:
+        args.extend(["--scenario-configs-dir", str(runtime.scenario_configs_dir)])
+    if runtime.session_instances_dir:
+        args.extend(["--session-instances-dir", str(runtime.session_instances_dir)])
+    if runtime.data_dict:
+        args.extend(["--data-dict", str(runtime.data_dict)])
+    return args
+
+
+def _scenario_communication_command(
+    runtime: RuntimeConfig,
+    definition: ScenarioDefinition,
+    identity: str,
+    instance_id: str,
+    args: argparse.Namespace,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "start",
+        definition.session,
+        "--identity",
+        identity,
+        "--mode",
+        "attach",
+        "--instance-id",
+        instance_id,
+        "--scenario-managed",
+        *_runtime_cli_args(runtime),
+    ]
+    command.append("--force" if getattr(args, "force", True) else "--no-force")
+    if getattr(args, "rewrite_formatting", False):
+        command.append("--rewrite-formatting")
+    remote_override = getattr(args, "overwrite_peers_via_remote_peer", None)
+    if remote_override:
+        command.extend(["--overwrite-peers-via-remote-peer", remote_override])
+    for override in getattr(args, "peer_address", []) or []:
+        command.extend(["--peer-address", override])
+    return command
+
+
+def _scenario_application_command(
+    runtime: RuntimeConfig,
+    resolved: ResolvedScenario,
+    identity: str,
+    application: ScenarioApplication,
+) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "scenario",
+        "_run-application",
+        resolved.name,
+        "--identity",
+        identity,
+        "--application",
+        application.name,
+        *_runtime_cli_args(runtime),
+    ]
+
+
+def _scenario_log_path(instance: SessionInstance, identity: str, component: str) -> Path:
+    return instance.logs_host_dir / _safe_path_token(identity) / "scenario" / f"{_safe_path_token(component)}.log"
+
+
+def _attach_tmux_pipe(runtime: RuntimeConfig, pane_id: str, log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        _tmux_command(runtime, "pipe-pane", "-o", "-t", pane_id, f"cat >> {shlex.quote(str(log_path))}"),
+        check=True,
+    )
+
+
+def _create_scenario_tmux(
+    runtime: RuntimeConfig,
+    resolved: ResolvedScenario,
+    definition: ScenarioDefinition,
+    instance: SessionInstance,
+    identity: str,
+    applications: tuple[ScenarioApplication, ...],
+    args: argparse.Namespace,
+) -> str:
+    session_name = _scenario_tmux_session(resolved.name, identity)
+    communication_command = shlex.join(
+        _scenario_communication_command(runtime, definition, identity, instance.instance_id, args)
+    )
+    created = subprocess.run(
+        _tmux_command(
+            runtime,
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-s",
+            session_name,
+            "-n",
+            "scenario",
+            communication_command,
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    communication_pane = created.stdout.strip()
+    subprocess.run(_tmux_command(runtime, "set-option", "-t", session_name, "remain-on-exit", "on"), check=True)
+    subprocess.run(_tmux_command(runtime, "set-option", "-t", session_name, "prefix", "C-b"), check=True)
+    subprocess.run(_tmux_command(runtime, "bind-key", "-T", "prefix", "C-b", "send-prefix"), check=True)
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "pane-border-status", "top"),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(
+            runtime,
+            "set-option",
+            "-t",
+            session_name,
+            "pane-border-format",
+            " #{pane_title} ",
+        ),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(
+            runtime,
+            "set-option",
+            "-t",
+            session_name,
+            "status-right",
+            " outer: C-b | inner catmux: C-b C-b ",
+        ),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(runtime, "select-pane", "-t", communication_pane, "-T", "communication"),
+        check=True,
+    )
+    _attach_tmux_pipe(
+        runtime,
+        communication_pane,
+        _scenario_log_path(instance, identity, "communication"),
+    )
+
+    for application in applications:
+        split = subprocess.run(
+            _tmux_command(
+                runtime,
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                f"{session_name}:0",
+                shlex.join(_scenario_application_command(runtime, resolved, identity, application)),
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        pane_id = split.stdout.strip()
+        subprocess.run(
+            _tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"application:{application.name}"),
+            check=True,
+        )
+        _attach_tmux_pipe(
+            runtime,
+            pane_id,
+            _scenario_log_path(instance, identity, f"application-{application.name}"),
+        )
+
+    subprocess.run(_tmux_command(runtime, "select-layout", "-t", f"{session_name}:0", "tiled"), check=True)
+    subprocess.run(_tmux_command(runtime, "select-pane", "-t", communication_pane), check=True)
+    return session_name
+
+
 def _base_extra_run_args(
     runtime: RuntimeConfig,
     session: ResolvedSession,
@@ -1046,17 +1513,18 @@ def start_session(args: argparse.Namespace) -> str:
             ]
         ),
     )
-    _write_instance_manifest(
-        instance,
-        session,
-        runtime,
-        cfg,
-        identity=identity,
-        container_name=container_name,
-        mode=mode,
-        peer_address=list(args.peer_address or []),
-        overwrite_peers_via_remote_peer=args.overwrite_peers_via_remote_peer,
-    )
+    if not getattr(args, "scenario_managed", False):
+        _write_instance_manifest(
+            instance,
+            session,
+            runtime,
+            cfg,
+            identity=identity,
+            container_name=container_name,
+            mode=mode,
+            peer_address=list(args.peer_address or []),
+            overwrite_peers_via_remote_peer=args.overwrite_peers_via_remote_peer,
+        )
     if args.force:
         _stop_container_name(container_name, runtime, quiet_missing=True)
 
@@ -1112,6 +1580,225 @@ def stop_session(args: argparse.Namespace) -> None:
         print(f"Auto-selected identity: {identity}")
     for container_name in _identity_container_names(cfg, runtime, identity):
         _stop_container_name(container_name, runtime)
+
+
+def _resolve_scenario_context(
+    args: argparse.Namespace,
+) -> tuple[
+    RuntimeConfig,
+    ResolvedScenario,
+    ScenarioDefinition,
+    ResolvedSession,
+    dict[str, Any],
+    str,
+    tuple[ScenarioApplication, ...],
+]:
+    runtime = _load_runtime_config(args)
+    resolved = _resolve_scenario(args.scenario, runtime)
+    definition = _load_scenario_definition(resolved)
+    session = _resolve_session(definition.session, runtime)
+    peer_overrides = _parse_peer_address_overrides(getattr(args, "peer_address", None))
+    cfg = _effective_session_config(
+        session.host_dir,
+        runtime,
+        overwrite_peers_via_remote_peer=getattr(args, "overwrite_peers_via_remote_peer", None),
+        peer_address_overrides=peer_overrides,
+    )
+    peers = cfg.get("peers")
+    if not isinstance(peers, dict):
+        raise RuntimeError("Scenario session must define a peers mapping.")
+    unknown_identities = sorted(set(definition.applications) - set(peers))
+    if unknown_identities:
+        raise RuntimeError(
+            f"Scenario defines applications for unknown session identities {unknown_identities}. "
+            f"Known identities: {sorted(peers)}"
+        )
+    identity = getattr(args, "identity", None)
+    if not identity and getattr(args, "auto_identity", True):
+        identity = _auto_identity(session.host_dir, runtime, cfg)
+        print(f"Auto-selected identity: {identity}")
+    if not identity:
+        raise RuntimeError("Missing --identity. Provide --identity <peer> or allow auto identity.")
+    if identity not in peers:
+        raise RuntimeError(f"--identity must be one of peers={list(peers.keys())}")
+    applications = definition.applications.get(identity)
+    if applications is None:
+        raise RuntimeError(f"Scenario '{resolved.name}' has no applications entry for identity '{identity}'.")
+    return runtime, resolved, definition, session, cfg, identity, applications
+
+
+def _stop_scenario_application(
+    runtime: RuntimeConfig,
+    resolved: ResolvedScenario,
+    identity: str,
+    application: ScenarioApplication,
+) -> bool:
+    container_name = _scenario_container_name(runtime, resolved.name, identity, application.name)
+    if not _container_exists(container_name):
+        return False
+    ros2docker_stop(
+        config_file=application.ros2docker_config,
+        override={"container_name": container_name},
+    )
+    return True
+
+
+def _kill_scenario_tmux(runtime: RuntimeConfig, session_name: str) -> bool:
+    if not _tmux_session_exists(runtime, session_name):
+        return False
+    subprocess.run(_tmux_command(runtime, "kill-session", "-t", session_name), check=True)
+    return True
+
+
+def _find_latest_scenario_instance(
+    runtime: RuntimeConfig,
+    scenario_name: str,
+    identity: str,
+    instance_id: str | None = None,
+) -> Path | None:
+    root = _session_instances_root(runtime)
+    candidates = sorted(root.glob("*/*/manifest.yaml"), reverse=True)
+    for manifest_path in candidates:
+        manifest = _load_yaml_file(manifest_path)
+        if instance_id and manifest.get("instance_id") != _safe_path_token(instance_id):
+            continue
+        scenario_runs = manifest.get("scenario_runs") or {}
+        if f"{scenario_name}:{identity}" in scenario_runs:
+            return manifest_path.parent.resolve()
+    return None
+
+
+def _stop_scenario_components(
+    runtime: RuntimeConfig,
+    resolved: ResolvedScenario,
+    cfg: dict[str, Any],
+    identity: str,
+    applications: tuple[ScenarioApplication, ...],
+    *,
+    quiet_missing: bool,
+) -> None:
+    for application in applications:
+        stopped = _stop_scenario_application(runtime, resolved, identity, application)
+        if stopped:
+            print(f"Stopped scenario application: {application.name}")
+        elif not quiet_missing:
+            print(
+                "Application container not found: "
+                + _scenario_container_name(runtime, resolved.name, identity, application.name)
+            )
+    communication_container = _container_name(_remote_peer_name(cfg, identity), runtime)
+    _stop_container_name(communication_container, runtime, quiet_missing=quiet_missing)
+    if _kill_scenario_tmux(runtime, _scenario_tmux_session(resolved.name, identity)):
+        print(f"Stopped scenario tmux session: {_scenario_tmux_session(resolved.name, identity)}")
+
+
+def start_scenario(args: argparse.Namespace) -> int:
+    _require_ros2docker()
+    _require_tmux()
+    runtime, resolved, definition, session, cfg, identity, applications = _resolve_scenario_context(args)
+    tmux_session = _scenario_tmux_session(resolved.name, identity)
+    if _tmux_session_exists(runtime, tmux_session):
+        if not getattr(args, "force", True):
+            raise RuntimeError(f"Scenario tmux session already exists: {tmux_session}. Use --force or attach to it.")
+        _stop_scenario_components(
+            runtime,
+            resolved,
+            cfg,
+            identity,
+            applications,
+            quiet_missing=True,
+        )
+
+    instance = _resolve_session_instance(runtime, session, getattr(args, "instance_id", None))
+    communication_container = _container_name(_remote_peer_name(cfg, identity), runtime)
+    _write_scenario_manifest(
+        instance,
+        session,
+        runtime,
+        cfg,
+        resolved,
+        identity=identity,
+        communication_container=communication_container,
+        applications=applications,
+        tmux_session=tmux_session,
+    )
+    created_session = _create_scenario_tmux(
+        runtime,
+        resolved,
+        definition,
+        instance,
+        identity,
+        applications,
+        args,
+    )
+    print(f"rosotacom scenario instance: {instance.host_dir}")
+    print(f"rosotacom scenario started: {resolved.name} ({identity})")
+    print("Outer tmux prefix: Ctrl-b; send the inner catmux prefix with Ctrl-b Ctrl-b.")
+    mode = _resolve_mode(getattr(args, "mode", "auto"))
+    if mode == "attach":
+        subprocess.run(_tmux_command(runtime, "attach-session", "-t", created_session), check=True)
+    else:
+        print(f"Attach with: rosotacom scenario attach {shlex.quote(resolved.name)} --identity {identity}")
+    return 0
+
+
+def attach_scenario(args: argparse.Namespace) -> int:
+    _require_tmux()
+    runtime, resolved, _definition, _session, _cfg, identity, _applications = _resolve_scenario_context(args)
+    tmux_session = _scenario_tmux_session(resolved.name, identity)
+    if not _tmux_session_exists(runtime, tmux_session):
+        raise RuntimeError(f"Scenario tmux session is not running: {tmux_session}")
+    subprocess.run(_tmux_command(runtime, "attach-session", "-t", tmux_session), check=True)
+    return 0
+
+
+def stop_scenario(args: argparse.Namespace) -> int:
+    _require_ros2docker()
+    runtime, resolved, _definition, _session, cfg, identity, applications = _resolve_scenario_context(args)
+    _stop_scenario_components(
+        runtime,
+        resolved,
+        cfg,
+        identity,
+        applications,
+        quiet_missing=False,
+    )
+    instance_dir = _find_latest_scenario_instance(
+        runtime,
+        resolved.name,
+        identity,
+        getattr(args, "instance_id", None),
+    )
+    if instance_dir:
+        _mark_scenario_stopped(instance_dir, resolved.name, identity)
+    return 0
+
+
+def run_scenario_application(args: argparse.Namespace) -> int:
+    _require_ros2docker()
+    runtime = _load_runtime_config(args)
+    resolved = _resolve_scenario(args.scenario, runtime)
+    definition = _load_scenario_definition(resolved)
+    application = _scenario_application(definition, args.identity, args.application)
+    container_name = _scenario_container_name(runtime, resolved.name, args.identity, application.name)
+    if _container_exists(container_name):
+        ros2docker_stop(
+            config_file=application.ros2docker_config,
+            override={"container_name": container_name},
+        )
+    override = {
+        "container_name": container_name,
+        "image_name": _scenario_application_image_name(runtime, application),
+    }
+    ros2docker_build(config_file=application.ros2docker_config, override=override)
+    ros2docker_run(config_file=application.ros2docker_config, override=override)
+    return 0
+
+
+def list_scenarios(args: argparse.Namespace) -> int:
+    runtime = _load_runtime_config(args)
+    print(_format_available_scenarios(runtime))
+    return 0
 
 
 def list_sessions(args: argparse.Namespace) -> None:
@@ -1292,6 +1979,10 @@ def doctor(args: argparse.Namespace) -> int:
             line("OK", "session definitions", f"{runtime.session_configs_dir} -> {SESSION_DEFINITION_CONTAINER_DIR}")
         else:
             line("INFO", "session definitions", "not configured")
+        if runtime.scenario_configs_dir:
+            line("OK", "scenario definitions", str(runtime.scenario_configs_dir))
+        else:
+            line("INFO", "scenario definitions", "not configured")
         line("OK", "session instances", f"{_session_instances_root(runtime)} -> {SESSION_INSTANCE_CONTAINER_DIR}")
         if runtime.data_dict:
             line("OK", "data dict", str(runtime.data_dict))
@@ -1312,6 +2003,12 @@ def doctor(args: argparse.Namespace) -> int:
             line("OK", "legacy start_rosotacom", f"{stale} points to this checkout")
     else:
         line("INFO", "legacy start_rosotacom", "no global legacy symlink found")
+
+    tmux = shutil.which("tmux")
+    if tmux:
+        line("OK", "tmux", tmux)
+    else:
+        line("WARN", "tmux", "not installed; required only for `rosotacom scenario`")
 
     if runtime and _ROS2DOCKER_IMPORT_ERROR is None:
         try:
@@ -2439,6 +3136,7 @@ def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("-f", "--ros2docker-config", help="Path to ros2docker JSON config.")
     parser.add_argument("--session-configs-dir", help="Host directory containing named session configs.")
+    parser.add_argument("--scenario-configs-dir", help="Host directory containing named scenario configs.")
     parser.add_argument("--session-instances-dir", help="Host directory for generated session instances and logs.")
     parser.add_argument("--data-dict", help="Host data_dict.json path for data:<key> address expressions.")
 
@@ -2447,6 +3145,20 @@ def _add_session_arg(parser: argparse.ArgumentParser, *args: str, **kwargs: Any)
     action = parser.add_argument(*args, **kwargs)
     cast(Any, action).completer = _session_name_completer
     return action
+
+
+def _add_scenario_arg(parser: argparse.ArgumentParser, *args: str, **kwargs: Any) -> argparse.Action:
+    action = parser.add_argument(*args, **kwargs)
+    cast(Any, action).completer = _scenario_name_completer
+    return action
+
+
+def _add_scenario_identity_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--identity")
+    parser.add_argument("--no-auto-identity", dest="auto_identity", action="store_false")
+    parser.add_argument("--overwrite-peers-via-remote-peer")
+    parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    parser.set_defaults(auto_identity=True)
 
 
 def _add_start_args(parser: argparse.ArgumentParser) -> None:
@@ -2462,6 +3174,7 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--overwrite-peers-via-remote-peer")
     parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
     parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
+    parser.add_argument("--scenario-managed", action="store_true", help=argparse.SUPPRESS)
     parser.set_defaults(force=True, auto_identity=True)
 
 
@@ -2538,6 +3251,7 @@ def main(argv: list[str] | None = None) -> int:
         "probe-check",
         "publish-test-topics",
         "list-sessions",
+        "scenario",
         "examples",
         "setup-env",
         "config",
@@ -2649,6 +3363,59 @@ def main(argv: list[str] | None = None) -> int:
     list_parser = subparsers.add_parser("list-sessions", help="List configured sessions.")
     _add_common_config_args(list_parser)
     list_parser.set_defaults(func=list_sessions_command)
+
+    scenario_parser = subparsers.add_parser(
+        "scenario",
+        help="Run a communication session together with identity-specific local applications.",
+    )
+    scenario_subparsers = scenario_parser.add_subparsers(dest="scenario_command", required=True)
+
+    scenario_start_parser = scenario_subparsers.add_parser(
+        "start",
+        help="Start a scenario in an isolated outer tmux session.",
+    )
+    _add_common_config_args(scenario_start_parser)
+    _add_scenario_arg(scenario_start_parser, "scenario")
+    _add_scenario_identity_args(scenario_start_parser)
+    scenario_start_parser.add_argument("--mode", choices=["auto", "attach", "detached"], default="auto")
+    scenario_start_parser.add_argument("--no-force", dest="force", action="store_false")
+    scenario_start_parser.add_argument("--force", dest="force", action="store_true")
+    scenario_start_parser.add_argument("--rewrite-formatting", action="store_true")
+    scenario_start_parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
+    scenario_start_parser.set_defaults(func=start_scenario, force=True)
+
+    scenario_attach_parser = scenario_subparsers.add_parser(
+        "attach",
+        help="Attach to a running scenario's outer tmux session.",
+    )
+    _add_common_config_args(scenario_attach_parser)
+    _add_scenario_arg(scenario_attach_parser, "scenario")
+    _add_scenario_identity_args(scenario_attach_parser)
+    scenario_attach_parser.set_defaults(func=attach_scenario)
+
+    scenario_stop_parser = scenario_subparsers.add_parser(
+        "stop",
+        help="Stop scenario applications, communication container, and outer tmux.",
+    )
+    _add_common_config_args(scenario_stop_parser)
+    _add_scenario_arg(scenario_stop_parser, "scenario")
+    _add_scenario_identity_args(scenario_stop_parser)
+    scenario_stop_parser.add_argument("--instance-id", help="Mark a specific scenario instance as stopped.")
+    scenario_stop_parser.set_defaults(func=stop_scenario)
+
+    scenario_list_parser = scenario_subparsers.add_parser("list", help="List configured scenarios.")
+    _add_common_config_args(scenario_list_parser)
+    scenario_list_parser.set_defaults(func=list_scenarios)
+
+    scenario_run_application_parser = scenario_subparsers.add_parser(
+        "_run-application",
+        help="Internal application runner used by scenario tmux panes.",
+    )
+    _add_common_config_args(scenario_run_application_parser)
+    _add_scenario_arg(scenario_run_application_parser, "scenario")
+    scenario_run_application_parser.add_argument("--identity", required=True)
+    scenario_run_application_parser.add_argument("--application", required=True)
+    scenario_run_application_parser.set_defaults(func=run_scenario_application)
 
     examples_parser = subparsers.add_parser("examples", help="Manage packaged rosotacom examples.")
     examples_subparsers = examples_parser.add_subparsers(dest="examples_command", required=True)

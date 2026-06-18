@@ -1,7 +1,7 @@
 # Rosotacom Examples
 
 This directory is a copyable rosotacom example project. It contains local
-project setup, reusable session configs, and helper scripts.
+project setup, reusable session/scenario configs, and helper scripts.
 
 ## Use From An Installed CLI
 
@@ -27,6 +27,26 @@ rosotacom stop 1_heartbeat --identity a
 rosotacom stop 1_heartbeat --identity b
 docker ps --filter name=rosotacom   # optional: confirm cleanup
 ```
+
+## Complete native-chatter scenario
+
+Example 2 composes its communication session with the matching local
+application container:
+
+```bash
+rosotacom scenario start 2_native_chatter --identity a
+```
+
+Run identity `b` on the other machine in the same way. The outer tmux prefix is
+`Ctrl-b`; use `Ctrl-b Ctrl-b` to address the inner catmux session. Detaching
+keeps the use case running:
+
+```bash
+rosotacom scenario attach 2_native_chatter --identity a
+rosotacom scenario stop 2_native_chatter --identity a
+```
+
+The existing scripts under `scripts/2_native_chatter/` remain as a fallback.
 
 ## Local smoke test
 
@@ -64,6 +84,7 @@ one host and identity `b` on the other with the same session.
 - `ros2docker.json`: Docker runtime defaults used by the communication containers
 - `data_dict.json`: example machine address data used by `data:<key>` session entries
 - `sessions/`: tracked static session definitions/templates
+- `scenarios/`: complete use cases that combine a session with local applications
 - `session-instances/`: ignored generated runtime configs, catmux logs, smoke logs, and rosbags
 - `scripts/`: convenience wrappers and external-node launchers
 

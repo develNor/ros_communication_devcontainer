@@ -5,5 +5,6 @@
 #   eval "$(rosotacom setup-env ./rosotacom.yaml)"
 ros2docker_config: src/rosotacom/resources/examples/ros2docker.json
 session_configs_dir: src/rosotacom/resources/examples/sessions
+scenario_configs_dir: src/rosotacom/resources/examples/scenarios
 session_instances_dir: session-instances
 data_dict: src/rosotacom/resources/examples/data_dict.json

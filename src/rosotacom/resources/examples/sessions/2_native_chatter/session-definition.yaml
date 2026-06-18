@@ -12,8 +12,8 @@ peer_settings:
 
 shared:
   use_status_overview: true
-  # Active variant: fastdds shortcut (sets both local and OTA RMW implementations).
-  rmw: fastdds
+  # Active variant: cyclone shortcut (sets both local and OTA RMW implementations).
+  rmw: cyclone
   ota_domain_id: 48
 
   # --- Alternative rmw syntaxes (uncomment one, comment out the others) ---

@@ -21,6 +21,7 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
         "resources/examples/data_dict.json",
         "resources/examples/sessions/1_heartbeat/session-definition.yaml",
         "resources/examples/sessions/1_heartbeat_status/session-definition.yaml",
+        "resources/examples/scenarios/2_native_chatter/scenario-definition.yaml",
         "resources/ws/session/creation/run_session.py",
         "resources/ws/session/creation/catmux_log_setup.sh",
         "resources/ws/session/creation/strip_ansi.py",

@@ -1,5 +1,6 @@
 {
   "container_name": "machine_a_logic",
+  "image_name": "rosotacom-native-chatter",
 
   "run_type": "command",
   "command": "/wait_for_echo_topic.sh",
@@ -8,6 +9,12 @@
   "run_args": [
     "--network", "host",
     "-v", "./wait_for_echo_topic.sh:/wait_for_echo_topic.sh",
+    "-e", "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp",
     "-e", "ROS_DOMAIN_ID=46"
-  ]
+  ],
+
+  "build_args": {
+    "BASE_IMAGE": "osrf/ros:kilted-desktop-full-noble",
+    "DIGEST": "@sha256:29eb6f48bb06549aba004a7a4b12c00ece23b156731df12cf1f3c1ae1b0fd178"
+  }
 }

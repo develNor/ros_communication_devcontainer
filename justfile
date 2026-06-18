@@ -67,6 +67,7 @@ _package-smoke:
 	"$tmpdir/venv/bin/python" -m rosotacom --version
 	"$tmpdir/venv/bin/rosotacom" examples create "$tmpdir/examples"
 	"$tmpdir/venv/bin/rosotacom" list-sessions --rosotacom-config "$tmpdir/examples/rosotacom.yaml"
+	"$tmpdir/venv/bin/rosotacom" scenario list --rosotacom-config "$tmpdir/examples/rosotacom.yaml"
 	"$tmpdir/venv/bin/python" - <<'PY'
 	from importlib import resources
 
@@ -75,6 +76,7 @@ _package-smoke:
 	    "resources/ros2docker.json.example",
 	    "resources/examples/rosotacom.yaml",
 	    "resources/examples/sessions/1_heartbeat/session-definition.yaml",
+	    "resources/examples/scenarios/2_native_chatter/scenario-definition.yaml",
 	    "resources/ws/session/creation/run_session.py",
 	    "resources/ws/ros2src/com_msgs/msg/Heartbeat.msg",
 	)

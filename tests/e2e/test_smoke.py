@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -190,6 +191,30 @@ def _smoke_command(project: Path, session_name: str) -> list[str]:
     ]
 
 
+def _scenario_command(project: Path, action: str, identity: str, instance_id: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "scenario",
+        action,
+        "2_native_chatter",
+        "--identity",
+        identity,
+        "--rosotacom-config",
+        str(project / "rosotacom.yaml"),
+        "--session-instances-dir",
+        str(SESSION_INSTANCES_DIR),
+        "--instance-id",
+        instance_id,
+        "--peer-address",
+        "a=127.0.0.1",
+        "--peer-address",
+        "b=127.0.0.1",
+        *(["--mode", "detached"] if action == "start" else []),
+    ]
+
+
 def _artifact_dir(stdout: str) -> Path:
     matches = re.findall(r"Smoke artifacts: (.+)", stdout)
     assert matches, f"no 'Smoke artifacts:' line in smoke output:\n{stdout}"
@@ -360,6 +385,48 @@ def test_local_native_chatter_smoke_from_copied_example_project(
 
     _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
     _assert_metric_present(session_name, result.stdout, topic="/chatter", label="b->a final topic")
+
+
+def test_native_chatter_scenario_starts_apps_and_communication_together(
+    copied_example_project: Path,
+) -> None:
+    instance_id = f"scenario-pilot-{time.time_ns()}"
+    try:
+        for identity in ("a", "b"):
+            result = _run(_scenario_command(copied_example_project, "start", identity, instance_id), timeout=900)
+            assert "rosotacom scenario started: 2_native_chatter" in result.stdout
+            assert "inner catmux prefix with Ctrl-b Ctrl-b" in result.stdout
+
+        _run(
+            [
+                sys.executable,
+                "-m",
+                "rosotacom",
+                "test",
+                "2_native_chatter",
+                "--rosotacom-config",
+                str(copied_example_project / "rosotacom.yaml"),
+                "--session-instances-dir",
+                str(SESSION_INSTANCES_DIR),
+                "--instance-id",
+                instance_id,
+                "--timeout",
+                "120",
+            ],
+            timeout=180,
+        )
+
+        manifests = sorted(SESSION_INSTANCES_DIR.glob(f"*/*_{instance_id}/manifest.yaml"))
+        assert manifests
+        manifest = manifests[-1].read_text(encoding="utf-8")
+        assert "2_native_chatter:a" in manifest
+        assert "2_native_chatter:b" in manifest
+        assert "rosotacom_" in manifest
+        scenario_logs = list(manifests[-1].parent.glob("logs/*/scenario/*.log"))
+        assert scenario_logs
+    finally:
+        for identity in ("a", "b"):
+            _run(_scenario_command(copied_example_project, "stop", identity, instance_id), timeout=60)
 
 
 @pytest.mark.parametrize("session_name", COMP_OCC_GRID_SMOKE_SESSIONS)

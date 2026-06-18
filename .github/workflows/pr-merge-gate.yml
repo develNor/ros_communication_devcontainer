@@ -125,7 +125,7 @@ jobs:
       - name: Show Docker environment
         run: docker info
 
-      - name: Run heartbeat smoke matrix
+      - name: Run single-machine smoke matrix
         run: just test-e2e-smoke
 
       - name: Upload smoke session artifacts

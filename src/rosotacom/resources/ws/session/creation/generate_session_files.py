@@ -1216,6 +1216,22 @@ def _final_topic_type(entry: TopicEntry, pipe: Dict[str, Any]) -> str:
     return msg_type
 
 
+def _heartbeat_monitor_overrides(heartbeat_expect: Optional[Dict[str, Any]]) -> List[Tuple[str, Any]]:
+    """Override the heartbeat_in_monitor status thresholds from a declared
+    `shared.heartbeat.expect`. Only latency and loss map cleanly to the monitor's
+    threshold model; the expected rate is the publish rate (heartbeat_out_hz) and
+    `expect.hz` (min/max) is enforced separately by the status overview."""
+    expect = heartbeat_expect if isinstance(heartbeat_expect, dict) else {}
+    overrides: List[Tuple[str, Any]] = []
+    latency = expect.get("latency_ms")
+    if isinstance(latency, dict) and "max" in latency:
+        overrides.append(("heartbeat_delay_bad_ms", float(latency["max"])))
+    loss = expect.get("loss_pct")
+    if isinstance(loss, dict) and "max" in loss:
+        overrides.append(("heartbeat_loss3_bad_pct", float(loss["max"])))
+    return overrides
+
+
 def _build_status_pipeline_spec(
     *,
     local: str,
@@ -2012,6 +2028,7 @@ def func(
                             ("heartbeat", True),
                             ("heartbeat_out_topics", hb_topic[local]),
                             ("heartbeat_in_topic", hb_topic[remote]),
+                            *_heartbeat_monitor_overrides((shared.get("heartbeat") or {}).get("expect")),
                         ],
                     )
                 )
@@ -2628,6 +2645,7 @@ def func(
                         ("heartbeat", True),
                         ("heartbeat_out_topics", hb_out),
                         ("heartbeat_in_topic", hb_in),
+                        *_heartbeat_monitor_overrides((shared.get("heartbeat") or {}).get("expect")),
                     ],
                 )
             )

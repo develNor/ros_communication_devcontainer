@@ -150,14 +150,21 @@ per-session marker.
   contract is surfaced in `status.json` (`quality` / `expect`).
 - `rosotacom test` leans on that verdict: a delivered topic whose final stage is
   `quality: BAD` fails (in addition to the raw-metric check).
+- Heartbeat `expect` (`shared.heartbeat.expect`) drives both the status overview
+  and the dedicated `heartbeat_in_monitor`: its `delay_bad_ms` / `loss3_bad_pct`
+  come from `latency_ms.max` / `loss_pct.max`, and `expected_hz` tracks the
+  publish rate. This is also where `loss_pct` is enforced.
 
 **Follow-ups**
-- Heartbeat `expect` (it has no `topics:` entry — likely `shared.heartbeat.expect`)
-  and feeding the same contract to `heartbeat_in_monitor`.
 - Marker migration (drop `multi_machine`; derive/`local_check`).
 - Examples curation + generated RMW matrix; `tests/sessions/` split.
 - Wire the manual full-suite promotion gate; fold `verify` into `rosotacom test`.
-- `loss_pct` in `expect` and the evaluator.
+
+**Not feasible as written**
+- `loss_pct` for *non-heartbeat* topics: ROS 2 messages carry no sequence number
+  (only `header.stamp`), so the generic status node cannot detect gaps. Loss is
+  only computable where the payload carries an explicit sequence (the heartbeat,
+  handled above).
 
 ## Notes / open
 

@@ -29,6 +29,7 @@ shared:
     expect:
       hz: { min: 8, max: 12 }
       latency_ms: { max: 200 }
+      loss_pct: { max: 5 }
   # Maintain a continuously-updated per-topic pipeline status overview
   # (status.json / status.txt / events.jsonl under logs/<peer>/status/).
   # OTA stages are graph-only; this does not add OTA payload subscriptions.

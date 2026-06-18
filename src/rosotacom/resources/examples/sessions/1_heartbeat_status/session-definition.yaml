@@ -22,6 +22,13 @@ peer_settings:
 
 shared:
   use_heartbeat: true
+  heartbeat:
+    # The heartbeat's intended behavior. The status overview classifies the live
+    # heartbeat against it (status.json `quality`/`reason`) and `rosotacom test`
+    # asserts it. See docs/rfcs/0001-expectation-driven-test-suite.md.
+    expect:
+      hz: { min: 8, max: 12 }
+      latency_ms: { max: 200 }
   # Maintain a continuously-updated per-topic pipeline status overview
   # (status.json / status.txt / events.jsonl under logs/<peer>/status/).
   # OTA stages are graph-only; this does not add OTA payload subscriptions.

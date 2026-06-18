@@ -8,6 +8,6 @@
   "run_args": [
     "--network", "host",
     "-v", "./wait_for_echo_topic.sh:/wait_for_echo_topic.sh",
-    "-e", "ROS_DOMAIN_ID=47"
+    "-e", "ROS_DOMAIN_ID=46"
   ]
 }

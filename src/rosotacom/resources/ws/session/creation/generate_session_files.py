@@ -936,6 +936,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "use_topic_monitor",
                 "use_status_overview",
                 "use_heartbeat",
+                "heartbeat",
                 "use_in",
                 "use_out",
                 "rmw",
@@ -979,6 +980,11 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
         if "qos" in shared and shared["qos"] is not None:
             qos = _assert_mapping(shared.get("qos"), "shared.qos")
             _assert_allowed_keys("shared.qos", qos, {"defaults", "for_role"})
+        if "heartbeat" in shared and shared["heartbeat"] is not None:
+            hb = _assert_mapping(shared.get("heartbeat"), "shared.heartbeat")
+            _assert_allowed_keys("shared.heartbeat", hb, {"expect"})
+            if "expect" in hb and hb["expect"] is not None and not isinstance(hb["expect"], dict):
+                raise RuntimeError("shared.heartbeat.expect must be a mapping.")
 
     # peer_settings is optional
     if "peer_settings" in cfg and cfg["peer_settings"] is not None:
@@ -1228,6 +1234,7 @@ def _build_status_pipeline_spec(
     uses_domain_bridge: bool,
     hb_topic: Dict[str, str],
     use_heartbeat: bool,
+    heartbeat_expect: Optional[Dict[str, Any]],
     out_enabled: bool,
     in_enabled: bool,
     final_topic_type,
@@ -1281,7 +1288,8 @@ def _build_status_pipeline_spec(
             outbound_items.append((e, p))
         if use_heartbeat and hb_local:
             hb_entry = TopicEntry(
-                base=hb_local, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1
+                base=hb_local, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1,
+                expect=heartbeat_expect,
             )
             hb_pipe = {"final": hb_local}
             outbound_items.insert(0, (hb_entry, hb_pipe))
@@ -1341,7 +1349,8 @@ def _build_status_pipeline_spec(
             inbound_items.append((e, p))
         if use_heartbeat and hb_remote:
             hb_entry = TopicEntry(
-                base=hb_remote, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1
+                base=hb_remote, msg_type=HEARTBEAT_MSG_TYPE, processing={}, qos=None, zen_qos=None, index=-1,
+                expect=heartbeat_expect,
             )
             hb_pipe = {"final": hb_remote}
             inbound_items.insert(0, (hb_entry, hb_pipe))
@@ -2589,6 +2598,7 @@ def func(
                 uses_domain_bridge=_use_domain_bridge(local),
                 hb_topic=hb_topic,
                 use_heartbeat=use_heartbeat,
+                heartbeat_expect=(shared.get("heartbeat") or {}).get("expect"),
                 out_enabled=out_enabled,
                 in_enabled=in_enabled,
                 final_topic_type=_final_topic_type,

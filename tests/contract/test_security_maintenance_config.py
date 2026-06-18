@@ -52,8 +52,8 @@ def test_session_test_tier_markers_drive_both_test_matrices() -> None:
     markers = session_test_markers()  # raises if any session lacks valid markers
     assert markers, "no example sessions found"
 
-    # Anti-drift guard: the heartbeat-RMW matrix is exactly the single-machine
-    # smoke set. Adding/removing an RMW example must update its marker accordingly.
+    # Anti-drift guard: these examples are exactly the single-machine smoke set.
+    # Adding/removing an example must update its marker accordingly.
     assert set(sessions_in_tier("single_machine", {"ok"})) == {
         "1_heartbeat_cyclone-ota",
         "1_heartbeat_fastdds",
@@ -61,6 +61,8 @@ def test_session_test_tier_markers_drive_both_test_matrices() -> None:
         "1_heartbeat_fastdds-local_cyclone-ota",
         "1_heartbeat_cyclone-local_fastdds-ota",
         "1_heartbeat_cyclone-local_zenoh-ros2dds-ota",
+        "2_native_chatter",
+        "3_comp_occ_grid",
     }
 
     # cyclone-ota-tuned hides local topics on a shared domain (no per-peer domain

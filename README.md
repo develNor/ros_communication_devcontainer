@@ -25,6 +25,8 @@ The ROS Communication DevContainer is a Docker-based solution designed to stream
 
 - Docker installed on all machines
 - Git for configuration management
+- Python 3 with virtual environment support (`python3-venv` on Debian/Ubuntu;
+  for versioned Python packages this may be named like `python3.14-venv`)
 - `ros2docker` v0.1.2 or newer. The local installer below installs the pinned
   supported range into this checkout's virtual environment.
 - Machines connected to the same network (VPN or local WLAN)
@@ -161,6 +163,12 @@ Run the local heartbeat smoke test:
 
 ```bash
 rosotacom smoke
+```
+
+To smoke-test one specific configured session locally, pass its name:
+
+```bash
+rosotacom smoke 1_heartbeat_cyclone-ota
 ```
 
 The smoke test verifies both directions through the communication path: it waits

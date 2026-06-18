@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -115,6 +115,22 @@ class SessionInstance:
     logs_container_dir: str
     rosbags_host_dir: Path
     rosbags_container_dir: str
+
+
+@dataclass(frozen=True)
+class SmokeTopicSpec:
+    source_peer_key: str
+    receiver_peer_key: str
+    topic: str
+    label: str
+    enforce_bounds: bool
+    use_default_bounds: bool = False
+    publish_topic: str | None = None
+    publish_type: str | None = None
+    publish_rate: float = 5.0
+    hz_min: float | None = None
+    hz_max: float | None = None
+    max_delay_s: float | None = None
 
 
 def _load_yaml_file(path: Path | None) -> dict[str, Any]:
@@ -1445,6 +1461,118 @@ def _smoke_inbound_bridge_topic(cfg: dict[str, Any], source_peer_key: str) -> st
     return f"/com/in/{source_name}/{heartbeat_topic}"
 
 
+def _smoke_forward_topic_for_inbound(
+    cfg: dict[str, Any], source_peer_key: str, receiver_peer_key: str, topic: str
+) -> str:
+    peer_settings = cfg.get("peer_settings", {}) or {}
+    peer_settings = peer_settings if isinstance(peer_settings, dict) else {}
+    source_settings = peer_settings.get(source_peer_key, {}) or {}
+    source_settings = source_settings if isinstance(source_settings, dict) else {}
+    outbound = source_settings.get("outbound", {}) or {}
+    outbound = outbound if isinstance(outbound, dict) else {}
+    target_prefix = outbound.get("target_prefix", {}) or {}
+    target_prefix = target_prefix if isinstance(target_prefix, dict) else {}
+    if bool(target_prefix.get("use_target_prefix", False)):
+        peers = cfg.get("peers", {}) or {}
+        if not isinstance(peers, dict):
+            raise RuntimeError("Smoke verification requires a session config with peers.")
+        return f"/to_{_peer_com_name(peers, receiver_peer_key)}{topic}"
+    return topic
+
+
+def _smoke_inbound_forward_topic(cfg: dict[str, Any], source_peer_key: str, receiver_peer_key: str, topic: str) -> str:
+    peers = cfg.get("peers", {}) or {}
+    if not isinstance(peers, dict):
+        raise RuntimeError("Smoke verification requires a session config with peers.")
+    source_name = _peer_com_name(peers, source_peer_key)
+    forward_topic = _smoke_forward_topic_for_inbound(cfg, source_peer_key, receiver_peer_key, topic).lstrip("/")
+    return f"/com/in/{source_name}/{forward_topic}"
+
+
+def _smoke_receiver_final_topic(cfg: dict[str, Any], source_peer_key: str, receiver_peer_key: str, topic: str) -> str:
+    peer_settings = cfg.get("peer_settings", {}) or {}
+    peer_settings = peer_settings if isinstance(peer_settings, dict) else {}
+    receiver_settings = peer_settings.get(receiver_peer_key, {}) or {}
+    receiver_settings = receiver_settings if isinstance(receiver_settings, dict) else {}
+    inbound = receiver_settings.get("inbound", {}) or {}
+    inbound = inbound if isinstance(inbound, dict) else {}
+    if bool(inbound.get("keep_source_prefix", False)):
+        peers = cfg.get("peers", {}) or {}
+        if not isinstance(peers, dict):
+            raise RuntimeError("Smoke verification requires a session config with peers.")
+        return f"/{_peer_com_name(peers, source_peer_key)}{topic}"
+    return topic
+
+
+def _topic_direction_peers(direction: str, cfg: dict[str, Any]) -> tuple[str, str]:
+    parts = direction.split("_to_")
+    if len(parts) != 2:
+        raise RuntimeError(f"topics key '{direction}' must match '<src>_to_<dst>'.")
+    src, dst = parts
+    peers = cfg.get("peers") or {}
+    if src not in peers or dst not in peers:
+        raise RuntimeError(f"topics key '{direction}' refers to unknown peer(s) '{src}'/'{dst}'.")
+    return src, dst
+
+
+def _smoke_topic_pipeline(cfg: dict[str, Any], entry: Any) -> dict[str, Any]:
+    shared = cfg.get("shared", {}) or {}
+    shared = shared if isinstance(shared, dict) else {}
+    suffixes = shared.get("processing_suffixes", {}) or {}
+    suffixes = suffixes if isinstance(suffixes, dict) else {}
+    restamped_suffix = str(suffixes.get("restamped", "/restamped"))
+    latched_suffix = str(suffixes.get("latched", "/latched"))
+    globalframe_suffix = str(suffixes.get("framebridge_global", "/globalframe"))
+    ota_suffix = str(suffixes.get("ota_stamped", "/ota_stamped"))
+    compression = shared.get("compression", {}) or {}
+    compression = compression if isinstance(compression, dict) else {}
+    comp_alg_suffix = "/" + str(compression.get("algorithm", "bz2") or "bz2").strip()
+    return cast(
+        dict[str, Any],
+        session_gen._compute_pipeline(
+            entry,
+            {},
+            restamped_suffix,
+            latched_suffix,
+            globalframe_suffix,
+            comp_alg_suffix,
+            ota_suffix,
+        ),
+    )
+
+
+def _smoke_postprocessed_topic(entry: Any, pipe: dict[str, Any]) -> str:
+    if pipe.get("compress"):
+        return str(pipe["comp_in"])
+    if pipe.get("ota_wrap"):
+        return str(pipe["ota_in"])
+    return str(pipe["final"])
+
+
+def _smoke_expect_bounds(expect: Any) -> tuple[float | None, float | None, float | None]:
+    if not isinstance(expect, dict):
+        return None, None, None
+    hz = expect.get("hz") or {}
+    latency = expect.get("latency_ms") or {}
+    hz_min = float(hz["min"]) if isinstance(hz, dict) and hz.get("min") is not None else None
+    hz_max = float(hz["max"]) if isinstance(hz, dict) and hz.get("max") is not None else None
+    max_delay_s = (
+        float(latency["max"]) / 1000.0 if isinstance(latency, dict) and latency.get("max") is not None else None
+    )
+    return hz_min, hz_max, max_delay_s
+
+
+def _smoke_publish_rate(expect: Any) -> float:
+    hz_min, hz_max, _ = _smoke_expect_bounds(expect)
+    if hz_min is not None and hz_max is not None:
+        return (hz_min + hz_max) / 2.0
+    if hz_min is not None:
+        return max(1.0, hz_min * 1.5)
+    if hz_max is not None:
+        return max(0.5, hz_max / 2.0)
+    return 5.0
+
+
 def _smoke_rmw_spec(cfg: dict[str, Any]) -> Any:
     peers = cfg.get("peers", {}) or {}
     if not isinstance(peers, dict):
@@ -1530,15 +1658,83 @@ def _other_peer_key(cfg: dict[str, Any], identity: str) -> str:
     return str(next(k for k in peers if k != identity))
 
 
-def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> list[tuple[str, str, bool]]:
-    """(topic, label, enforce_bounds) the receiver must get from the other peer:
-    the inbound-bridge topic (presence only) and the final remapped heartbeat
-    (presence + rate/latency bounds)."""
+def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> list[SmokeTopicSpec]:
+    """Topics the receiver must get from crossed session traffic.
+
+    Heartbeat sessions self-publish from their plugin; plain topic examples need
+    smoke to synthesize a local app publisher on the source peer.
+    """
     source = _other_peer_key(cfg, receiver_peer_key)
-    return [
-        (_smoke_inbound_bridge_topic(cfg, source), f"{source}->{receiver_peer_key} inbound bridge heartbeat", False),
-        (_smoke_heartbeat_topic(cfg, source), f"{source}->{receiver_peer_key} final heartbeat", True),
-    ]
+    specs: list[SmokeTopicSpec] = []
+    shared = cfg.get("shared", {}) or {}
+    shared = shared if isinstance(shared, dict) else {}
+
+    if bool(shared.get("use_heartbeat", False)):
+        specs.extend(
+            [
+                SmokeTopicSpec(
+                    source_peer_key=source,
+                    receiver_peer_key=receiver_peer_key,
+                    topic=_smoke_inbound_bridge_topic(cfg, source),
+                    label=f"{source}->{receiver_peer_key} inbound bridge heartbeat",
+                    enforce_bounds=False,
+                ),
+                SmokeTopicSpec(
+                    source_peer_key=source,
+                    receiver_peer_key=receiver_peer_key,
+                    topic=_smoke_heartbeat_topic(cfg, source),
+                    label=f"{source}->{receiver_peer_key} final heartbeat",
+                    enforce_bounds=True,
+                    use_default_bounds=True,
+                ),
+            ]
+        )
+
+    topics = cfg.get("topics", {}) or {}
+    if not isinstance(topics, dict):
+        raise RuntimeError("Smoke verification requires 'topics' to be a mapping when provided.")
+
+    for direction in topics:
+        src, dst = _topic_direction_peers(str(direction), cfg)
+        if src != source or dst != receiver_peer_key:
+            continue
+        for entry in session_gen._topic_entries(cfg, str(direction)):
+            pipe = _smoke_topic_pipeline(cfg, entry)
+            final_topic = str(pipe["final"])
+            if bool(shared.get("use_heartbeat", False)) and final_topic == _smoke_heartbeat_topic(cfg, src):
+                continue
+            postprocessed_topic = _smoke_postprocessed_topic(entry, pipe)
+            received_topic = _smoke_receiver_final_topic(cfg, src, dst, postprocessed_topic)
+            inbound_topic = _smoke_inbound_forward_topic(cfg, src, dst, final_topic)
+            expect_hz_min, expect_hz_max, expect_max_delay_s = _smoke_expect_bounds(entry.expect)
+            specs.extend(
+                [
+                    SmokeTopicSpec(
+                        source_peer_key=src,
+                        receiver_peer_key=dst,
+                        topic=inbound_topic,
+                        label=f"{src}->{dst} inbound bridge topic",
+                        enforce_bounds=False,
+                    ),
+                    SmokeTopicSpec(
+                        source_peer_key=src,
+                        receiver_peer_key=dst,
+                        topic=received_topic,
+                        label=f"{src}->{dst} final topic",
+                        enforce_bounds=any(
+                            value is not None for value in (expect_hz_min, expect_hz_max, expect_max_delay_s)
+                        ),
+                        publish_topic=entry.base,
+                        publish_type=entry.msg_type,
+                        publish_rate=_smoke_publish_rate(entry.expect),
+                        hz_min=expect_hz_min,
+                        hz_max=expect_hz_max,
+                        max_delay_s=expect_max_delay_s,
+                    ),
+                ]
+            )
+
+    return specs
 
 
 def _verify_received_topics(
@@ -1557,7 +1753,9 @@ def _verify_received_topics(
     so within rate/latency bounds). Emits the OK/SMOKE_METRIC lines smoke has
     always produced; returns a list of failures (empty == all good)."""
     errors: list[str] = []
-    for topic, label, enforce_bounds in _received_crossed_topics(cfg, receiver_peer_key):
+    for spec in _received_crossed_topics(cfg, receiver_peer_key):
+        topic = spec.topic
+        label = spec.label
         output = _wait_for_topic_hz(container_name, ros_setup, topic)
         if detail_log:
             detail_log(f"\n--- {label} ({topic}) in {container_name} ---\n{output}")
@@ -1571,12 +1769,106 @@ def _verify_received_topics(
             detail_log(f"\n--- delay {label} ({topic}) in {container_name} ---\n{delay_output}")
         delay_s = _parse_topic_delay_seconds(delay_output)
         log_line(_smoke_metric_line(label=label, topic=topic, container_name=container_name, hz=hz, delay_s=delay_s))
-        if enforce_bounds:
-            if hz is None or not (hz_min <= hz <= hz_max):
-                errors.append(f"{label} ({topic}) rate {hz} Hz outside [{hz_min}, {hz_max}] in {container_name}")
-            if delay_s is None or delay_s >= max_delay_s:
-                errors.append(f"{label} ({topic}) latency {delay_s}s >= {max_delay_s}s in {container_name}")
+        if spec.enforce_bounds:
+            effective_hz_min = hz_min if spec.use_default_bounds else spec.hz_min
+            effective_hz_max = hz_max if spec.use_default_bounds else spec.hz_max
+            effective_max_delay_s = max_delay_s if spec.use_default_bounds else spec.max_delay_s
+            if effective_hz_min is not None and (hz is None or hz < effective_hz_min):
+                errors.append(f"{label} ({topic}) rate {hz} Hz below {effective_hz_min} in {container_name}")
+            if effective_hz_max is not None and (hz is None or hz > effective_hz_max):
+                errors.append(f"{label} ({topic}) rate {hz} Hz above {effective_hz_max} in {container_name}")
+            if effective_max_delay_s is not None and (delay_s is None or delay_s >= effective_max_delay_s):
+                errors.append(f"{label} ({topic}) latency {delay_s}s >= {effective_max_delay_s}s in {container_name}")
     return errors
+
+
+def _smoke_publish_message(msg_type: str) -> str:
+    normalized = msg_type.strip()
+    if normalized in {"std_msgs/msg/String", "std_msgs/String"}:
+        return "{data: 'rosotacom smoke'}"
+    if normalized == "nav_msgs/msg/OccupancyGrid":
+        return (
+            "{header: {frame_id: map}, "
+            "info: {resolution: 0.5, width: 4, height: 4, origin: {orientation: {w: 1.0}}}, "
+            "data: [0, 0, 0, 0, 0, 25, 50, 0, 0, 50, 100, 0, -1, -1, -1, -1]}"
+        )
+    raise RuntimeError(f"Smoke cannot synthesize a publisher for message type {msg_type!r}.")
+
+
+def _smoke_publish_specs(cfg: dict[str, Any]) -> list[SmokeTopicSpec]:
+    peers = cfg.get("peers") or {}
+    specs: list[SmokeTopicSpec] = []
+    seen: set[tuple[str, str, str]] = set()
+    for receiver in peers:
+        for spec in _received_crossed_topics(cfg, str(receiver)):
+            if not spec.publish_topic:
+                continue
+            if not spec.publish_type:
+                raise RuntimeError(f"Smoke topic {spec.publish_topic!r} requires a message type.")
+            key = (spec.source_peer_key, spec.publish_topic, spec.publish_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            specs.append(spec)
+    return specs
+
+
+def _start_smoke_topic_publishers(
+    containers: dict[str, str],
+    ros_setups: dict[str, str],
+    cfg: dict[str, Any],
+    *,
+    log_line: Callable[[str], None] = print,
+    duration: float = 180.0,
+) -> list[SmokeTopicSpec]:
+    started: list[SmokeTopicSpec] = []
+    for spec in _smoke_publish_specs(cfg):
+        assert spec.publish_topic is not None and spec.publish_type is not None
+        container = containers[spec.source_peer_key]
+        ros_setup = ros_setups[spec.source_peer_key]
+        message = _smoke_publish_message(spec.publish_type)
+        cmd = (
+            f"{ros_setup} && timeout {duration} ros2 topic pub -r {spec.publish_rate} "
+            f"{shlex.quote(spec.publish_topic)} {shlex.quote(spec.publish_type)} "
+            f"{shlex.quote(message)}"
+        )
+        subprocess.run(
+            ["docker", "exec", "-d", container, "bash", "-lc", cmd],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for _ in range(10):
+            if _topic_present(container, ros_setup, spec.publish_topic):
+                log_line(
+                    f"OK: smoke publisher {spec.source_peer_key}->{spec.receiver_peer_key} "
+                    f"{spec.publish_topic} ({spec.publish_type}) is advertising in {container} "
+                    f"at {spec.publish_rate:g} Hz"
+                )
+                started.append(spec)
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError(
+                f"Smoke publisher {spec.source_peer_key}->{spec.receiver_peer_key} "
+                f"{spec.publish_topic} ({spec.publish_type}) did not advertise in {container}."
+            )
+    return started
+
+
+def _stop_smoke_topic_publishers(containers: dict[str, str], specs: list[SmokeTopicSpec]) -> None:
+    for spec in specs:
+        if not spec.publish_topic:
+            continue
+        container = containers.get(spec.source_peer_key)
+        if not container:
+            continue
+        subprocess.run(
+            ["docker", "exec", container, "pkill", "-f", f"ros2 topic pub {spec.publish_topic}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 def _publish_isolation_probe(
@@ -1815,6 +2107,7 @@ def smoke(args: argparse.Namespace) -> int:
     log_line(f"Smoke artifacts: {smoke_instance.host_dir}")
     a_container = None
     b_container = None
+    smoke_publishers: list[SmokeTopicSpec] = []
     try:
         _ensure_smoke_network()
         a_container = start_session(
@@ -1837,6 +2130,9 @@ def smoke(args: argparse.Namespace) -> int:
 
         ros_setup_a = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "a")
         ros_setup_b = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "b")
+        containers = {"a": a_container, "b": b_container}
+        ros_setups = {"a": ros_setup_a, "b": ros_setup_b}
+        smoke_publishers = _start_smoke_topic_publishers(containers, ros_setups, cfg, log_line=log_line)
         errors: list[str] = []
         # Delivery: each peer must receive the other's crossed topics within bounds.
         errors += _verify_received_topics(b_container, ros_setup_b, cfg, "b", log_line=log_line, detail_log=detail)
@@ -1853,6 +2149,7 @@ def smoke(args: argparse.Namespace) -> int:
         _append_log(smoke_log, f"ERROR: {exc}")
         raise
     finally:
+        _stop_smoke_topic_publishers({"a": a_container or "", "b": b_container or ""}, smoke_publishers)
         for started_container, peer in [(a_container, "a"), (b_container, "b")]:
             if started_container:
                 _write_docker_log(started_container, smoke_instance, peer)

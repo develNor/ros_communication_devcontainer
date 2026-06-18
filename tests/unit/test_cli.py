@@ -236,12 +236,24 @@ def test_completion_command_emits_shell_registration(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    monkeypatch.setattr(sys, "argv", ["/tmp/bin/rosotacom@2.2.0"])
 
     assert rosotacom.completion_command(argparse.Namespace(shell=None)) == 0
 
     output = capsys.readouterr().out
-    assert "_python_argcomplete" in output
-    assert "rosotacom" in output
+    assert "_python_argcomplete_global" in output
+    assert "compdef _python_argcomplete_global rosotacom@2.2.0" in output
+
+
+def test_module_completion_registers_the_public_command(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["/tmp/site-packages/rosotacom/__main__.py"])
+
+    assert rosotacom.completion_command(argparse.Namespace(shell="bash")) == 0
+
+    assert "_python_argcomplete_global rosotacom" in capsys.readouterr().out
 
 
 def test_argcomplete_protocol_returns_session_prefix_matches() -> None:

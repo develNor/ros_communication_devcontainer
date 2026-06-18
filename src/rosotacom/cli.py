@@ -2492,11 +2492,35 @@ def list_sessions_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _safe_completion_shellcode(executable: str) -> str:
+    """Register completion only when the executable currently on PATH supports argcomplete."""
+    loader_path = importlib_resources.files("argcomplete").joinpath("bash_completion.d").joinpath("_python-argcomplete")
+    loader = loader_path.read_text(encoding="utf-8")
+    registration_marker = '\nif [[ -z "${ZSH_VERSION-}" ]]; then\n    complete -o default'
+    registration_start = loader.rfind(registration_marker)
+    if registration_start < 0:
+        raise RuntimeError("Installed argcomplete does not contain the expected shell loader.")
+    loader = loader[:registration_start].rstrip()
+    command = shlex.quote(executable)
+    return (
+        f"{loader}\n"
+        'if [[ -z "${ZSH_VERSION-}" ]]; then\n'
+        f"    complete -o default -o bashdefault -F _python_argcomplete_global {command}\n"
+        "else\n"
+        "    autoload -Uz is-at-least\n"
+        f"    compdef _python_argcomplete_global {command}\n"
+        "fi\n"
+    )
+
+
 def completion_command(args: argparse.Namespace) -> int:
     shell = args.shell or Path(os.environ.get("SHELL", "bash")).name
     if shell not in {"bash", "zsh"}:
         raise RuntimeError(f"Could not infer a supported shell from {shell!r}; pass `bash` or `zsh` explicitly.")
-    print(argcomplete.shellcode(["rosotacom"], shell=shell))
+    executable = Path(sys.argv[0]).name
+    if executable in {"__main__.py", "cli.py"}:
+        executable = "rosotacom"
+    print(_safe_completion_shellcode(executable), end="")
     return 0
 
 

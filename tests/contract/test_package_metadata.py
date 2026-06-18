@@ -23,6 +23,15 @@ def test_console_scripts_target_package_cli() -> None:
     assert 'stop_rosotacom = "rosotacom.cli:stop_compat_main"' in pyproject
 
 
+def test_checkout_installer_enables_completion_during_venv_activation() -> None:
+    installer = (PACKAGE_ROOT / "install.sh").read_text(encoding="utf-8")
+
+    assert "# >>> rosotacom shell completion >>>" in installer
+    assert '"$VIRTUAL_ENV/bin/rosotacom" completion zsh' in installer
+    assert '"$VIRTUAL_ENV/bin/rosotacom" completion bash' in installer
+    assert "case $- in" in installer  # Do not register completion in non-interactive scripts.
+
+
 def test_python_support_contract_is_consistent() -> None:
     pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     contributing = (PACKAGE_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")

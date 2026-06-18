@@ -58,7 +58,10 @@ python -m rosotacom --version
 rosotacom doctor
 ```
 
-Enable command, option, and configured session-name completion once per shell:
+For a source checkout, that single `source .venv/bin/activate` command also
+enables completion. Nothing needs to be added to your shell configuration.
+
+For a pipx/global installation, add one line once to your shell startup file:
 
 ```bash
 # zsh: add this line to ~/.zshrc
@@ -68,13 +71,22 @@ eval "$(rosotacom completion zsh)"
 eval "$(rosotacom completion bash)"
 ```
 
-After reloading the shell, `rosotacom <TAB><TAB>` lists commands,
+Every new terminal then loads completion automatically; you do not run the
+command manually in each terminal. After reloading the shell,
+`rosotacom <TAB><TAB>` lists commands,
 `rosotacom smoke <TAB><TAB>` lists sessions from the active project, and a
 prefix such as `rosotacom smoke 1<TAB>` expands to `1_heartbeat`. The same
 session completion is available for `start`, `stop`, `status`, `test`, and the
 probe commands; absolute and relative session-directory paths still complete
 normally. Running `rosotacom completion` without a shell argument infers bash
 or zsh from `$SHELL`.
+
+Completion is not pinned to the version that registered it: each Tab press runs
+the `rosotacom` currently selected by `PATH`. Activating another checkout's
+virtual environment therefore switches both the command and its completion,
+and `deactivate` switches back without a reset step. A pipx-suffixed executable
+can be registered independently with, for example,
+`eval "$(rosotacom@2.2.0 completion zsh)"`.
 
 **Multiple versions / try-without-disturbing.** Because each checkout owns its
 own `.venv` and `./install.sh` never touches your PATH on its own, you can keep a

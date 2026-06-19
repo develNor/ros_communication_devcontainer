@@ -5,6 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/rosotacom.svg)](https://pypi.org/project/rosotacom/)
 [![Python](https://img.shields.io/pypi/pyversions/rosotacom.svg)](https://pypi.org/project/rosotacom/)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](https://github.com/develNor/ros_communication_devcontainer/blob/HEAD/LICENSE.txt)
+[![Nightly E2E](https://github.com/develNor/ros_communication_devcontainer/actions/workflows/nightly-e2e.yml/badge.svg?branch=develop)](https://github.com/develNor/ros_communication_devcontainer/actions/workflows/nightly-e2e.yml)
 
 The ROS Communication DevContainer is a Docker-based solution designed to streamline the bidirectional synchronization of ROS2 topics between two Linux machines. It provides built-in compression and routing capabilities for over-the-air (OTA) data transfer: selected topics are remapped into an OTA namespace and transmitted either via direct DDS (CycloneDDS) or through a Zenoh router. When desired, the session can also place local application nodes and OTA-facing bridge nodes into separate ROS 2 domain IDs and automatically generate a standard ROS 2 `domain_bridge` configuration for the `/com/...` boundary. This project aligns with the publication *“Scalable Remote Operation for Autonomous Vehicles: Integration of Cooperative Perception and Open Source Communication.”*
 

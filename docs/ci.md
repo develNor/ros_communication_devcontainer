@@ -66,11 +66,11 @@ config, catmux pane logs, Docker logs when available, and the smoke verification
 log under `session-instances/`; collect that directory as the first debugging
 artifact when an E2E job fails.
 
-## Manual And Maintenance Checks
+## Nightly And Maintenance Checks
 
-`.github/workflows/nightly-e2e.yml` is now manual-only despite the historical
-file name. It can run the local smoke slice plus the generated RMW matrix on
-GitHub-hosted infrastructure, but it is not the private OTA promotion gate.
+`.github/workflows/nightly-e2e.yml` runs the local smoke slice plus the generated
+RMW matrix nightly on GitHub-hosted infrastructure and also supports manual
+dispatch. It is not the private OTA promotion gate.
 `.github/workflows/image-scan.yml` builds the default communication image and
 uploads an advisory Trivy report.
 

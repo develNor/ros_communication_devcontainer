@@ -47,12 +47,13 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     assert "just test-e2e-smoke" in merge_gate
 
 
-def test_full_e2e_workflow_is_manual_promotion_support_not_scheduled() -> None:
+def test_full_e2e_workflow_runs_nightly_and_supports_manual_dispatch() -> None:
     full_e2e = FULL_E2E_PATH.read_text(encoding="utf-8")
 
-    assert "name: Manual Full E2E" in full_e2e
+    assert "name: Nightly E2E" in full_e2e
+    assert '- cron: "37 2 * * *"' in full_e2e
     assert "workflow_dispatch:" in full_e2e
-    assert "schedule:" not in full_e2e
+    assert "name: full-e2e" in full_e2e
     assert "ROSOTACOM_RUN_FULL_E2E=1" in full_e2e
 
 

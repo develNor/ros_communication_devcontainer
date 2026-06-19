@@ -51,7 +51,7 @@ test. Everything else is a lens:
 2. **`rosotacom test` reads the session's self-report (`status.json`)** rather than
    probing externally.
 3. **Generate the RMW matrix** instead of hand-maintaining one dir per combo.
-4. **Cadence: a manual full-suite gate before each promotion** (not nightly-auto).
+4. **Cadence: nightly full local suite plus a manual external OTA gate before promotion.**
 
 ## Design
 
@@ -160,7 +160,8 @@ per-session marker.
   into the generated `tests/sessions/rmw_matrix` test-config set.
 - `verify` is retired. Delivery uses `rosotacom test`; local-only isolation stays
   a framework probe via `probe-publish` / `probe-check`.
-- The full suite is a manual promotion gate rather than a scheduled job.
+- The full local suite runs nightly; the external OTA suite remains a manual
+  promotion gate.
 
 **Not feasible as written**
 - `loss_pct` for *non-heartbeat* topics: ROS 2 messages carry no sequence number

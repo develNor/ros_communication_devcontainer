@@ -2373,6 +2373,7 @@ def _smoke_ros_setup(config_container_dir: str, cfg: dict[str, Any], receiver_pe
 SMOKE_HZ_MIN = 5.0
 SMOKE_HZ_MAX = 20.0
 SMOKE_MAX_DELAY_S = 1.0
+SMOKE_PUBLISHER_DURATION_S = 900.0
 ISOLATION_PROBE_TOPIC = "/local_only"
 
 
@@ -2977,7 +2978,13 @@ def smoke(args: argparse.Namespace) -> int:
         ros_setup_b = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "b")
         containers = {"a": a_container, "b": b_container}
         ros_setups = {"a": ros_setup_a, "b": ros_setup_b}
-        smoke_publishers = _start_smoke_topic_publishers(containers, ros_setups, cfg, log_line=log_line)
+        smoke_publishers = _start_smoke_topic_publishers(
+            containers,
+            ros_setups,
+            cfg,
+            log_line=log_line,
+            duration=SMOKE_PUBLISHER_DURATION_S,
+        )
         errors: list[str] = []
         # Delivery: each peer must receive the other's crossed topics within bounds.
         errors += _verify_received_topics(b_container, ros_setup_b, cfg, "b", log_line=log_line, detail_log=detail)

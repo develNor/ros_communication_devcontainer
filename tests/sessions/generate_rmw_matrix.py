@@ -74,10 +74,7 @@ RMW_CASES: list[dict[str, Any]] = [
 
 def _base_config() -> dict[str, Any]:
     return {
-        "peers": {
-            "a": {"address": "data:machine_a_ip"},
-            "b": {"address": "data:machine_b_ip"},
-        },
+        "peers": {"a": {}, "b": {}},
         "peer_settings": {
             "a": {"domain_id": 46},
             "b": {"domain_id": 47},

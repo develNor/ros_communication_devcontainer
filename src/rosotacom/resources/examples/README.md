@@ -8,7 +8,6 @@ project setup, reusable session/scenario configs, and helper scripts.
 ```bash
 rosotacom examples create ./rosotacom_examples
 cd ./rosotacom_examples
-eval "$(rosotacom setup-env ./rosotacom.yaml)"
 rosotacom start 1_heartbeat --identity a
 ```
 
@@ -16,7 +15,6 @@ In another terminal on the same host:
 
 ```bash
 cd ./rosotacom_examples
-eval "$(rosotacom setup-env ./rosotacom.yaml)"
 rosotacom start 1_heartbeat --identity b
 ```
 
@@ -60,7 +58,6 @@ checkout-scoped containers, verifies the path, and removes its own containers
 before returning:
 
 ```bash
-eval "$(rosotacom setup-env ./rosotacom.yaml)"
 rosotacom smoke
 ```
 
@@ -72,10 +69,9 @@ Expected result:
 - each checked topic prints a `SMOKE_METRIC` line (rate `hz`, latency `delay_s`);
 - the command removes its containers before returning.
 
-`rosotacom smoke` injects literal peer addresses internally, so it does not
-depend on `data_dict.json`. The manual `start` path above instead resolves
-`data:<key>` values from `data_dict.json`. This is the single-machine tier; see
-the repository's `docs/testing.md` for how it relates to the multi-machine tier.
+`rosotacom smoke` injects isolated peer addresses internally. The tracked
+session definitions contain only logical peers, so local testing never depends
+on physical-machine configuration.
 
 For an interactive local end-to-end debug session, use the same smoke target
 with `--interactive`:
@@ -90,25 +86,27 @@ This opens an outer tmux session with full windows for each peer's communication
 container, each scenario application, and a verification/status view. Scenario
 applications share their peer communication container's isolated network
 namespace. The outer prefix is `Ctrl-b`; use `Ctrl-b Ctrl-b` for the inner
-catmux sessions. The local interactive run injects isolated Docker-network peer
-addresses, so it remains independent of the real addresses in `data_dict.json`.
+catmux sessions.
 
 ## Two-machine runs
 
-For a real two-machine run, replace the loopback values in `data_dict.json` with
-each machine's reachable IP address (see Layout below), then run identity `a` on
-one host and identity `b` on the other with the same session.
+For a real two-machine run, pass both reachable addresses on both hosts:
+
+```bash
+rosotacom start 1_heartbeat --identity a \
+  --peer-address a=10.0.0.10 --peer-address b=10.0.0.11
+```
+
+Use `--identity b` on the second host. Alternatively copy
+`deployment.example.yaml` to `deployment.yaml`, reference it from
+`rosotacom.yaml`, and use `--peer a=machine-a --peer b=machine-b`.
 
 ## Layout
 
 - `rosotacom.yaml`: project-local rosotacom setup
 - `ros2docker.json`: Docker runtime defaults used by the communication containers
-- `data_dict.json`: example machine address data used by `data:<key>` session entries
+- `deployment.example.yaml`: optional named-host deployment example
 - `sessions/`: tracked static session definitions/templates
 - `scenarios/`: complete use cases that combine a session with local applications
 - `session-instances/`: ignored generated runtime configs, catmux logs, smoke logs, and rosbags
 - `scripts/`: convenience wrappers and external-node launchers
-
-`data_dict.json` intentionally uses `127.0.0.1` for both peers so the examples
-can demonstrate data-dict wiring on one host. For real two-machine runs, replace
-those values with reachable IPs or hostnames for your machines.

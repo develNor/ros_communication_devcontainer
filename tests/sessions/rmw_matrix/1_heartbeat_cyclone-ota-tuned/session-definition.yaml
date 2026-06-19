@@ -1,8 +1,6 @@
 peers:
-  a:
-    address: data:machine_a_ip
-  b:
-    address: data:machine_b_ip
+  a: {}
+  b: {}
 shared:
   use_heartbeat: true
   use_status_overview: true

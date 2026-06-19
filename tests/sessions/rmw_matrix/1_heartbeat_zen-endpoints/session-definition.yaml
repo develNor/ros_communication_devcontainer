@@ -1,8 +1,6 @@
 peers:
-  a:
-    address: data:machine_a_ip
-  b:
-    address: data:machine_b_ip
+  a: {}
+  b: {}
 peer_settings:
   a:
     domain_id: 46

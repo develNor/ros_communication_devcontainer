@@ -2,8 +2,8 @@
 """Unified OTA DDS XML generator.
 
 Loads an XML template from /ws/ota_configs/<config>(.template), detects which
-placeholders it uses (#host_ip, #peer, #easy_mode_ip), resolves them from
-rosotacom address expressions, and prints the substituted XML to stdout.
+placeholders it uses (#host_ip, #peer, #easy_mode_ip), substitutes already
+resolved addresses, and prints the resulting XML to stdout.
 
 Replaces the old per-template scripts (get_fastdds_xml.py,
 get_fastdds_easy_mode_xml.py, get_cyclonedds_xml.py).
@@ -12,12 +12,6 @@ get_fastdds_easy_mode_xml.py, get_cyclonedds_xml.py).
 import argparse
 import os
 import re
-import sys
-
-ws_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-sys.path.append(ws_dir)
-
-from session.content.address_resolution import main as resolve_address_expressions  # noqa: E402
 
 
 KNOWN_PLACEHOLDERS = {"#host_ip", "#peer", "#easy_mode_ip"}
@@ -44,26 +38,24 @@ def _template_path(name: str) -> str:
     return os.path.join(here, name)
 
 
-def _resolve_single_ip(value: str, label: str) -> str:
-    resolved = resolve_address_expressions(value)
-    if len(resolved) != 1:
-        raise ValueError(
-            f"{label} must resolve to exactly one IP address, got {resolved}."
-        )
-    return resolved[0]
+def _resolved_address(value: str, label: str) -> str:
+    address = value.strip()
+    if not address:
+        raise ValueError(f"{label} must be a non-empty resolved address.")
+    return address
 
 
 def _resolve_peer_ips(value: str) -> list:
-    resolved = resolve_address_expressions(value)
     seen = set()
     unique = []
-    for ip in resolved:
-        if ip in seen:
+    for address in value.split(","):
+        address = address.strip()
+        if not address or address in seen:
             continue
-        seen.add(ip)
-        unique.append(ip)
+        seen.add(address)
+        unique.append(address)
     if not unique:
-        raise ValueError("Peer key must resolve to at least one IP address.")
+        raise ValueError("Peer address must contain at least one resolved address.")
     return unique
 
 
@@ -153,7 +145,7 @@ def main(
             raise RuntimeError(
                 f"Template '{os.path.basename(path)}' uses #host_ip but --host-ip was not provided."
             )
-        content = content.replace("#host_ip", _resolve_single_ip(host_ip, "Host IP"))
+        content = content.replace("#host_ip", _resolved_address(host_ip, "Host IP"))
 
     if "#easy_mode_ip" in found:
         if not easy_mode_ip:
@@ -161,7 +153,7 @@ def main(
                 f"Template '{os.path.basename(path)}' uses #easy_mode_ip but --easy-mode-ip was not provided."
             )
         content = content.replace(
-            "#easy_mode_ip", _resolve_single_ip(easy_mode_ip, "Easy Mode IP")
+            "#easy_mode_ip", _resolved_address(easy_mode_ip, "Easy Mode IP")
         )
 
     if "#peer" in found:
@@ -184,15 +176,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-i", "--host-ip", dest="host_ip",
-        help="Address expression resolving to the local host IP (#host_ip).",
+        help="Resolved local host address (#host_ip).",
     )
     parser.add_argument(
         "-p", "--peer", dest="peer",
-        help="Address expression resolving to one or more peer IPs (#peer).",
+        help="Resolved peer address, or comma-separated addresses (#peer).",
     )
     parser.add_argument(
         "-e", "--easy-mode-ip", dest="easy_mode_ip",
-        help="Address expression resolving to the Fast DDS Easy Mode IP (#easy_mode_ip).",
+        help="Resolved Fast DDS Easy Mode address (#easy_mode_ip).",
     )
     args = parser.parse_args()
     print(main(**{k: v for k, v in vars(args).items() if v is not None}))

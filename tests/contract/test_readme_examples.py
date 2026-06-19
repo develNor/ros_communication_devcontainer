@@ -26,7 +26,7 @@ def test_source_checkout_rosotacom_yaml_loads() -> None:
     assert runtime.session_configs_dir == cli.EXAMPLE_PROJECT_DIR / "sessions"
     assert runtime.scenario_configs_dir == cli.EXAMPLE_PROJECT_DIR / "scenarios"
     assert runtime.session_instances_dir == PACKAGE_ROOT / "session-instances"
-    assert runtime.data_dict == cli.EXAMPLE_PROJECT_DIR / "data_dict.json"
+    assert runtime.deployment is None
 
 
 def test_packaged_example_setup_paths_are_relative_to_example_root() -> None:
@@ -37,7 +37,6 @@ def test_packaged_example_setup_paths_are_relative_to_example_root() -> None:
         "session_configs_dir": "sessions",
         "scenario_configs_dir": "scenarios",
         "session_instances_dir": "session-instances",
-        "data_dict": "data_dict.json",
     }
 
 
@@ -47,7 +46,8 @@ def test_packaged_example_project_contains_documented_heartbeat_session() -> Non
     assert "`1_heartbeat`" in readme
     assert "rosotacom scenario start 2_native_chatter" in readme
     assert "rosotacom smoke 2_native_chatter --interactive" in readme
-    assert "rosotacom ota-smoke 2_native_chatter --inventory ota-smoke.yaml --interactive" in readme
+    assert "rosotacom ota-smoke 2_native_chatter \\" in readme
+    assert "--peer-ssh b=robot-b" in readme
     assert (cli.EXAMPLE_PROJECT_DIR / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
     assert (cli.EXAMPLE_PROJECT_DIR / "scenarios" / "2_native_chatter" / "scenario-definition.yaml").is_file()
     assert (cli.EXAMPLE_PROJECT_DIR / "scripts" / "1_heartbeat" / "run_machine_a.sh").is_file()

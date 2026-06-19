@@ -50,7 +50,7 @@ core = _load_module(STATUS_CORE_PY, "rosotacom_status_overview_core")
 
 def _heartbeat_cfg() -> dict:
     return {
-        "peers": {"a": {"address": "127.0.0.1"}, "b": {"address": "127.0.0.1"}},
+        "peers": {"a": {}, "b": {}},
         "peer_settings": {"a": {"domain_id": 46}, "b": {"domain_id": 47}},
         "shared": {
             "use_heartbeat": True,
@@ -64,10 +64,19 @@ def _heartbeat_cfg() -> dict:
     }
 
 
+def _generate(cfg: dict, output_dir: Path) -> None:
+    generator.func(
+        session_config_obj=cfg,
+        output_dir=str(output_dir),
+        force=True,
+        peer_addresses={"a": "127.0.0.1", "b": "127.0.0.2"},
+    )
+
+
 def test_pipeline_spec_generated_for_heartbeat(tmp_path: Path) -> None:
     import yaml
 
-    generator.func(session_config_obj=_heartbeat_cfg(), output_dir=str(tmp_path), force=True)
+    _generate(_heartbeat_cfg(), tmp_path)
 
     spec_path = tmp_path / "a" / "pipeline_spec.yaml"
     assert spec_path.exists(), "pipeline_spec.yaml should be generated for peer a"
@@ -99,7 +108,7 @@ def test_pipeline_spec_generated_for_heartbeat(tmp_path: Path) -> None:
 def test_pipeline_spec_absent_when_flag_off(tmp_path: Path) -> None:
     cfg = _heartbeat_cfg()
     cfg["shared"]["use_status_overview"] = False
-    generator.func(session_config_obj=cfg, output_dir=str(tmp_path), force=True)
+    _generate(cfg, tmp_path)
     assert not (tmp_path / "a" / "pipeline_spec.yaml").exists()
 
 
@@ -378,7 +387,7 @@ def _make_project(tmp_path: Path) -> tuple[argparse.Namespace, Path]:
         ros2docker_config=None,
         session_configs_dir=None,
         session_instances_dir=None,
-        data_dict=None,
+        deployment=None,
         session_dir="mysess",
         identity=None,
         instance_id=None,
@@ -475,7 +484,7 @@ def test_pipeline_spec_carries_per_topic_expect(tmp_path: Path) -> None:
     import yaml
 
     cfg = {
-        "peers": {"a": {"address": "127.0.0.1"}, "b": {"address": "127.0.0.1"}},
+        "peers": {"a": {}, "b": {}},
         "peer_settings": {"a": {"domain_id": 46}, "b": {"domain_id": 47}},
         "shared": {
             "use_status_overview": True,
@@ -495,7 +504,7 @@ def test_pipeline_spec_carries_per_topic_expect(tmp_path: Path) -> None:
             ]
         },
     }
-    generator.func(session_config_obj=cfg, output_dir=str(tmp_path), force=True)
+    _generate(cfg, tmp_path)
     spec = yaml.safe_load((tmp_path / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
     by_dir = {(t["base"], t["direction"]): t for t in spec["topics"]}
     assert by_dir[("/costmap", "inbound")]["expect"] == {"hz": {"min": 1, "max": 5}, "latency_ms": {"max": 500}}
@@ -509,7 +518,7 @@ def test_pipeline_spec_uses_postprocessed_topics_and_stage_specific_types(tmp_pa
     occupancy_cfg = yaml.safe_load(
         (examples / "3_comp_occ_grid" / "session-definition.yaml").read_text(encoding="utf-8")
     )
-    generator.func(session_config_obj=occupancy_cfg, output_dir=str(tmp_path / "occupancy"), force=True)
+    _generate(occupancy_cfg, tmp_path / "occupancy")
     occupancy_spec = yaml.safe_load((tmp_path / "occupancy" / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
     occupancy_in = next(
         topic
@@ -523,7 +532,7 @@ def test_pipeline_spec_uses_postprocessed_topics_and_stage_specific_types(tmp_pa
     assert occupancy_stages["native_in"]["type"] == "nav_msgs/msg/OccupancyGrid"
 
     payload_cfg = yaml.safe_load((examples / "5_sized_payload" / "session-definition.yaml").read_text(encoding="utf-8"))
-    generator.func(session_config_obj=payload_cfg, output_dir=str(tmp_path / "payload"), force=True)
+    _generate(payload_cfg, tmp_path / "payload")
     payload_spec = yaml.safe_load((tmp_path / "payload" / "b" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
     payload_out = next(
         topic
@@ -545,7 +554,7 @@ def test_pipeline_spec_carries_heartbeat_expect(tmp_path: Path) -> None:
     cfg = _heartbeat_cfg()
     contract = {"hz": {"min": 8, "max": 12}, "latency_ms": {"max": 200}}
     cfg["shared"]["heartbeat"] = {"expect": contract}
-    generator.func(session_config_obj=cfg, output_dir=str(tmp_path), force=True)
+    _generate(cfg, tmp_path)
     spec = yaml.safe_load((tmp_path / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
     by_dir = {(t["base"], t["direction"]): t for t in spec["topics"]}
     # The contract applies to both the locally-published and the received heartbeat.
@@ -558,14 +567,14 @@ def test_heartbeat_monitor_thresholds_overridden_from_expect(tmp_path: Path) -> 
     # status thresholds (delay_bad_ms / loss3_bad_pct).
     cfg = _heartbeat_cfg()
     cfg["shared"]["heartbeat"] = {"expect": {"latency_ms": {"max": 150}, "loss_pct": {"max": 3}}}
-    generator.func(session_config_obj=cfg, output_dir=str(tmp_path), force=True)
+    _generate(cfg, tmp_path)
     plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
     assert "heartbeat_delay_bad_ms: 150.0" in plugin
     assert "heartbeat_loss3_bad_pct: 3.0" in plugin
 
 
 def test_heartbeat_monitor_thresholds_default_without_expect(tmp_path: Path) -> None:
-    generator.func(session_config_obj=_heartbeat_cfg(), output_dir=str(tmp_path), force=True)
+    _generate(_heartbeat_cfg(), tmp_path)
     plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
     # No override emitted -> the plugin base template defaults apply.
     assert "heartbeat_delay_bad_ms" not in plugin

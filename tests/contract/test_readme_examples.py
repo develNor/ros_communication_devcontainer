@@ -46,6 +46,7 @@ def test_packaged_example_project_contains_documented_heartbeat_session() -> Non
 
     assert "`1_heartbeat`" in readme
     assert "rosotacom scenario start 2_native_chatter" in readme
+    assert "rosotacom smoke 2_native_chatter --interactive" in readme
     assert (cli.EXAMPLE_PROJECT_DIR / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
     assert (cli.EXAMPLE_PROJECT_DIR / "scenarios" / "2_native_chatter" / "scenario-definition.yaml").is_file()
     assert (cli.EXAMPLE_PROJECT_DIR / "scripts" / "1_heartbeat" / "run_machine_a.sh").is_file()

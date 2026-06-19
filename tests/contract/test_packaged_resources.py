@@ -42,6 +42,16 @@ def test_cli_resource_constants_point_inside_package_resources() -> None:
     assert cli.EXAMPLE_PROJECT_DIR == cli.RESOURCE_DIR / "examples"
 
 
+def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
+    default_build_args = cli.load_config(cli.DEFAULT_ROS2DOCKER_CONFIG)["build_args"]
+    example_build_args = cli.load_config(cli.EXAMPLE_PROJECT_DIR / "ros2docker.json")["build_args"]
+
+    assert default_build_args["BASE_IMAGE"] == "osrf/ros:kilted-desktop-full-noble"
+    assert default_build_args["DIGEST"].startswith("@sha256:")
+    assert default_build_args["BASE_IMAGE"] == example_build_args["BASE_IMAGE"]
+    assert default_build_args["DIGEST"] == example_build_args["DIGEST"]
+
+
 def test_shell_entrypoints_pass_syntax_check() -> None:
     scripts = sorted(cli.EXAMPLE_PROJECT_DIR.glob("scripts/**/*.sh"))
     assert scripts

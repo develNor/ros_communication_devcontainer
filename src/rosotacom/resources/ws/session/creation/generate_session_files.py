@@ -1293,6 +1293,13 @@ def _build_status_pipeline_spec(
             return float(pipe["trickle_hz"])
         return None
 
+    def _postprocessed_topic(pipe: Dict[str, Any], final: str) -> str:
+        if pipe.get("compress"):
+            return str(pipe["comp_in"])
+        if pipe.get("ota_wrap"):
+            return str(pipe["ota_in"])
+        return final
+
     def _relay_in_local_topic(topic: str) -> str:
         if inbound_keep_source_prefix:
             return f"/{remote_name}{topic}"
@@ -1323,18 +1330,33 @@ def _build_status_pipeline_spec(
             forward_ns = forward_final.lstrip("/")
             app_native = f"/{local_name}{base}" if native_have_source_prefix else base
             app_processed = f"/{local_name}{final}" if native_have_source_prefix else final
+            base_type = _safe_type(e, p, fallback_base_type=True)
+            final_type = _safe_type(e, p)
 
             stages: List[Dict[str, Any]] = [
-                {"stage": "native", "topic": app_native, "domain": "local", "produced_by": "application"},
+                {
+                    "stage": "native",
+                    "topic": app_native,
+                    "type": base_type,
+                    "domain": "local",
+                    "produced_by": "application",
+                },
             ]
             if final != base:
                 stages.append(
-                    {"stage": "processed", "topic": app_processed, "domain": "local", "produced_by": "preprocessing"}
+                    {
+                        "stage": "processed",
+                        "topic": app_processed,
+                        "type": final_type,
+                        "domain": "local",
+                        "produced_by": "preprocessing",
+                    }
                 )
             stages.append(
                 {
                     "stage": "com_out",
                     "topic": f"/com/out/{local_name}/{forward_ns}",
+                    "type": final_type,
                     "domain": "local",
                     "produced_by": "relay_out",
                 }
@@ -1343,6 +1365,7 @@ def _build_status_pipeline_spec(
                 {
                     "stage": "ota_sent",
                     "topic": f"/ota/{local_name}/{forward_ns}",
+                    "type": final_type,
                     "domain": "ota",
                     "produced_by": "bridge_out",
                 }
@@ -1354,7 +1377,7 @@ def _build_status_pipeline_spec(
                     "direction": "outbound",
                     "source": local_name,
                     "target": remote_name,
-                    "type": _safe_type(e, p),
+                    "type": final_type,
                     "expected_hz": _expected_hz(p),
                     "expect": e.expect,
                     "stages": stages,
@@ -1383,27 +1406,39 @@ def _build_status_pipeline_spec(
             forward_final = f"/to_{local_name}{final}" if remote_uses_target_prefix else final
             forward_ns = forward_final.lstrip("/")
             app_in = _relay_in_local_topic(final)
+            postprocessed = _postprocessed_topic(p, final)
+            base_type = _safe_type(e, p, fallback_base_type=True)
+            final_type = _safe_type(e, p)
 
             stages = [
                 {
                     "stage": "ota_recv",
                     "topic": f"/ota/{remote_name}/{forward_ns}",
+                    "type": final_type,
                     "domain": "ota",
                     "produced_by": "transport",
                 },
                 {
                     "stage": "com_in",
                     "topic": f"/com/in/{remote_name}/{forward_ns}",
+                    "type": final_type,
                     "domain": "local",
                     "produced_by": "bridge_in",
                 },
-                {"stage": "app_in", "topic": app_in, "domain": "local", "produced_by": "relay_in"},
+                {
+                    "stage": "app_in",
+                    "topic": app_in,
+                    "type": final_type,
+                    "domain": "local",
+                    "produced_by": "relay_in",
+                },
             ]
-            if final != base:
+            if postprocessed != final:
                 stages.append(
                     {
                         "stage": "native_in",
-                        "topic": _relay_in_local_topic(base),
+                        "topic": _relay_in_local_topic(postprocessed),
+                        "type": base_type,
                         "domain": "local",
                         "produced_by": "postprocessing",
                     }
@@ -1415,7 +1450,7 @@ def _build_status_pipeline_spec(
                     "direction": "inbound",
                     "source": remote_name,
                     "target": local_name,
-                    "type": _safe_type(e, p),
+                    "type": final_type,
                     "expected_hz": _expected_hz(p),
                     "expect": e.expect,
                     "stages": stages,

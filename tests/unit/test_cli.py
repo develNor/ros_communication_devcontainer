@@ -957,6 +957,13 @@ def test_stop_list_doctor_and_smoke_host_flows(
     monkeypatch.setattr(rosotacom, "_verify_received_topics", lambda *args, **kwargs: [])
     monkeypatch.setattr(rosotacom, "_verify_isolation", lambda *args, **kwargs: [])
     monkeypatch.setattr(rosotacom, "test_command", lambda args: 0)
+    publisher_durations: list[float] = []
+
+    def fake_start_publishers(*args: object, **kwargs: object) -> list[rosotacom.SmokeTopicSpec]:
+        publisher_durations.append(float(kwargs["duration"]))
+        return []
+
+    monkeypatch.setattr(rosotacom, "_start_smoke_topic_publishers", fake_start_publishers)
     assert (
         rosotacom.smoke(
             argparse.Namespace(
@@ -974,6 +981,8 @@ def test_stop_list_doctor_and_smoke_host_flows(
         )
         == 0
     )
+    assert publisher_durations == [rosotacom.SMOKE_PUBLISHER_DURATION_S]
+    assert rosotacom.SMOKE_PUBLISHER_DURATION_S == 900.0
     assert stopped[-2:] == ["container_a", "container_b"]
 
 

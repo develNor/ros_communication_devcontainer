@@ -501,6 +501,44 @@ def test_pipeline_spec_carries_per_topic_expect(tmp_path: Path) -> None:
     assert by_dir[("/costmap", "inbound")]["expect"] == {"hz": {"min": 1, "max": 5}, "latency_ms": {"max": 500}}
 
 
+def test_pipeline_spec_uses_postprocessed_topics_and_stage_specific_types(tmp_path: Path) -> None:
+    import yaml
+
+    examples = Path(__file__).resolve().parents[2] / "src" / "rosotacom" / "resources" / "examples" / "sessions"
+
+    occupancy_cfg = yaml.safe_load(
+        (examples / "3_comp_occ_grid" / "session-definition.yaml").read_text(encoding="utf-8")
+    )
+    generator.func(session_config_obj=occupancy_cfg, output_dir=str(tmp_path / "occupancy"), force=True)
+    occupancy_spec = yaml.safe_load((tmp_path / "occupancy" / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
+    occupancy_in = next(
+        topic
+        for topic in occupancy_spec["topics"]
+        if topic["base"] == "/costmap/costmap" and topic["direction"] == "inbound"
+    )
+    occupancy_stages = {stage["stage"]: stage for stage in occupancy_in["stages"]}
+    assert occupancy_stages["app_in"]["topic"] == "/costmap/costmap/restamped/bz2"
+    assert occupancy_stages["app_in"]["type"] == "com_msgs/msg/CompressedData"
+    assert occupancy_stages["native_in"]["topic"] == "/costmap/costmap/restamped"
+    assert occupancy_stages["native_in"]["type"] == "nav_msgs/msg/OccupancyGrid"
+
+    payload_cfg = yaml.safe_load((examples / "5_sized_payload" / "session-definition.yaml").read_text(encoding="utf-8"))
+    generator.func(session_config_obj=payload_cfg, output_dir=str(tmp_path / "payload"), force=True)
+    payload_spec = yaml.safe_load((tmp_path / "payload" / "b" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
+    payload_out = next(
+        topic
+        for topic in payload_spec["topics"]
+        if topic["base"] == "/size_test_b" and topic["direction"] == "outbound"
+    )
+    payload_out_stages = {stage["stage"]: stage for stage in payload_out["stages"]}
+    assert payload_out_stages["native"]["type"] == "com_msgs/msg/SizedPayload"
+    assert payload_out_stages["processed"]["type"] == "com_msgs/msg/OtaStamped"
+
+    collected = core.collect_stage_topics(payload_spec)
+    assert collected["local"]["/size_test_b"] == "com_msgs/msg/SizedPayload"
+    assert collected["local"]["/size_test_b/ota_stamped"] == "com_msgs/msg/OtaStamped"
+
+
 def test_pipeline_spec_carries_heartbeat_expect(tmp_path: Path) -> None:
     import yaml
 

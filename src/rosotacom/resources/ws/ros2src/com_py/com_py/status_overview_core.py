@@ -537,5 +537,5 @@ def collect_stage_topics(spec: Dict[str, Any]) -> Dict[str, Dict[str, Optional[s
             domain = stage.get("domain", "local")
             by_domain.setdefault(domain, {})
             existing = by_domain[domain].get(stage["topic"])
-            by_domain[domain][stage["topic"]] = existing or type_hint
+            by_domain[domain][stage["topic"]] = existing or stage.get("type") or type_hint
     return by_domain

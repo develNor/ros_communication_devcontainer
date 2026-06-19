@@ -1,6 +1,8 @@
-name: Manual Full E2E
+name: Nightly E2E
 
 on:
+  schedule:
+    - cron: "37 2 * * *"
   workflow_dispatch:
     inputs:
       full-rmw-matrix:
@@ -17,7 +19,7 @@ concurrency:
 
 jobs:
   full-e2e:
-    name: manual-full-e2e
+    name: full-e2e
     runs-on: ubuntu-latest
     timeout-minutes: 180
 

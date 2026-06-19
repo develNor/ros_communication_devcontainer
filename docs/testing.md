@@ -16,11 +16,12 @@ This project separates copyable examples from verification configs:
 | host / unit | `tests/unit` | no | none | draft + ready PR |
 | contract | `tests/contract` | no | none | ready PR |
 | local smoke | `tests/e2e` | yes | one host, isolated bridge | merge gate |
-| full suite | examples + `tests/sessions` | yes | local smoke + external OTA | manual promotion gate |
+| full local suite | examples + `tests/sessions` | yes | one host, isolated bridge | nightly + manual |
+| external OTA | operator deployment | yes | multiple machines | manual promotion gate |
 
 Ready PRs run the non-Docker checks, package validation, and the local smoke
-slice. The full suite is deliberately operator-started before a promotion to
-`main`; it is not scheduled automatically.
+slice. The full local suite also runs nightly. The external OTA gate remains
+operator-started before a promotion to `main`.
 
 ## Expectations
 

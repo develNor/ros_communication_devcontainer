@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 from rosotacom.cli import (
     EXAMPLE_PROJECT_DIR,
@@ -212,6 +213,22 @@ def _scenario_command(project: Path, action: str, identity: str, instance_id: st
         "--peer-address",
         "b=127.0.0.1",
         *(["--mode", "detached"] if action == "start" else []),
+    ]
+
+
+def _interactive_smoke_command(project: Path, *extra: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "smoke",
+        "2_native_chatter",
+        "--interactive",
+        "--rosotacom-config",
+        str(project / "rosotacom.yaml"),
+        "--session-instances-dir",
+        str(SESSION_INSTANCES_DIR),
+        *extra,
     ]
 
 
@@ -471,6 +488,131 @@ def test_native_chatter_scenario_starts_apps_and_communication_together(
     finally:
         for identity in ("a", "b"):
             _run(_scenario_command(copied_example_project, "stop", identity, instance_id), timeout=60)
+
+
+def test_interactive_native_chatter_smoke_starts_full_local_debug_rig(
+    copied_example_project: Path,
+) -> None:
+    instance_id = f"interactive-smoke-{time.time_ns()}"
+    try:
+        result = _run(
+            _interactive_smoke_command(
+                copied_example_project,
+                "--mode",
+                "detached",
+                "--instance-id",
+                instance_id,
+            ),
+            timeout=900,
+        )
+        assert "rosotacom interactive smoke started: 2_native_chatter (scenario)" in result.stdout
+        assert "Smoke peers isolated on docker network" in result.stdout
+
+        listing = _run(
+            _interactive_smoke_command(copied_example_project, "--list"),
+            timeout=30,
+        )
+        assert "2_native_chatter (scenario)" in listing.stdout
+        assert instance_id in listing.stdout
+
+        manifests = sorted(SESSION_INSTANCES_DIR.glob(f"*/*_{instance_id}/manifest.yaml"))
+        assert manifests
+        manifest = yaml.safe_load(manifests[-1].read_text(encoding="utf-8"))
+        run = manifest["interactive_smoke_runs"]["scenario:2_native_chatter"]
+        peer_addresses = set(run["peer_address"])
+        assert all(address.startswith(("a=10.137.", "b=10.137.")) for address in peer_addresses)
+        plugin_a = manifests[-1].parent / "config" / "a" / "plugin.yaml"
+        plugin_b = manifests[-1].parent / "config" / "b" / "plugin.yaml"
+        deadline = time.time() + 180
+        while time.time() < deadline and not (plugin_a.is_file() and plugin_b.is_file()):
+            time.sleep(2)
+        assert plugin_a.is_file()
+        assert plugin_b.is_file()
+        assert "data:" not in plugin_a.read_text(encoding="utf-8")
+        assert "data:" not in plugin_b.read_text(encoding="utf-8")
+
+        windows = _run(
+            [
+                "tmux",
+                "-L",
+                run["tmux_socket"],
+                "list-windows",
+                "-t",
+                run["tmux_session"],
+                "-F",
+                "#{window_name}",
+            ],
+            timeout=30,
+        )
+        assert windows.stdout.splitlines() == [
+            "a_communication",
+            "b_communication",
+            "a_native_application",
+            "b_native_application",
+            "verification",
+        ]
+
+        _run(
+            [
+                sys.executable,
+                "-m",
+                "rosotacom",
+                "test",
+                "2_native_chatter",
+                "--rosotacom-config",
+                str(copied_example_project / "rosotacom.yaml"),
+                "--session-instances-dir",
+                str(SESSION_INSTANCES_DIR),
+                "--instance-id",
+                instance_id,
+                "--timeout",
+                "180",
+            ],
+            timeout=240,
+        )
+
+        _run(_interactive_smoke_command(copied_example_project, "--stop"), timeout=120)
+        stopped_listing = _run(_interactive_smoke_command(copied_example_project, "--list"), timeout=30)
+        assert "(none)" in stopped_listing.stdout
+        tmux_check = subprocess.run(
+            ["tmux", "-L", run["tmux_socket"], "has-session", "-t", run["tmux_session"]],
+            cwd=PACKAGE_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert tmux_check.returncode != 0
+        owned_containers = set(run["communication_containers"].values()) | {
+            application["container_name"] for application in run["applications"]
+        }
+        running_containers = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            cwd=PACKAGE_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert owned_containers.isdisjoint(set(running_containers.stdout.splitlines()))
+        network_inspect = subprocess.run(
+            ["docker", "network", "inspect", run["network_name"]],
+            cwd=PACKAGE_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert network_inspect.returncode != 0
+    finally:
+        subprocess.run(
+            _interactive_smoke_command(copied_example_project, "--stop"),
+            cwd=PACKAGE_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
 
 
 @pytest.mark.parametrize("session_name", COMP_OCC_GRID_SMOKE_SESSIONS)

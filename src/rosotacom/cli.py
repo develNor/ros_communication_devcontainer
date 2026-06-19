@@ -136,6 +136,25 @@ class ActiveScenarioRun:
 
 
 @dataclass(frozen=True)
+class InteractiveSmokeTarget:
+    name: str
+    target_type: str
+    session: ResolvedSession
+    cfg: dict[str, Any]
+    scenario: ResolvedScenario | None = None
+    scenario_definition: ScenarioDefinition | None = None
+
+
+@dataclass(frozen=True)
+class ActiveInteractiveSmokeRun:
+    target: str
+    target_type: str
+    tmux_session: str
+    instance_id: str
+    network_name: str
+
+
+@dataclass(frozen=True)
 class SessionInstance:
     instance_id: str
     host_dir: Path
@@ -592,10 +611,94 @@ def _write_scenario_manifest(
     )
 
 
+def _interactive_smoke_run_key(target_type: str, target_name: str) -> str:
+    return f"{target_type}:{target_name}"
+
+
+def _write_interactive_smoke_manifest(
+    instance: SessionInstance,
+    target: InteractiveSmokeTarget,
+    runtime: RuntimeConfig,
+    *,
+    peer_ips: dict[str, str],
+    network_name: str,
+    network_subnet: str,
+    tmux_session: str,
+) -> None:
+    manifest_path = instance.host_dir / "manifest.yaml"
+    manifest = _load_yaml_file(manifest_path)
+    now = datetime.now().isoformat(timespec="seconds")
+    if not manifest:
+        manifest = {
+            "schema_version": 1,
+            "created_at": now,
+            "instance_id": instance.instance_id,
+            "rosotacom_version": __version__,
+            "source_session_host_dir": str(target.session.host_dir),
+            "source_session_container_dir": target.session.container_dir,
+            "source": target.session.source,
+            "config_dir": str(instance.config_host_dir),
+            "logs_dir": str(instance.logs_host_dir),
+            "rosbags_dir": str(instance.rosbags_host_dir),
+            "rollout": None,
+            "starts": [],
+        }
+    manifest["updated_at"] = now
+    manifest["effective_config_sha256"] = _effective_config_sha256(target.cfg)
+    smoke_runs = manifest.setdefault("interactive_smoke_runs", {})
+    run: dict[str, Any] = {
+        "started_at": now,
+        "stopped_at": None,
+        "target": target.name,
+        "target_type": target.target_type,
+        "tmux_socket": _scenario_tmux_socket(runtime),
+        "tmux_session": tmux_session,
+        "network_name": network_name,
+        "network_subnet": network_subnet,
+        "peer_address": [f"{peer}={ip}" for peer, ip in peer_ips.items()],
+        "communication_containers": {
+            peer: _container_name(_remote_peer_name(target.cfg, peer), runtime) for peer in peer_ips
+        },
+    }
+    if target.scenario is not None and target.scenario_definition is not None:
+        run["source_scenario_definition"] = str(target.scenario.definition_path)
+        run["applications"] = [
+            {
+                "identity": identity,
+                "name": application.name,
+                "ros2docker_config": str(application.ros2docker_config),
+                "container_name": _scenario_container_name(runtime, target.scenario.name, identity, application.name),
+                "image_name": _scenario_application_image_name(runtime, application),
+            }
+            for identity, applications in target.scenario_definition.applications.items()
+            for application in applications
+        ]
+    smoke_runs[_interactive_smoke_run_key(target.target_type, target.name)] = run
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=True, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
 def _mark_scenario_stopped(instance_dir: Path, scenario_name: str, identity: str) -> None:
     manifest_path = instance_dir / "manifest.yaml"
     manifest = _load_yaml_file(manifest_path)
     run = (manifest.get("scenario_runs") or {}).get(f"{scenario_name}:{identity}")
+    if not isinstance(run, dict):
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    run["stopped_at"] = now
+    manifest["updated_at"] = now
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=True, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def _mark_interactive_smoke_stopped(instance_dir: Path, target_type: str, target_name: str) -> None:
+    manifest_path = instance_dir / "manifest.yaml"
+    manifest = _load_yaml_file(manifest_path)
+    run = (manifest.get("interactive_smoke_runs") or {}).get(_interactive_smoke_run_key(target_type, target_name))
     if not isinstance(run, dict):
         return
     now = datetime.now().isoformat(timespec="seconds")
@@ -1086,6 +1189,145 @@ def _format_scenario_listing(runtime: RuntimeConfig) -> str:
     return f"Configured scenarios:\n{configured_text}\nActive scenarios:\n{_format_active_scenario_runs(active)}"
 
 
+def _peer_keys_from_cfg(cfg: dict[str, Any]) -> list[str]:
+    peers = cfg.get("peers")
+    if not isinstance(peers, dict) or not peers:
+        raise RuntimeError("Smoke target session must define a non-empty peers mapping.")
+    return [str(peer) for peer in peers]
+
+
+def _require_two_peer_smoke_cfg(cfg: dict[str, Any], target_name: str) -> list[str]:
+    peers = _peer_keys_from_cfg(cfg)
+    if len(peers) != 2:
+        raise RuntimeError(
+            f"Interactive smoke v1 requires exactly 2 peers for local end-to-end runs; "
+            f"target '{target_name}' defines peers={peers}."
+        )
+    return peers
+
+
+def _resolve_interactive_smoke_target(
+    target_arg: str | None,
+    runtime: RuntimeConfig,
+    target_type: str,
+    *,
+    peer_address_overrides: dict[str, str] | None = None,
+) -> InteractiveSmokeTarget:
+    if target_type not in {"auto", "session", "scenario"}:
+        raise RuntimeError("--target-type must be one of: auto, session, scenario")
+    target_name = target_arg or DEFAULT_SMOKE_SESSION
+    prefer_scenario = target_type == "scenario" or (target_type == "auto" and target_arg is not None)
+
+    scenario_error: Exception | None = None
+    if prefer_scenario:
+        try:
+            scenario = _resolve_scenario(target_name, runtime)
+            definition = _load_scenario_definition(scenario)
+            session = _resolve_session(definition.session, runtime)
+            cfg = _effective_session_config(session.host_dir, runtime, peer_address_overrides=peer_address_overrides)
+            _require_two_peer_smoke_cfg(cfg, scenario.name)
+            unknown_identities = sorted(set(definition.applications) - set(_peer_keys_from_cfg(cfg)))
+            if unknown_identities:
+                raise RuntimeError(
+                    f"Scenario '{scenario.name}' defines applications for unknown session identities "
+                    f"{unknown_identities}."
+                )
+            return InteractiveSmokeTarget(
+                name=scenario.name,
+                target_type="scenario",
+                session=session,
+                cfg=cfg,
+                scenario=scenario,
+                scenario_definition=definition,
+            )
+        except Exception as exc:  # noqa: BLE001 - auto falls back to a session target.
+            scenario_error = exc
+            if target_type == "scenario":
+                raise
+
+    try:
+        session = _resolve_session(target_name, runtime)
+        cfg = _effective_session_config(session.host_dir, runtime, peer_address_overrides=peer_address_overrides)
+        _require_two_peer_smoke_cfg(cfg, session.host_dir.name)
+        return InteractiveSmokeTarget(name=session.host_dir.name, target_type="session", session=session, cfg=cfg)
+    except Exception as exc:
+        if scenario_error is not None:
+            raise scenario_error from exc
+        raise
+
+
+def _interactive_smoke_tmux_session(target_type: str, target_name: str) -> str:
+    return _safe_path_token(f"smoke-{target_type}-{target_name}")
+
+
+def _active_interactive_smoke_runs(runtime: RuntimeConfig) -> list[ActiveInteractiveSmokeRun]:
+    if not shutil.which("tmux"):
+        return []
+    result = subprocess.run(
+        _tmux_command(
+            runtime,
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{@rosotacom_smoke_target}\t#{@rosotacom_smoke_target_type}\t"
+            "#{@rosotacom_smoke_instance}\t#{@rosotacom_smoke_network}",
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    runs: list[ActiveInteractiveSmokeRun] = []
+    for line in result.stdout.splitlines():
+        session_name, _, metadata = line.partition("\t")
+        target, _, rest = metadata.partition("\t")
+        target_type, _, rest = rest.partition("\t")
+        instance_id, _, network_name = rest.partition("\t")
+        if target and target_type and instance_id:
+            runs.append(
+                ActiveInteractiveSmokeRun(
+                    target=target,
+                    target_type=target_type,
+                    tmux_session=session_name,
+                    instance_id=instance_id,
+                    network_name=network_name,
+                )
+            )
+    return sorted(runs, key=lambda run: (run.target_type, run.target))
+
+
+def _format_active_interactive_smoke_runs(runs: list[ActiveInteractiveSmokeRun]) -> str:
+    if not runs:
+        return "Active interactive smoke runs:\n  (none)"
+    lines = ["Active interactive smoke runs:"]
+    for run in runs:
+        lines.append(f"  - {run.target} ({run.target_type}) instance={run.instance_id} network={run.network_name}")
+    return "\n".join(lines)
+
+
+def _infer_active_interactive_smoke_run(
+    runtime: RuntimeConfig,
+    target_arg: str | None,
+    target_type: str,
+) -> ActiveInteractiveSmokeRun:
+    runs = _active_interactive_smoke_runs(runtime)
+    if target_arg:
+        target = _resolve_interactive_smoke_target(target_arg, runtime, target_type)
+        matches = [run for run in runs if run.target == target.name and run.target_type == target.target_type]
+    elif target_type != "auto":
+        matches = [run for run in runs if run.target_type == target_type]
+    else:
+        matches = runs
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise RuntimeError("No active interactive smoke run found.")
+    raise RuntimeError(
+        "Multiple active interactive smoke runs found; specify TARGET:\n"
+        + "\n".join(f"  - {run.target} ({run.target_type})" for run in matches)
+    )
+
+
 def _scenario_name_completer(
     prefix: str,
     parsed_args: argparse.Namespace,
@@ -1143,6 +1385,90 @@ def _identity_completer(
         session_name = getattr(parsed_args, "session_dir", None) or getattr(parsed_args, "session_dir_positional", None)
         identities = _session_identities(runtime, session_name) if session_name else []
     return {identity: "peer identity" for identity in identities if identity.startswith(prefix)}
+
+
+def _smoke_target_completer(
+    prefix: str,
+    parsed_args: argparse.Namespace,
+    **_: Any,
+) -> dict[str, str]:
+    completions = _session_name_completer(prefix, parsed_args)
+    try:
+        runtime = _load_runtime_config(parsed_args)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return completions
+    completions.update({name: "configured scenario" for name in _scenario_names(runtime) if name.startswith(prefix)})
+    return completions
+
+
+def _data_dict_reference_keys(runtime: RuntimeConfig) -> list[str]:
+    try:
+        data_dict = _load_host_data_dict(runtime)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return []
+    keys: set[str] = set()
+    for key, value in data_dict.items():
+        if isinstance(value, dict):
+            keys.update(str(child_key) for child_key in value)
+        else:
+            keys.add(str(key))
+    return sorted(keys)
+
+
+def _peer_keys_for_completion(runtime: RuntimeConfig, parsed_args: argparse.Namespace) -> list[str]:
+    try:
+        command = getattr(parsed_args, "command", None)
+        if command == "scenario":
+            scenario_name = getattr(parsed_args, "scenario", None)
+            if not scenario_name:
+                return []
+            resolved = _resolve_scenario(scenario_name, runtime)
+            definition = _load_scenario_definition(resolved)
+            session = _resolve_session(definition.session, runtime)
+        elif command == "smoke":
+            target = _resolve_interactive_smoke_target(
+                getattr(parsed_args, "session_dir", None),
+                runtime,
+                getattr(parsed_args, "target_type", "auto"),
+            )
+            return _peer_keys_from_cfg(target.cfg)
+        else:
+            session_name = getattr(parsed_args, "session_dir", None) or getattr(
+                parsed_args, "session_dir_positional", None
+            )
+            if not session_name:
+                return []
+            session = _resolve_session(session_name, runtime)
+        cfg = _effective_session_config(session.host_dir, runtime)
+        return _peer_keys_from_cfg(cfg)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return []
+
+
+def _peer_address_completer(
+    prefix: str,
+    parsed_args: argparse.Namespace,
+    **_: Any,
+) -> dict[str, str]:
+    try:
+        runtime = _load_runtime_config(parsed_args)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return {}
+    if "=" not in prefix:
+        return {
+            f"{peer}=": "peer address override"
+            for peer in _peer_keys_for_completion(runtime, parsed_args)
+            if peer.startswith(prefix)
+        }
+    peer, value_prefix = prefix.split("=", 1)
+    if value_prefix and not "data:".startswith(value_prefix) and not value_prefix.startswith("data:"):
+        return {}
+    key_prefix = value_prefix[len("data:") :] if value_prefix.startswith("data:") else ""
+    return {
+        f"{peer}=data:{key}": "data_dict key"
+        for key in _data_dict_reference_keys(runtime)
+        if key.startswith(key_prefix)
+    }
 
 
 def _load_scenario_definition(resolved: ResolvedScenario) -> ScenarioDefinition:
@@ -1318,8 +1644,11 @@ def _scenario_application_command(
     resolved: ResolvedScenario,
     identity: str,
     application: ScenarioApplication,
+    *,
+    network_name: str | None = None,
+    network_ip: str | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-m",
         "rosotacom",
@@ -1332,6 +1661,11 @@ def _scenario_application_command(
         application.name,
         *_runtime_cli_args(runtime),
     ]
+    if network_name:
+        command.extend(["--network-name", network_name])
+    if network_ip:
+        command.extend(["--network-ip", network_ip])
+    return command
 
 
 def _scenario_log_path(instance: SessionInstance, identity: str, component: str) -> Path:
@@ -1656,7 +1990,7 @@ def start_session(args: argparse.Namespace) -> str:
             ]
         ),
     )
-    if not getattr(args, "scenario_managed", False):
+    if not getattr(args, "scenario_managed", False) and not getattr(args, "smoke_managed", False):
         _write_instance_manifest(
             instance,
             session,
@@ -1971,10 +2305,18 @@ def run_scenario_application(args: argparse.Namespace) -> int:
             config_file=application.ros2docker_config,
             override={"container_name": container_name},
         )
-    override = {
+    override: dict[str, object] = {
         "container_name": container_name,
         "image_name": _scenario_application_image_name(runtime, application),
     }
+    network_name = getattr(args, "network_name", None)
+    if network_name:
+        base_run_args = load_config(application.ros2docker_config).get("run_args", []) or []
+        override["run_args"] = _isolated_network_run_args(
+            [str(arg) for arg in base_run_args],
+            network_name,
+            getattr(args, "network_ip", None),
+        )
     ros2docker_build(config_file=application.ros2docker_config, override=override)
     ros2docker_run(config_file=application.ros2docker_config, override=override)
     return 0
@@ -2302,30 +2644,49 @@ SMOKE_NETWORK_SUBNET = "10.137.0.0/24"
 SMOKE_PEER_IPS: dict[str, str] = {"a": "10.137.0.2", "b": "10.137.0.3"}
 
 
+def _interactive_smoke_network_config(runtime: RuntimeConfig, target_type: str, target_name: str) -> tuple[str, str]:
+    token = _sanitize_docker_name(f"rosotacom_smoke_{runtime.install_id}_{target_type}_{target_name}")
+    if len(token) > 63:
+        digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:10]
+        token = f"{token[:52]}_{digest}"
+    subnet_octet = 1 + (int(hashlib.sha1(token.encode("utf-8")).hexdigest()[:8], 16) % 200)
+    return token, f"10.137.{subnet_octet}.0/24"
+
+
+def _smoke_peer_ips_for_subnet(peers: list[str], subnet: str) -> dict[str, str]:
+    match = re.match(r"^(\d+\.\d+\.\d+)\.0/24$", subnet)
+    if not match:
+        raise RuntimeError(f"Interactive smoke requires a /24 IPv4 subnet, got: {subnet}")
+    prefix = match.group(1)
+    sorted_peers = sorted(peers)
+    if len(sorted_peers) > 250:
+        raise RuntimeError(f"Too many peers for a /24 smoke subnet: {len(sorted_peers)}")
+    return {peer: f"{prefix}.{index + 2}" for index, peer in enumerate(sorted_peers)}
+
+
 def _smoke_peer_address_args() -> list[str]:
     return [f"{peer}={ip}" for peer, ip in SMOKE_PEER_IPS.items()]
 
 
-def _ensure_smoke_network() -> None:
+def _ensure_smoke_network(network_name: str = SMOKE_NETWORK_NAME, subnet: str = SMOKE_NETWORK_SUBNET) -> None:
     # Recreate from a clean slate so a leftover network from a crashed run cannot
     # cause a subnet-overlap failure on create.
-    _remove_smoke_network()
+    _remove_smoke_network(network_name)
     result = subprocess.run(
-        ["docker", "network", "create", "--subnet", SMOKE_NETWORK_SUBNET, SMOKE_NETWORK_NAME],
+        ["docker", "network", "create", "--subnet", subnet, network_name],
         text=True,
         capture_output=True,
         check=False,
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"Failed to create smoke network {SMOKE_NETWORK_NAME} ({SMOKE_NETWORK_SUBNET}): "
-            f"{(result.stderr or result.stdout).strip()}"
+            f"Failed to create smoke network {network_name} ({subnet}): {(result.stderr or result.stdout).strip()}"
         )
 
 
-def _remove_smoke_network() -> None:
+def _remove_smoke_network(network_name: str = SMOKE_NETWORK_NAME) -> None:
     subprocess.run(
-        ["docker", "network", "rm", SMOKE_NETWORK_NAME],
+        ["docker", "network", "rm", network_name],
         text=True,
         capture_output=True,
         check=False,
@@ -3100,7 +3461,551 @@ def test_command(args: argparse.Namespace) -> int:
     return 1
 
 
+def _interactive_smoke_session_arg(target: InteractiveSmokeTarget) -> str:
+    if target.target_type == "scenario" and target.scenario_definition is not None:
+        return target.scenario_definition.session
+    return str(target.session.host_dir)
+
+
+def _interactive_smoke_peer_address_args(peer_ips: dict[str, str]) -> list[str]:
+    return [f"{peer}={ip}" for peer, ip in peer_ips.items()]
+
+
+def _interactive_smoke_log_path(instance: SessionInstance, identity: str | None, component: str) -> Path:
+    token = _safe_path_token(component)
+    if identity is None:
+        return instance.logs_host_dir / "interactive-smoke" / f"{token}.log"
+    return instance.logs_host_dir / _safe_path_token(identity) / "interactive-smoke" / f"{token}.log"
+
+
+def _interactive_smoke_communication_command(
+    runtime: RuntimeConfig,
+    target: InteractiveSmokeTarget,
+    identity: str,
+    instance: SessionInstance,
+    peer_ips: dict[str, str],
+    network_name: str,
+    *,
+    force: bool,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "start",
+        _interactive_smoke_session_arg(target),
+        "--identity",
+        identity,
+        "--mode",
+        "attach",
+        "--instance-id",
+        instance.instance_id,
+        "--smoke-managed",
+        "--network-name",
+        network_name,
+        "--network-ip",
+        peer_ips[identity],
+        *_runtime_cli_args(runtime),
+    ]
+    command.append("--force" if force else "--no-force")
+    for override in _interactive_smoke_peer_address_args(peer_ips):
+        command.extend(["--peer-address", override])
+    return command
+
+
+def _interactive_smoke_application_command(
+    runtime: RuntimeConfig,
+    target: InteractiveSmokeTarget,
+    identity: str,
+    application: ScenarioApplication,
+    network_name: str,
+) -> list[str]:
+    assert target.scenario is not None
+    return _scenario_application_command(
+        runtime,
+        target.scenario,
+        identity,
+        application,
+        network_name=network_name,
+    )
+
+
+def _interactive_smoke_verify_command(
+    runtime: RuntimeConfig,
+    target: InteractiveSmokeTarget,
+    instance: SessionInstance,
+    peer_ips: dict[str, str],
+) -> list[str]:
+    target_arg = target.scenario.name if target.scenario is not None else str(target.session.host_dir)
+    command = [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "smoke",
+        target_arg,
+        "--interactive",
+        "--verify-only",
+        "--target-type",
+        target.target_type,
+        "--instance-id",
+        instance.instance_id,
+        *_runtime_cli_args(runtime),
+    ]
+    for override in _interactive_smoke_peer_address_args(peer_ips):
+        command.extend(["--peer-address", override])
+    return command
+
+
+def _interactive_smoke_status_command(
+    runtime: RuntimeConfig,
+    target: InteractiveSmokeTarget,
+    instance: SessionInstance,
+) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "status",
+        _interactive_smoke_session_arg(target),
+        "--instance-id",
+        instance.instance_id,
+        "--watch",
+        *_runtime_cli_args(runtime),
+    ]
+
+
+def _host_shell(script: str) -> str:
+    return shlex.join(["bash", "-lc", script])
+
+
+def _wait_for_peer_spec_script(instance: SessionInstance, identity: str) -> str:
+    spec = instance.config_host_dir / identity / "session_specification.yaml"
+    quoted = shlex.quote(str(spec))
+    return f"until [ -f {quoted} ]; do echo '[INFO] waiting for generated config: {quoted}'; sleep 2; done"
+
+
+def _wait_for_container_running_script(container_name: str) -> str:
+    quoted = shlex.quote(container_name)
+    return (
+        f"until [ \"$(docker inspect -f '{{{{.State.Running}}}}' {quoted} 2>/dev/null)\" = true ]; do "
+        f"echo '[INFO] waiting for container: {quoted}'; sleep 2; done"
+    )
+
+
+def _create_interactive_smoke_tmux(
+    runtime: RuntimeConfig,
+    target: InteractiveSmokeTarget,
+    instance: SessionInstance,
+    peer_ips: dict[str, str],
+    network_name: str,
+) -> str:
+    session_name = _interactive_smoke_tmux_session(target.target_type, target.name)
+    peers = sorted(peer_ips)
+    first_peer = peers[0]
+    first_command = shlex.join(
+        _interactive_smoke_communication_command(
+            runtime,
+            target,
+            first_peer,
+            instance,
+            peer_ips,
+            network_name,
+            force=True,
+        )
+    )
+    created = subprocess.run(
+        _tmux_command(
+            runtime,
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-s",
+            session_name,
+            "-n",
+            _safe_path_token(f"{first_peer}_communication"),
+            _host_shell(first_command),
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    first_pane = created.stdout.strip()
+    subprocess.run(
+        _tmux_command(runtime, "set-window-option", "-g", "-t", session_name, "remain-on-exit", "on"),
+        check=True,
+    )
+    subprocess.run(_tmux_command(runtime, "set-option", "-t", session_name, "prefix", "C-b"), check=True)
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "@rosotacom_smoke_target", target.name),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "@rosotacom_smoke_target_type", target.target_type),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "@rosotacom_smoke_instance", instance.instance_id),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "@rosotacom_smoke_network", network_name),
+        check=True,
+    )
+    subprocess.run(_tmux_command(runtime, "bind-key", "-T", "prefix", "C-b", "send-prefix"), check=True)
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "pane-border-status", "top"),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "pane-border-format", " #{pane_title} "),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(
+            runtime,
+            "set-option",
+            "-t",
+            session_name,
+            "status-right",
+            " interactive smoke | windows: C-b n/p | inner catmux: C-b C-b ",
+        ),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(runtime, "select-pane", "-t", first_pane, "-T", f"{first_peer}:communication"),
+        check=True,
+    )
+    _attach_tmux_pipe(runtime, first_pane, _interactive_smoke_log_path(instance, first_peer, "communication"))
+
+    for peer in peers[1:]:
+        command = shlex.join(
+            _interactive_smoke_communication_command(
+                runtime,
+                target,
+                peer,
+                instance,
+                peer_ips,
+                network_name,
+                force=False,
+            )
+        )
+        script = f"{_wait_for_peer_spec_script(instance, peer)}; exec {command}"
+        created_window = subprocess.run(
+            _tmux_command(
+                runtime,
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                session_name,
+                "-n",
+                _safe_path_token(f"{peer}_communication"),
+                _host_shell(script),
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        pane_id = created_window.stdout.strip()
+        subprocess.run(_tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"{peer}:communication"), check=True)
+        _attach_tmux_pipe(runtime, pane_id, _interactive_smoke_log_path(instance, peer, "communication"))
+
+    if target.target_type == "scenario" and target.scenario_definition is not None:
+        for peer in peers:
+            communication_container = _container_name(_remote_peer_name(target.cfg, peer), runtime)
+            app_network = f"container:{communication_container}"
+            for application in target.scenario_definition.applications.get(peer, ()):
+                command = shlex.join(
+                    _interactive_smoke_application_command(runtime, target, peer, application, app_network)
+                )
+                script = (
+                    f"{_wait_for_peer_spec_script(instance, peer)}; "
+                    f"{_wait_for_container_running_script(communication_container)}; "
+                    f"exec {command}"
+                )
+                created_window = subprocess.run(
+                    _tmux_command(
+                        runtime,
+                        "new-window",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                        "-t",
+                        session_name,
+                        "-n",
+                        _safe_path_token(f"{peer}_{application.name}"),
+                        _host_shell(script),
+                    ),
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                pane_id = created_window.stdout.strip()
+                subprocess.run(
+                    _tmux_command(
+                        runtime,
+                        "select-pane",
+                        "-t",
+                        pane_id,
+                        "-T",
+                        f"{peer}:application:{application.name}",
+                    ),
+                    check=True,
+                )
+                _attach_tmux_pipe(
+                    runtime,
+                    pane_id,
+                    _interactive_smoke_log_path(instance, peer, f"application-{application.name}"),
+                )
+
+    verify = shlex.join(_interactive_smoke_verify_command(runtime, target, instance, peer_ips))
+    status_watch = shlex.join(_interactive_smoke_status_command(runtime, target, instance))
+    verify_script = (
+        f"{verify}; rc=$?; echo; echo '[INFO] one-shot verification exited with status' \"$rc\"; "
+        f"echo '[INFO] live status follows (Ctrl-C in this pane only stops the watch)'; exec {status_watch}"
+    )
+    verification = subprocess.run(
+        _tmux_command(
+            runtime,
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            session_name,
+            "-n",
+            "verification",
+            _host_shell(verify_script),
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    verification_pane = verification.stdout.strip()
+    subprocess.run(_tmux_command(runtime, "select-pane", "-t", verification_pane, "-T", "verification"), check=True)
+    _attach_tmux_pipe(runtime, verification_pane, _interactive_smoke_log_path(instance, None, "verification"))
+    subprocess.run(_tmux_command(runtime, "select-window", "-t", f"{session_name}:verification"), check=True)
+    return session_name
+
+
+def _find_latest_interactive_smoke_instance(
+    runtime: RuntimeConfig,
+    target_type: str,
+    target_name: str,
+    instance_id: str | None = None,
+) -> Path | None:
+    root = _session_instances_root(runtime)
+    run_key = _interactive_smoke_run_key(target_type, target_name)
+    candidates = sorted(root.glob("*/*/manifest.yaml"), reverse=True)
+    for manifest_path in candidates:
+        manifest = _load_yaml_file(manifest_path)
+        if instance_id and manifest.get("instance_id") != _safe_path_token(instance_id):
+            continue
+        smoke_runs = manifest.get("interactive_smoke_runs") or {}
+        if run_key in smoke_runs:
+            return manifest_path.parent.resolve()
+    return None
+
+
+def _interactive_smoke_verify(args: argparse.Namespace) -> int:
+    runtime = _load_runtime_config(args)
+    peer_overrides = _parse_peer_address_overrides(getattr(args, "peer_address", None))
+    target = _resolve_interactive_smoke_target(
+        getattr(args, "session_dir", None),
+        runtime,
+        getattr(args, "target_type", "auto"),
+        peer_address_overrides=peer_overrides,
+    )
+    instance = _resolve_session_instance(runtime, target.session, getattr(args, "instance_id", None))
+    smoke_log = instance.logs_host_dir / "interactive-smoke-verification.log"
+
+    def log_line(message: str) -> None:
+        print(message)
+        _append_log(smoke_log, message)
+
+    peers = _require_two_peer_smoke_cfg(target.cfg, target.name)
+    containers = {peer: _container_name(_remote_peer_name(target.cfg, peer), runtime) for peer in peers}
+    for container in containers.values():
+        _wait_for_container_ready(container, timeout_s=360)
+    ros_setups = {peer: _smoke_ros_setup(instance.config_container_dir, target.cfg, peer) for peer in peers}
+
+    if target.target_type == "session":
+        _start_smoke_topic_publishers(
+            containers,
+            ros_setups,
+            target.cfg,
+            log_line=log_line,
+            duration=SMOKE_PUBLISHER_DURATION_S,
+        )
+
+    errors: list[str] = []
+    for peer in peers:
+        errors += _verify_received_topics(
+            containers[peer],
+            ros_setups[peer],
+            target.cfg,
+            peer,
+            log_line=log_line,
+            detail_log=lambda message: _append_log(smoke_log, message),
+        )
+    errors += _verify_isolation(
+        containers[peers[0]],
+        ros_setups[peers[0]],
+        containers[peers[1]],
+        ros_setups[peers[1]],
+        ISOLATION_PROBE_TOPIC,
+        log_line=log_line,
+    )
+    test_rc = test_command(
+        argparse.Namespace(
+            rosotacom_config=args.rosotacom_config,
+            ros2docker_config=args.ros2docker_config,
+            session_configs_dir=args.session_configs_dir,
+            scenario_configs_dir=getattr(args, "scenario_configs_dir", None),
+            session_instances_dir=getattr(args, "session_instances_dir", None),
+            data_dict=args.data_dict,
+            session_dir=_interactive_smoke_session_arg(target),
+            instance_id=instance.instance_id,
+            timeout=120.0,
+            interval=2.0,
+        )
+    )
+    if test_rc != 0:
+        errors.append("rosotacom test failed for the session self-report")
+    if errors:
+        for error in errors:
+            log_line(f"ERROR: {error}")
+        return 1
+    log_line("INTERACTIVE SMOKE OK")
+    return 0
+
+
+def _start_interactive_smoke(args: argparse.Namespace) -> int:
+    _require_ros2docker()
+    _require_tmux()
+    runtime = _load_runtime_config(args)
+    target = _resolve_interactive_smoke_target(
+        getattr(args, "session_dir", None),
+        runtime,
+        getattr(args, "target_type", "auto"),
+    )
+    network_name, network_subnet = _interactive_smoke_network_config(runtime, target.target_type, target.name)
+    peer_ips = _smoke_peer_ips_for_subnet(_require_two_peer_smoke_cfg(target.cfg, target.name), network_subnet)
+    target = _resolve_interactive_smoke_target(
+        getattr(args, "session_dir", None),
+        runtime,
+        target.target_type,
+        peer_address_overrides=peer_ips,
+    )
+    tmux_session = _interactive_smoke_tmux_session(target.target_type, target.name)
+    mode = _resolve_mode(getattr(args, "mode", "auto"))
+    if _tmux_session_exists(runtime, tmux_session):
+        print(f"Interactive smoke already running: {target.name} ({target.target_type})")
+        if mode == "attach":
+            subprocess.run(_tmux_command(runtime, "attach-session", "-t", tmux_session), check=True)
+        else:
+            print(f"Attach with: rosotacom smoke {shlex.quote(target.name)} --interactive")
+        return 0
+
+    instance = _resolve_session_instance(
+        runtime,
+        target.session,
+        getattr(args, "instance_id", None) or _new_instance_id(),
+    )
+    _ensure_smoke_network(network_name, network_subnet)
+    _write_interactive_smoke_manifest(
+        instance,
+        target,
+        runtime,
+        peer_ips=peer_ips,
+        network_name=network_name,
+        network_subnet=network_subnet,
+        tmux_session=tmux_session,
+    )
+    created_session = _create_interactive_smoke_tmux(runtime, target, instance, peer_ips, network_name)
+    print(f"rosotacom interactive smoke instance: {instance.host_dir}")
+    print(f"rosotacom interactive smoke started: {target.name} ({target.target_type})")
+    print(f"Smoke peers isolated on docker network {network_name} ({network_subnet})")
+    print("Outer tmux prefix: Ctrl-b; send the inner catmux prefix with Ctrl-b Ctrl-b.")
+    if mode == "attach":
+        subprocess.run(_tmux_command(runtime, "attach-session", "-t", created_session), check=True)
+    else:
+        print(f"Attach with: rosotacom smoke {shlex.quote(target.name)} --interactive")
+        print(f"Stop with: rosotacom smoke {shlex.quote(target.name)} --interactive --stop")
+    return 0
+
+
+def _stop_interactive_smoke(args: argparse.Namespace) -> int:
+    _require_ros2docker()
+    runtime = _load_runtime_config(args)
+    target_arg = getattr(args, "session_dir", None)
+    target_type = getattr(args, "target_type", "auto")
+    active: ActiveInteractiveSmokeRun | None
+    instance_id: str | None
+    try:
+        active = _infer_active_interactive_smoke_run(runtime, target_arg, target_type)
+        target = _resolve_interactive_smoke_target(active.target, runtime, active.target_type)
+        network_name = active.network_name
+        tmux_session = active.tmux_session
+        instance_id = active.instance_id
+    except RuntimeError:
+        if not target_arg:
+            raise
+        active = None
+        target = _resolve_interactive_smoke_target(target_arg, runtime, target_type)
+        network_name, _network_subnet = _interactive_smoke_network_config(runtime, target.target_type, target.name)
+        tmux_session = _interactive_smoke_tmux_session(target.target_type, target.name)
+        instance_id = getattr(args, "instance_id", None)
+
+    peers = _require_two_peer_smoke_cfg(target.cfg, target.name)
+    containers = {peer: _container_name(_remote_peer_name(target.cfg, peer), runtime) for peer in peers}
+    if target.target_type == "session":
+        _stop_smoke_topic_publishers(containers, _smoke_publish_specs(target.cfg))
+    if target.target_type == "scenario" and target.scenario is not None and target.scenario_definition is not None:
+        for peer in peers:
+            for application in target.scenario_definition.applications.get(peer, ()):
+                if _stop_scenario_application(runtime, target.scenario, peer, application):
+                    print(f"Stopped scenario application: {peer}/{application.name}")
+    for peer, container in containers.items():
+        if _stop_container_name(container, runtime, quiet_missing=True):
+            print(f"Stopped communication container: {peer} ({container})")
+    if _kill_scenario_tmux(runtime, tmux_session):
+        print(f"Stopped interactive smoke tmux session: {tmux_session}")
+    _remove_smoke_network(network_name)
+    instance_dir = _find_latest_interactive_smoke_instance(
+        runtime,
+        target.target_type,
+        target.name,
+        instance_id,
+    )
+    if instance_dir:
+        _mark_interactive_smoke_stopped(instance_dir, target.target_type, target.name)
+    if active is None:
+        print(f"Interactive smoke cleanup attempted for: {target.name} ({target.target_type})")
+    return 0
+
+
+def _list_interactive_smoke(args: argparse.Namespace) -> int:
+    runtime = _load_runtime_config(args)
+    print(_format_active_interactive_smoke_runs(_active_interactive_smoke_runs(runtime)))
+    return 0
+
+
 def smoke(args: argparse.Namespace) -> int:
+    if getattr(args, "verify_only", False):
+        return _interactive_smoke_verify(args)
+    if getattr(args, "interactive_list", False):
+        return _list_interactive_smoke(args)
+    if getattr(args, "interactive_stop", False):
+        return _stop_interactive_smoke(args)
+    if getattr(args, "interactive", False):
+        return _start_interactive_smoke(args)
     if not args.local:
         raise RuntimeError("Only --local smoke mode is implemented.")
     session_dir = args.session_dir or DEFAULT_SMOKE_SESSION
@@ -3355,11 +4260,16 @@ def _add_identity_arg(parser: argparse.ArgumentParser, *, required: bool = False
     cast(Any, action).completer = _identity_completer
 
 
+def _add_peer_address_arg(parser: argparse.ArgumentParser) -> None:
+    action = parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    cast(Any, action).completer = _peer_address_completer
+
+
 def _add_scenario_identity_args(parser: argparse.ArgumentParser) -> None:
     _add_identity_arg(parser)
     parser.add_argument("--no-auto-identity", dest="auto_identity", action="store_false")
     parser.add_argument("--overwrite-peers-via-remote-peer")
-    parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    _add_peer_address_arg(parser)
     parser.set_defaults(auto_identity=True)
 
 
@@ -3374,9 +4284,12 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--force", dest="force", action="store_true")
     parser.add_argument("--rewrite-formatting", action="store_true")
     parser.add_argument("--overwrite-peers-via-remote-peer")
-    parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    _add_peer_address_arg(parser)
     parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
     parser.add_argument("--scenario-managed", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--smoke-managed", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--network-name", help=argparse.SUPPRESS)
+    parser.add_argument("--network-ip", help=argparse.SUPPRESS)
     parser.set_defaults(force=True, auto_identity=True)
 
 
@@ -3478,7 +4391,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_session_arg(stop_parser, "-s", "--session-dir", dest="session_dir")
     _add_identity_arg(stop_parser)
     stop_parser.add_argument("--auto-identity", action="store_true")
-    stop_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    _add_peer_address_arg(stop_parser)
     stop_parser.add_argument("--overwrite-peers-via-remote-peer")
     stop_parser.set_defaults(func=stop_command)
 
@@ -3488,11 +4401,33 @@ def main(argv: list[str] | None = None) -> int:
 
     smoke_parser = subparsers.add_parser("smoke", help="Run a local smoke test.")
     _add_common_config_args(smoke_parser)
-    _add_session_arg(smoke_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    smoke_target = smoke_parser.add_argument("session_dir", nargs="?")
+    cast(Any, smoke_target).completer = _smoke_target_completer
     smoke_parser.add_argument("--local", action="store_true", default=True)
     smoke_parser.add_argument("--local-ip")
+    smoke_parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Open an interactive local end-to-end tmux rig.",
+    )
+    smoke_parser.add_argument(
+        "--stop",
+        dest="interactive_stop",
+        action="store_true",
+        help="Stop an interactive smoke run.",
+    )
+    smoke_parser.add_argument(
+        "--list",
+        dest="interactive_list",
+        action="store_true",
+        help="List active interactive smoke runs.",
+    )
+    smoke_parser.add_argument("--target-type", choices=["auto", "session", "scenario"], default="auto")
+    smoke_parser.add_argument("--mode", choices=["auto", "attach", "detached"], default="auto")
     smoke_parser.add_argument("--keep-running", action="store_true", help="Leave smoke-test containers running.")
     smoke_parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
+    _add_peer_address_arg(smoke_parser)
+    smoke_parser.add_argument("--verify-only", action="store_true", help=argparse.SUPPRESS)
     smoke_parser.set_defaults(func=smoke)
 
     status_parser = subparsers.add_parser(
@@ -3525,7 +4460,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_common_config_args(probe_publish_parser)
     _add_session_arg(probe_publish_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     _add_identity_arg(probe_publish_parser, required=True)
-    probe_publish_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    _add_peer_address_arg(probe_publish_parser)
     probe_publish_parser.add_argument("--instance-id")
     probe_publish_parser.add_argument("--topic", default=ISOLATION_PROBE_TOPIC)
     probe_publish_parser.add_argument("--rate", type=float, default=5.0)
@@ -3541,7 +4476,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_common_config_args(probe_check_parser)
     _add_session_arg(probe_check_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     _add_identity_arg(probe_check_parser, required=True)
-    probe_check_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    _add_peer_address_arg(probe_check_parser)
     probe_check_parser.add_argument("--instance-id")
     probe_check_parser.add_argument("--topic", default=ISOLATION_PROBE_TOPIC)
     probe_check_parser.add_argument("--expect", choices=["present", "absent"], default="absent")
@@ -3554,7 +4489,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_common_config_args(publish_test_topics_parser)
     _add_session_arg(publish_test_topics_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     _add_identity_arg(publish_test_topics_parser, required=True)
-    publish_test_topics_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
+    _add_peer_address_arg(publish_test_topics_parser)
     publish_test_topics_parser.add_argument("--instance-id")
     publish_test_topics_parser.add_argument("--duration", type=float, default=180.0)
     publish_test_topics_parser.add_argument(
@@ -3617,6 +4552,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_scenario_arg(scenario_run_application_parser, "scenario")
     _add_identity_arg(scenario_run_application_parser, required=True)
     scenario_run_application_parser.add_argument("--application", required=True)
+    scenario_run_application_parser.add_argument("--network-name", help=argparse.SUPPRESS)
+    scenario_run_application_parser.add_argument("--network-ip", help=argparse.SUPPRESS)
     scenario_run_application_parser.set_defaults(func=run_scenario_application)
 
     examples_parser = subparsers.add_parser("examples", help="Manage packaged rosotacom examples.")

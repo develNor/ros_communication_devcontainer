@@ -81,9 +81,11 @@ prefix such as `rosotacom smoke 1<TAB>` expands to `1_heartbeat`. The same
 session completion is available for `start`, `stop`, `status`, `test`, and the
 probe commands; absolute and relative session-directory paths still complete
 normally. `--identity <TAB><TAB>` lists the peer identities from the selected
-session or scenario. Scenario `attach` and `stop` complete only active
-scenarios and identities. Running `rosotacom completion` without a shell
-argument infers bash or zsh from `$SHELL`.
+session or scenario. `--peer-address <TAB><TAB>` completes peer keys, and
+`--peer-address a=data:<TAB><TAB>` completes explicit `data_dict.json` keys.
+Scenario `attach` and `stop` complete only active scenarios and identities.
+Running `rosotacom completion` without a shell argument infers bash or zsh from
+`$SHELL`.
 
 Completion is not pinned to the version that registered it: each Tab press runs
 the `rosotacom` currently selected by `PATH`. Activating another checkout's
@@ -166,7 +168,13 @@ scripts/
 See the [example project README](src/rosotacom/resources/examples/README.md)
 for the copyable example layout.
 
-The example `data_dict.json` uses `127.0.0.1` for both peers so the examples can run on one host and show how `data:<key>` references work. For two-machine runs, replace those values with each machine's reachable IP address or hostname.
+The example `data_dict.json` uses `127.0.0.1` for both peers so the examples can
+show how `data:<key>` references work. For two-machine runs, replace those
+values with each machine's reachable IP address or hostname, or override them at
+launch time with `--peer-address a=data:machine_a_ip` / literal IP values.
+Automated and interactive local smoke runs do not use those deployment
+addresses; they inject isolated Docker-network addresses for the duration of the
+local test.
 
 Write or edit session configs under `sessions/<name>/`:
 
@@ -254,6 +262,28 @@ also reports a `SMOKE_METRIC` line with the received rate (`hz`) and end-to-end
 latency (`delay_s`) so rate and latency regressions are visible. It prints the
 `session-instances/...` artifact path so failures (and the per-peer
 `logs/<peer>/catmux/...` pane output) can be inspected after the containers stop.
+
+For local debugging, run the same end-to-end idea interactively:
+
+```bash
+rosotacom smoke 2_native_chatter --interactive
+rosotacom smoke --interactive --list
+rosotacom smoke 2_native_chatter --interactive --stop
+```
+
+Interactive smoke starts all peers on one host, opens an isolated outer tmux
+session, and keeps full windows for each peer's communication container. If the
+target is a scenario, it also opens one window per local application container;
+each application shares its peer communication container's isolated network
+namespace so local ROS discovery behaves like colocated processes. A
+`verification` window runs the local checks/status view while you inspect the
+system. The outer prefix is `Ctrl-b`; use `Ctrl-b n`/`Ctrl-b p` for windows and
+`Ctrl-b Ctrl-b` for the inner catmux session.
+
+`rosotacom smoke TARGET --interactive` accepts either a session or a scenario.
+When both names exist, interactive smoke treats `TARGET` as a scenario unless
+you pass `--target-type session`. Non-interactive `rosotacom smoke TARGET`
+keeps its existing session-only behavior.
 
 ### Live status / debugging overview
 

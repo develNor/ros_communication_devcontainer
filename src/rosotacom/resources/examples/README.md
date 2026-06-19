@@ -77,6 +77,22 @@ depend on `data_dict.json`. The manual `start` path above instead resolves
 `data:<key>` values from `data_dict.json`. This is the single-machine tier; see
 the repository's `docs/testing.md` for how it relates to the multi-machine tier.
 
+For an interactive local end-to-end debug session, use the same smoke target
+with `--interactive`:
+
+```bash
+rosotacom smoke 2_native_chatter --interactive
+rosotacom smoke --interactive --list
+rosotacom smoke 2_native_chatter --interactive --stop
+```
+
+This opens an outer tmux session with full windows for each peer's communication
+container, each scenario application, and a verification/status view. Scenario
+applications share their peer communication container's isolated network
+namespace. The outer prefix is `Ctrl-b`; use `Ctrl-b Ctrl-b` for the inner
+catmux sessions. The local interactive run injects isolated Docker-network peer
+addresses, so it remains independent of the real addresses in `data_dict.json`.
+
 ## Two-machine runs
 
 For a real two-machine run, replace the loopback values in `data_dict.json` with

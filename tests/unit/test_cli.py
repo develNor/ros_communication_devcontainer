@@ -506,6 +506,192 @@ def test_scenario_tmux_commands_keep_ctrl_b_and_use_full_windows(
     assert (instance.logs_host_dir / "a" / "scenario").is_dir()
 
 
+def test_interactive_smoke_target_resolution_prefers_scenario_and_peer_ips(tmp_path: Path) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "auto")
+    session_target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "session")
+
+    assert target.target_type == "scenario"
+    assert target.name == "demo"
+    assert session_target.target_type == "session"
+    assert rosotacom._smoke_peer_ips_for_subnet(["robot_b", "robot_a"], "10.137.42.0/24") == {
+        "robot_a": "10.137.42.2",
+        "robot_b": "10.137.42.3",
+    }
+
+
+def test_interactive_smoke_tmux_uses_full_windows_and_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    target = rosotacom._resolve_interactive_smoke_target(
+        "demo",
+        runtime,
+        "scenario",
+        peer_address_overrides={"a": "10.137.42.2", "b": "10.137.42.3"},
+    )
+    instance = rosotacom._resolve_session_instance(runtime, target.session, "interactive")
+    calls: list[list[str]] = []
+    pane_number = 0
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal pane_number
+        calls.append(command)
+        if "new-session" in command or "new-window" in command:
+            pane_number += 1
+            return subprocess.CompletedProcess(command, 0, f"%{pane_number}\n", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(rosotacom.subprocess, "run", fake_run)
+
+    tmux_session = rosotacom._create_interactive_smoke_tmux(
+        runtime,
+        target,
+        instance,
+        {"a": "10.137.42.2", "b": "10.137.42.3"},
+        "smoke-net",
+    )
+
+    assert tmux_session == "smoke-scenario-demo"
+    window_names = [
+        command[command.index("-n") + 1]
+        for command in calls
+        if ("new-session" in command or "new-window" in command) and "-n" in command
+    ]
+    assert window_names == [
+        "a_communication",
+        "b_communication",
+        "a_local_app",
+        "b_local_app",
+        "verification",
+    ]
+    assert any(command[-2:] == ["@rosotacom_smoke_target", "demo"] for command in calls)
+    assert any(command[-2:] == ["@rosotacom_smoke_target_type", "scenario"] for command in calls)
+    assert any(command[-2:] == ["@rosotacom_smoke_instance", "interactive"] for command in calls)
+    assert any("inner catmux: C-b C-b" in part for command in calls for part in command)
+    joined = "\n".join(" ".join(command) for command in calls)
+    assert "--smoke-managed" in joined
+    assert "--network-name smoke-net --network-ip 10.137.42.2" in joined
+    assert "--peer-address a=10.137.42.2 --peer-address b=10.137.42.3" in joined
+    assert "scenario _run-application demo --identity a --application local_app" in joined
+    assert "--network-name container:rosotacom_test_com_to_b" in joined
+    assert "waiting for generated config" in joined
+    assert "waiting for container" in joined
+    assert any(command[-1] == "smoke-scenario-demo:verification" for command in calls if "select-window" in command)
+
+
+def test_run_scenario_application_can_override_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    (tmp_path / "apps" / "a.json").write_text(
+        "\n".join(
+            [
+                "{",
+                '  "container_name": "a_app",',
+                '  "image_name": "app-image",',
+                '  "run_type": "command",',
+                '  "command": ["true"],',
+                '  "run_args": ["--network", "host", "-e", "ROS_DOMAIN_ID=46"]',
+                "}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    runs: list[dict[str, object]] = []
+    monkeypatch.setattr(rosotacom, "_require_ros2docker", lambda: None)
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(rosotacom, "_container_exists", lambda name: False)
+    monkeypatch.setattr(rosotacom, "ros2docker_build", lambda **kwargs: None)
+    monkeypatch.setattr(
+        rosotacom,
+        "ros2docker_run",
+        lambda **kwargs: runs.append(dict(kwargs)),
+    )
+
+    assert (
+        rosotacom.run_scenario_application(
+            argparse.Namespace(
+                scenario="demo",
+                identity="a",
+                application="local_app",
+                network_name="smoke-net",
+                network_ip=None,
+            )
+        )
+        == 0
+    )
+
+    override = runs[0]["override"]
+    assert isinstance(override, dict)
+    assert override["container_name"] == "rosotacom_test_scenario_demo_a_local_app"
+    assert override["image_name"] == "app-image-test"
+    assert override["run_args"] == ["-e", "ROS_DOMAIN_ID=46", "--network", "smoke-net"]
+
+
+def test_active_interactive_smoke_runs_are_listed_from_tmux_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command[:3] == ["tmux", "-L", "rosotacom-test"]
+        return subprocess.CompletedProcess(command, 0, "smoke-scenario-demo\tdemo\tscenario\trun1\tnet1\n", "")
+
+    monkeypatch.setattr(rosotacom.shutil, "which", lambda name: "/usr/bin/tmux")
+    monkeypatch.setattr(rosotacom.subprocess, "run", fake_run)
+
+    runs = rosotacom._active_interactive_smoke_runs(runtime)
+
+    assert runs == [rosotacom.ActiveInteractiveSmokeRun("demo", "scenario", "smoke-scenario-demo", "run1", "net1")]
+    assert "demo (scenario) instance=run1 network=net1" in rosotacom._format_active_interactive_smoke_runs(runs)
+
+
+def test_interactive_smoke_stop_infers_active_run_and_cleans_components(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
+    calls: list[str] = []
+
+    monkeypatch.setattr(rosotacom, "_require_ros2docker", lambda: None)
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(
+        rosotacom,
+        "_active_interactive_smoke_runs",
+        lambda runtime: [
+            rosotacom.ActiveInteractiveSmokeRun("demo", "scenario", "smoke-scenario-demo", "run1", "net1")
+        ],
+    )
+    monkeypatch.setattr(rosotacom, "_resolve_interactive_smoke_target", lambda *args, **kwargs: target)
+    monkeypatch.setattr(
+        rosotacom,
+        "_stop_scenario_application",
+        lambda *args, **kwargs: calls.append("app") or True,
+    )
+    monkeypatch.setattr(
+        rosotacom,
+        "_stop_container_name",
+        lambda *args, **kwargs: calls.append("communication") or True,
+    )
+    monkeypatch.setattr(rosotacom, "_kill_scenario_tmux", lambda *args, **kwargs: calls.append("tmux") or True)
+    monkeypatch.setattr(rosotacom, "_remove_smoke_network", lambda *args, **kwargs: calls.append("network"))
+    monkeypatch.setattr(rosotacom, "_find_latest_interactive_smoke_instance", lambda *args, **kwargs: None)
+
+    assert (
+        rosotacom._stop_interactive_smoke(argparse.Namespace(session_dir=None, target_type="auto", instance_id=None))
+        == 0
+    )
+
+    assert calls == ["app", "app", "communication", "communication", "tmux", "network"]
+
+
 def test_start_and_stop_scenario_manage_manifest_and_component_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -635,6 +821,46 @@ def test_argcomplete_protocol_returns_identity_matches() -> None:
     )
 
     assert result.stdout.split("\v") == ["a", "b"]
+
+
+def test_peer_address_completion_returns_peer_and_data_dict_matches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    data_dict = tmp_path / "data_dict.json"
+    data_dict.write_text('{"machine_a_ip": "127.0.0.1", "machines": {"machine_b_ip": "127.0.0.2"}}', encoding="utf-8")
+    runtime = rosotacom.RuntimeConfig(
+        rosotacom_config=runtime.rosotacom_config,
+        ros2docker_config=runtime.ros2docker_config,
+        session_configs_dir=runtime.session_configs_dir,
+        data_dict=data_dict,
+        install_id=runtime.install_id,
+        session_instances_dir=runtime.session_instances_dir,
+        scenario_configs_dir=runtime.scenario_configs_dir,
+    )
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    parsed = argparse.Namespace(command="start", session_dir_positional="demo", session_dir=None)
+
+    assert rosotacom._peer_address_completer("", parsed) == {
+        "a=": "peer address override",
+        "b=": "peer address override",
+    }
+    assert rosotacom._peer_address_completer("a=data:machine_", parsed) == {
+        "a=data:machine_a_ip": "data_dict key",
+        "a=data:machine_b_ip": "data_dict key",
+    }
+
+
+def test_smoke_interactive_parser_accepts_stop_without_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[argparse.Namespace] = []
+    monkeypatch.setattr(rosotacom, "smoke", lambda args: calls.append(args) or 0)
+
+    assert rosotacom.main(["smoke", "--interactive", "--stop"]) == 0
+
+    assert calls[0].session_dir is None
+    assert calls[0].interactive is True
+    assert calls[0].interactive_stop is True
 
 
 def test_local_check_derives_from_domains_and_allows_opt_out(tmp_path: Path) -> None:

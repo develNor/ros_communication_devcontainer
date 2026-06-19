@@ -1,6 +1,5 @@
 # ignore local system specific settings
 /.devcontainer/devcontainer.json
-/data_dict.json
 /ros2docker.json
 /session-instances/
 /zenoh.json5

@@ -81,8 +81,9 @@ prefix such as `rosotacom smoke 1<TAB>` expands to `1_heartbeat`. The same
 session completion is available for `start`, `stop`, `status`, `test`, and the
 probe commands; absolute and relative session-directory paths still complete
 normally. `--identity <TAB><TAB>` lists the peer identities from the selected
-session or scenario. `--peer-address <TAB><TAB>` completes peer keys, and
-`--peer-address a=data:<TAB><TAB>` completes explicit `data_dict.json` keys.
+session or scenario. `--peer <TAB><TAB>` completes logical peer keys, and
+`--peer a=<TAB><TAB>` completes named hosts from the active deployment file.
+`--peer-address <TAB><TAB>` completes logical peer keys for raw overrides.
 Scenario `attach` and `stop` complete only active scenarios and identities.
 Running `rosotacom completion` without a shell argument infers bash or zsh from
 `$SHELL`.
@@ -112,11 +113,12 @@ version manager.
 
 ### Basic Setup
 
-`rosotacom` uses four layers of configuration/runtime state:
+`rosotacom` uses five layers of configuration/runtime state:
 
-- A **project setup** file (`rosotacom.yaml`) points to host-local resources such as `ros2docker.json`, static `sessions/`, ignored `session-instances/`, and `data_dict.json`.
-- A **session config** defines the communication behavior for one run: peers, addresses, topics, QoS, processing, and transport choices.
+- A **project setup** file (`rosotacom.yaml`) points to host-local resources such as `ros2docker.json`, static `sessions/`, ignored `session-instances/`, and an optional deployment file.
+- A **session config** defines the communication behavior for one run: logical peers, topics, QoS, processing, and transport choices.
 - An optional **scenario config** composes one communication session with identity-specific local application containers.
+- An optional **deployment config** maps named physical hosts to reachable addresses and optional SSH targets.
 - A **session instance** stores one concrete run: generated config, catmux pane logs, smoke debug output, and future rosbags.
 
 `rosotacom` resolves the active `rosotacom.yaml` by scope (first wins), using the
@@ -151,14 +153,12 @@ rosotacom config set project ./rosotacom.yaml --global           # machine-wide 
 eval "$(rosotacom config set project ./rosotacom.yaml --shell)"  # this terminal only
 ```
 
-(`rosotacom setup-env ./rosotacom.yaml` is a deprecated alias for the `--shell` form.)
-
 The copied packaged example project uses this layout:
 
 ```text
 rosotacom.yaml
 ros2docker.json
-data_dict.json
+deployment.example.yaml
 sessions/
 scenarios/
 session-instances/
@@ -166,15 +166,13 @@ scripts/
 ```
 
 See the [example project README](src/rosotacom/resources/examples/README.md)
-for the copyable example layout.
+for the copyable example layout and the
+[deployment configuration reference](deployment-configuration.md) for the
+machine-specific schema and peer-binding precedence.
 
-The example `data_dict.json` uses `127.0.0.1` for both peers so the examples can
-show how `data:<key>` references work. For two-machine runs, replace those
-values with each machine's reachable IP address or hostname, or override them at
-launch time with `--peer-address a=data:machine_a_ip` / literal IP values.
-Automated and interactive local smoke runs do not use those deployment
-addresses; they inject isolated Docker-network addresses for the duration of the
-local test.
+The normal examples intentionally contain no machine addresses. `rosotacom
+smoke` injects isolated Docker-network addresses, while manual and OTA runs
+select physical hosts explicitly.
 
 Write or edit session configs under `sessions/<name>/`:
 
@@ -185,10 +183,12 @@ Run `rosotacom` on each peer with the same active setup but a different identity
 
 ```bash
 # on peer "a"
-rosotacom start 1_heartbeat --identity a
+rosotacom start 1_heartbeat --identity a \
+  --peer-address a=10.0.0.10 --peer-address b=10.0.0.11
 
 # on peer "b"
-rosotacom start 1_heartbeat --identity b
+rosotacom start 1_heartbeat --identity b \
+  --peer-address a=10.0.0.10 --peer-address b=10.0.0.11
 ```
 
 `rosotacom` reads the static session input and creates generated files under `session-instances/<date>/<session>_<timestamp>_<id>/config/`, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`. Catmux pane output is logged under the same instance in `logs/<peer>/catmux/`.
@@ -285,39 +285,46 @@ When both names exist, interactive smoke treats `TARGET` as a scenario unless
 you pass `--target-type session`. Non-interactive `rosotacom smoke TARGET`
 keeps its existing session-only behavior.
 
-For a real two-host OTA check, keep the machine-specific details in a private
-inventory file and let `rosotacom` orchestrate the generic lifecycle:
-
-```yaml
-schema_version: 1
-source:
-  repo_url: https://github.com/develNor/ros_communication_devcontainer.git
-  ref: develop
-defaults:
-  workdir: /tmp/rosotacom_ota
-  rosotacom: .venv/bin/rosotacom
-  project: rosotacom_examples/rosotacom.yaml
-peers:
-  a: {ssh: null, address: 10.0.0.10}
-  b: {ssh: robot-b, address: 10.0.0.11}
-```
-
-Then run the automated or interactive OTA smoke harness:
+For a real two-host OTA check with no deployment file, provide both addresses
+and only the SSH target needed to reach the remote peer:
 
 ```bash
-rosotacom ota-smoke 2_native_chatter --inventory ota-smoke.yaml --prepare
-rosotacom ota-smoke 2_native_chatter --inventory ota-smoke.yaml --interactive
-rosotacom ota-smoke --list
-rosotacom ota-smoke 2_native_chatter --inventory ota-smoke.yaml --stop
+rosotacom ota-smoke 2_native_chatter \
+  --peer-address a=10.0.0.10 \
+  --peer-address b=10.0.0.11 \
+  --peer-ssh b=robot-b
 ```
 
-`ota-smoke` accepts sessions and scenarios. It passes every peer address via
-`--peer-address`, so deployment IPs stay outside session definitions and
-`data_dict.json` is not edited. `--prepare` is explicit: it clones/installs the
-configured source on each peer and refuses broad or dangerous workdirs unless a
-safe target is configured. The interactive form opens a local control tmux with
-remote start/status and debug-shell windows; it does not attach nested remote
-tmux sessions by default.
+For reusable host names, reference one deployment file from `rosotacom.yaml`:
+
+```yaml
+# rosotacom.yaml
+deployment: deployment.yaml
+```
+
+```yaml
+# deployment.yaml
+hosts:
+  workstation:
+    address: 10.0.0.10
+    ssh: null
+  robot:
+    address: 10.0.0.11
+    ssh: robot-b
+```
+
+```bash
+rosotacom ota-smoke 2_native_chatter \
+  --peer a=workstation \
+  --peer b=robot
+```
+
+`ota-smoke` accepts sessions and scenarios. It automatically stages and
+installs the currently selected rosotacom version, stages the active project,
+runs delivery and isolation checks, collects artifacts, stops the run, and
+removes the remote workdir. Add `--interactive` for the control tmux,
+`--keep-running` to leave components up, `--keep-workdir` to retain staged
+files, or `--reuse` to reuse an existing installation.
 
 ### Live status / debugging overview
 

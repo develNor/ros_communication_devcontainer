@@ -132,8 +132,8 @@ class YamlBlockScalar:
 #   - a string: cyclone | fastdds | zenoh_connect_endpoints | zenoh_ros2dds | <raw rmw string>
 #     (zenoh_ros2dds is allowed for ota only; raw rmw strings are for local only)
 #   - a tagged-union mapping with exactly one key (the RMW name):
-#       {cyclone: {config?: <fname.xml>, easy_mode_ip_key?: <key>}}
-#       {fastdds: {config?: <fname.xml>, easy_mode_ip_key?: <key>}}
+#       {cyclone: {config?: <fname.xml>, easy_mode_ip?: <address>}}
+#       {fastdds: {config?: <fname.xml>, easy_mode_ip?: <address>}}
 #       {zenoh_connect_endpoints: {main_peer?: <peer_key>, main_port?: 7447}}
 #       {zenoh_ros2dds: {transport?: udp|tcp, main_peer?: <peer_key>, main_port?: 7447}}
 # -----------------------------------------------------------------------------
@@ -145,7 +145,7 @@ _OTA_SHORTS = {"cyclone", "fastdds", *_NATIVE_ZENOH_OTA_SHORTS, "zenoh_ros2dds"}
 _LOCAL_SHORTS = {"cyclone", "fastdds", "zenoh"}
 _SHORTCUT_ALLOWED = {"cyclone", "fastdds", "zenoh"}
 
-_DDS_CFG_KEYS = {"config", "easy_mode_ip_key"}
+_DDS_CFG_KEYS = {"config", "easy_mode_ip"}
 _ZEN_OTA_CFG_KEYS = {"main_peer", "main_port"}
 _ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
 
@@ -168,7 +168,7 @@ class RmwSideSpec:
     impl: Optional[str] = None
     # DDS-specific (cyclone, fastdds)
     dds_config: Optional[str] = None
-    dds_easy_mode_ip_key: Optional[str] = None
+    dds_easy_mode_ip: Optional[str] = None
     # zenoh / zenoh_ros2dds
     zen_main_peer: Optional[str] = None
     # zenoh_ros2dds only
@@ -224,10 +224,10 @@ def _parse_rmw_side(value: Any, ctx: str, *, is_local: bool) -> RmwSideSpec:
             if not isinstance(cfg["config"], str) or not cfg["config"].strip():
                 raise RuntimeError(f"{ctx}.{impl}.config must be a non-empty string if provided.")
             spec.dds_config = cfg["config"].strip()
-        if cfg.get("easy_mode_ip_key") is not None:
-            if not isinstance(cfg["easy_mode_ip_key"], str) or not cfg["easy_mode_ip_key"].strip():
-                raise RuntimeError(f"{ctx}.{impl}.easy_mode_ip_key must be a non-empty string if provided.")
-            spec.dds_easy_mode_ip_key = cfg["easy_mode_ip_key"].strip()
+        if cfg.get("easy_mode_ip") is not None:
+            if not isinstance(cfg["easy_mode_ip"], str) or not cfg["easy_mode_ip"].strip():
+                raise RuntimeError(f"{ctx}.{impl}.easy_mode_ip must be a non-empty string if provided.")
+            spec.dds_easy_mode_ip = cfg["easy_mode_ip"].strip()
     elif _is_native_zenoh_ota(impl):
         extra = set(cfg.keys()) - _ZEN_OTA_CFG_KEYS
         if extra:
@@ -902,18 +902,12 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
     if not peers:
         raise RuntimeError("peers must be a non-empty mapping.")
     for peer_key, peer_obj in peers.items():
-        if isinstance(peer_obj, dict) and "ip_key" in peer_obj:
-            raise RuntimeError(
-                f"peers.{peer_key}.ip_key is no longer supported. "
-                f"Use peers.{peer_key}.address instead. "
-                "For data_dict references, use address: 'data:<key>'."
-            )
-        _assert_allowed_keys(f"peers.{peer_key}", peer_obj, {"address", "com-name"})
+        _assert_allowed_keys(f"peers.{peer_key}", peer_obj, {"host", "com-name"})
         peer_obj = _assert_mapping(peer_obj, f"peers.{peer_key}")
-        if "address" not in peer_obj:
-            raise RuntimeError(f"peers.{peer_key}.address is required")
-        if not isinstance(peer_obj["address"], str) or not peer_obj["address"].strip():
-            raise RuntimeError(f"peers.{peer_key}.address must be a non-empty string")
+        if "host" in peer_obj and (
+            not isinstance(peer_obj["host"], str) or not peer_obj["host"].strip()
+        ):
+            raise RuntimeError(f"peers.{peer_key}.host must be a non-empty string if provided")
         if (
             "com-name" in peer_obj
             and peer_obj["com-name"] is not None
@@ -1674,6 +1668,7 @@ def func(
     session_config_obj: Optional[Dict[str, Any]] = None,
     output_dir: Optional[str] = None,
     write_resolved_definition: Optional[bool] = None,
+    peer_addresses: Optional[Dict[str, str]] = None,
 ) -> None:
     session_config_yaml = os.path.abspath(session_config_yaml) if session_config_yaml else ""
     if output_dir:
@@ -1727,7 +1722,7 @@ def func(
     # ---------------------------
 
     if "peers" not in cfg or not isinstance(cfg["peers"], dict) or not cfg["peers"]:
-        raise RuntimeError("session-config must define a mapping 'peers: { <peer_key>: {address: ...} }'.")
+        raise RuntimeError("session-config must define a mapping 'peers: { <peer_key>: {...} }'.")
 
     peer_keys = list(cfg["peers"].keys())
     if len(peer_keys) != 2:
@@ -1736,11 +1731,21 @@ def func(
             f"Got peers={peer_keys}"
         )
 
+    peer_addresses = peer_addresses or {}
+    unknown_addresses = sorted(set(peer_addresses) - set(peer_keys))
+    if unknown_addresses:
+        raise RuntimeError(
+            f"peer_addresses contains unknown peer(s) {unknown_addresses}. Known peers: {peer_keys}"
+        )
+    missing_addresses = [peer for peer in peer_keys if not str(peer_addresses.get(peer, "")).strip()]
+    if missing_addresses:
+        raise RuntimeError(
+            f"Missing resolved addresses for peer(s) {missing_addresses}. "
+            "Resolve deployment hosts or pass --peer-address before generating a session."
+        )
+
     def _peer_address(peer_key: str) -> str:
-        try:
-            return str(cfg["peers"][peer_key]["address"]).strip()
-        except Exception as e:
-            raise RuntimeError(f"session-template must define peers.{peer_key}.address") from e
+        return str(peer_addresses[peer_key]).strip()
 
     def _peer_com_name(peer_key: str) -> str:
         """
@@ -1880,8 +1885,8 @@ def func(
             if side.impl == "fastdds" and side.dds_config == "fastdds_easy_mode.xml":
                 items.append(
                     (
-                        "local_easy_mode_ip_key",
-                        side.dds_easy_mode_ip_key or peer_ip[peer_keys[0]],
+                        "local_easy_mode_ip",
+                        side.dds_easy_mode_ip or peer_ip[peer_keys[0]],
                     )
                 )
         return items
@@ -1904,8 +1909,8 @@ def func(
             if ota.impl == "fastdds" and ota.dds_config == "fastdds_easy_mode.xml":
                 items.append(
                     (
-                        "ota_easy_mode_ip_key",
-                        ota.dds_easy_mode_ip_key or peer_ip[peer_keys[0]],
+                        "ota_easy_mode_ip",
+                        ota.dds_easy_mode_ip or peer_ip[peer_keys[0]],
                     )
                 )
         return items
@@ -2948,5 +2953,20 @@ if __name__ == "__main__":
         help="Path to session_plugin_base.yaml to include in session_specification.yaml",
         default=BASE_PLUGIN_PATH_DEFAULT,
     )
+    parser.add_argument(
+        "--peer-address",
+        action="append",
+        default=[],
+        metavar="PEER=ADDRESS",
+        help="Resolved peer address. Pass once for every logical peer.",
+    )
     args = parser.parse_args()
-    func(**{k: v for k, v in vars(args).items() if v is not None})
+    kwargs = {k: v for k, v in vars(args).items() if v is not None}
+    raw_addresses = kwargs.pop("peer_address")
+    peer_addresses = {}
+    for raw in raw_addresses:
+        peer, separator, address = raw.partition("=")
+        if separator != "=" or not peer.strip() or not address.strip():
+            raise RuntimeError("--peer-address must use PEER=ADDRESS.")
+        peer_addresses[peer.strip()] = address.strip()
+    func(peer_addresses=peer_addresses, **kwargs)

@@ -57,22 +57,19 @@ topics: {}         # optional
 ```yaml
 peers:
   <peer_key>:
-    address: <string>        # required address expression
+    host: <string>           # optional default name from deployment.yaml
     com-name: <scalar>       # optional, default: <peer_key>
 ```
 
 - **`peer_key`**: used to form direction keys like `<src>_to_<dst>`.
-- **`address`**: becomes the address expression used in the generated `plugin.yaml` (`ip_local` / `ip_remote`).
+- **`host`**: optional named-host default. It may be overridden with
+  `--peer <peer_key>=<host>`.
 - **`com-name`**: peer communication name (default = `peer_key`); affects e.g. topic prefixes.
 
-Address expressions are explicit:
-
-- Literal IPs/hostnames are used as-is: `192.168.1.42`, `127.0.0.1`, `localhost`, `robot-a.local`.
-- `data:<key>` resolves `<key>` from `data_dict.json`, e.g. `data:machine_a_ip`.
-- Missing or ambiguous `data:` references are errors.
-- Bare names such as `machine_a_ip` are literals, not data-dict references.
-
-`peers.<peer>.ip_key` is no longer supported. Use `peers.<peer>.address` instead.
+Session definitions never contain physical addresses or SSH targets. Supply
+them at launch with `--peer-address`, or map logical peers to named hosts from
+the project's deployment file with `--peer`. See
+[deployment-configuration.md](deployment-configuration.md).
 
 ### `shared` (optional)
 
@@ -86,7 +83,7 @@ shared:
   # over-the-air (OTA) bridge processes. See "RMW configuration" below.
   rmw: cyclone               # string shortcut => local=ota=cyclone (only cyclone|fastdds|zenoh allowed as shortcut)
   # rmw:                     # mapping form (per-side)
-  #   local: cyclone         # optional per-side string or {impl: {config?, easy_mode_ip_key?, main_peer?, main_port?, transport?}}
+  #   local: cyclone         # optional per-side string or {impl: {config?, easy_mode_ip?, main_peer?, main_port?, transport?}}
   #   ota:
   #     fastdds:
   #       config: fastdds_v1.xml
@@ -171,7 +168,7 @@ Per-side config blocks:
 
 - DDS implementations (`cyclone`, `fastdds`) accept:
   - `config: <template>` — template file under `ws/ota_configs/` (e.g. `fastdds_v1.xml`, `cyclonedds.xml`, `fastdds_easy_mode.xml`). Omit to use the RMW's built-in defaults.
-  - `easy_mode_ip_key: <string>` — only honored by `fastdds_easy_mode.xml`; defaults to the first peer's `address`.
+  - `easy_mode_ip: <string>` — only honored by `fastdds_easy_mode.xml`; defaults to the first resolved peer address.
 - `zenoh_connect_endpoints` (native, OTA side only; `zenoh` is still accepted as a legacy OTA alias) accepts:
   - `main_peer: <peer_key>` — the peer whose zenoh router listens. Defaults to the first peer declared under `peers:`.
   - `main_port: 7447` — listening port. Default `7447`.
@@ -259,13 +256,13 @@ session's `before_commands`, so all non-OTA splits inherit it.
 Templates live under [ws/ota_configs/](src/rosotacom/resources/ws/ota_configs/)
 and may reference these placeholders:
 
-- `#host_ip` — the local peer's IP (single value, resolved via an address expression)
+- `#host_ip` — the local peer's resolved address
 - `#peer` — the remote peer's IP. For multiple peers, the template must wrap the
   per-peer region with `<!--peer-block-->...<!--/peer-block-->` markers; the
   marked region is duplicated once per peer IP. For a single peer the markers
   are optional (the generator just strips them).
 - `#easy_mode_ip` — only used by `fastdds_easy_mode.xml`; resolved from
-  the side-specific `easy_mode_ip_key` inside `shared.rmw.{local|ota}.fastdds`
+  the side-specific `easy_mode_ip` inside `shared.rmw.{local|ota}.fastdds`
   (defaults to the first peer's `address`).
 
 Unknown `#…` placeholders in templates cause the generator to error.

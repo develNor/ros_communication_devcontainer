@@ -21,7 +21,7 @@ def clear_config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "ROSOTACOM_SESSION_CONFIGS_DIR",
         "ROSOTACOM_SCENARIO_CONFIGS_DIR",
         "ROSOTACOM_SESSION_INSTANCES_DIR",
-        "ROSOTACOM_DATA_DICT",
+        "ROSOTACOM_DEPLOYMENT",
     ):
         monkeypatch.delenv(key, raising=False)
     # Keep the global user config and the built-in example's tmpfs instances dir
@@ -104,7 +104,10 @@ def test_config_set_project_shell_prints_export(tmp_path: Path, capsys: pytest.C
 
 def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -> None:
     (tmp_path / "ros2docker.json").write_text('{"image_name": "test"}\n', encoding="utf-8")
-    (tmp_path / "data_dict.json").write_text('{"machine_a_ip": "127.0.0.1"}\n', encoding="utf-8")
+    (tmp_path / "deployment.yaml").write_text(
+        "hosts:\n  local: {address: 127.0.0.1, ssh: null}\n",
+        encoding="utf-8",
+    )
     (tmp_path / "sessions").mkdir()
     (tmp_path / "scenarios").mkdir()
     config = tmp_path / "rosotacom.yaml"
@@ -115,7 +118,7 @@ def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -
                 "session_configs_dir: sessions",
                 "scenario_configs_dir: scenarios",
                 "session_instances_dir: session-instances",
-                "data_dict: data_dict.json",
+                "deployment: deployment.yaml",
                 "",
             ]
         ),
@@ -129,7 +132,24 @@ def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -
     assert runtime.session_configs_dir == tmp_path / "sessions"
     assert runtime.scenario_configs_dir == tmp_path / "scenarios"
     assert runtime.session_instances_dir == tmp_path / "session-instances"
-    assert runtime.data_dict == tmp_path / "data_dict.json"
+    assert runtime.deployment == tmp_path / "deployment.yaml"
+
+
+def test_rosotacom_yaml_rejects_removed_data_dict_key(tmp_path: Path) -> None:
+    (tmp_path / "ros2docker.json").write_text('{"image_name": "test"}\n', encoding="utf-8")
+    config = tmp_path / "rosotacom.yaml"
+    config.write_text(
+        "ros2docker_config: ros2docker.json\ndata_dict: data_dict.json\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="Unsupported rosotacom.yaml keys.*data_dict"):
+        rosotacom._load_runtime_config(argparse.Namespace(rosotacom_config=str(config)))
+
+
+def test_session_definition_rejects_physical_address_field() -> None:
+    with pytest.raises(RuntimeError, match="Unsupported keys in peers.a.*address"):
+        rosotacom.session_gen._validate_session_template_cfg({"peers": {"a": {"address": "10.0.0.1"}, "b": {}}})
 
 
 def test_environment_config_is_used_when_no_config_arg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -161,7 +181,7 @@ def test_examples_create_copies_project_and_refuses_overwrite(
 
     assert (target / "rosotacom.yaml").is_file()
     assert (target / "ros2docker.json").is_file()
-    assert (target / "data_dict.json").is_file()
+    assert (target / "deployment.example.yaml").is_file()
     assert "session-instances/" in (target / ".gitignore").read_text(encoding="utf-8")
     assert (target / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
     assert (target / "scenarios" / "2_native_chatter" / "scenario-definition.yaml").is_file()
@@ -175,16 +195,6 @@ def test_examples_create_copies_project_and_refuses_overwrite(
     assert (target / "scripts" / "1_heartbeat" / "run_machine_a.sh").is_file()
 
 
-def test_setup_env_prints_absolute_export(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    config = tmp_path / "project setup" / "rosotacom.yaml"
-    config.parent.mkdir()
-    config.write_text("ros2docker_config: ros2docker.json\n", encoding="utf-8")
-
-    rosotacom.setup_env_command(argparse.Namespace(rosotacom_config=str(config)))
-
-    assert capsys.readouterr().out.strip() == f"export ROSOTACOM_CONFIG={rosotacom.shlex.quote(str(config))}"
-
-
 def test_session_name_resolves_through_configured_sessions_dir(tmp_path: Path) -> None:
     session = tmp_path / "sessions" / "1_heartbeat"
     session.mkdir(parents=True)
@@ -193,7 +203,7 @@ def test_session_name_resolves_through_configured_sessions_dir(tmp_path: Path) -
         rosotacom_config=tmp_path / "rosotacom.yaml",
         ros2docker_config=rosotacom.DEFAULT_ROS2DOCKER_CONFIG,
         session_configs_dir=tmp_path / "sessions",
-        data_dict=None,
+        deployment=None,
         install_id="test",
     )
 
@@ -244,8 +254,8 @@ def _write_test_scenario_project(tmp_path: Path) -> tuple[rosotacom.RuntimeConfi
         "\n".join(
             [
                 "peers:",
-                "  a: { address: 127.0.0.1 }",
-                "  b: { address: 127.0.0.1 }",
+                "  a: {}",
+                "  b: {}",
                 "",
             ]
         ),
@@ -290,7 +300,7 @@ def _write_test_scenario_project(tmp_path: Path) -> tuple[rosotacom.RuntimeConfi
         rosotacom_config=tmp_path / "rosotacom.yaml",
         ros2docker_config=rosotacom.DEFAULT_ROS2DOCKER_CONFIG,
         session_configs_dir=sessions,
-        data_dict=None,
+        deployment=None,
         install_id="test",
         session_instances_dir=tmp_path / "session-instances",
         scenario_configs_dir=tmp_path / "scenarios",
@@ -298,32 +308,17 @@ def _write_test_scenario_project(tmp_path: Path) -> tuple[rosotacom.RuntimeConfi
     return runtime, rosotacom._resolve_scenario("demo", runtime)
 
 
-def _write_ota_inventory(tmp_path: Path) -> Path:
-    inventory = tmp_path / "ota-smoke.yaml"
-    inventory.write_text(
-        "\n".join(
-            [
-                "schema_version: 1",
-                "source:",
-                "  repo_url: https://token@example.test/rosotacom.git",
-                "  ref: develop",
-                "defaults:",
-                "  workdir: /tmp/rosotacom_ota",
-                "  rosotacom: .venv/bin/rosotacom",
-                "  project: rosotacom_examples/rosotacom.yaml",
-                "peers:",
-                "  a:",
-                "    ssh: null",
-                "    address: 10.0.0.10",
-                "  b:",
-                "    ssh: robot-b",
-                "    address: 10.0.0.11",
-                "",
-            ]
-        ),
-        encoding="utf-8",
+def _ota_plan(tmp_path: Path) -> rosotacom.OtaSmokePlan:
+    return rosotacom.OtaSmokePlan(
+        state_path=tmp_path / "ota-deployment.yaml",
+        workdir="/tmp/rosotacom_ota",
+        rosotacom="source/.venv/bin/rosotacom",
+        project="project/rosotacom.yaml",
+        peers={
+            "a": rosotacom.OtaSmokePeer("a", None, "10.0.0.10"),
+            "b": rosotacom.OtaSmokePeer("b", "robot-b", "10.0.0.11"),
+        },
     )
-    return inventory
 
 
 def test_scenario_definition_resolves_and_validates_strictly(tmp_path: Path) -> None:
@@ -554,12 +549,7 @@ def test_interactive_smoke_tmux_uses_full_windows_and_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, _resolved = _write_test_scenario_project(tmp_path)
-    target = rosotacom._resolve_interactive_smoke_target(
-        "demo",
-        runtime,
-        "scenario",
-        peer_address_overrides={"a": "10.137.42.2", "b": "10.137.42.3"},
-    )
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
     instance = rosotacom._resolve_session_instance(runtime, target.session, "interactive")
     calls: list[list[str]] = []
     pane_number = 0
@@ -680,22 +670,17 @@ def test_active_interactive_smoke_runs_are_listed_from_tmux_metadata(
     assert "demo (scenario) instance=run1 network=net1" in rosotacom._format_active_interactive_smoke_runs(runs)
 
 
-def test_ota_smoke_inventory_resolves_target_and_redacts_repo_url(tmp_path: Path) -> None:
+def test_ota_smoke_plan_writes_state_and_manifest(tmp_path: Path) -> None:
     runtime, _resolved = _write_test_scenario_project(tmp_path)
-    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
-
-    target = rosotacom._resolve_interactive_smoke_target(
-        "demo",
-        runtime,
-        "auto",
-        peer_address_overrides=rosotacom._ota_peer_address_overrides(inventory),
-    )
+    plan = _ota_plan(tmp_path)
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "auto")
     instance = rosotacom._resolve_session_instance(runtime, target.session, "ota")
+    plan = rosotacom._ota_write_state(instance, plan)
     rosotacom._ota_write_manifest(
         instance,
         target,
         runtime,
-        inventory,
+        plan,
         tmux_session="ota-smoke-scenario-demo",
         interactive=True,
         phase="running",
@@ -704,31 +689,31 @@ def test_ota_smoke_inventory_resolves_target_and_redacts_repo_url(tmp_path: Path
     run = manifest["ota_smoke_runs"]["scenario:demo"]
 
     assert target.target_type == "scenario"
-    assert target.cfg["peers"]["a"]["address"] == "10.0.0.10"
-    assert inventory.peers["b"].ssh == "robot-b"
-    assert run["source_repo_url"] == "https://<redacted>@example.test/rosotacom.git"
+    assert plan.peers["b"].ssh == "robot-b"
+    assert run["deployment_state"] == str(instance.host_dir / "ota-deployment.yaml")
     assert run["peers"]["b"] == {"ssh_configured": True, "address": "10.0.0.11"}
+    assert rosotacom._ota_load_state(str(plan.state_path)) == plan
 
 
 def test_ota_smoke_command_building_and_remote_wrapping(tmp_path: Path) -> None:
     runtime, _resolved = _write_test_scenario_project(tmp_path)
-    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+    plan = _ota_plan(tmp_path)
     target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
-    peer_args = rosotacom._ota_peer_address_args(inventory)
+    peer_args = rosotacom._ota_peer_address_args(plan)
 
     start = rosotacom._ota_rosotacom_command(
-        inventory,
+        plan,
         rosotacom._ota_start_parts(target, "a", "run1", peer_args, mode="detached"),
     )
-    stop = rosotacom._ota_rosotacom_command(inventory, rosotacom._ota_stop_parts(target, "b", "run1", peer_args))
+    stop = rosotacom._ota_rosotacom_command(plan, rosotacom._ota_stop_parts(target, "b", "run1", peer_args))
 
-    assert start.startswith("cd /tmp/rosotacom_ota && .venv/bin/rosotacom scenario start demo")
+    assert start.startswith("cd /tmp/rosotacom_ota && source/.venv/bin/rosotacom scenario start demo")
     assert "--identity a --mode detached --instance-id run1 --force" in start
     assert "--peer-address a=10.0.0.10 --peer-address b=10.0.0.11" in start
-    assert "--rosotacom-config rosotacom_examples/rosotacom.yaml" in start
+    assert "--rosotacom-config project/rosotacom.yaml" in start
     assert "scenario stop demo --identity b --instance-id run1" in stop
-    assert rosotacom._ota_remote_argv(inventory.peers["a"], "true") == ["bash", "-lc", "true"]
-    assert rosotacom._ota_remote_argv(inventory.peers["b"], "true", tty=True, batch=True) == [
+    assert rosotacom._ota_remote_argv(plan.peers["a"], "true") == ["bash", "-lc", "true"]
+    assert rosotacom._ota_remote_argv(plan.peers["b"], "true", tty=True, batch=True) == [
         "ssh",
         "-o",
         "BatchMode=yes",
@@ -738,37 +723,10 @@ def test_ota_smoke_command_building_and_remote_wrapping(tmp_path: Path) -> None:
     ]
 
 
-def test_ota_prepare_script_refuses_dangerous_workdir(tmp_path: Path) -> None:
-    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
-    unsafe = rosotacom.OtaSmokeInventory(
-        path=inventory.path,
-        repo_url=inventory.repo_url,
-        ref=inventory.ref,
-        workdir="/",
-        rosotacom=inventory.rosotacom,
-        project=inventory.project,
-        peers=inventory.peers,
-    )
-
+def test_ota_workdir_validation_refuses_dangerous_paths() -> None:
     with pytest.raises(RuntimeError, match="dangerous OTA prepare workdir"):
-        rosotacom._ota_prepare_script(
-            unsafe,
-            repo_url="https://example.test/repo.git",
-            ref="develop",
-            commit_sha=None,
-            force=True,
-        )
-
-    script = rosotacom._ota_prepare_script(
-        inventory,
-        repo_url="https://example.test/repo.git",
-        ref="develop",
-        commit_sha="abc123",
-        force=False,
-    )
-    assert "workdir exists; pass --force-prepare" in script
-    assert "git checkout --detach abc123" in script
-    assert ".venv/bin/rosotacom examples create ./rosotacom_examples" in script
+        rosotacom._ota_validate_prepare_workdir("/")
+    rosotacom._ota_validate_prepare_workdir("/tmp/rosotacom_ota")
 
 
 def test_active_ota_smoke_runs_are_listed_from_tmux_metadata(
@@ -782,7 +740,7 @@ def test_active_ota_smoke_runs_are_listed_from_tmux_metadata(
         return subprocess.CompletedProcess(
             command,
             0,
-            "ota-smoke-scenario-demo\tdemo\tscenario\trun1\t/tmp/ota.yaml\n",
+            "ota-smoke-scenario-demo\tdemo\tscenario\trun1\t/tmp/ota-state.yaml\n",
             "",
         )
 
@@ -791,8 +749,10 @@ def test_active_ota_smoke_runs_are_listed_from_tmux_metadata(
 
     runs = rosotacom._active_ota_smoke_runs(runtime)
 
-    assert runs == [rosotacom.ActiveOtaSmokeRun("demo", "scenario", "ota-smoke-scenario-demo", "run1", "/tmp/ota.yaml")]
-    assert "demo (scenario) instance=run1 inventory=/tmp/ota.yaml" in rosotacom._format_active_ota_smoke_runs(runs)
+    assert runs == [
+        rosotacom.ActiveOtaSmokeRun("demo", "scenario", "ota-smoke-scenario-demo", "run1", "/tmp/ota-state.yaml")
+    ]
+    assert "demo (scenario) instance=run1" in rosotacom._format_active_ota_smoke_runs(runs)
 
 
 def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
@@ -800,7 +760,7 @@ def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, _resolved = _write_test_scenario_project(tmp_path)
-    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+    plan = _ota_plan(tmp_path)
     target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
     instance = rosotacom._resolve_session_instance(runtime, target.session, "ota-interactive")
     calls: list[list[str]] = []
@@ -817,7 +777,7 @@ def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
     monkeypatch.setattr(rosotacom.shutil, "which", lambda name: "/usr/bin/tmux")
     monkeypatch.setattr(rosotacom.subprocess, "run", fake_run)
 
-    tmux_session = rosotacom._ota_create_tmux(runtime, target, inventory, instance)
+    tmux_session = rosotacom._ota_create_tmux(runtime, target, plan, instance)
 
     assert tmux_session == "ota-smoke-scenario-demo"
     window_names = [
@@ -829,18 +789,18 @@ def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
     assert any(command[-2:] == ["@rosotacom_ota_smoke_target", "demo"] for command in calls)
     assert any(command[-2:] == ["@rosotacom_ota_smoke_target_type", "scenario"] for command in calls)
     assert any(command[-2:] == ["@rosotacom_ota_smoke_instance", "ota-interactive"] for command in calls)
-    assert any(command[-2:] == ["@rosotacom_ota_smoke_inventory", str(inventory.path)] for command in calls)
+    assert any(command[-2:] == ["@rosotacom_ota_smoke_state", str(plan.state_path)] for command in calls)
     joined = "\n".join(" ".join(command) for command in calls)
     assert "scenario start demo --identity a --mode detached --instance-id ota-interactive" in joined
     assert "scenario start demo --identity b --mode detached --instance-id ota-interactive" in joined
     assert "status demo --identity a --instance-id ota-interactive --watch" in joined
     assert "status demo --identity b --instance-id ota-interactive --watch" in joined
-    assert "ota-smoke demo --inventory" in joined
+    assert "ota-smoke demo --state-file" in joined
     assert "--verify-only" in joined
     assert "scenario attach" not in joined
 
 
-def test_ota_smoke_parser_accepts_stop_without_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ota_smoke_parser_accepts_stop_without_peer_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[argparse.Namespace] = []
     monkeypatch.setattr(rosotacom, "ota_smoke", lambda args: calls.append(args) or 0)
 
@@ -848,7 +808,7 @@ def test_ota_smoke_parser_accepts_stop_without_inventory(monkeypatch: pytest.Mon
 
     assert calls[0].target is None
     assert calls[0].stop is True
-    assert calls[0].inventory is None
+    assert calls[0].state_file is None
 
 
 def test_ota_smoke_stop_dry_run_does_not_kill_local_tmux(
@@ -857,11 +817,11 @@ def test_ota_smoke_stop_dry_run_does_not_kill_local_tmux(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     runtime, _resolved = _write_test_scenario_project(tmp_path)
-    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+    plan = _ota_plan(tmp_path)
     target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
     calls: list[str] = []
     monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
-    monkeypatch.setattr(rosotacom, "_resolve_ota_smoke_context", lambda args: (runtime, inventory, target))
+    monkeypatch.setattr(rosotacom, "_resolve_ota_smoke_context", lambda args: (runtime, plan, target))
     monkeypatch.setattr(rosotacom, "_ota_stop_peers", lambda *args, **kwargs: calls.append("remote-dry-run"))
     monkeypatch.setattr(rosotacom, "_kill_scenario_tmux", lambda *args, **kwargs: calls.append("tmux") or True)
 
@@ -870,9 +830,10 @@ def test_ota_smoke_stop_dry_run_does_not_kill_local_tmux(
             argparse.Namespace(
                 target="demo",
                 target_type="scenario",
-                inventory=str(inventory.path),
+                state_file=str(plan.state_path),
                 instance_id="run1",
                 dry_run=True,
+                keep_workdir=True,
             )
         )
         == 0
@@ -887,12 +848,12 @@ def test_noninteractive_ota_smoke_lifecycle_uses_generic_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, _resolved = _write_test_scenario_project(tmp_path)
-    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+    plan = _ota_plan(tmp_path)
     target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
     instance = rosotacom._resolve_session_instance(runtime, target.session, "ota-lifecycle")
     calls: list[str] = []
 
-    monkeypatch.setattr(rosotacom, "_resolve_ota_smoke_context", lambda args: (runtime, inventory, target))
+    monkeypatch.setattr(rosotacom, "_resolve_ota_smoke_context", lambda args: (runtime, plan, target))
     monkeypatch.setattr(rosotacom, "_resolve_session_instance", lambda *args, **kwargs: instance)
     monkeypatch.setattr(rosotacom, "_ota_preflight", lambda *args, **kwargs: calls.append("preflight"))
     monkeypatch.setattr(rosotacom, "_ota_prepare_hosts", lambda *args, **kwargs: calls.append("prepare"))
@@ -902,17 +863,19 @@ def test_noninteractive_ota_smoke_lifecycle_uses_generic_runner(
     monkeypatch.setattr(rosotacom, "_ota_verify_isolation", lambda *args, **kwargs: calls.append("isolation") or [])
     monkeypatch.setattr(rosotacom, "_ota_collect_logs", lambda *args, **kwargs: calls.append("collect"))
     monkeypatch.setattr(rosotacom, "_ota_stop_peers", lambda *args, **kwargs: calls.append("stop"))
+    monkeypatch.setattr(rosotacom, "_ota_cleanup_hosts", lambda *args, **kwargs: calls.append("cleanup"))
+    monkeypatch.setattr(rosotacom, "_ota_write_state", lambda instance, plan: plan)
     monkeypatch.setattr(rosotacom.time, "sleep", lambda seconds: calls.append(f"sleep:{seconds}"))
 
     assert (
         rosotacom._start_noninteractive_ota_smoke(
             argparse.Namespace(
-                prepare=True,
                 skip_preflight=False,
                 check_peer_reachability=False,
                 dry_run=False,
                 instance_id="ota-lifecycle",
                 keep_running=False,
+                keep_workdir=False,
             )
         )
         == 0
@@ -928,6 +891,7 @@ def test_noninteractive_ota_smoke_lifecycle_uses_generic_runner(
         "isolation",
         "collect",
         "stop",
+        "cleanup",
     ]
 
 
@@ -937,38 +901,43 @@ def test_ota_smoke_dry_run_exercises_generic_remote_flow(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     runtime, _resolved = _write_test_scenario_project(tmp_path)
-    inventory_path = _write_ota_inventory(tmp_path)
     monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(rosotacom, "_ota_source_checkout", lambda: tmp_path)
 
     assert (
         rosotacom.ota_smoke(
             argparse.Namespace(
                 target="demo",
                 target_type="scenario",
-                inventory=str(inventory_path),
+                peer=[],
+                peer_address=["a=10.0.0.10", "b=10.0.0.11"],
+                peer_ssh=["b=robot-b"],
+                deployment=None,
                 interactive=False,
                 stop=False,
                 list=False,
                 verify_only=False,
-                prepare=False,
-                force_prepare=False,
-                repo_url=None,
-                ref=None,
-                commit_sha=None,
+                reuse=False,
+                workdir="/tmp/rosotacom_ota",
+                keep_workdir=False,
                 skip_preflight=False,
                 check_peer_reachability=True,
                 dry_run=True,
                 instance_id="ota-dry",
                 keep_running=False,
                 mode="detached",
+                state_file=None,
             )
         )
         == 0
     )
 
     out = capsys.readouterr().out
-    assert "required command .venv/bin/rosotacom" in out
+    assert "stage rosotacom source" in out
+    assert "install rosotacom" in out
     assert "required command tmux" in out
+    assert "Python venv support" in out
+    assert 'grep -Eq "[1-9][0-9]* received"' in out
     assert "ssh -o BatchMode=yes robot-b true" in out
     assert "scenario start demo --identity a --mode detached --instance-id ota-dry" in out
     assert "scenario start demo --identity b --mode detached --instance-id ota-dry" in out
@@ -1151,18 +1120,31 @@ def test_argcomplete_protocol_returns_identity_matches() -> None:
     assert result.stdout.split("\v") == ["a", "b"]
 
 
-def test_peer_address_completion_returns_peer_and_data_dict_matches(
+def test_peer_completion_returns_logical_peers_hosts_and_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime, _resolved = _write_test_scenario_project(tmp_path)
-    data_dict = tmp_path / "data_dict.json"
-    data_dict.write_text('{"machine_a_ip": "127.0.0.1", "machines": {"machine_b_ip": "127.0.0.2"}}', encoding="utf-8")
+    deployment = tmp_path / "deployment.yaml"
+    deployment.write_text(
+        "\n".join(
+            [
+                "hosts:",
+                "  workstation: {address: 10.0.0.1, ssh: null}",
+                "  robot: {address: 10.0.0.2, ssh: robot-b}",
+                "values:",
+                "  vpn:",
+                "    gateway: 10.0.0.254",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     runtime = rosotacom.RuntimeConfig(
         rosotacom_config=runtime.rosotacom_config,
         ros2docker_config=runtime.ros2docker_config,
         session_configs_dir=runtime.session_configs_dir,
-        data_dict=data_dict,
+        deployment=deployment,
         install_id=runtime.install_id,
         session_instances_dir=runtime.session_instances_dir,
         scenario_configs_dir=runtime.scenario_configs_dir,
@@ -1174,9 +1156,12 @@ def test_peer_address_completion_returns_peer_and_data_dict_matches(
         "a=": "peer address override",
         "b=": "peer address override",
     }
-    assert rosotacom._peer_address_completer("a=data:machine_", parsed) == {
-        "a=data:machine_a_ip": "data_dict key",
-        "a=data:machine_b_ip": "data_dict key",
+    assert rosotacom._peer_address_completer("a=value:vpn.", parsed) == {
+        "a=value:vpn.gateway": "deployment value",
+    }
+    assert rosotacom._peer_host_completer("a=", parsed) == {
+        "a=robot": "deployment host",
+        "a=workstation": "deployment host",
     }
 
 
@@ -1199,8 +1184,8 @@ def test_local_check_derives_from_domains_and_allows_opt_out(tmp_path: Path) -> 
         "\n".join(
             [
                 "peers:",
-                "  a: { address: 127.0.0.1 }",
-                "  b: { address: 127.0.0.1 }",
+                "  a: {}",
+                "  b: {}",
                 "peer_settings:",
                 "  a: { domain_id: 46 }",
                 "  b: { domain_id: 47 }",
@@ -1216,8 +1201,8 @@ def test_local_check_derives_from_domains_and_allows_opt_out(tmp_path: Path) -> 
             [
                 "local_check: false",
                 "peers:",
-                "  a: { address: 127.0.0.1 }",
-                "  b: { address: 127.0.0.1 }",
+                "  a: {}",
+                "  b: {}",
                 "",
             ]
         ),
@@ -1229,8 +1214,8 @@ def test_local_check_derives_from_domains_and_allows_opt_out(tmp_path: Path) -> 
         "\n".join(
             [
                 "peers:",
-                "  a: { address: 127.0.0.1 }",
-                "  b: { address: 127.0.0.1 }",
+                "  a: {}",
+                "  b: {}",
                 "shared:",
                 "  local_domain_id: 46",
                 "",
@@ -1248,17 +1233,21 @@ def test_local_check_derives_from_domains_and_allows_opt_out(tmp_path: Path) -> 
     assert set(rosotacom.ota_suite_sessions(sessions)) == {"derived", "opted_out", "shared_domain"}
 
 
-def test_example_loopback_data_dict_resolves() -> None:
+def test_examples_have_logical_peers_without_default_deployment() -> None:
     runtime = rosotacom.RuntimeConfig(
         rosotacom_config=rosotacom.EXAMPLE_PROJECT_DIR / "rosotacom.yaml",
         ros2docker_config=rosotacom.EXAMPLE_PROJECT_DIR / "ros2docker.json",
         session_configs_dir=rosotacom.EXAMPLE_PROJECT_DIR / "sessions",
-        data_dict=rosotacom.EXAMPLE_PROJECT_DIR / "data_dict.json",
+        deployment=None,
         install_id="test",
     )
-
-    assert rosotacom._resolved_address_expr_ips("data:machine_a_ip", runtime) == {"127.0.0.1"}
-    assert rosotacom._resolved_address_expr_ips("data:machine_b_ip", runtime) == {"127.0.0.1"}
+    cfg = rosotacom._effective_session_config(
+        rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "1_heartbeat",
+        runtime,
+    )
+    assert cfg["peers"] == {"a": {}, "b": {}}
+    with pytest.raises(RuntimeError, match="Missing deployment address"):
+        rosotacom._resolve_bindings(cfg, runtime)
 
 
 def test_version_flag_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1356,45 +1345,44 @@ def test_path_yaml_and_network_helpers(tmp_path: Path, monkeypatch: pytest.Monke
     assert rosotacom._default_local_ip() == "10.0.0.5"
 
 
-def test_peer_override_identity_and_command_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    data_dict = tmp_path / "data_dict.json"
-    data_dict.write_text(
-        '{"machines": {"local_box": "10.0.0.1", "remote_box": "10.0.0.2"}}',
+def test_peer_binding_identity_and_command_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    deployment = tmp_path / "deployment.yaml"
+    deployment.write_text(
+        "\n".join(
+            [
+                "hosts:",
+                "  local_box: {address: 10.0.0.1, ssh: null}",
+                "  remote_box: {address: 10.0.0.2, ssh: remote}",
+                "",
+            ]
+        ),
         encoding="utf-8",
     )
     runtime = rosotacom.RuntimeConfig(
         rosotacom_config=tmp_path / "rosotacom.yaml",
         ros2docker_config=rosotacom.DEFAULT_ROS2DOCKER_CONFIG,
         session_configs_dir=None,
-        data_dict=data_dict,
+        deployment=deployment,
         install_id="abc",
     )
     cfg = {
         "peers": {
-            "a": {"address": "0.0.0.0", "com-name": "local unit"},
-            "b": {"address": "0.0.0.0", "com-name": "remote/unit"},
+            "a": {"com-name": "local unit"},
+            "b": {"com-name": "remote/unit"},
         }
     }
 
-    overridden = rosotacom._apply_remote_peer_override_to_cfg(
+    bindings = rosotacom._resolve_bindings(
         cfg,
-        "b=remote_box",
         runtime,
-        local_ips={"10.0.0.1"},
+        peer=["a=local_box", "b=remote_box"],
     )
-    overridden = rosotacom._apply_peer_address_overrides_to_cfg(overridden, {"a": "data:local_box"})
-
-    assert overridden["peers"]["a"]["address"] == "data:local_box"
-    assert overridden["peers"]["b"]["address"] == "data:remote_box"
-    assert rosotacom._resolved_address_expr_ips("data:local_box + data:remote_box", runtime) == {
-        "10.0.0.1",
-        "10.0.0.2",
-    }
-    assert rosotacom._contains_data_ref(overridden)
+    assert bindings["a"] == rosotacom.PeerBinding("a", "10.0.0.1", None, "local_box")
+    assert bindings["b"] == rosotacom.PeerBinding("b", "10.0.0.2", "remote", "remote_box")
     monkeypatch.setattr(rosotacom, "_get_local_ipv4s", lambda: ["10.0.0.1"])
-    assert rosotacom._auto_identity(tmp_path, runtime, overridden) == "a"
-    assert rosotacom._remote_peer_name(overridden, "a") == "remote/unit"
-    assert rosotacom._identity_container_names(overridden, runtime, "a") == ["rosotacom_abc_com_to_remote_unit"]
+    assert rosotacom._auto_identity(bindings) == "a"
+    assert rosotacom._remote_peer_name(cfg, "a") == "remote/unit"
+    assert rosotacom._identity_container_names(cfg, runtime, "a") == ["rosotacom_abc_com_to_remote_unit"]
 
     session = rosotacom.ResolvedSession(tmp_path, "/session/current", "absolute")
     instance = rosotacom.SessionInstance(
@@ -1414,8 +1402,7 @@ def test_peer_override_identity_and_command_helpers(tmp_path: Path, monkeypatch:
         "a",
         force=True,
         rewrite_formatting=True,
-        overwrite_peers_via_remote_peer="b=remote_box",
-        peer_address_overrides={"a": "data:local_box"},
+        peer_address_overrides={"a": "10.0.0.1", "b": "10.0.0.2"},
         attach_mode="attach",
     ) == [
         "/ws/session/creation/run_session.py",
@@ -1433,10 +1420,10 @@ def test_peer_override_identity_and_command_helpers(tmp_path: Path, monkeypatch:
         "a",
         "--force",
         "--rewrite-formatting",
-        "--overwrite-peers-via-remote-peer",
-        "b=remote_box",
         "--peer-address",
-        "a=data:local_box",
+        "a=10.0.0.1",
+        "--peer-address",
+        "b=10.0.0.2",
         "--attach",
     ]
 
@@ -1448,13 +1435,11 @@ def test_resolve_session_and_base_extra_run_args(tmp_path: Path, monkeypatch: py
     session = tmp_path / "sessions" / "1_heartbeat"
     session.mkdir(parents=True)
     (session / "session-definition.yaml").write_text("peers: {}\n", encoding="utf-8")
-    data_dict = tmp_path / "data.json"
-    data_dict.write_text('{"machine_a_ip": "127.0.0.1"}', encoding="utf-8")
     runtime = rosotacom.RuntimeConfig(
         rosotacom_config=tmp_path / "rosotacom.yaml",
         ros2docker_config=tmp_path / "ros2docker.json",
         session_configs_dir=tmp_path / "sessions",
-        data_dict=data_dict,
+        deployment=None,
         install_id="id",
         session_instances_dir=tmp_path / "session-instances",
     )
@@ -1465,7 +1450,7 @@ def test_resolve_session_and_base_extra_run_args(tmp_path: Path, monkeypatch: py
     args = rosotacom._base_extra_run_args(
         runtime,
         resolved,
-        {"peers": {"a": {"address": "data:machine_a_ip"}}},
+        {"peers": {"a": {}, "b": {}}},
         instance,
     )
 
@@ -1473,7 +1458,6 @@ def test_resolve_session_and_base_extra_run_args(tmp_path: Path, monkeypatch: py
     assert f"{rosotacom.WS_DIR.resolve()}:/ws" in args
     assert f"{runtime.session_configs_dir}:/session/definitions:ro" in args
     assert f"{runtime.session_instances_dir}:/session/instances" in args
-    assert f"{data_dict}:/data_dict.json:ro" in args
     assert "Configured sessions:" in rosotacom._format_available_sessions(runtime)
 
 
@@ -1528,8 +1512,8 @@ def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.Monkey
     container = rosotacom.start_session(
         argparse.Namespace(
             session_dir="1_heartbeat",
-            peer_address=["a=127.0.0.1"],
-            overwrite_peers_via_remote_peer=None,
+            peer=[],
+            peer_address=["a=127.0.0.1", "b=127.0.0.2"],
             identity="a",
             auto_identity=True,
             mode="detached",
@@ -1568,8 +1552,8 @@ def test_start_session_attach_dispatches_command_run(monkeypatch: pytest.MonkeyP
     rosotacom.start_session(
         argparse.Namespace(
             session_dir="1_heartbeat",
-            peer_address=[],
-            overwrite_peers_via_remote_peer=None,
+            peer=[],
+            peer_address=["a=127.0.0.1", "b=127.0.0.2"],
             identity=None,
             auto_identity=True,
             mode="attach",
@@ -1668,7 +1652,7 @@ def test_stop_list_doctor_and_smoke_host_flows(
                 ros2docker_config=None,
                 session_configs_dir=None,
                 session_instances_dir=None,
-                data_dict=None,
+                deployment=None,
                 instance_id="smoke",
                 keep_running=False,
             )
@@ -1867,10 +1851,8 @@ def test_run_session_generates_into_instance_config_without_touching_static_sour
         "\n".join(
             [
                 "peers:",
-                "  a:",
-                "    address: 127.0.0.1",
-                "  b:",
-                "    address: 127.0.0.1",
+                "  a: {}",
+                "  b: {}",
                 "",
             ]
         ),
@@ -1883,6 +1865,7 @@ def test_run_session_generates_into_instance_config_without_touching_static_sour
         "a",
         force=True,
         rewrite_formatting=False,
+        peer_address=["a=127.0.0.1", "b=127.0.0.2"],
     )
 
     assert Path(peer_dir) == output / "a"

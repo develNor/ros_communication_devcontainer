@@ -85,20 +85,20 @@ candidate to `main`.
 
 A generic OTA run:
 
-1. checks out the same candidate on both hosts,
-2. passes each host's reachable address with `--peer-address`,
-3. starts identity `a` on host A and identity `b` on host B,
-4. starts synthetic publishers with `rosotacom publish-test-topics` where needed,
-5. asserts delivery with `rosotacom test`,
-6. asserts local-topic isolation with `rosotacom probe-publish` and
+1. stages and installs the current rosotacom source on both hosts,
+2. stages the complete active project and any external deployment file,
+3. resolves named hosts or raw peer addresses,
+4. starts identity `a` on host A and identity `b` on host B,
+5. starts synthetic publishers with `rosotacom publish-test-topics` where needed,
+6. asserts delivery with `rosotacom test`,
+7. asserts local-topic isolation with `rosotacom probe-publish` and
    `rosotacom probe-check --expect absent`,
-7. collects each host's `session-instances/` logs.
+8. collects each host's `session-instances/` logs and cleans up.
 
-Use `rosotacom ota-smoke TARGET --inventory ota-smoke.yaml` for a generic
-operator-started harness. The inventory is intentionally external to the package
-so public docs and examples contain no real hostnames, SSH aliases, or private
-network topology. `rosotacom ota-smoke TARGET --inventory ota-smoke.yaml
---interactive` opens a local control tmux for debugging the same run.
+Use `rosotacom ota-smoke TARGET --peer-address ... --peer-ssh ...` for a
+configuration-free operator run, or map peers to named hosts with `--peer`
+through the active project's deployment file. Add `--interactive` to open a
+local control tmux for the same run.
 
 External runners should use `ota_suite_sessions()` to discover the scenario set
 from examples and generated test-configs instead of hardcoding transport names.

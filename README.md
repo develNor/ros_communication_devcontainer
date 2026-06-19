@@ -285,6 +285,40 @@ When both names exist, interactive smoke treats `TARGET` as a scenario unless
 you pass `--target-type session`. Non-interactive `rosotacom smoke TARGET`
 keeps its existing session-only behavior.
 
+For a real two-host OTA check, keep the machine-specific details in a private
+inventory file and let `rosotacom` orchestrate the generic lifecycle:
+
+```yaml
+schema_version: 1
+source:
+  repo_url: https://github.com/develNor/ros_communication_devcontainer.git
+  ref: develop
+defaults:
+  workdir: /tmp/rosotacom_ota
+  rosotacom: .venv/bin/rosotacom
+  project: rosotacom_examples/rosotacom.yaml
+peers:
+  a: {ssh: null, address: 10.0.0.10}
+  b: {ssh: robot-b, address: 10.0.0.11}
+```
+
+Then run the automated or interactive OTA smoke harness:
+
+```bash
+rosotacom ota-smoke 2_native_chatter --inventory ota-smoke.yaml --prepare
+rosotacom ota-smoke 2_native_chatter --inventory ota-smoke.yaml --interactive
+rosotacom ota-smoke --list
+rosotacom ota-smoke 2_native_chatter --inventory ota-smoke.yaml --stop
+```
+
+`ota-smoke` accepts sessions and scenarios. It passes every peer address via
+`--peer-address`, so deployment IPs stay outside session definitions and
+`data_dict.json` is not edited. `--prepare` is explicit: it clones/installs the
+configured source on each peer and refuses broad or dangerous workdirs unless a
+safe target is configured. The interactive form opens a local control tmux with
+remote start/status and debug-shell windows; it does not attach nested remote
+tmux sessions by default.
+
 ### Live status / debugging overview
 
 Enable a continuously-updated, per-topic pipeline overview by setting

@@ -38,13 +38,18 @@ rosotacom scenario start 2_native_chatter --identity a
 ```
 
 Run identity `b` on the other machine in the same way. The outer tmux prefix is
-`Ctrl-b`; use `Ctrl-b Ctrl-b` to address the inner catmux session. Detaching
-keeps the use case running:
+`Ctrl-b`; communication and the local application use separate full windows.
+Switch with `Ctrl-b n`/`Ctrl-b p`, and use `Ctrl-b Ctrl-b` to address the inner
+catmux session. Detaching keeps the use case running:
 
 ```bash
-rosotacom scenario attach 2_native_chatter --identity a
-rosotacom scenario stop 2_native_chatter --identity a
+rosotacom scenario list
+rosotacom scenario attach
+rosotacom scenario stop
 ```
+
+The short `attach`/`stop` forms work when exactly one scenario/identity pair is
+active. Otherwise tab completion lists only the active choices.
 
 The existing scripts under `scripts/2_native_chatter/` remain as a fallback.
 

@@ -80,8 +80,10 @@ command manually in each terminal. After reloading the shell,
 prefix such as `rosotacom smoke 1<TAB>` expands to `1_heartbeat`. The same
 session completion is available for `start`, `stop`, `status`, `test`, and the
 probe commands; absolute and relative session-directory paths still complete
-normally. Running `rosotacom completion` without a shell argument infers bash
-or zsh from `$SHELL`.
+normally. `--identity <TAB><TAB>` lists the peer identities from the selected
+session or scenario. Scenario `attach` and `stop` complete only active
+scenarios and identities. Running `rosotacom completion` without a shell
+argument infers bash or zsh from `$SHELL`.
 
 Completion is not pinned to the version that registered it: each Tab press runs
 the `rosotacom` currently selected by `PATH`. Activating another checkout's
@@ -206,14 +208,22 @@ Start one identity's communication and local application together:
 
 ```bash
 rosotacom scenario start 2_native_chatter --identity a
-rosotacom scenario attach 2_native_chatter --identity a
-rosotacom scenario stop 2_native_chatter --identity a
+rosotacom scenario list
+rosotacom scenario attach
+rosotacom scenario stop
 ```
 
-The outer view uses an isolated host tmux server. Its prefix remains `Ctrl-b`;
-send the inner container-side catmux prefix with `Ctrl-b Ctrl-b`. Detaching from
-the outer tmux does not stop the use case. `scenario stop` owns cleanup of the
-application containers, communication container, and outer tmux session.
+`scenario list` shows both configured scenarios and currently active
+scenario/identity pairs. `attach` and `stop` infer omitted values when exactly
+one active choice exists; otherwise their completions and error messages show
+the eligible active choices.
+
+The outer view uses an isolated host tmux server with one full window for
+communication and one full window per local application. Its prefix remains
+`Ctrl-b`; switch windows with `Ctrl-b n`/`Ctrl-b p`, and send the inner
+container-side catmux prefix with `Ctrl-b Ctrl-b`. Detaching from the outer
+tmux does not stop the use case. `scenario stop` owns cleanup of the application
+containers, communication container, and outer tmux session.
 
 ## Usage Examples
 

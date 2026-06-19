@@ -397,6 +397,24 @@ def test_native_chatter_scenario_starts_apps_and_communication_together(
             assert "rosotacom scenario started: 2_native_chatter" in result.stdout
             assert "inner catmux prefix with Ctrl-b Ctrl-b" in result.stdout
 
+        listing = _run(
+            [
+                sys.executable,
+                "-m",
+                "rosotacom",
+                "scenario",
+                "list",
+                "--rosotacom-config",
+                str(copied_example_project / "rosotacom.yaml"),
+                "--session-instances-dir",
+                str(SESSION_INSTANCES_DIR),
+            ],
+            timeout=30,
+        )
+        assert "2_native_chatter (active: a, b)" in listing.stdout
+        assert "2_native_chatter --identity a" in listing.stdout
+        assert "2_native_chatter --identity b" in listing.stdout
+
         _run(
             [
                 sys.executable,
@@ -424,6 +442,32 @@ def test_native_chatter_scenario_starts_apps_and_communication_together(
         assert "rosotacom_" in manifest
         scenario_logs = list(manifests[-1].parent.glob("logs/*/scenario/*.log"))
         assert scenario_logs
+
+        tmux_socket = re.search(r"tmux_socket: (.+)", manifest)
+        assert tmux_socket
+        windows = _run(
+            ["tmux", "-L", tmux_socket.group(1), "list-windows", "-t", "2_native_chatter-a", "-F", "#{window_name}"],
+            timeout=30,
+        )
+        assert windows.stdout.splitlines() == ["communication", "native_application"]
+
+        _run(_scenario_command(copied_example_project, "stop", "b", instance_id), timeout=60)
+        inferred_stop = _run(
+            [
+                sys.executable,
+                "-m",
+                "rosotacom",
+                "scenario",
+                "stop",
+                "--rosotacom-config",
+                str(copied_example_project / "rosotacom.yaml"),
+                "--session-instances-dir",
+                str(SESSION_INSTANCES_DIR),
+            ],
+            timeout=60,
+        )
+        assert "Auto-selected active scenario: 2_native_chatter" in inferred_stop.stdout
+        assert "Auto-selected active identity: a" in inferred_stop.stdout
     finally:
         for identity in ("a", "b"):
             _run(_scenario_command(copied_example_project, "stop", identity, instance_id), timeout=60)

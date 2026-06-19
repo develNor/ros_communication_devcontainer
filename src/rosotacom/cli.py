@@ -129,6 +129,13 @@ class ScenarioDefinition:
 
 
 @dataclass(frozen=True)
+class ActiveScenarioRun:
+    scenario: str
+    identity: str
+    tmux_session: str
+
+
+@dataclass(frozen=True)
 class SessionInstance:
     instance_id: str
     host_dir: Path
@@ -955,6 +962,18 @@ def _session_name_completer(
     return completions
 
 
+def _session_identities(runtime: RuntimeConfig, session_name: str) -> list[str]:
+    try:
+        session = _resolve_session(session_name, runtime)
+        cfg = _effective_session_config(session.host_dir, runtime)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return []
+    peers = cfg.get("peers")
+    if not isinstance(peers, dict):
+        return []
+    return [str(identity) for identity in peers]
+
+
 def _is_scenario_dir(path: Path) -> bool:
     return (path / "scenario-definition.yaml").is_file()
 
@@ -998,6 +1017,75 @@ def _format_available_scenarios(runtime: RuntimeConfig) -> str:
     return "No configured scenarios found. Set scenario_configs_dir in rosotacom.yaml."
 
 
+def _scenario_identities(runtime: RuntimeConfig, scenario_name: str) -> list[str]:
+    try:
+        resolved = _resolve_scenario(scenario_name, runtime)
+        definition = _load_scenario_definition(resolved)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return []
+    return list(definition.applications)
+
+
+def _active_scenario_runs(runtime: RuntimeConfig) -> list[ActiveScenarioRun]:
+    if not shutil.which("tmux"):
+        return []
+    result = subprocess.run(
+        _tmux_command(
+            runtime,
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{@rosotacom_scenario}\t#{@rosotacom_identity}",
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+
+    configured_by_tmux_name: dict[str, tuple[str, str]] = {}
+    for scenario_name in _scenario_names(runtime):
+        for identity in _scenario_identities(runtime, scenario_name):
+            configured_by_tmux_name[_scenario_tmux_session(scenario_name, identity)] = (scenario_name, identity)
+
+    runs: list[ActiveScenarioRun] = []
+    for line in result.stdout.splitlines():
+        tmux_session, _, metadata = line.partition("\t")
+        scenario, _, identity = metadata.partition("\t")
+        if not scenario or not identity:
+            fallback = configured_by_tmux_name.get(tmux_session)
+            if fallback:
+                scenario, identity = fallback
+        if scenario and identity:
+            runs.append(ActiveScenarioRun(scenario=scenario, identity=identity, tmux_session=tmux_session))
+    return sorted(runs, key=lambda run: (run.scenario, run.identity))
+
+
+def _format_active_scenario_runs(runs: list[ActiveScenarioRun]) -> str:
+    if not runs:
+        return "  (none)"
+    return "\n".join(f"  - {run.scenario} --identity {run.identity}" for run in runs)
+
+
+def _format_scenario_listing(runtime: RuntimeConfig) -> str:
+    configured = _scenario_names(runtime)
+    active = _active_scenario_runs(runtime)
+    active_by_scenario: dict[str, list[str]] = {}
+    for run in active:
+        active_by_scenario.setdefault(run.scenario, []).append(run.identity)
+
+    if configured:
+        configured_lines = []
+        for name in configured:
+            identities = active_by_scenario.get(name, [])
+            state = f"active: {', '.join(identities)}" if identities else "inactive"
+            configured_lines.append(f"  - {name} ({state})")
+        configured_text = "\n".join(configured_lines)
+    else:
+        configured_text = "  (none)"
+    return f"Configured scenarios:\n{configured_text}\nActive scenarios:\n{_format_active_scenario_runs(active)}"
+
+
 def _scenario_name_completer(
     prefix: str,
     parsed_args: argparse.Namespace,
@@ -1012,6 +1100,49 @@ def _scenario_name_completer(
         return completions
     completions.update({name: "configured scenario" for name in _scenario_names(runtime) if name.startswith(prefix)})
     return completions
+
+
+def _active_scenario_name_completer(
+    prefix: str,
+    parsed_args: argparse.Namespace,
+    **_: Any,
+) -> dict[str, str]:
+    try:
+        runtime = _load_runtime_config(parsed_args)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return {}
+    names = sorted({run.scenario for run in _active_scenario_runs(runtime)})
+    return {name: "active scenario" for name in names if name.startswith(prefix)}
+
+
+def _identity_completer(
+    prefix: str,
+    parsed_args: argparse.Namespace,
+    **_: Any,
+) -> dict[str, str]:
+    try:
+        runtime = _load_runtime_config(parsed_args)
+    except (FileNotFoundError, RuntimeError, OSError, yaml.YAMLError):
+        return {}
+
+    if getattr(parsed_args, "command", None) == "scenario":
+        scenario_name = getattr(parsed_args, "scenario", None)
+        if getattr(parsed_args, "scenario_command", None) in {"attach", "stop"}:
+            identities = sorted(
+                {
+                    run.identity
+                    for run in _active_scenario_runs(runtime)
+                    if not scenario_name or run.scenario == scenario_name
+                }
+            )
+        elif scenario_name:
+            identities = _scenario_identities(runtime, scenario_name)
+        else:
+            identities = []
+    else:
+        session_name = getattr(parsed_args, "session_dir", None) or getattr(parsed_args, "session_dir_positional", None)
+        identities = _session_identities(runtime, session_name) if session_name else []
+    return {identity: "peer identity" for identity in identities if identity.startswith(prefix)}
 
 
 def _load_scenario_definition(resolved: ResolvedScenario) -> ScenarioDefinition:
@@ -1239,7 +1370,7 @@ def _create_scenario_tmux(
             "-s",
             session_name,
             "-n",
-            "scenario",
+            "communication",
             communication_command,
         ),
         text=True,
@@ -1247,8 +1378,19 @@ def _create_scenario_tmux(
         check=True,
     )
     communication_pane = created.stdout.strip()
-    subprocess.run(_tmux_command(runtime, "set-option", "-t", session_name, "remain-on-exit", "on"), check=True)
+    subprocess.run(
+        _tmux_command(runtime, "set-window-option", "-g", "-t", session_name, "remain-on-exit", "on"),
+        check=True,
+    )
     subprocess.run(_tmux_command(runtime, "set-option", "-t", session_name, "prefix", "C-b"), check=True)
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "@rosotacom_scenario", resolved.name),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "@rosotacom_identity", identity),
+        check=True,
+    )
     subprocess.run(_tmux_command(runtime, "bind-key", "-T", "prefix", "C-b", "send-prefix"), check=True)
     subprocess.run(
         _tmux_command(runtime, "set-option", "-t", session_name, "pane-border-status", "top"),
@@ -1272,7 +1414,7 @@ def _create_scenario_tmux(
             "-t",
             session_name,
             "status-right",
-            " outer: C-b | inner catmux: C-b C-b ",
+            " windows: C-b n/p | inner catmux: C-b C-b ",
         ),
         check=True,
     )
@@ -1287,23 +1429,25 @@ def _create_scenario_tmux(
     )
 
     for application in applications:
-        split = subprocess.run(
+        created_window = subprocess.run(
             _tmux_command(
                 runtime,
-                "split-window",
+                "new-window",
                 "-d",
                 "-P",
                 "-F",
                 "#{pane_id}",
                 "-t",
-                f"{session_name}:0",
+                session_name,
+                "-n",
+                _safe_path_token(application.name),
                 shlex.join(_scenario_application_command(runtime, resolved, identity, application)),
             ),
             text=True,
             capture_output=True,
             check=True,
         )
-        pane_id = split.stdout.strip()
+        pane_id = created_window.stdout.strip()
         subprocess.run(
             _tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"application:{application.name}"),
             check=True,
@@ -1314,8 +1458,7 @@ def _create_scenario_tmux(
             _scenario_log_path(instance, identity, f"application-{application.name}"),
         )
 
-    subprocess.run(_tmux_command(runtime, "select-layout", "-t", f"{session_name}:0", "tiled"), check=True)
-    subprocess.run(_tmux_command(runtime, "select-pane", "-t", communication_pane), check=True)
+    subprocess.run(_tmux_command(runtime, "select-window", "-t", f"{session_name}:communication"), check=True)
     return session_name
 
 
@@ -1627,6 +1770,45 @@ def _resolve_scenario_context(
     return runtime, resolved, definition, session, cfg, identity, applications
 
 
+def _infer_active_scenario_selector(args: argparse.Namespace, *, require_active: bool) -> None:
+    runtime = _load_runtime_config(args)
+    runs = _active_scenario_runs(runtime)
+    scenario_name = getattr(args, "scenario", None)
+    identity = getattr(args, "identity", None)
+
+    if not scenario_name:
+        eligible_runs = [run for run in runs if not identity or run.identity == identity]
+        scenario_names = sorted({run.scenario for run in eligible_runs})
+        if len(scenario_names) == 1:
+            scenario_name = scenario_names[0]
+            args.scenario = scenario_name
+            print(f"Auto-selected active scenario: {scenario_name}")
+        elif not scenario_names:
+            raise RuntimeError("No active scenarios found. Start one with `rosotacom scenario start <name>`.")
+        else:
+            raise RuntimeError(
+                "Multiple active scenarios found; specify one:\n" + _format_active_scenario_runs(eligible_runs)
+            )
+
+    matching = [run for run in runs if run.scenario == scenario_name]
+    if not identity:
+        identities = sorted({run.identity for run in matching})
+        if len(identities) == 1:
+            identity = identities[0]
+            args.identity = identity
+            print(f"Auto-selected active identity: {identity}")
+        elif not identities:
+            raise RuntimeError(f"No active run found for scenario '{scenario_name}'.")
+        else:
+            raise RuntimeError(
+                f"Scenario '{scenario_name}' has multiple active identities; specify --identity:\n"
+                + _format_active_scenario_runs(matching)
+            )
+
+    if require_active and not any(run.scenario == scenario_name and run.identity == identity for run in matching):
+        raise RuntimeError(f"Scenario '{scenario_name}' is not active for identity '{identity}'.")
+
+
 def _stop_scenario_application(
     runtime: RuntimeConfig,
     resolved: ResolvedScenario,
@@ -1738,12 +1920,13 @@ def start_scenario(args: argparse.Namespace) -> int:
     if mode == "attach":
         subprocess.run(_tmux_command(runtime, "attach-session", "-t", created_session), check=True)
     else:
-        print(f"Attach with: rosotacom scenario attach {shlex.quote(resolved.name)} --identity {identity}")
+        print("Attach with: rosotacom scenario attach")
     return 0
 
 
 def attach_scenario(args: argparse.Namespace) -> int:
     _require_tmux()
+    _infer_active_scenario_selector(args, require_active=True)
     runtime, resolved, _definition, _session, _cfg, identity, _applications = _resolve_scenario_context(args)
     tmux_session = _scenario_tmux_session(resolved.name, identity)
     if not _tmux_session_exists(runtime, tmux_session):
@@ -1754,6 +1937,8 @@ def attach_scenario(args: argparse.Namespace) -> int:
 
 def stop_scenario(args: argparse.Namespace) -> int:
     _require_ros2docker()
+    if not getattr(args, "scenario", None) or not getattr(args, "identity", None):
+        _infer_active_scenario_selector(args, require_active=False)
     runtime, resolved, _definition, _session, cfg, identity, applications = _resolve_scenario_context(args)
     _stop_scenario_components(
         runtime,
@@ -1797,7 +1982,7 @@ def run_scenario_application(args: argparse.Namespace) -> int:
 
 def list_scenarios(args: argparse.Namespace) -> int:
     runtime = _load_runtime_config(args)
-    print(_format_available_scenarios(runtime))
+    print(_format_scenario_listing(runtime))
     return 0
 
 
@@ -3154,14 +3339,24 @@ def _add_session_arg(parser: argparse.ArgumentParser, *args: str, **kwargs: Any)
     return action
 
 
-def _add_scenario_arg(parser: argparse.ArgumentParser, *args: str, **kwargs: Any) -> argparse.Action:
+def _add_scenario_arg(
+    parser: argparse.ArgumentParser,
+    *args: str,
+    active_only: bool = False,
+    **kwargs: Any,
+) -> argparse.Action:
     action = parser.add_argument(*args, **kwargs)
-    cast(Any, action).completer = _scenario_name_completer
+    cast(Any, action).completer = _active_scenario_name_completer if active_only else _scenario_name_completer
     return action
 
 
+def _add_identity_arg(parser: argparse.ArgumentParser, *, required: bool = False, help: str | None = None) -> None:
+    action = parser.add_argument("--identity", required=required, help=help)
+    cast(Any, action).completer = _identity_completer
+
+
 def _add_scenario_identity_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--identity")
+    _add_identity_arg(parser)
     parser.add_argument("--no-auto-identity", dest="auto_identity", action="store_false")
     parser.add_argument("--overwrite-peers-via-remote-peer")
     parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
@@ -3172,7 +3367,7 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     _add_common_config_args(parser)
     _add_session_arg(parser, "session_dir_positional", nargs="?")
     _add_session_arg(parser, "-s", "--session-dir", dest="session_dir")
-    parser.add_argument("--identity")
+    _add_identity_arg(parser)
     parser.add_argument("--mode", choices=["auto", "attach", "detached"], default="auto")
     parser.add_argument("--no-auto-identity", dest="auto_identity", action="store_false")
     parser.add_argument("--no-force", dest="force", action="store_false")
@@ -3281,7 +3476,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_common_config_args(stop_parser)
     _add_session_arg(stop_parser, "session_dir_positional", nargs="?")
     _add_session_arg(stop_parser, "-s", "--session-dir", dest="session_dir")
-    stop_parser.add_argument("--identity")
+    _add_identity_arg(stop_parser)
     stop_parser.add_argument("--auto-identity", action="store_true")
     stop_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
     stop_parser.add_argument("--overwrite-peers-via-remote-peer")
@@ -3305,7 +3500,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_common_config_args(status_parser)
     _add_session_arg(status_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
-    status_parser.add_argument("--identity", help="Show only this peer identity (default: all available).")
+    _add_identity_arg(status_parser, help="Show only this peer identity (default: all available).")
     status_parser.add_argument(
         "--instance-id", help="Inspect a specific instance id (default: most recent for the session)."
     )
@@ -3329,7 +3524,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_common_config_args(probe_publish_parser)
     _add_session_arg(probe_publish_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
-    probe_publish_parser.add_argument("--identity", required=True)
+    _add_identity_arg(probe_publish_parser, required=True)
     probe_publish_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
     probe_publish_parser.add_argument("--instance-id")
     probe_publish_parser.add_argument("--topic", default=ISOLATION_PROBE_TOPIC)
@@ -3345,7 +3540,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_common_config_args(probe_check_parser)
     _add_session_arg(probe_check_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
-    probe_check_parser.add_argument("--identity", required=True)
+    _add_identity_arg(probe_check_parser, required=True)
     probe_check_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
     probe_check_parser.add_argument("--instance-id")
     probe_check_parser.add_argument("--topic", default=ISOLATION_PROBE_TOPIC)
@@ -3358,7 +3553,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_common_config_args(publish_test_topics_parser)
     _add_session_arg(publish_test_topics_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
-    publish_test_topics_parser.add_argument("--identity", required=True)
+    _add_identity_arg(publish_test_topics_parser, required=True)
     publish_test_topics_parser.add_argument("--peer-address", action="append", default=[], metavar="PEER=ADDRESS_EXPR")
     publish_test_topics_parser.add_argument("--instance-id")
     publish_test_topics_parser.add_argument("--duration", type=float, default=180.0)
@@ -3396,7 +3591,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Attach to a running scenario's outer tmux session.",
     )
     _add_common_config_args(scenario_attach_parser)
-    _add_scenario_arg(scenario_attach_parser, "scenario")
+    _add_scenario_arg(scenario_attach_parser, "scenario", nargs="?", active_only=True)
     _add_scenario_identity_args(scenario_attach_parser)
     scenario_attach_parser.set_defaults(func=attach_scenario)
 
@@ -3405,7 +3600,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Stop scenario applications, communication container, and outer tmux.",
     )
     _add_common_config_args(scenario_stop_parser)
-    _add_scenario_arg(scenario_stop_parser, "scenario")
+    _add_scenario_arg(scenario_stop_parser, "scenario", nargs="?", active_only=True)
     _add_scenario_identity_args(scenario_stop_parser)
     scenario_stop_parser.add_argument("--instance-id", help="Mark a specific scenario instance as stopped.")
     scenario_stop_parser.set_defaults(func=stop_scenario)
@@ -3420,7 +3615,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_common_config_args(scenario_run_application_parser)
     _add_scenario_arg(scenario_run_application_parser, "scenario")
-    scenario_run_application_parser.add_argument("--identity", required=True)
+    _add_identity_arg(scenario_run_application_parser, required=True)
     scenario_run_application_parser.add_argument("--application", required=True)
     scenario_run_application_parser.set_defaults(func=run_scenario_application)
 

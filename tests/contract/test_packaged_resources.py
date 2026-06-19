@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from importlib import resources
 from pathlib import Path
@@ -63,3 +64,41 @@ def test_shell_entrypoints_pass_syntax_check() -> None:
         ["python3", "-m", "py_compile", str(cli.WS_DIR / "session" / "creation" / "strip_ansi.py")],
         check=True,
     )
+
+
+def test_native_chatter_waiter_reads_topic_info_without_broken_pipe(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ros2 = fake_bin / "ros2"
+    fake_ros2.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                'if [[ "$1 $2" == "topic info" ]]; then',
+                '  for i in {1..100}; do echo "detail $i"; done',
+                '  echo "Type: std_msgs/msg/String"',
+                "  exit 0",
+                "fi",
+                'if [[ "$1 $2" == "topic echo" ]]; then',
+                '  echo "echo started"',
+                "  exit 0",
+                "fi",
+                "exit 2",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_ros2.chmod(0o755)
+    script = cli.EXAMPLE_PROJECT_DIR / "scripts" / "2_native_chatter" / "machine_a" / "wait_for_echo_topic.sh"
+
+    result = subprocess.run(
+        [str(script)],
+        text=True,
+        capture_output=True,
+        check=True,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+
+    assert result.stdout.strip() == "echo started"
+    assert "BrokenPipeError" not in result.stderr

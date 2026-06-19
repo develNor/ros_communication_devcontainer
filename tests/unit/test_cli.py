@@ -342,7 +342,115 @@ def test_scenario_name_completion_uses_active_project(
     assert rosotacom._scenario_name_completer("de", argparse.Namespace()) == {"demo": "configured scenario"}
 
 
-def test_scenario_tmux_commands_keep_ctrl_b_and_log_each_pane(
+def test_active_scenarios_are_discovered_from_tmux_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command[:3] == ["tmux", "-L", "rosotacom-test"]
+        return subprocess.CompletedProcess(command, 0, "demo-a\tdemo\ta\ndemo-b\tdemo\tb\n", "")
+
+    monkeypatch.setattr(rosotacom.shutil, "which", lambda name: "/usr/bin/tmux")
+    monkeypatch.setattr(rosotacom.subprocess, "run", fake_run)
+
+    assert rosotacom._active_scenario_runs(runtime) == [
+        rosotacom.ActiveScenarioRun("demo", "a", "demo-a"),
+        rosotacom.ActiveScenarioRun("demo", "b", "demo-b"),
+    ]
+    assert rosotacom._format_scenario_listing(runtime) == "\n".join(
+        [
+            "Configured scenarios:",
+            "  - demo (active: a, b)",
+            "Active scenarios:",
+            "  - demo --identity a",
+            "  - demo --identity b",
+        ]
+    )
+
+
+def test_scenario_attach_selector_infers_the_only_active_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(
+        rosotacom,
+        "_active_scenario_runs",
+        lambda runtime: [rosotacom.ActiveScenarioRun("demo", "a", "demo-a")],
+    )
+    args = argparse.Namespace(scenario=None, identity=None)
+
+    rosotacom._infer_active_scenario_selector(args, require_active=True)
+
+    assert (args.scenario, args.identity) == ("demo", "a")
+    assert "Auto-selected active scenario: demo" in capsys.readouterr().out
+
+
+def test_scenario_selector_requires_choice_for_multiple_active_identities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(
+        rosotacom,
+        "_active_scenario_runs",
+        lambda runtime: [
+            rosotacom.ActiveScenarioRun("demo", "a", "demo-a"),
+            rosotacom.ActiveScenarioRun("demo", "b", "demo-b"),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="multiple active identities"):
+        rosotacom._infer_active_scenario_selector(
+            argparse.Namespace(scenario="demo", identity=None),
+            require_active=True,
+        )
+
+
+def test_scenario_and_identity_completion_follow_active_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(
+        rosotacom,
+        "_active_scenario_runs",
+        lambda runtime: [rosotacom.ActiveScenarioRun("demo", "a", "demo-a")],
+    )
+
+    attach_args = argparse.Namespace(command="scenario", scenario_command="attach", scenario=None)
+    assert rosotacom._active_scenario_name_completer("d", attach_args) == {"demo": "active scenario"}
+    assert rosotacom._identity_completer("", attach_args) == {"a": "peer identity"}
+
+    start_args = argparse.Namespace(command="scenario", scenario_command="start", scenario="demo")
+    assert rosotacom._identity_completer("", start_args) == {
+        "a": "peer identity",
+        "b": "peer identity",
+    }
+
+    session_args = argparse.Namespace(command="start", session_dir_positional="demo", session_dir=None)
+    assert rosotacom._identity_completer("", session_args) == {
+        "a": "peer identity",
+        "b": "peer identity",
+    }
+
+
+def test_scenario_attach_cli_accepts_no_selector(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[argparse.Namespace] = []
+    monkeypatch.setattr(rosotacom, "attach_scenario", lambda args: calls.append(args) or 0)
+
+    assert rosotacom.main(["scenario", "attach"]) == 0
+    assert calls[0].scenario is None
+    assert calls[0].identity is None
+
+
+def test_scenario_tmux_commands_keep_ctrl_b_and_use_full_windows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -356,7 +464,7 @@ def test_scenario_tmux_commands_keep_ctrl_b_and_log_each_pane(
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal pane_number
         calls.append(command)
-        if "new-session" in command or "split-window" in command:
+        if "new-session" in command or "new-window" in command:
             pane_number += 1
             return subprocess.CompletedProcess(command, 0, f"%{pane_number}\n", "")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -382,9 +490,19 @@ def test_scenario_tmux_commands_keep_ctrl_b_and_log_each_pane(
     assert all(command[:3] == ["tmux", "-L", "rosotacom-test"] for command in calls)
     assert any(command[-2:] == ["prefix", "C-b"] for command in calls if "set-option" in command)
     assert any(command[-3:] == ["prefix", "C-b", "send-prefix"] for command in calls if "bind-key" in command)
+    assert any(command[-2:] == ["@rosotacom_scenario", "demo"] for command in calls)
+    assert any(command[-2:] == ["@rosotacom_identity", "a"] for command in calls)
     assert any("inner catmux: C-b C-b" in part for command in calls for part in command)
     assert any("rosotacom start demo --identity a --mode attach" in " ".join(command) for command in calls)
     assert any("scenario _run-application demo" in " ".join(command) for command in calls)
+    assert sum("new-window" in command for command in calls) == 1
+    assert not any("split-window" in command for command in calls)
+    assert any(
+        command[command.index("-n") : command.index("-n") + 2] == ["-n", "local_app"]
+        for command in calls
+        if "new-window" in command
+    )
+    assert any(command[-1] == "demo-a:communication" for command in calls if "select-window" in command)
     assert (instance.logs_host_dir / "a" / "scenario").is_dir()
 
 
@@ -495,6 +613,28 @@ def test_argcomplete_protocol_returns_session_prefix_matches() -> None:
     )
 
     assert result.stdout.split("\v") == ["1_heartbeat", "1_heartbeat_status"]
+
+
+def test_argcomplete_protocol_returns_identity_matches() -> None:
+    line = "rosotacom start 1_heartbeat --identity "
+    env = {
+        **os.environ,
+        "_ARGCOMPLETE": "1",
+        "_ARGCOMPLETE_IFS": "\v",
+        "_ARGCOMPLETE_SUPPRESS_SPACE": "1",
+        "COMP_LINE": line,
+        "COMP_POINT": str(len(line)),
+    }
+
+    result = subprocess.run(
+        ["bash", "-c", f"{rosotacom.shlex.quote(sys.executable)} -m rosotacom 8>&1"],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.stdout.split("\v") == ["a", "b"]
 
 
 def test_local_check_derives_from_domains_and_allows_opt_out(tmp_path: Path) -> None:

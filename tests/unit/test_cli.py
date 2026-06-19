@@ -298,6 +298,34 @@ def _write_test_scenario_project(tmp_path: Path) -> tuple[rosotacom.RuntimeConfi
     return runtime, rosotacom._resolve_scenario("demo", runtime)
 
 
+def _write_ota_inventory(tmp_path: Path) -> Path:
+    inventory = tmp_path / "ota-smoke.yaml"
+    inventory.write_text(
+        "\n".join(
+            [
+                "schema_version: 1",
+                "source:",
+                "  repo_url: https://token@example.test/rosotacom.git",
+                "  ref: develop",
+                "defaults:",
+                "  workdir: /tmp/rosotacom_ota",
+                "  rosotacom: .venv/bin/rosotacom",
+                "  project: rosotacom_examples/rosotacom.yaml",
+                "peers:",
+                "  a:",
+                "    ssh: null",
+                "    address: 10.0.0.10",
+                "  b:",
+                "    ssh: robot-b",
+                "    address: 10.0.0.11",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return inventory
+
+
 def test_scenario_definition_resolves_and_validates_strictly(tmp_path: Path) -> None:
     runtime, resolved = _write_test_scenario_project(tmp_path)
 
@@ -650,6 +678,306 @@ def test_active_interactive_smoke_runs_are_listed_from_tmux_metadata(
 
     assert runs == [rosotacom.ActiveInteractiveSmokeRun("demo", "scenario", "smoke-scenario-demo", "run1", "net1")]
     assert "demo (scenario) instance=run1 network=net1" in rosotacom._format_active_interactive_smoke_runs(runs)
+
+
+def test_ota_smoke_inventory_resolves_target_and_redacts_repo_url(tmp_path: Path) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+
+    target = rosotacom._resolve_interactive_smoke_target(
+        "demo",
+        runtime,
+        "auto",
+        peer_address_overrides=rosotacom._ota_peer_address_overrides(inventory),
+    )
+    instance = rosotacom._resolve_session_instance(runtime, target.session, "ota")
+    rosotacom._ota_write_manifest(
+        instance,
+        target,
+        runtime,
+        inventory,
+        tmux_session="ota-smoke-scenario-demo",
+        interactive=True,
+        phase="running",
+    )
+    manifest = yaml.safe_load((instance.host_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    run = manifest["ota_smoke_runs"]["scenario:demo"]
+
+    assert target.target_type == "scenario"
+    assert target.cfg["peers"]["a"]["address"] == "10.0.0.10"
+    assert inventory.peers["b"].ssh == "robot-b"
+    assert run["source_repo_url"] == "https://<redacted>@example.test/rosotacom.git"
+    assert run["peers"]["b"] == {"ssh_configured": True, "address": "10.0.0.11"}
+
+
+def test_ota_smoke_command_building_and_remote_wrapping(tmp_path: Path) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
+    peer_args = rosotacom._ota_peer_address_args(inventory)
+
+    start = rosotacom._ota_rosotacom_command(
+        inventory,
+        rosotacom._ota_start_parts(target, "a", "run1", peer_args, mode="detached"),
+    )
+    stop = rosotacom._ota_rosotacom_command(inventory, rosotacom._ota_stop_parts(target, "b", "run1", peer_args))
+
+    assert start.startswith("cd /tmp/rosotacom_ota && .venv/bin/rosotacom scenario start demo")
+    assert "--identity a --mode detached --instance-id run1 --force" in start
+    assert "--peer-address a=10.0.0.10 --peer-address b=10.0.0.11" in start
+    assert "--rosotacom-config rosotacom_examples/rosotacom.yaml" in start
+    assert "scenario stop demo --identity b --instance-id run1" in stop
+    assert rosotacom._ota_remote_argv(inventory.peers["a"], "true") == ["bash", "-lc", "true"]
+    assert rosotacom._ota_remote_argv(inventory.peers["b"], "true", tty=True, batch=True) == [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-t",
+        "robot-b",
+        "true",
+    ]
+
+
+def test_ota_prepare_script_refuses_dangerous_workdir(tmp_path: Path) -> None:
+    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+    unsafe = rosotacom.OtaSmokeInventory(
+        path=inventory.path,
+        repo_url=inventory.repo_url,
+        ref=inventory.ref,
+        workdir="/",
+        rosotacom=inventory.rosotacom,
+        project=inventory.project,
+        peers=inventory.peers,
+    )
+
+    with pytest.raises(RuntimeError, match="dangerous OTA prepare workdir"):
+        rosotacom._ota_prepare_script(
+            unsafe,
+            repo_url="https://example.test/repo.git",
+            ref="develop",
+            commit_sha=None,
+            force=True,
+        )
+
+    script = rosotacom._ota_prepare_script(
+        inventory,
+        repo_url="https://example.test/repo.git",
+        ref="develop",
+        commit_sha="abc123",
+        force=False,
+    )
+    assert "workdir exists; pass --force-prepare" in script
+    assert "git checkout --detach abc123" in script
+    assert ".venv/bin/rosotacom examples create ./rosotacom_examples" in script
+
+
+def test_active_ota_smoke_runs_are_listed_from_tmux_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command[:3] == ["tmux", "-L", "rosotacom-test"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "ota-smoke-scenario-demo\tdemo\tscenario\trun1\t/tmp/ota.yaml\n",
+            "",
+        )
+
+    monkeypatch.setattr(rosotacom.shutil, "which", lambda name: "/usr/bin/tmux")
+    monkeypatch.setattr(rosotacom.subprocess, "run", fake_run)
+
+    runs = rosotacom._active_ota_smoke_runs(runtime)
+
+    assert runs == [rosotacom.ActiveOtaSmokeRun("demo", "scenario", "ota-smoke-scenario-demo", "run1", "/tmp/ota.yaml")]
+    assert "demo (scenario) instance=run1 inventory=/tmp/ota.yaml" in rosotacom._format_active_ota_smoke_runs(runs)
+
+
+def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
+    instance = rosotacom._resolve_session_instance(runtime, target.session, "ota-interactive")
+    calls: list[list[str]] = []
+    pane_number = 0
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal pane_number
+        calls.append(command)
+        if "new-session" in command or "new-window" in command:
+            pane_number += 1
+            return subprocess.CompletedProcess(command, 0, f"%{pane_number}\n", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(rosotacom.shutil, "which", lambda name: "/usr/bin/tmux")
+    monkeypatch.setattr(rosotacom.subprocess, "run", fake_run)
+
+    tmux_session = rosotacom._ota_create_tmux(runtime, target, inventory, instance)
+
+    assert tmux_session == "ota-smoke-scenario-demo"
+    window_names = [
+        command[command.index("-n") + 1]
+        for command in calls
+        if ("new-session" in command or "new-window" in command) and "-n" in command
+    ]
+    assert window_names == ["a_remote", "b_remote", "a_shell", "b_shell", "verification"]
+    assert any(command[-2:] == ["@rosotacom_ota_smoke_target", "demo"] for command in calls)
+    assert any(command[-2:] == ["@rosotacom_ota_smoke_target_type", "scenario"] for command in calls)
+    assert any(command[-2:] == ["@rosotacom_ota_smoke_instance", "ota-interactive"] for command in calls)
+    assert any(command[-2:] == ["@rosotacom_ota_smoke_inventory", str(inventory.path)] for command in calls)
+    joined = "\n".join(" ".join(command) for command in calls)
+    assert "scenario start demo --identity a --mode detached --instance-id ota-interactive" in joined
+    assert "scenario start demo --identity b --mode detached --instance-id ota-interactive" in joined
+    assert "status demo --identity a --instance-id ota-interactive --watch" in joined
+    assert "status demo --identity b --instance-id ota-interactive --watch" in joined
+    assert "ota-smoke demo --inventory" in joined
+    assert "--verify-only" in joined
+    assert "scenario attach" not in joined
+
+
+def test_ota_smoke_parser_accepts_stop_without_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[argparse.Namespace] = []
+    monkeypatch.setattr(rosotacom, "ota_smoke", lambda args: calls.append(args) or 0)
+
+    assert rosotacom.main(["ota-smoke", "--stop"]) == 0
+
+    assert calls[0].target is None
+    assert calls[0].stop is True
+    assert calls[0].inventory is None
+
+
+def test_ota_smoke_stop_dry_run_does_not_kill_local_tmux(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
+    calls: list[str] = []
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(rosotacom, "_resolve_ota_smoke_context", lambda args: (runtime, inventory, target))
+    monkeypatch.setattr(rosotacom, "_ota_stop_peers", lambda *args, **kwargs: calls.append("remote-dry-run"))
+    monkeypatch.setattr(rosotacom, "_kill_scenario_tmux", lambda *args, **kwargs: calls.append("tmux") or True)
+
+    assert (
+        rosotacom._stop_ota_smoke(
+            argparse.Namespace(
+                target="demo",
+                target_type="scenario",
+                inventory=str(inventory.path),
+                instance_id="run1",
+                dry_run=True,
+            )
+        )
+        == 0
+    )
+
+    assert calls == ["remote-dry-run"]
+    assert "Would stop OTA smoke tmux session: ota-smoke-scenario-demo" in capsys.readouterr().out
+
+
+def test_noninteractive_ota_smoke_lifecycle_uses_generic_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    inventory = rosotacom._load_ota_smoke_inventory(str(_write_ota_inventory(tmp_path)))
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
+    instance = rosotacom._resolve_session_instance(runtime, target.session, "ota-lifecycle")
+    calls: list[str] = []
+
+    monkeypatch.setattr(rosotacom, "_resolve_ota_smoke_context", lambda args: (runtime, inventory, target))
+    monkeypatch.setattr(rosotacom, "_resolve_session_instance", lambda *args, **kwargs: instance)
+    monkeypatch.setattr(rosotacom, "_ota_preflight", lambda *args, **kwargs: calls.append("preflight"))
+    monkeypatch.setattr(rosotacom, "_ota_prepare_hosts", lambda *args, **kwargs: calls.append("prepare"))
+    monkeypatch.setattr(rosotacom, "_ota_start_peers", lambda *args, **kwargs: calls.append("start"))
+    monkeypatch.setattr(rosotacom, "_ota_start_session_publishers", lambda *args, **kwargs: calls.append("publishers"))
+    monkeypatch.setattr(rosotacom, "_ota_verify_delivery", lambda *args, **kwargs: calls.append("test") or [])
+    monkeypatch.setattr(rosotacom, "_ota_verify_isolation", lambda *args, **kwargs: calls.append("isolation") or [])
+    monkeypatch.setattr(rosotacom, "_ota_collect_logs", lambda *args, **kwargs: calls.append("collect"))
+    monkeypatch.setattr(rosotacom, "_ota_stop_peers", lambda *args, **kwargs: calls.append("stop"))
+    monkeypatch.setattr(rosotacom.time, "sleep", lambda seconds: calls.append(f"sleep:{seconds}"))
+
+    assert (
+        rosotacom._start_noninteractive_ota_smoke(
+            argparse.Namespace(
+                prepare=True,
+                skip_preflight=False,
+                check_peer_reachability=False,
+                dry_run=False,
+                instance_id="ota-lifecycle",
+                keep_running=False,
+            )
+        )
+        == 0
+    )
+
+    assert calls == [
+        "preflight",
+        "prepare",
+        "start",
+        "sleep:12",
+        "publishers",
+        "test",
+        "isolation",
+        "collect",
+        "stop",
+    ]
+
+
+def test_ota_smoke_dry_run_exercises_generic_remote_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    inventory_path = _write_ota_inventory(tmp_path)
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+
+    assert (
+        rosotacom.ota_smoke(
+            argparse.Namespace(
+                target="demo",
+                target_type="scenario",
+                inventory=str(inventory_path),
+                interactive=False,
+                stop=False,
+                list=False,
+                verify_only=False,
+                prepare=False,
+                force_prepare=False,
+                repo_url=None,
+                ref=None,
+                commit_sha=None,
+                skip_preflight=False,
+                check_peer_reachability=True,
+                dry_run=True,
+                instance_id="ota-dry",
+                keep_running=False,
+                mode="detached",
+            )
+        )
+        == 0
+    )
+
+    out = capsys.readouterr().out
+    assert "required command .venv/bin/rosotacom" in out
+    assert "required command tmux" in out
+    assert "ssh -o BatchMode=yes robot-b true" in out
+    assert "scenario start demo --identity a --mode detached --instance-id ota-dry" in out
+    assert "scenario start demo --identity b --mode detached --instance-id ota-dry" in out
+    assert "test demo --instance-id ota-dry" in out
+    assert "probe-publish demo --identity a --topic /local_only" in out
+    assert "probe-check demo --identity b --topic /local_only --expect absent" in out
+    assert "scenario stop demo --identity a --instance-id ota-dry" in out
+    assert "*_ota-dry" in out
+    assert "OTA SMOKE OK" in out
 
 
 def test_interactive_smoke_stop_infers_active_run_and_cleans_components(

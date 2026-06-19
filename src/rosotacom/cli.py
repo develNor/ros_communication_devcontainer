@@ -155,6 +155,33 @@ class ActiveInteractiveSmokeRun:
 
 
 @dataclass(frozen=True)
+class OtaSmokePeer:
+    name: str
+    ssh: str | None
+    address: str
+
+
+@dataclass(frozen=True)
+class OtaSmokeInventory:
+    path: Path
+    repo_url: str | None
+    ref: str
+    workdir: str
+    rosotacom: str
+    project: str | None
+    peers: dict[str, OtaSmokePeer]
+
+
+@dataclass(frozen=True)
+class ActiveOtaSmokeRun:
+    target: str
+    target_type: str
+    tmux_session: str
+    instance_id: str
+    inventory: str
+
+
+@dataclass(frozen=True)
 class SessionInstance:
     instance_id: str
     host_dir: Path
@@ -1326,6 +1353,1036 @@ def _infer_active_interactive_smoke_run(
         "Multiple active interactive smoke runs found; specify TARGET:\n"
         + "\n".join(f"  - {run.target} ({run.target_type})" for run in matches)
     )
+
+
+def _load_ota_smoke_inventory(path_arg: str | None) -> OtaSmokeInventory:
+    if not path_arg:
+        raise RuntimeError("ota-smoke requires --inventory PATH.")
+    path = Path(path_arg).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    raw = _load_yaml_file(path)
+    if not raw:
+        raise RuntimeError(f"OTA smoke inventory is empty or missing: {path}")
+    if raw.get("schema_version") != 1:
+        raise RuntimeError("OTA smoke inventory schema_version must be 1.")
+    source = raw.get("source") or {}
+    defaults = raw.get("defaults") or {}
+    if not isinstance(source, dict):
+        raise RuntimeError("inventory.source must be a mapping when provided.")
+    if not isinstance(defaults, dict):
+        raise RuntimeError("inventory.defaults must be a mapping when provided.")
+    peers_raw = raw.get("peers")
+    if not isinstance(peers_raw, dict) or len(peers_raw) != 2:
+        raise RuntimeError("OTA smoke v1 requires exactly two peers in inventory.peers.")
+
+    peers: dict[str, OtaSmokePeer] = {}
+    for name, peer_raw in peers_raw.items():
+        if not isinstance(peer_raw, dict):
+            raise RuntimeError(f"inventory.peers.{name} must be a mapping.")
+        address = peer_raw.get("address")
+        if not isinstance(address, str) or not address.strip():
+            raise RuntimeError(f"inventory.peers.{name}.address is required.")
+        ssh = peer_raw.get("ssh")
+        if ssh is not None and not isinstance(ssh, str):
+            raise RuntimeError(f"inventory.peers.{name}.ssh must be a string or null.")
+        peers[str(name)] = OtaSmokePeer(name=str(name), ssh=ssh or None, address=address.strip())
+
+    return OtaSmokeInventory(
+        path=path,
+        repo_url=str(source["repo_url"]) if source.get("repo_url") else None,
+        ref=str(source.get("ref") or "develop"),
+        workdir=str(defaults.get("workdir") or "/tmp/rosotacom_ota"),
+        rosotacom=str(defaults.get("rosotacom") or "rosotacom"),
+        project=str(defaults["project"]) if defaults.get("project") else None,
+        peers=peers,
+    )
+
+
+def _ota_peer_address_overrides(inventory: OtaSmokeInventory) -> dict[str, str]:
+    return {name: peer.address for name, peer in inventory.peers.items()}
+
+
+def _ota_peer_address_args(inventory: OtaSmokeInventory) -> list[str]:
+    return [f"{name}={peer.address}" for name, peer in inventory.peers.items()]
+
+
+def _redact_url_userinfo(url: str | None) -> str | None:
+    if not url:
+        return url
+    return re.sub(r"^(https?://)[^/@]+@", r"\1<redacted>@", url)
+
+
+def _ota_validate_prepare_workdir(workdir: str) -> None:
+    raw = workdir.strip()
+    if raw in {"", "/", ".", "~", "$HOME", "${HOME}"}:
+        raise RuntimeError(f"Refusing dangerous OTA prepare workdir: {workdir!r}")
+    if raw.startswith("-"):
+        raise RuntimeError(f"Refusing OTA prepare workdir that looks like an option: {workdir!r}")
+    if raw.startswith("/") and len(Path(raw).parts) <= 2:
+        raise RuntimeError(f"Refusing broad top-level OTA prepare workdir: {workdir!r}")
+
+
+def _ota_quote_cmd(parts: list[str]) -> str:
+    return shlex.join(parts)
+
+
+def _ota_remote_argv(peer: OtaSmokePeer, script: str, *, tty: bool = False, batch: bool = False) -> list[str]:
+    if peer.ssh:
+        argv = ["ssh"]
+        if batch:
+            argv.extend(["-o", "BatchMode=yes"])
+        if tty:
+            argv.append("-t")
+        argv.extend([peer.ssh, script])
+        return argv
+    return ["bash", "-lc", script]
+
+
+def _ota_run(
+    peer: OtaSmokePeer,
+    script: str,
+    *,
+    label: str,
+    dry_run: bool = False,
+    check: bool = True,
+    tty: bool = False,
+    batch: bool = False,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    argv = _ota_remote_argv(peer, script, tty=tty, batch=batch)
+    print(f"+ {label}: {_ota_quote_cmd(argv)}")
+    if dry_run:
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    result = subprocess.run(argv, text=True, capture_output=not tty, check=False, timeout=timeout)
+    if check and result.returncode != 0:
+        detail = ((result.stdout or "") + (result.stderr or "")).strip()
+        raise RuntimeError(f"{label} failed with exit code {result.returncode}:\n{detail}")
+    return result
+
+
+def _ota_project_cli_args(inventory: OtaSmokeInventory) -> list[str]:
+    if not inventory.project:
+        return []
+    return ["--rosotacom-config", inventory.project]
+
+
+def _ota_rosotacom_command(inventory: OtaSmokeInventory, parts: list[str]) -> str:
+    command = [inventory.rosotacom, *parts, *_ota_project_cli_args(inventory)]
+    return f"cd {shlex.quote(inventory.workdir)} && {_ota_quote_cmd(command)}"
+
+
+def _ota_prepare_script(
+    inventory: OtaSmokeInventory,
+    *,
+    repo_url: str,
+    ref: str,
+    commit_sha: str | None,
+    force: bool,
+) -> str:
+    _ota_validate_prepare_workdir(inventory.workdir)
+    workdir = shlex.quote(inventory.workdir)
+    repo = shlex.quote(repo_url)
+    ref_q = shlex.quote(ref)
+    lines = [
+        "set -eu",
+        'for cmd in python3 git docker; do command -v "$cmd" >/dev/null 2>&1 || '
+        '{ echo "ERROR: missing required command: $cmd" >&2; exit 127; }; done',
+        "docker ps >/dev/null",
+    ]
+    if force:
+        lines.append(f"rm -rf {workdir}")
+    else:
+        lines.append(f"[ ! -e {workdir} ] || {{ echo 'ERROR: workdir exists; pass --force-prepare' >&2; exit 1; }}")
+    lines.extend(
+        [
+            f"git clone --no-single-branch --branch {ref_q} {repo} {workdir}",
+            f"cd {workdir}",
+        ]
+    )
+    if commit_sha:
+        lines.append(f"git checkout --detach {shlex.quote(commit_sha)}")
+    lines.extend(
+        [
+            "./install.sh",
+            ".venv/bin/rosotacom examples create ./rosotacom_examples",
+        ]
+    )
+    return " && ".join(lines)
+
+
+def _ota_target_session_arg(target: InteractiveSmokeTarget) -> str:
+    if target.target_type == "scenario" and target.scenario_definition is not None:
+        return target.scenario_definition.session
+    return target.name
+
+
+def _ota_start_parts(
+    target: InteractiveSmokeTarget,
+    identity: str,
+    instance_id: str,
+    peer_args: list[str],
+    *,
+    mode: str,
+    force: bool = True,
+) -> list[str]:
+    if target.target_type == "scenario":
+        parts = ["scenario", "start", target.name, "--identity", identity, "--mode", mode, "--instance-id", instance_id]
+    else:
+        parts = [
+            "start",
+            _ota_target_session_arg(target),
+            "--identity",
+            identity,
+            "--mode",
+            mode,
+            "--instance-id",
+            instance_id,
+        ]
+    parts.append("--force" if force else "--no-force")
+    for override in peer_args:
+        parts.extend(["--peer-address", override])
+    return parts
+
+
+def _ota_stop_parts(
+    target: InteractiveSmokeTarget,
+    identity: str,
+    instance_id: str | None,
+    peer_args: list[str],
+) -> list[str]:
+    if target.target_type == "scenario":
+        parts = ["scenario", "stop", target.name, "--identity", identity]
+        if instance_id:
+            parts.extend(["--instance-id", instance_id])
+    else:
+        parts = ["stop", _ota_target_session_arg(target), "--identity", identity]
+    for override in peer_args:
+        parts.extend(["--peer-address", override])
+    return parts
+
+
+def _ota_publish_parts(
+    target: InteractiveSmokeTarget,
+    identity: str,
+    peer_args: list[str],
+    *,
+    stop: bool = False,
+) -> list[str]:
+    parts = [
+        "publish-test-topics",
+        _ota_target_session_arg(target),
+        "--identity",
+        identity,
+        "--duration",
+        str(int(SMOKE_PUBLISHER_DURATION_S)),
+    ]
+    if stop:
+        parts.append("--stop")
+    for override in peer_args:
+        parts.extend(["--peer-address", override])
+    return parts
+
+
+def _ota_test_parts(target: InteractiveSmokeTarget, instance_id: str) -> list[str]:
+    return [
+        "test",
+        _ota_target_session_arg(target),
+        "--instance-id",
+        instance_id,
+        "--timeout",
+        "120",
+        "--interval",
+        "2",
+    ]
+
+
+def _ota_status_parts(target: InteractiveSmokeTarget, instance_id: str, identity: str, *, watch: bool) -> list[str]:
+    parts = ["status", _ota_target_session_arg(target), "--identity", identity, "--instance-id", instance_id]
+    if watch:
+        parts.append("--watch")
+    return parts
+
+
+def _ota_probe_publish_parts(
+    target: InteractiveSmokeTarget,
+    identity: str,
+    peer_args: list[str],
+    *,
+    stop: bool,
+) -> list[str]:
+    parts = [
+        "probe-publish",
+        _ota_target_session_arg(target),
+        "--identity",
+        identity,
+        "--topic",
+        ISOLATION_PROBE_TOPIC,
+    ]
+    if stop:
+        parts.append("--stop")
+    for override in peer_args:
+        parts.extend(["--peer-address", override])
+    return parts
+
+
+def _ota_probe_check_parts(target: InteractiveSmokeTarget, identity: str, peer_args: list[str]) -> list[str]:
+    parts = [
+        "probe-check",
+        _ota_target_session_arg(target),
+        "--identity",
+        identity,
+        "--topic",
+        ISOLATION_PROBE_TOPIC,
+        "--expect",
+        "absent",
+    ]
+    for override in peer_args:
+        parts.extend(["--peer-address", override])
+    return parts
+
+
+def _ota_write_manifest(
+    instance: SessionInstance,
+    target: InteractiveSmokeTarget,
+    runtime: RuntimeConfig,
+    inventory: OtaSmokeInventory,
+    *,
+    tmux_session: str | None,
+    interactive: bool,
+    phase: str,
+) -> None:
+    manifest_path = instance.host_dir / "manifest.yaml"
+    manifest = _load_yaml_file(manifest_path)
+    now = datetime.now().isoformat(timespec="seconds")
+    if not manifest:
+        manifest = {
+            "schema_version": 1,
+            "created_at": now,
+            "instance_id": instance.instance_id,
+            "rosotacom_version": __version__,
+            "source_session_host_dir": str(target.session.host_dir),
+            "source_session_container_dir": target.session.container_dir,
+            "source": target.session.source,
+            "config_dir": str(instance.config_host_dir),
+            "logs_dir": str(instance.logs_host_dir),
+            "rosbags_dir": str(instance.rosbags_host_dir),
+            "rollout": None,
+            "starts": [],
+        }
+    manifest["updated_at"] = now
+    run_key = _interactive_smoke_run_key(target.target_type, target.name)
+    runs = manifest.setdefault("ota_smoke_runs", {})
+    run = runs.setdefault(
+        run_key,
+        {
+            "started_at": now,
+            "stopped_at": None,
+            "target": target.name,
+            "target_type": target.target_type,
+            "interactive": interactive,
+            "inventory": str(inventory.path),
+            "source_repo_url": _redact_url_userinfo(inventory.repo_url),
+            "source_ref": inventory.ref,
+            "workdir": inventory.workdir,
+            "project": inventory.project,
+            "peers": {
+                name: {"ssh_configured": bool(peer.ssh), "address": peer.address}
+                for name, peer in inventory.peers.items()
+            },
+        },
+    )
+    run["phase"] = phase
+    run["updated_at"] = now
+    run["tmux_socket"] = _scenario_tmux_socket(runtime) if tmux_session else None
+    run["tmux_session"] = tmux_session
+    if phase == "stopped":
+        run["stopped_at"] = now
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=True, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def _ota_smoke_tmux_session(target_type: str, target_name: str) -> str:
+    return _safe_path_token(f"ota-smoke-{target_type}-{target_name}")
+
+
+def _active_ota_smoke_runs(runtime: RuntimeConfig) -> list[ActiveOtaSmokeRun]:
+    if not shutil.which("tmux"):
+        return []
+    result = subprocess.run(
+        _tmux_command(
+            runtime,
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{@rosotacom_ota_smoke_target}\t#{@rosotacom_ota_smoke_target_type}\t"
+            "#{@rosotacom_ota_smoke_instance}\t#{@rosotacom_ota_smoke_inventory}",
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    runs: list[ActiveOtaSmokeRun] = []
+    for line in result.stdout.splitlines():
+        session_name, _, metadata = line.partition("\t")
+        target, _, rest = metadata.partition("\t")
+        target_type, _, rest = rest.partition("\t")
+        instance_id, _, inventory = rest.partition("\t")
+        if target and target_type and instance_id and inventory:
+            runs.append(
+                ActiveOtaSmokeRun(
+                    target=target,
+                    target_type=target_type,
+                    tmux_session=session_name,
+                    instance_id=instance_id,
+                    inventory=inventory,
+                )
+            )
+    return sorted(runs, key=lambda run: (run.target_type, run.target))
+
+
+def _format_active_ota_smoke_runs(runs: list[ActiveOtaSmokeRun]) -> str:
+    if not runs:
+        return "Active OTA smoke runs:\n  (none)"
+    lines = ["Active OTA smoke runs:"]
+    for run in runs:
+        lines.append(f"  - {run.target} ({run.target_type}) instance={run.instance_id} inventory={run.inventory}")
+    return "\n".join(lines)
+
+
+def _infer_active_ota_smoke_run(
+    runtime: RuntimeConfig,
+    target_arg: str | None,
+    target_type: str,
+) -> ActiveOtaSmokeRun:
+    runs = _active_ota_smoke_runs(runtime)
+    if target_arg:
+        target = _resolve_interactive_smoke_target(target_arg, runtime, target_type)
+        matches = [run for run in runs if run.target == target.name and run.target_type == target.target_type]
+    elif target_type != "auto":
+        matches = [run for run in runs if run.target_type == target_type]
+    else:
+        matches = runs
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise RuntimeError("No active OTA smoke run found.")
+    raise RuntimeError(
+        "Multiple active OTA smoke runs found; specify TARGET:\n"
+        + "\n".join(f"  - {run.target} ({run.target_type})" for run in matches)
+    )
+
+
+def _resolve_ota_smoke_context(
+    args: argparse.Namespace,
+) -> tuple[RuntimeConfig, OtaSmokeInventory, InteractiveSmokeTarget]:
+    runtime = _load_runtime_config(args)
+    inventory = _load_ota_smoke_inventory(getattr(args, "inventory", None))
+    target = _resolve_interactive_smoke_target(
+        getattr(args, "target", None),
+        runtime,
+        getattr(args, "target_type", "auto"),
+        peer_address_overrides=_ota_peer_address_overrides(inventory),
+    )
+    inventory_peers = set(inventory.peers)
+    target_peers = set(_peer_keys_from_cfg(target.cfg))
+    if inventory_peers != target_peers:
+        raise RuntimeError(
+            "OTA smoke inventory peers must match the target session peers: "
+            f"inventory={sorted(inventory_peers)} target={sorted(target_peers)}"
+        )
+    return runtime, inventory, target
+
+
+def _ota_preflight(
+    inventory: OtaSmokeInventory,
+    *,
+    prepare: bool,
+    require_tmux: bool,
+    check_peer_reachability: bool,
+    dry_run: bool,
+) -> None:
+    for peer in inventory.peers.values():
+        if peer.ssh:
+            _ota_run(peer, "true", label=f"{peer.name}: SSH reachable", dry_run=dry_run, batch=True)
+        required = ["python3", "docker"]
+        if prepare:
+            required.append("git")
+        else:
+            rosotacom_cmd = inventory.rosotacom.split()[0]
+            if "/" in rosotacom_cmd:
+                _ota_run(
+                    peer,
+                    f"cd {shlex.quote(inventory.workdir)} && test -x {shlex.quote(rosotacom_cmd)}",
+                    label=f"{peer.name}: required command {rosotacom_cmd}",
+                    dry_run=dry_run,
+                    batch=True,
+                )
+            else:
+                required.append(rosotacom_cmd)
+        if require_tmux:
+            required.append("tmux")
+        for command in required:
+            _ota_run(
+                peer,
+                f"command -v {shlex.quote(command)} >/dev/null 2>&1",
+                label=f"{peer.name}: required command {command}",
+                dry_run=dry_run,
+                batch=True,
+            )
+        _ota_run(peer, "docker ps >/dev/null", label=f"{peer.name}: docker access", dry_run=dry_run, batch=True)
+
+    if check_peer_reachability:
+        for src in inventory.peers.values():
+            for dst in inventory.peers.values():
+                if src.name == dst.name:
+                    continue
+                _ota_run(
+                    src,
+                    f"ping -c3 -W2 {shlex.quote(dst.address)} >/dev/null",
+                    label=f"{src.name}: reach peer {dst.name} ({dst.address})",
+                    dry_run=dry_run,
+                    check=False,
+                    batch=True,
+                )
+
+
+def _ota_prepare_hosts(args: argparse.Namespace, inventory: OtaSmokeInventory) -> None:
+    repo_url = getattr(args, "repo_url", None) or inventory.repo_url
+    if not repo_url:
+        raise RuntimeError("ota-smoke --prepare requires source.repo_url in inventory or --repo-url.")
+    ref = getattr(args, "ref", None) or inventory.ref
+    commit_sha = getattr(args, "commit_sha", None)
+    script = _ota_prepare_script(
+        inventory,
+        repo_url=repo_url,
+        ref=ref,
+        commit_sha=commit_sha,
+        force=bool(getattr(args, "force_prepare", False)),
+    )
+    for peer in inventory.peers.values():
+        _ota_run(
+            peer,
+            script,
+            label=f"{peer.name}: prepare rosotacom checkout",
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+
+
+def _ota_start_peers(
+    target: InteractiveSmokeTarget,
+    inventory: OtaSmokeInventory,
+    instance_id: str,
+    *,
+    dry_run: bool,
+    mode: str = "detached",
+) -> None:
+    peer_args = _ota_peer_address_args(inventory)
+    for peer_name in sorted(inventory.peers):
+        peer = inventory.peers[peer_name]
+        command = _ota_rosotacom_command(
+            inventory,
+            _ota_start_parts(target, peer_name, instance_id, peer_args, mode=mode),
+        )
+        _ota_run(peer, command, label=f"{peer_name}: start {target.name}", dry_run=dry_run)
+
+
+def _ota_start_session_publishers(
+    target: InteractiveSmokeTarget,
+    inventory: OtaSmokeInventory,
+    *,
+    dry_run: bool,
+) -> None:
+    if target.target_type != "session":
+        return
+    peer_args = _ota_peer_address_args(inventory)
+    for peer_name in sorted(inventory.peers):
+        peer = inventory.peers[peer_name]
+        command = _ota_rosotacom_command(inventory, _ota_publish_parts(target, peer_name, peer_args))
+        _ota_run(peer, command, label=f"{peer_name}: start synthetic publishers", dry_run=dry_run, check=False)
+
+
+def _ota_stop_session_publishers(
+    target: InteractiveSmokeTarget,
+    inventory: OtaSmokeInventory,
+    *,
+    dry_run: bool,
+) -> None:
+    if target.target_type != "session":
+        return
+    peer_args = _ota_peer_address_args(inventory)
+    for peer_name in sorted(inventory.peers):
+        peer = inventory.peers[peer_name]
+        command = _ota_rosotacom_command(inventory, _ota_publish_parts(target, peer_name, peer_args, stop=True))
+        _ota_run(peer, command, label=f"{peer_name}: stop synthetic publishers", dry_run=dry_run, check=False)
+
+
+def _ota_verify_delivery(
+    target: InteractiveSmokeTarget,
+    inventory: OtaSmokeInventory,
+    instance_id: str,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    errors: list[str] = []
+    for peer_name in sorted(inventory.peers):
+        peer = inventory.peers[peer_name]
+        command = _ota_rosotacom_command(inventory, _ota_test_parts(target, instance_id))
+        result = _ota_run(peer, command, label=f"{peer_name}: rosotacom test", dry_run=dry_run, check=False)
+        if result.returncode != 0:
+            errors.append(f"{peer_name}: rosotacom test failed")
+    return errors
+
+
+def _ota_verify_isolation(
+    target: InteractiveSmokeTarget,
+    inventory: OtaSmokeInventory,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    peer_names = sorted(inventory.peers)
+    source_name, receiver_name = peer_names[0], peer_names[1]
+    source = inventory.peers[source_name]
+    receiver = inventory.peers[receiver_name]
+    peer_args = _ota_peer_address_args(inventory)
+    errors: list[str] = []
+    publish = _ota_rosotacom_command(inventory, _ota_probe_publish_parts(target, source_name, peer_args, stop=False))
+    published = _ota_run(source, publish, label=f"{source_name}: publish isolation probe", dry_run=dry_run, check=False)
+    if published.returncode != 0:
+        errors.append(f"{source_name}: isolation probe publisher failed")
+        return errors
+    check = _ota_rosotacom_command(inventory, _ota_probe_check_parts(target, receiver_name, peer_args))
+    checked = _ota_run(
+        receiver,
+        check,
+        label=f"{receiver_name}: check isolation probe absent",
+        dry_run=dry_run,
+        check=False,
+    )
+    if checked.returncode != 0:
+        errors.append(f"{receiver_name}: isolation probe crossed OTA boundary")
+    stop = _ota_rosotacom_command(inventory, _ota_probe_publish_parts(target, source_name, peer_args, stop=True))
+    _ota_run(source, stop, label=f"{source_name}: stop isolation probe", dry_run=dry_run, check=False)
+    return errors
+
+
+def _ota_collect_logs(
+    instance: SessionInstance,
+    inventory: OtaSmokeInventory,
+    *,
+    dry_run: bool,
+) -> None:
+    if not inventory.project:
+        return
+    project = shlex.quote(inventory.project)
+    instance_suffix = shlex.quote(f"*_{instance.instance_id}")
+    script = (
+        f"cd {shlex.quote(inventory.workdir)} && "
+        f"project_dir=$(dirname {project}) && "
+        f'instance_dir=$(find "$project_dir/session-instances" -mindepth 2 -maxdepth 2 '
+        f"-type d -name {instance_suffix} -print -quit 2>/dev/null) && "
+        'if [ -n "$instance_dir" ]; then '
+        'relative=${instance_dir#"$project_dir"/}; '
+        'tar cz -C "$project_dir" "$relative" 2>/dev/null | base64; fi'
+    )
+    out_dir = instance.logs_host_dir / "ota-smoke"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for peer in inventory.peers.values():
+        result = _ota_run(peer, script, label=f"{peer.name}: collect session-instances", dry_run=dry_run, check=False)
+        if dry_run or not result.stdout.strip():
+            continue
+        (out_dir / f"{_safe_path_token(peer.name)}-session-instances.tar.gz.b64").write_text(
+            result.stdout,
+            encoding="utf-8",
+        )
+
+
+def _ota_stop_peers(
+    target: InteractiveSmokeTarget,
+    inventory: OtaSmokeInventory,
+    instance_id: str | None,
+    *,
+    dry_run: bool,
+) -> None:
+    _ota_stop_session_publishers(target, inventory, dry_run=dry_run)
+    peer_args = _ota_peer_address_args(inventory)
+    for peer_name in sorted(inventory.peers):
+        peer = inventory.peers[peer_name]
+        command = _ota_rosotacom_command(inventory, _ota_stop_parts(target, peer_name, instance_id, peer_args))
+        _ota_run(peer, command, label=f"{peer_name}: stop {target.name}", dry_run=dry_run, check=False)
+
+
+def _ota_verify_only(args: argparse.Namespace) -> int:
+    _runtime, inventory, target = _resolve_ota_smoke_context(args)
+    instance_id = getattr(args, "instance_id", None)
+    if not instance_id:
+        raise RuntimeError("ota-smoke --verify-only requires --instance-id.")
+    dry_run = bool(getattr(args, "dry_run", False))
+    _ota_start_session_publishers(target, inventory, dry_run=dry_run)
+    errors = _ota_verify_delivery(target, inventory, instance_id, dry_run=dry_run)
+    errors += _ota_verify_isolation(target, inventory, dry_run=dry_run)
+    if errors:
+        for error in errors:
+            print(f"OTA SMOKE ERROR: {error}", file=sys.stderr)
+        return 1
+    print("OTA SMOKE OK")
+    return 0
+
+
+def _ota_status_watch_script(
+    inventory: OtaSmokeInventory,
+    target: InteractiveSmokeTarget,
+    instance_id: str,
+    peer_name: str,
+) -> str:
+    return _ota_rosotacom_command(inventory, _ota_status_parts(target, instance_id, peer_name, watch=True))
+
+
+def _ota_debug_shell_script(inventory: OtaSmokeInventory) -> str:
+    return f'cd {shlex.quote(inventory.workdir)} && exec "${{SHELL:-bash}}"'
+
+
+def _ota_create_tmux(
+    runtime: RuntimeConfig,
+    target: InteractiveSmokeTarget,
+    inventory: OtaSmokeInventory,
+    instance: SessionInstance,
+) -> str:
+    _require_tmux()
+    session_name = _ota_smoke_tmux_session(target.target_type, target.name)
+    peer_args = _ota_peer_address_args(inventory)
+    peers = [inventory.peers[name] for name in sorted(inventory.peers)]
+    first_peer = peers[0]
+    first_start = _ota_rosotacom_command(
+        inventory,
+        _ota_start_parts(target, first_peer.name, instance.instance_id, peer_args, mode="detached"),
+    )
+    first_status = _ota_status_watch_script(inventory, target, instance.instance_id, first_peer.name)
+    first_script = f"set -e; {first_start}; echo; echo '[INFO] live remote status follows'; {first_status}"
+    created = subprocess.run(
+        _tmux_command(
+            runtime,
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-s",
+            session_name,
+            "-n",
+            _safe_path_token(f"{first_peer.name}_remote"),
+            _ota_quote_cmd(_ota_remote_argv(first_peer, first_script, tty=bool(first_peer.ssh))),
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    first_pane = created.stdout.strip()
+    subprocess.run(
+        _tmux_command(runtime, "set-window-option", "-g", "-t", session_name, "remain-on-exit", "on"),
+        check=True,
+    )
+    subprocess.run(_tmux_command(runtime, "set-option", "-t", session_name, "prefix", "C-b"), check=True)
+    subprocess.run(_tmux_command(runtime, "bind-key", "-T", "prefix", "C-b", "send-prefix"), check=True)
+    for key, value in (
+        ("@rosotacom_ota_smoke_target", target.name),
+        ("@rosotacom_ota_smoke_target_type", target.target_type),
+        ("@rosotacom_ota_smoke_instance", instance.instance_id),
+        ("@rosotacom_ota_smoke_inventory", str(inventory.path)),
+    ):
+        subprocess.run(_tmux_command(runtime, "set-option", "-t", session_name, key, value), check=True)
+    subprocess.run(_tmux_command(runtime, "set-option", "-t", session_name, "pane-border-status", "top"), check=True)
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "pane-border-format", " #{pane_title} "),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(
+            runtime,
+            "set-option",
+            "-t",
+            session_name,
+            "status-right",
+            " ota smoke | windows: C-b n/p | remote tmux attach is opt-in ",
+        ),
+        check=True,
+    )
+    subprocess.run(
+        _tmux_command(runtime, "select-pane", "-t", first_pane, "-T", f"{first_peer.name}:remote"),
+        check=True,
+    )
+    _attach_tmux_pipe(runtime, first_pane, instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-remote.log")
+
+    for peer in peers[1:]:
+        start = _ota_rosotacom_command(
+            inventory,
+            _ota_start_parts(target, peer.name, instance.instance_id, peer_args, mode="detached"),
+        )
+        status = _ota_status_watch_script(inventory, target, instance.instance_id, peer.name)
+        script = f"set -e; {start}; echo; echo '[INFO] live remote status follows'; {status}"
+        created_window = subprocess.run(
+            _tmux_command(
+                runtime,
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                session_name,
+                "-n",
+                _safe_path_token(f"{peer.name}_remote"),
+                _ota_quote_cmd(_ota_remote_argv(peer, script, tty=bool(peer.ssh))),
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        pane_id = created_window.stdout.strip()
+        subprocess.run(_tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"{peer.name}:remote"), check=True)
+        _attach_tmux_pipe(runtime, pane_id, instance.logs_host_dir / "ota-smoke" / f"{peer.name}-remote.log")
+
+    for peer in peers:
+        shell_script = _ota_debug_shell_script(inventory)
+        created_shell = subprocess.run(
+            _tmux_command(
+                runtime,
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                session_name,
+                "-n",
+                _safe_path_token(f"{peer.name}_shell"),
+                _ota_quote_cmd(_ota_remote_argv(peer, shell_script, tty=bool(peer.ssh))),
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        pane_id = created_shell.stdout.strip()
+        subprocess.run(_tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"{peer.name}:shell"), check=True)
+
+    verify_parts = [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "ota-smoke",
+        target.name,
+        "--inventory",
+        str(inventory.path),
+        "--target-type",
+        target.target_type,
+        "--instance-id",
+        instance.instance_id,
+        "--verify-only",
+        *_runtime_cli_args(runtime),
+    ]
+    verify_cmd = _ota_quote_cmd(verify_parts)
+    verify_script = f"{verify_cmd}; rc=$?; echo; echo '[INFO] verification exited with status' \"$rc\"; exec bash"
+    verification = subprocess.run(
+        _tmux_command(
+            runtime,
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            session_name,
+            "-n",
+            "verification",
+            _host_shell(verify_script),
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    verification_pane = verification.stdout.strip()
+    subprocess.run(_tmux_command(runtime, "select-pane", "-t", verification_pane, "-T", "verification"), check=True)
+    _attach_tmux_pipe(runtime, verification_pane, instance.logs_host_dir / "ota-smoke" / "verification.log")
+    subprocess.run(_tmux_command(runtime, "select-window", "-t", f"{session_name}:verification"), check=True)
+    return session_name
+
+
+def _list_ota_smoke(args: argparse.Namespace) -> int:
+    runtime = _load_runtime_config(args)
+    print(_format_active_ota_smoke_runs(_active_ota_smoke_runs(runtime)))
+    return 0
+
+
+def _start_interactive_ota_smoke(args: argparse.Namespace) -> int:
+    runtime, inventory, target = _resolve_ota_smoke_context(args)
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not getattr(args, "skip_preflight", False):
+        _ota_preflight(
+            inventory,
+            prepare=bool(getattr(args, "prepare", False)),
+            require_tmux=target.target_type == "scenario",
+            check_peer_reachability=bool(getattr(args, "check_peer_reachability", False)),
+            dry_run=dry_run,
+        )
+    if getattr(args, "prepare", False):
+        _ota_prepare_hosts(args, inventory)
+    tmux_session = _ota_smoke_tmux_session(target.target_type, target.name)
+    mode = _resolve_mode(getattr(args, "mode", "auto"))
+    if _tmux_session_exists(runtime, tmux_session):
+        print(f"OTA smoke already running: {target.name} ({target.target_type})")
+        if mode == "attach":
+            subprocess.run(_tmux_command(runtime, "attach-session", "-t", tmux_session), check=True)
+        else:
+            print(
+                "Attach with: rosotacom ota-smoke "
+                f"{shlex.quote(target.name)} --inventory {shlex.quote(str(inventory.path))} --interactive"
+            )
+        return 0
+
+    instance = _resolve_session_instance(
+        runtime,
+        target.session,
+        getattr(args, "instance_id", None) or _new_instance_id(),
+    )
+    _ota_write_manifest(
+        instance,
+        target,
+        runtime,
+        inventory,
+        tmux_session=tmux_session,
+        interactive=True,
+        phase="running",
+    )
+    if dry_run:
+        print(f"Would create OTA smoke tmux session: {tmux_session}")
+        print(f"OTA smoke artifacts: {instance.host_dir}")
+        return 0
+    created = _ota_create_tmux(runtime, target, inventory, instance)
+    print(f"rosotacom OTA smoke instance: {instance.host_dir}")
+    print(f"rosotacom OTA smoke started: {target.name} ({target.target_type})")
+    print("Local control tmux prefix: Ctrl-b. Remote scenario/catmux attach is opt-in from debug shells.")
+    if target.target_type == "scenario":
+        for peer_name, peer in inventory.peers.items():
+            attach = _ota_rosotacom_command(inventory, ["scenario", "attach", target.name, "--identity", peer_name])
+            attach_cmd = _ota_quote_cmd(_ota_remote_argv(peer, attach, tty=bool(peer.ssh)))
+            print(f"Remote scenario attach for {peer_name}: {attach_cmd}")
+    if mode == "attach":
+        subprocess.run(_tmux_command(runtime, "attach-session", "-t", created), check=True)
+    else:
+        print(
+            "Attach with: rosotacom ota-smoke "
+            f"{shlex.quote(target.name)} --inventory {shlex.quote(str(inventory.path))} --interactive"
+        )
+        print(
+            "Stop with: rosotacom ota-smoke "
+            f"{shlex.quote(target.name)} --inventory {shlex.quote(str(inventory.path))} --stop"
+        )
+    return 0
+
+
+def _start_noninteractive_ota_smoke(args: argparse.Namespace) -> int:
+    runtime, inventory, target = _resolve_ota_smoke_context(args)
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not getattr(args, "skip_preflight", False):
+        _ota_preflight(
+            inventory,
+            prepare=bool(getattr(args, "prepare", False)),
+            require_tmux=target.target_type == "scenario",
+            check_peer_reachability=bool(getattr(args, "check_peer_reachability", False)),
+            dry_run=dry_run,
+        )
+    if getattr(args, "prepare", False):
+        _ota_prepare_hosts(args, inventory)
+    instance = _resolve_session_instance(
+        runtime,
+        target.session,
+        getattr(args, "instance_id", None) or _new_instance_id(),
+    )
+    _ota_write_manifest(
+        instance,
+        target,
+        runtime,
+        inventory,
+        tmux_session=None,
+        interactive=False,
+        phase="running",
+    )
+    errors: list[str] = []
+    try:
+        _ota_start_peers(target, inventory, instance.instance_id, dry_run=dry_run)
+        if not dry_run:
+            time.sleep(12)
+        _ota_start_session_publishers(target, inventory, dry_run=dry_run)
+        errors += _ota_verify_delivery(target, inventory, instance.instance_id, dry_run=dry_run)
+        errors += _ota_verify_isolation(target, inventory, dry_run=dry_run)
+        if errors:
+            raise RuntimeError("OTA smoke verification failed:\n  - " + "\n  - ".join(errors))
+        print("OTA SMOKE OK")
+        return 0
+    finally:
+        _ota_collect_logs(instance, inventory, dry_run=dry_run)
+        if not getattr(args, "keep_running", False):
+            _ota_stop_peers(target, inventory, instance.instance_id, dry_run=dry_run)
+            _ota_write_manifest(
+                instance,
+                target,
+                runtime,
+                inventory,
+                tmux_session=None,
+                interactive=False,
+                phase="stopped",
+            )
+        print(f"OTA smoke artifacts: {instance.host_dir}")
+
+
+def _stop_ota_smoke(args: argparse.Namespace) -> int:
+    runtime = _load_runtime_config(args)
+    dry_run = bool(getattr(args, "dry_run", False))
+    target_arg = getattr(args, "target", None)
+    target_type = getattr(args, "target_type", "auto")
+    active: ActiveOtaSmokeRun | None = None
+    if not getattr(args, "inventory", None):
+        active = _infer_active_ota_smoke_run(runtime, target_arg, target_type)
+        args.inventory = active.inventory
+        args.instance_id = getattr(args, "instance_id", None) or active.instance_id
+        args.target = target_arg or active.target
+        args.target_type = active.target_type
+    runtime, inventory, target = _resolve_ota_smoke_context(args)
+    instance_id = getattr(args, "instance_id", None)
+    _ota_stop_peers(target, inventory, instance_id, dry_run=dry_run)
+    tmux_session = active.tmux_session if active else _ota_smoke_tmux_session(target.target_type, target.name)
+    if dry_run:
+        print(f"Would stop OTA smoke tmux session: {tmux_session}")
+    elif _kill_scenario_tmux(runtime, tmux_session):
+        print(f"Stopped OTA smoke tmux session: {tmux_session}")
+    if instance_id and not dry_run:
+        instance = _resolve_session_instance(runtime, target.session, instance_id)
+        _ota_write_manifest(
+            instance,
+            target,
+            runtime,
+            inventory,
+            tmux_session=None,
+            interactive=bool(active),
+            phase="stopped",
+        )
+    print(f"OTA smoke cleanup attempted for: {target.name} ({target.target_type})")
+    return 0
+
+
+def ota_smoke(args: argparse.Namespace) -> int:
+    if getattr(args, "verify_only", False):
+        return _ota_verify_only(args)
+    if getattr(args, "list", False):
+        return _list_ota_smoke(args)
+    if getattr(args, "stop", False):
+        return _stop_ota_smoke(args)
+    if getattr(args, "interactive", False):
+        return _start_interactive_ota_smoke(args)
+    return _start_noninteractive_ota_smoke(args)
 
 
 def _scenario_name_completer(
@@ -4359,6 +5416,7 @@ def main(argv: list[str] | None = None) -> int:
         "stop",
         "doctor",
         "smoke",
+        "ota-smoke",
         "status",
         "test",
         "verify",  # retired; keep guarded so it is not rewritten as `start verify`.
@@ -4429,6 +5487,48 @@ def main(argv: list[str] | None = None) -> int:
     _add_peer_address_arg(smoke_parser)
     smoke_parser.add_argument("--verify-only", action="store_true", help=argparse.SUPPRESS)
     smoke_parser.set_defaults(func=smoke)
+
+    ota_smoke_parser = subparsers.add_parser("ota-smoke", help="Run a generic multi-machine OTA smoke test.")
+    _add_common_config_args(ota_smoke_parser)
+    ota_target = ota_smoke_parser.add_argument("target", nargs="?")
+    cast(Any, ota_target).completer = _smoke_target_completer
+    inventory_arg = ota_smoke_parser.add_argument("--inventory", help="OTA smoke inventory YAML.")
+    cast(Any, inventory_arg).completer = DirectoriesCompleter()
+    ota_smoke_parser.add_argument("--target-type", choices=["auto", "session", "scenario"], default="auto")
+    ota_smoke_parser.add_argument("--interactive", action="store_true", help="Open a local control tmux UI.")
+    ota_smoke_parser.add_argument("--stop", action="store_true", help="Stop an OTA smoke run.")
+    ota_smoke_parser.add_argument("--list", action="store_true", help="List active interactive OTA smoke runs.")
+    ota_smoke_parser.add_argument("--mode", choices=["auto", "attach", "detached"], default="auto")
+    ota_smoke_parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
+    ota_smoke_parser.add_argument("--prepare", action="store_true", help="Clone/install rosotacom on each peer first.")
+    ota_smoke_parser.add_argument(
+        "--force-prepare",
+        action="store_true",
+        help="Allow --prepare to replace the configured workdir.",
+    )
+    ota_smoke_parser.add_argument(
+        "--repo-url",
+        help="Repository URL for --prepare (overrides inventory source.repo_url).",
+    )
+    ota_smoke_parser.add_argument("--ref", help="Repository branch/ref for --prepare (overrides inventory source.ref).")
+    ota_smoke_parser.add_argument(
+        "--commit-sha",
+        help="Optional commit SHA to check out after cloning during --prepare.",
+    )
+    ota_smoke_parser.add_argument("--skip-preflight", action="store_true", help="Skip SSH/Docker readiness checks.")
+    ota_smoke_parser.add_argument(
+        "--check-peer-reachability",
+        action="store_true",
+        help="Also ping every peer address from every other peer during preflight.",
+    )
+    ota_smoke_parser.add_argument("--keep-running", action="store_true", help="Leave remote components running.")
+    ota_smoke_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print remote commands without executing them.",
+    )
+    ota_smoke_parser.add_argument("--verify-only", action="store_true", help=argparse.SUPPRESS)
+    ota_smoke_parser.set_defaults(func=ota_smoke)
 
     status_parser = subparsers.add_parser(
         "status", help="Show the live per-topic pipeline status for a session instance."

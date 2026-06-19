@@ -47,6 +47,7 @@ def test_packaged_example_project_contains_documented_heartbeat_session() -> Non
     assert "`1_heartbeat`" in readme
     assert "rosotacom scenario start 2_native_chatter" in readme
     assert "rosotacom smoke 2_native_chatter --interactive" in readme
+    assert "rosotacom ota-smoke 2_native_chatter --inventory ota-smoke.yaml --interactive" in readme
     assert (cli.EXAMPLE_PROJECT_DIR / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
     assert (cli.EXAMPLE_PROJECT_DIR / "scenarios" / "2_native_chatter" / "scenario-definition.yaml").is_file()
     assert (cli.EXAMPLE_PROJECT_DIR / "scripts" / "1_heartbeat" / "run_machine_a.sh").is_file()
@@ -62,3 +63,15 @@ def test_packaged_native_chatter_scenario_and_application_configs_load() -> None
 
     assert definition.session == "2_native_chatter"
     assert set(definition.applications) == {"a", "b"}
+
+
+def test_public_docs_do_not_contain_private_host_inventory_details() -> None:
+    public_text = "\n".join(
+        [
+            (PACKAGE_ROOT / "README.md").read_text(encoding="utf-8"),
+            (PACKAGE_ROOT / "docs" / "testing.md").read_text(encoding="utf-8"),
+        ]
+    )
+
+    for private_token in ("tks-lamborghini", "tks-majestic", "majestic_go914", "10.254.0."):
+        assert private_token not in public_text

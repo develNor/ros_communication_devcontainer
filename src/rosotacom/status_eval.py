@@ -2,11 +2,29 @@
 `expect` contract declared in its session-definition.
 
 This is the test-side half of the expectation-driven model (see
-docs/rfcs/0001-expectation-driven-test-suite.md): the live status overview already
+docs/rfcs/0001-expectation-driven-test-suite.md and
+docs/rfcs/0002-expectation-concepts.md): the live status overview already
 classifies every topic (state/quality/hz/latency per stage); `rosotacom test`
-reads that self-report and asserts each crossed topic was delivered (overall OK)
-and that the inbound side meets its declared hz/latency expectations. Pure
-functions (no ROS/Docker), so they are unit-testable against status.json fixtures.
+reads that self-report and asserts each crossed topic meets its declared
+contract. Pure functions (no ROS/Docker), so they are unit-testable against
+status.json fixtures.
+
+Per-topic `expect` supports (all optional):
+
+  presence: required | optional   (default required) -- an optional topic that
+            does not deliver is not a failure (e.g. a bidirectional command
+            topic with no source in a one-directional replay test).
+  mode:     stream | latched | existence   (default stream)
+            - stream:    must deliver end-to-end and currently be FLOWING; hz /
+                         latency_ms / quality are asserted.
+            - latched:   must have delivered its value at least once (and may be
+                         held via transient_local). Rate is NOT required -- a
+                         static/latched topic publishes on change and then idles.
+            - existence: only requires the topic to be present in the graph (a
+                         publisher exists). For irregular topics where neither
+                         rate nor a held value is meaningful.
+  hz:       { min, max }           (stream only)
+  latency_ms: { max }              (stream only)
 """
 
 from __future__ import annotations
@@ -14,6 +32,12 @@ from __future__ import annotations
 from typing import Any
 
 STATUS_OK = "OK"
+
+# Stage states reported by the status overview (status_overview_core.py).
+_DELIVERED_STATES = {"FLOWING", "STALE"}  # a message was observed at least once
+
+_VALID_MODES = {"stream", "latched", "existence"}
+_VALID_PRESENCE = {"required", "optional"}
 
 
 def expectations_from_cfg(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -29,6 +53,20 @@ def expectations_from_cfg(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _topic_mode(expect: dict[str, Any]) -> str:
+    mode = str(expect.get("mode", "stream")).strip().lower() or "stream"
+    if mode not in _VALID_MODES:
+        raise ValueError(f"expect.mode must be one of {sorted(_VALID_MODES)}, got {mode!r}")
+    return mode
+
+
+def _is_optional(expect: dict[str, Any]) -> bool:
+    presence = str(expect.get("presence", "required")).strip().lower() or "required"
+    if presence not in _VALID_PRESENCE:
+        raise ValueError(f"expect.presence must be one of {sorted(_VALID_PRESENCE)}, got {presence!r}")
+    return presence == "optional"
+
+
 def _final_stage(topic: dict[str, Any]) -> dict[str, Any] | None:
     """The deepest *flowing* stage of a topic pipeline (its delivered end)."""
     stages: list[dict[str, Any]] = topic.get("stages") or []
@@ -36,6 +74,22 @@ def _final_stage(topic: dict[str, Any]) -> dict[str, Any] | None:
     if flowing:
         return flowing[-1]
     return stages[-1] if stages else None
+
+
+def _was_delivered(topic: dict[str, Any]) -> bool:
+    """True if this peer's end of the pipeline ever observed a message (the final
+    stage is FLOWING or STALE). For a latched topic this means the held value
+    reached its destination even though it no longer ticks."""
+    stages: list[dict[str, Any]] = topic.get("stages") or []
+    if not stages:
+        return False
+    return stages[-1].get("state") in _DELIVERED_STATES
+
+
+def _has_publisher(topic: dict[str, Any]) -> bool:
+    """True if any stage advertises a publisher (the topic exists in the graph)."""
+    stages: list[dict[str, Any]] = topic.get("stages") or []
+    return any((s.get("publishers") or 0) > 0 for s in stages)
 
 
 def _check_expect(peer: str, base: str, stage: dict[str, Any], expect: dict[str, Any]) -> list[str]:
@@ -60,25 +114,36 @@ def evaluate_report(report: dict[str, Any], expect_by_topic: dict[str, dict[str,
     failures: list[str] = []
     for topic in topics:
         base = topic.get("base", "?")
+        expect = expect_by_topic.get(base) or {}
+        mode = _topic_mode(expect)
+        optional = _is_optional(expect)
         overall = topic.get("overall")
-        if overall != STATUS_OK:
-            diag = topic.get("diagnosis")
-            failures.append(f"[{peer}] {base}: status {overall}" + (f" ({diag})" if diag else ""))
+
+        if overall == STATUS_OK:
+            stage = _final_stage(topic)
+            # Stream contracts assert delivered behaviour against the monitor's
+            # own verdict and the declared thresholds. latched/existence topics
+            # only need to have reached OK, which they have.
+            if mode == "stream":
+                if stage and stage.get("quality") == "BAD":
+                    reason = stage.get("quality_reason")
+                    detail = f": {reason}" if reason else ""
+                    failures.append(f"[{peer}] {base}: contract violated (quality BAD{detail})")
+                    continue
+                if expect and topic.get("direction") == "inbound" and stage is not None:
+                    failures += _check_expect(peer, base, stage, expect)
             continue
-        stage = _final_stage(topic)
-        # Lean on the session's own verdict: the status overview now classifies
-        # each stage against the topic's `expect`, so a BAD stage means the
-        # delivered behavior violates the declared contract.
-        if stage and stage.get("quality") == "BAD":
-            reason = stage.get("quality_reason")
-            detail = f": {reason}" if reason else ""
-            failures.append(f"[{peer}] {base}: contract violated (quality BAD{detail})")
-            continue
-        # Belt-and-suspenders: also assert raw metrics against `expect` directly,
-        # for a precise message and independence from the monitor's thresholds.
-        expect = expect_by_topic.get(base)
-        if expect and topic.get("direction") == "inbound" and stage is not None:
-            failures += _check_expect(peer, base, stage, expect)
+
+        # overall != OK -- reinterpret per the declared delivery mode.
+        if mode == "latched" and _was_delivered(topic):
+            continue  # held value delivered; a latched topic is not expected to tick
+        if mode == "existence" and _has_publisher(topic):
+            continue  # present in the graph as required
+        if optional:
+            continue  # optional: non-delivery is not a failure
+
+        diag = topic.get("diagnosis")
+        failures.append(f"[{peer}] {base}: status {overall}" + (f" ({diag})" if diag else ""))
     return failures
 
 

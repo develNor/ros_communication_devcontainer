@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from rosotacom.status_eval import evaluate_report, evaluate_reports, expectations_from_cfg
 
 
-def _stage(stage: str, hz: float, latency_ms: float | None, state: str = "FLOWING") -> dict:
-    return {"stage": stage, "hz": hz, "latency_ms": latency_ms, "state": state}
+def _stage(stage: str, hz: float, latency_ms: float | None, state: str = "FLOWING", publishers: int = 1) -> dict:
+    return {"stage": stage, "hz": hz, "latency_ms": latency_ms, "state": state, "publishers": publishers}
 
 
 def _topic(base: str, direction: str, overall: str, stages: list[dict]) -> dict:
@@ -83,3 +85,78 @@ def test_bad_quality_on_final_stage_fails_even_when_delivered() -> None:
     report = {"peer": "b", "topics": [_topic("/heartbeat_a", "inbound", "OK", [bad_stage])]}
     failures = evaluate_report(report, {})
     assert len(failures) == 1 and "contract violated" in failures[0] and "hz" in failures[0]
+
+
+# --- presence: required | optional ------------------------------------------
+
+
+def _stalled(base: str, *, state: str, publishers: int) -> dict:
+    t = _topic(base, "inbound", "STALLED", [_stage("app_in", 0.0, None, state, publishers)])
+    t["diagnosis"] = "no publisher" if publishers == 0 else "stopped 9s ago"
+    return t
+
+
+def test_optional_topic_not_delivered_passes() -> None:
+    # An optional topic (e.g. an a_to_b command with no source in a one-way
+    # replay test) that never delivers is not a failure.
+    report = {"peer": "a", "topics": [_stalled("/cmd", state="ABSENT", publishers=0)]}
+    assert evaluate_report(report, {"/cmd": {"presence": "optional"}}) == []
+
+
+def test_required_topic_not_delivered_still_fails() -> None:
+    report = {"peer": "a", "topics": [_stalled("/cmd", state="ABSENT", publishers=0)]}
+    failures = evaluate_report(report, {"/cmd": {"presence": "required"}})
+    assert len(failures) == 1 and "STALLED" in failures[0]
+
+
+# --- mode: latched ----------------------------------------------------------
+
+
+def test_latched_delivered_then_idle_passes() -> None:
+    # A latched/static topic delivers its value once and then stops ticking; the
+    # final stage is STALE, overall is STALLED, but the held value arrived.
+    report = {"peer": "a", "topics": [_stalled("/site", state="STALE", publishers=1)]}
+    assert evaluate_report(report, {"/site": {"mode": "latched"}}) == []
+
+
+def test_latched_never_delivered_fails() -> None:
+    # Publisher present but no message ever observed -> the latch never arrived.
+    report = {"peer": "a", "topics": [_stalled("/site", state="IDLE", publishers=1)]}
+    failures = evaluate_report(report, {"/site": {"mode": "latched"}})
+    assert len(failures) == 1 and "STALLED" in failures[0]
+
+
+def test_latched_does_not_assert_rate_when_ok() -> None:
+    # A latched topic that happens to be FLOWING must not fail on a stream-style
+    # hz contract (it has none); only stream mode asserts hz/quality.
+    bad_stage = {
+        "stage": "app_in",
+        "hz": 1.0,
+        "latency_ms": 5.0,
+        "state": "FLOWING",
+        "quality": "BAD",
+        "quality_reason": "hz",
+        "publishers": 1,
+    }
+    report = {"peer": "a", "topics": [_topic("/site", "inbound", "OK", [bad_stage])]}
+    assert evaluate_report(report, {"/site": {"mode": "latched"}}) == []
+
+
+# --- mode: existence --------------------------------------------------------
+
+
+def test_existence_with_publisher_passes() -> None:
+    report = {"peer": "a", "topics": [_stalled("/diag", state="IDLE", publishers=1)]}
+    assert evaluate_report(report, {"/diag": {"mode": "existence"}}) == []
+
+
+def test_existence_without_publisher_fails() -> None:
+    report = {"peer": "a", "topics": [_stalled("/diag", state="ABSENT", publishers=0)]}
+    failures = evaluate_report(report, {"/diag": {"mode": "existence"}})
+    assert len(failures) == 1
+
+
+def test_invalid_mode_raises() -> None:
+    report = {"peer": "a", "topics": [_stalled("/x", state="STALE", publishers=1)]}
+    with pytest.raises(ValueError):
+        evaluate_report(report, {"/x": {"mode": "bogus"}})

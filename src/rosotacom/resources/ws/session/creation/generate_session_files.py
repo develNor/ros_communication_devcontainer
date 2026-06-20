@@ -2313,6 +2313,10 @@ def func(
     # ---------------------------
     dir_topic_list: Dict[Tuple[str, str], List[str]] = {}
     dir_topic_list_with_types: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    # Effective durability of each forwarded topic (by its final name), so the
+    # domain_bridge can preserve transient_local instead of auto-detecting it
+    # (which races the publisher and defaults to volatile).
+    dir_durability: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
     for (src, dst), direction_key in direction_key_for.items():
         pos = _hb_position(direction_key)
         hb = hb_topic.get(src, "")
@@ -2329,6 +2333,10 @@ def func(
                 hb,
                 pos,
             )
+            dir_durability[(src, dst)] = {
+                p["final"]: ((e.qos or {}).get("durability") if isinstance(e.qos, dict) else None)
+                for e, p in zip(dir_entries[(src, dst)], dir_pipes[(src, dst)])
+            }
 
     # ---------------------------
     # Per-peer plugin.yaml generation
@@ -2598,33 +2606,36 @@ def func(
             ldid = peer_local_domain_id[local]
             assert ldid is not None and ota_domain_id is not None
 
-            def _db_entry(msg_type: str, from_domain: int, to_domain: int, forward_topic: str) -> Dict[str, Any]:
+            def _db_entry(msg_type: str, from_domain: int, to_domain: int, durability: Optional[str]) -> Dict[str, Any]:
                 entry: Dict[str, Any] = {
                     "type": msg_type,
                     "from_domain": from_domain,
                     "to_domain": to_domain,
                 }
-                # Latched statics are delivered via transient_local. The stock
-                # domain_bridge auto-detects QoS from the live publisher and races
-                # it, defaulting to volatile -- which drops the held value and
-                # mismatches the transient_local OTA subscriber. Pin transient_local
-                # so the bridge carries the held value across domains.
-                if forward_topic.endswith(latched_suffix):
+                # The stock domain_bridge auto-detects QoS from the live publisher
+                # and races it, defaulting to volatile -- which drops a transient_local
+                # held value (latched/static one-shots) and mismatches the
+                # transient_local OTA subscriber. Pin transient_local so the bridge
+                # carries the held value across domains. Volatile streams are left to
+                # the default (best_effort), which crosses fine.
+                if durability == "transient_local":
                     entry["qos"] = {"durability": "transient_local", "reliability": "reliable"}
                 return entry
 
+            out_durability = dir_durability.get((local, remote), {})
+            in_durability = dir_durability.get((remote, local), {})
             domain_bridge_topics: Dict[str, Dict[str, Any]] = {}
             if out_enabled:
                 for topic_name, msg_type in out_list_with_types:
                     forward_topic = f"/to_{peer_name[remote]}{topic_name}" if use_target_prefix else topic_name
                     domain_bridge_topics[_com_topic("out", peer_name[local], forward_topic)] = _db_entry(
-                        msg_type, ldid, ota_domain_id, forward_topic
+                        msg_type, ldid, ota_domain_id, out_durability.get(topic_name)
                     )
             if in_enabled:
                 for topic_name, msg_type in in_list_with_types:
                     forward_topic = f"/to_{peer_name[local]}{topic_name}" if remote_uses_target_prefix else topic_name
                     domain_bridge_topics[_com_topic("in", peer_name[remote], forward_topic)] = _db_entry(
-                        msg_type, ota_domain_id, ldid, forward_topic
+                        msg_type, ota_domain_id, ldid, in_durability.get(topic_name)
                     )
 
             if domain_bridge_topics:

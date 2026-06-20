@@ -211,14 +211,26 @@ once fixed):
       + direction-aware `mode: latched`). See the remote_assist section above.
 - [x] Live status overview made mode-aware (latched/existence show OK; latched is
       direction-aware) in `status_overview_core.py` rollup.
-- [ ] `/tf_static` and `/execution/debug/switchbox_state`: per-topic `latch_sub`
-      durability matching the recorded bag QoS so these static one-shots deliver;
-      then flip from optional to required.
-- [ ] Center OUTBOUND relay (a_to_b): `/planning/free/reset` produces no
-      `/com/out`; `/move_base_free/goal` framebridge emits no `/globalframe`.
+- [ ] `/tf_static` and `/execution/debug/switchbox_state` (recorded reliable +
+      transient_local; published essentially once): on b the pipeline never even
+      observes `native` (`reached: None, blocked: native`), unlike the 1 Hz statics
+      whose native is a continuous stream the latch catches live. Root question:
+      whether `ros2 bag play` actually re-offers these as transient_local across
+      `--loop` (so a transient_local sub catches the held value), or publishes them
+      volatile-once. Likely needs a bag-play `--qos-profile-overrides-path` or a
+      send-side latch with a transient_local `latch_sub`. The domain_bridge fix is
+      now general (pins transient_local for any transient_local topic, not just
+      `/latched`), so it is ready once b observes the value.
+- [ ] Center OUTBOUND relay (a_to_b) — genuine generation inconsistency on the
+      `target_prefix` path (the center never had outbound traffic before).
+      `relay_out` subscribes the **target-prefixed** `/to_b/planning/free/reset`,
+      but the status pipeline's `native` stage (and the mock) use the **unprefixed**
+      `/planning/free/reset` — so `native` flows yet `relay_out` gets nothing.
+      Separately, no `FB` (framebridge) node runs on a, so
+      `/move_base_free/goal`'s `global_to_local` never emits `/globalframe`. Fix:
+      make the native stage / app-published topic and `relay_out`'s input agree on
+      the prefix, and generate the center-side outbound framebridge.
 - [ ] Curated public example sessions per feature (table above) + e2e assertions.
-- [ ] `min_count`/completeness: overview must report received vs expected counts
-      (and a finite source must declare its count); then assert in `status_eval`.
 - [ ] `min_count`/completeness: overview must report received vs expected counts
       (and a finite source must declare its count); then assert in `status_eval`.
 - [ ] Link-overhead assertion. **Do not reinvent the measurement** — it already

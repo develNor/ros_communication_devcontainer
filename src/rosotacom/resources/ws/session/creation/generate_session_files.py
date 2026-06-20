@@ -1303,6 +1303,11 @@ def _build_status_pipeline_spec(
             return str(pipe["comp_in"])
         if pipe.get("ota_wrap"):
             return str(pipe["ota_in"])
+        if pipe.get("framebridge") == "global_to_local":
+            # global_to_local runs on the receiver: the OTA `final` is the global
+            # (globalframe) topic, and the framebridge transforms it down to the
+            # local base topic -- that base is the post-framebridge native_in.
+            return str(pipe["fb_g2l_base"])
         return final
 
     def _relay_in_local_topic(topic: str) -> str:
@@ -1333,21 +1338,34 @@ def _build_status_pipeline_spec(
             final = p.get("final", base)
             forward_final = f"/to_{remote_name}{final}" if use_target_prefix else final
             forward_ns = forward_final.lstrip("/")
-            app_native = f"/{local_name}{base}" if native_have_source_prefix else base
-            app_processed = f"/{local_name}{final}" if native_have_source_prefix else final
+            # The application publishes target-prefixed topics when use_target_prefix
+            # (native_have_outgoing_target_prefix == use_target_prefix, enforced
+            # above), so the native/processed stages -- and relay_out's input -- must
+            # carry that /to_<remote> prefix too, or the status `native` stage and
+            # the relay disagree and nothing forwards.
+            target_pfx = f"/to_{remote_name}" if use_target_prefix else ""
+            app_native = f"{target_pfx}/{local_name}{base}" if native_have_source_prefix else f"{target_pfx}{base}"
+            app_processed = f"{target_pfx}/{local_name}{final}" if native_have_source_prefix else f"{target_pfx}{final}"
             base_type = _safe_type(e, p, fallback_base_type=True)
             final_type = _safe_type(e, p)
+
+            # global_to_local is a receiver-side transform: the sender's application
+            # produces the global (globalframe) topic directly, so its native stage
+            # IS the OTA `final` and there is no sender-side preprocessing stage.
+            is_g2l = p.get("framebridge") == "global_to_local"
+            native_topic = app_processed if is_g2l else app_native
+            native_type = final_type if is_g2l else base_type
 
             stages: List[Dict[str, Any]] = [
                 {
                     "stage": "native",
-                    "topic": app_native,
-                    "type": base_type,
+                    "topic": native_topic,
+                    "type": native_type,
                     "domain": "local",
                     "produced_by": "application",
                 },
             ]
-            if final != base:
+            if final != base and not is_g2l:
                 stages.append(
                     {
                         "stage": "processed",
@@ -1610,9 +1628,15 @@ def _compute_pipeline(
             raise ValueError(f"Unknown framebridge '{framebridge}' for topic '{entry.base}'")
 
         if framebridge == "local_to_global":
+            # Sender-side transform: the globalframe topic is what crosses OTA.
             fb_l2g_in = topic
             topic = topic + globalframe_suffix
         else:
+            # global_to_local runs on the RECEIVER: the sender ships the global
+            # (globalframe) topic -- which IS the OTA `final` -- and the receiver's
+            # framebridge transforms it down to the local base topic (its native_in,
+            # see _postprocessed_topic). The center application produces the global
+            # topic directly, so there is no sender-side processing stage.
             fb_g2l_base = entry.base
             topic = entry.base + globalframe_suffix
 

@@ -168,11 +168,9 @@ delivery + isolation.
 
 OTA transport works (cyclone) and the streaming contract passes after
 recalibration (`restamp_if` added where headers exist; `latency_ms` dropped from
-headerless topics; `/tf` rate floored). The latched topics carry
-`mode: latched` + `presence: optional` and the `a_to_b` commands carry
-`presence: optional` (+ a mock center publisher), so ota-smoke is unblocked at the
-**contract** level. Two delivery bugs remain (flip the `optional`s to required
-once fixed):
+headerless topics; `/tf` rate floored). The latched topics carry `mode: latched`
+and the `a_to_b` commands are now `presence: required` (driven by a mock center
+publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains:
 
 1. **Latched OTA delivery — FIXED** (on-change latch preserved; no
    retransmission). Root cause found via the b-side catmux logs:
@@ -199,11 +197,26 @@ once fixed):
    the volatile one used for 1 Hz statics) and `/execution/debug/switchbox_state`
    (trickle; needs a send-side latch with a bag-matched `latch_sub` durability).
    Both want a per-topic `latch_sub` durability matching their recorded QoS.
-2. **Center OUTBOUND relay.** `a_to_b` topics reach `native` (mock publishes) but
-   the center's outbound relay does not forward: `/planning/free/reset` produces no
-   `/com/out`, and `/move_base_free/goal`'s `framebridge: global_to_local` emits no
-   `/globalframe`. The center peer never had outbound traffic before — this path is
-   undertested. Needs pipeline debugging.
+2. **Center OUTBOUND relay — FIXED** (both `a_to_b` commands `presence: required`,
+   green on a+b). The center peer never carried outbound traffic before, so two
+   generation bugs hid in `generate_session_files`:
+   - *target_prefix.* The center uses `target_prefix`, so its app/mock publish
+     `/to_b/<topic>` and `relay_out` subscribes the prefixed name — but the OUT
+     pipeline's `native`/`processed` stages used the **unprefixed** topic, so
+     `native` flowed yet `relay_out` got nothing. Fix: the OUT `native`/`processed`
+     stages now carry the same `/to_<remote>` prefix.
+   - *global_to_local direction.* This framebridge is a **receiver-side** transform.
+     The earlier model treated it like a sender-side one and expected a `/globalframe`
+     `processed` stage on a (which a never produces). Correct model: the center's
+     application produces the **global** topic directly (`/move_base_free/goal/
+     globalframe`), that IS the OTA `final` (so a's `native` = `final`, no sender
+     `processed` stage), and **b's** framebridge subscribes `.../globalframe` and
+     publishes the local base `/move_base_free/goal` (the inbound `native_in`). This
+     matches the framebridge node's `PubSubPair` (sub = base + `/globalframe`,
+     pub = base), which was always correct. Verified: on b, `/move_base_free/goal`
+     is FLOWING through `native_in`. `/move_base_free/goal` carries `mode: latched`
+     (the mock's static PoseStamped has `stamp=0` ⇒ latency is not meaningful);
+     `/planning/free/reset` (headerless Empty) is `mode: stream`.
 
 ## Open TODO
 
@@ -221,15 +234,12 @@ once fixed):
       send-side latch with a transient_local `latch_sub`. The domain_bridge fix is
       now general (pins transient_local for any transient_local topic, not just
       `/latched`), so it is ready once b observes the value.
-- [ ] Center OUTBOUND relay (a_to_b) — genuine generation inconsistency on the
-      `target_prefix` path (the center never had outbound traffic before).
-      `relay_out` subscribes the **target-prefixed** `/to_b/planning/free/reset`,
-      but the status pipeline's `native` stage (and the mock) use the **unprefixed**
-      `/planning/free/reset` — so `native` flows yet `relay_out` gets nothing.
-      Separately, no `FB` (framebridge) node runs on a, so
-      `/move_base_free/goal`'s `global_to_local` never emits `/globalframe`. Fix:
-      make the native stage / app-published topic and `relay_out`'s input agree on
-      the prefix, and generate the center-side outbound framebridge.
+- [x] Center OUTBOUND relay (a_to_b) fixed — OUT `native`/`processed` stages carry
+      the `/to_<remote>` `target_prefix` so they agree with `relay_out`'s
+      subscription; and `global_to_local` is modelled as a receiver-side transform
+      (sender ships the global `/globalframe` topic as its native = OTA `final`; b's
+      framebridge produces the local base as `native_in`). Both commands are now
+      `presence: required` and green on a+b. See the remote_assist section above.
 - [ ] Curated public example sessions per feature (table above) + e2e assertions.
 - [ ] `min_count`/completeness: overview must report received vs expected counts
       (and a finite source must declare its count); then assert in `status_eval`.
@@ -241,8 +251,9 @@ once fixed):
       work: surface both into status.json and assert the ratio
       `link_kbps / ros_topic_bw` (≈1 good; ≫1 ⇒ retransmits / shadow connections /
       bad RMW or QoS) — likely a session-level expect, not per-topic.
-- [ ] Fix the two remote_assist delivery bugs above; flip its `optional`s to
-      required.
+- [x] remote_assist center OUTBOUND (a_to_b) bug fixed; both commands flipped to
+      `presence: required`. Only the `/tf_static` + `/switchbox_state` bag-play-QoS
+      latch edge (above) stays `optional`.
 - [ ] Decide testability of framebridge / ffmpeg video (existence vs throughput).
 
 ### Replay-only (ground-truth) assertions — from "Live vs replay" above

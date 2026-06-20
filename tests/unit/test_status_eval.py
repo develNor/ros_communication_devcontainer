@@ -126,6 +126,34 @@ def test_latched_never_delivered_fails() -> None:
     assert len(failures) == 1 and "STALLED" in failures[0]
 
 
+def test_latched_outbound_produced_passes_even_if_send_stage_idle() -> None:
+    # On the sender a one-shot held value shows at native/processed but the
+    # inferred OTA-send stage may not keep ticking; producing+latching is enough.
+    topic = {
+        "base": "/site",
+        "direction": "outbound",
+        "overall": "STALLED",
+        "diagnosis": "stopped",
+        "stages": [
+            _stage("native", 1.0, None, "FLOWING"),
+            _stage("processed", 0.0, None, "STALE"),
+            _stage("ota_sent", 0.0, None, "IDLE"),
+        ],
+    }
+    assert evaluate_report({"peer": "b", "topics": [topic]}, {"/site": {"mode": "latched"}}) == []
+
+
+def test_latched_outbound_never_produced_fails() -> None:
+    topic = {
+        "base": "/site",
+        "direction": "outbound",
+        "overall": "STALLED",
+        "diagnosis": "no publisher",
+        "stages": [_stage("native", 0.0, None, "IDLE"), _stage("ota_sent", 0.0, None, "IDLE")],
+    }
+    assert len(evaluate_report({"peer": "b", "topics": [topic]}, {"/site": {"mode": "latched"}})) == 1
+
+
 def test_latched_does_not_assert_rate_when_ok() -> None:
     # A latched topic that happens to be FLOWING must not fail on a stream-style
     # hz contract (it has none); only stream mode asserts hz/quality.

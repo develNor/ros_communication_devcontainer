@@ -242,6 +242,21 @@ def test_rollup_latched_never_delivered_still_stalled(tmp_path: Path) -> None:
     assert agg.rollup(spec, stages)["overall"] == core.STALLED
 
 
+def test_rollup_latched_outbound_produced_is_ok(tmp_path: Path) -> None:
+    # On the sender a one-shot held value shows at native/processed; the inferred
+    # send stage may idle. Producing+latching is enough (receiver confirms delivery).
+    agg = _build({}, tmp_path)
+    spec = {"direction": "outbound", "expect": {"mode": "latched"}}
+    stages = [
+        _sr("native", "/site", core.FLOWING),
+        _sr("processed", "/site/latched", core.STALE),
+        _sr("ota_sent", "/ota/b/site/latched", core.IDLE),
+    ]
+    roll = agg.rollup(spec, stages)
+    assert roll["overall"] == core.OK
+    assert "produced" in roll["diagnosis"]
+
+
 def test_rollup_existence_present_is_ok(tmp_path: Path) -> None:
     agg = _build({}, tmp_path)
     spec = {"direction": "inbound", "expect": {"mode": "existence"}}

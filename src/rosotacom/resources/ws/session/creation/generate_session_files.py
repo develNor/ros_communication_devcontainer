@@ -2103,6 +2103,12 @@ def func(
         raise RuntimeError(f"shared.processing_suffixes must be a mapping if provided, got {type(suffixes)}")
     restamped_suffix = str(suffixes.get("restamped", "/restamped"))
     latched_suffix = str(suffixes.get("latched", "/latched"))
+    # Latch keepalive (OPT-IN, default OFF). The latch is on-change by design --
+    # that is the bandwidth feature, so we do NOT re-stream static values by
+    # default. This is only an escape hatch for an OTA path that cannot carry the
+    # held value via transient_local: set shared.latch_keepalive_hz > 0 to re-assert
+    # each held value at that rate. Prefer fixing transient_local delivery instead.
+    latch_keepalive_hz = shared.get("latch_keepalive_hz", 0.0) if isinstance(shared, dict) else 0.0
     globalframe_suffix = str(suffixes.get("framebridge_global", "/globalframe"))
     ota_suffix = str(suffixes.get("ota_stamped", "/ota_stamped"))
 
@@ -2592,23 +2598,34 @@ def func(
             ldid = peer_local_domain_id[local]
             assert ldid is not None and ota_domain_id is not None
 
+            def _db_entry(msg_type: str, from_domain: int, to_domain: int, forward_topic: str) -> Dict[str, Any]:
+                entry: Dict[str, Any] = {
+                    "type": msg_type,
+                    "from_domain": from_domain,
+                    "to_domain": to_domain,
+                }
+                # Latched statics are delivered via transient_local. The stock
+                # domain_bridge auto-detects QoS from the live publisher and races
+                # it, defaulting to volatile -- which drops the held value and
+                # mismatches the transient_local OTA subscriber. Pin transient_local
+                # so the bridge carries the held value across domains.
+                if forward_topic.endswith(latched_suffix):
+                    entry["qos"] = {"durability": "transient_local", "reliability": "reliable"}
+                return entry
+
             domain_bridge_topics: Dict[str, Dict[str, Any]] = {}
             if out_enabled:
                 for topic_name, msg_type in out_list_with_types:
                     forward_topic = f"/to_{peer_name[remote]}{topic_name}" if use_target_prefix else topic_name
-                    domain_bridge_topics[_com_topic("out", peer_name[local], forward_topic)] = {
-                        "type": msg_type,
-                        "from_domain": ldid,
-                        "to_domain": ota_domain_id,
-                    }
+                    domain_bridge_topics[_com_topic("out", peer_name[local], forward_topic)] = _db_entry(
+                        msg_type, ldid, ota_domain_id, forward_topic
+                    )
             if in_enabled:
                 for topic_name, msg_type in in_list_with_types:
                     forward_topic = f"/to_{peer_name[local]}{topic_name}" if remote_uses_target_prefix else topic_name
-                    domain_bridge_topics[_com_topic("in", peer_name[remote], forward_topic)] = {
-                        "type": msg_type,
-                        "from_domain": ota_domain_id,
-                        "to_domain": ldid,
-                    }
+                    domain_bridge_topics[_com_topic("in", peer_name[remote], forward_topic)] = _db_entry(
+                        msg_type, ota_domain_id, ldid, forward_topic
+                    )
 
             if domain_bridge_topics:
                 per_peer_domain_bridge_yaml[local] = _render_domain_bridge_yaml(
@@ -2728,6 +2745,9 @@ def func(
                         ("lat", True),
                         ("lat_topics", ",".join(lat_topics)),
                         ("lat_topic_suffix", latched_suffix),
+                        # Keep latched statics alive as a low-rate stream so the
+                        # held value actually crosses the OTA pipeline.
+                        ("lat_keepalive_hz", latch_keepalive_hz),
                     ],
                 )
             )

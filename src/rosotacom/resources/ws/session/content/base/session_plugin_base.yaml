@@ -79,6 +79,7 @@ parameters:
   lat: false
   lat_topics: "" # e.g. "/can/is_autonomous,/can/is_rearmed,/site" – only republish when serialized content changes
   lat_topic_suffix: # e.g. "/latched"
+  lat_keepalive_hz: 0.0 # OPT-IN escape hatch (default off): re-assert held value at this rate if the OTA path can't carry transient_local. Latch is on-change by design.
 
   trickle: false
   trickle_topics: "" # e.g. "/can/is_autonomous/latched,/can/is_rearmed/latched" – periodically republish last msg for visualization
@@ -373,6 +374,7 @@ windows:
             -p qos_config_file:='${qos_config_file}'
             -p latch_topics:=[${lat_topics}]
             -p topic_suffix:=${lat_topic_suffix}
+            -p keepalive_hz:=${lat_keepalive_hz}
   - name: TRICKLE
     if: trickle
     splits:

@@ -86,6 +86,16 @@ def _was_delivered(topic: dict[str, Any]) -> bool:
     return stages[-1].get("state") in _DELIVERED_STATES
 
 
+def _was_produced(topic: dict[str, Any]) -> bool:
+    """True if any stage was ever observed flowing. For an OUTBOUND latched topic
+    the held value is a one-shot: the source/latch stages show it (FLOWING/STALE)
+    but the inferred OTA-send stage may not keep ticking, so requiring the final
+    stage is wrong on the sender. Actual OTA delivery is asserted by the receiver's
+    inbound report."""
+    stages: list[dict[str, Any]] = topic.get("stages") or []
+    return any(s.get("state") in _DELIVERED_STATES for s in stages)
+
+
 def _has_publisher(topic: dict[str, Any]) -> bool:
     """True if any stage advertises a publisher (the topic exists in the graph)."""
     stages: list[dict[str, Any]] = topic.get("stages") or []
@@ -135,8 +145,15 @@ def evaluate_report(report: dict[str, Any], expect_by_topic: dict[str, dict[str,
             continue
 
         # overall != OK -- reinterpret per the declared delivery mode.
-        if mode == "latched" and _was_delivered(topic):
-            continue  # held value delivered; a latched topic is not expected to tick
+        if mode == "latched":
+            # Receiver (inbound): the held value must have reached the final stage.
+            # Sender (outbound): a one-shot held value need only have been produced
+            # and latched -- its OTA delivery is asserted by the receiver's report.
+            if topic.get("direction") == "outbound":
+                if _was_produced(topic):
+                    continue
+            elif _was_delivered(topic):
+                continue
         if mode == "existence" and _has_publisher(topic):
             continue  # present in the graph as required
         if optional:

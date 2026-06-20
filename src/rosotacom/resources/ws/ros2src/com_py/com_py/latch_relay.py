@@ -74,12 +74,25 @@ from com_py.qos import load_qos_config
 
 class LatchPubSubPair(PubSubPair):
     """PubSubPair that only forwards messages whose serialized bytes differ from
-    the previously published message (content-based deduplication)."""
+    the previously published message (content-based deduplication).
 
-    def __init__(self, *, node, **kwargs):
+    Optionally re-asserts the held value at a low keepalive rate. transient_local
+    alone is not enough to deliver a once-published static value over the OTA
+    pipeline: the held sample is not reliably replayed across the multi-hop
+    relay/domain-bridge chain, so a constant topic that latches once never reaches
+    the receiver. Re-asserting at a low rate turns it into a (very) low-rate stream
+    that crosses reliably -- every continuous stream delivers -- while still saving
+    bandwidth vs the native rate and letting a late subscriber pick the value up
+    within one keepalive period."""
+
+    def __init__(self, *, node, keepalive_hz: float = 0.0, **kwargs):
         self._last_bytes: bytes | None = None
+        self._last_msg = None
         self._suppressed: int = 0
         super().__init__(node=node, **kwargs)
+        self._keepalive_timer = None
+        if keepalive_hz and keepalive_hz > 0:
+            self._keepalive_timer = node.create_timer(1.0 / keepalive_hz, self._keepalive)
 
     def _callback(self, msg):
         try:
@@ -95,9 +108,10 @@ class LatchPubSubPair(PubSubPair):
 
         if current_bytes == self._last_bytes:
             self._suppressed += 1
-            return  # No change — skip publishing.
+            return  # No change — skip publishing (the keepalive re-asserts it).
 
         self._last_bytes = current_bytes
+        self._last_msg = msg
 
         if self.first_msg:
             self.logger.info(
@@ -113,6 +127,12 @@ class LatchPubSubPair(PubSubPair):
         self._suppressed = 0
         self.publisher.publish(msg)
 
+    def _keepalive(self):
+        """Re-publish the last known value so the latched topic stays a live (low
+        rate) stream end-to-end instead of relying on transient_local history."""
+        if self._last_msg is not None:
+            self.publisher.publish(self._last_msg)
+
 
 class LatchRelay(Node, PairRefreshMixin):
     """Node that manages multiple LatchPubSubPair instances."""
@@ -125,6 +145,9 @@ class LatchRelay(Node, PairRefreshMixin):
         # -----------------------
         self.topic_suffix = self.declare_parameter("topic_suffix", "/latched").value
         self.qos_config_file = self.declare_parameter("qos_config_file", "").value
+        # Re-assert the held value at this rate (0 = off) so once-published static
+        # topics cross the OTA pipeline as a low-rate stream (see LatchPubSubPair).
+        self.keepalive_hz = float(self.declare_parameter("keepalive_hz", 0.0).value or 0.0)
         self.sub_role = "latch_sub"
         self.pub_role = "latch_pub"
 
@@ -142,6 +165,7 @@ class LatchRelay(Node, PairRefreshMixin):
         self.get_logger().info("=== LatchRelay configuration ===")
         self.get_logger().info(f"topic_suffix='{self.topic_suffix}'")
         self.get_logger().info(f"latch_topics={self.latch_topics}")
+        self.get_logger().info(f"keepalive_hz={self.keepalive_hz}")
 
         # -----------------------
         # Build pairs
@@ -158,6 +182,7 @@ class LatchRelay(Node, PairRefreshMixin):
                     sub_role=self.sub_role,
                     pub_role=self.pub_role,
                     qos_config=self.qos_config,
+                    keepalive_hz=self.keepalive_hz,
                 )
             )
 

@@ -174,28 +174,31 @@ headerless topics; `/tf` rate floored). The latched topics carry
 **contract** level. Two delivery bugs remain (flip the `optional`s to required
 once fixed):
 
-1. **Latched OTA delivery.** Sharpened by the live `status.txt` of the
-   mode-aware run (b side): a latched topic whose value *changes* delivers fine —
-   `/gnss_reference` streams native→processed→com_out→ota_sent all FLOWING at
-   10 Hz (it is never actually reduced to on-change). The bug is specific to
-   **truly-constant** statics (`/site`, `/type`, `/vehicle`, native 1 Hz): the
-   `latch_relay` fires **once** (`processed` = `/site/latched` STALE, 0 Hz, ~25 s
-   old, transient_local held) and that held value **never propagates downstream**
-   — `com_out` (`relay_out` `forward_sub`) stays IDLE, so it never reaches OTA.
-   Two further wrinkles: `/mission/debug/drive_to_state` (latch+trickle) never
-   fires at all (`processed` IDLE — latch change-detection / trickle not
-   re-publishing), and `/tf_static` never reaches `native`. So the path has
-   distinct sub-bugs: (a) the transient_local held value is not forwarded across
-   relay hops to a late `forward_sub` (relays don't replay history; or a
-   subscribe-order race; or `latch_pub`/`forward_sub` durability is not actually
-   transient_local at runtime — verify live with `ros2 topic info -v`); (b)
-   `latch_relay` change-detection / `trickle_hz` re-publish is inconsistent. Per-
-   topic `for_role.ota_pub/ota_sub: transient_local` was added (correct, kept) but
-   only covers the `/com/out`→OTA hop, not `latch_pub`→`forward_sub`. **Fix
-   directions:** trickle the latch output at a low rate so static topics become a
-   continuous stream (no reliance on transient_local history — the robust path),
-   and/or make every relay hop forward transient_local history. Needs in-container
-   iteration with live QoS inspection.
+1. **Latched OTA delivery — FIXED** (on-change latch preserved; no
+   retransmission). Root cause found via the b-side catmux logs:
+   `ota_bridge_out` logged `New publisher ... '/com/out/b/site/latched', offering
+   incompatible QoS ... DURABILITY` for *every* latched topic. The stock ROS
+   `domain_bridge` auto-detects a topic's QoS from the live publisher and **races
+   it**, defaulting to **volatile** when it bridges `/com/out` across domains
+   47↔48 — which both drops the once-published held value and mismatches the
+   transient_local OTA subscriber. The streaming topics are best_effort, so they
+   matched and crossed; the latched ones (transient_local) did not. A second hop:
+   the OTA-stage publisher inherited the global streaming `ota_pub` `lifespan:
+   0.7s`, expiring a held value before a late receiver subscribed. **Fix:**
+   `generate_session_files._db_entry` now pins `qos: {durability: transient_local,
+   reliability: reliable}` on the domain_bridge entries for `/latched` topics
+   (both directions), and the latched topics override `for_role.ota_pub.lifespan`
+   so the held value does not expire. Result: `/site /type /vehicle
+   /gnss_reference /mission/debug/drive_to_state` deliver their held value to the
+   receiver's `app_in` (OK) with pure on-change latch. (An opt-in
+   `shared.latch_keepalive_hz`, default 0, remains as an escape hatch for OTA
+   paths that genuinely cannot carry transient_local — but it is NOT used here, as
+   re-streaming would defeat the latch's bandwidth purpose.)
+   *Still optional:* `/tf_static` (restamp/framebridge, not a latch topic — its
+   bag publisher is transient_local so it needs a transient_local `latch_sub`, not
+   the volatile one used for 1 Hz statics) and `/execution/debug/switchbox_state`
+   (trickle; needs a send-side latch with a bag-matched `latch_sub` durability).
+   Both want a per-topic `latch_sub` durability matching their recorded QoS.
 2. **Center OUTBOUND relay.** `a_to_b` topics reach `native` (mock publishes) but
    the center's outbound relay does not forward: `/planning/free/reset` produces no
    `/com/out`, and `/move_base_free/goal`'s `framebridge: global_to_local` emits no
@@ -204,10 +207,18 @@ once fixed):
 
 ## Open TODO
 
+- [x] Latched OTA delivery fixed (domain_bridge transient_local + ota_pub lifespan
+      + direction-aware `mode: latched`). See the remote_assist section above.
+- [x] Live status overview made mode-aware (latched/existence show OK; latched is
+      direction-aware) in `status_overview_core.py` rollup.
+- [ ] `/tf_static` and `/execution/debug/switchbox_state`: per-topic `latch_sub`
+      durability matching the recorded bag QoS so these static one-shots deliver;
+      then flip from optional to required.
+- [ ] Center OUTBOUND relay (a_to_b): `/planning/free/reset` produces no
+      `/com/out`; `/move_base_free/goal` framebridge emits no `/globalframe`.
 - [ ] Curated public example sessions per feature (table above) + e2e assertions.
-- [ ] Make the live status overview mode-aware so latched/existence topics show
-      OK in `status.txt`, not STALLED (mirror `status_eval` in
-      `status_overview_core.py` rollup).
+- [ ] `min_count`/completeness: overview must report received vs expected counts
+      (and a finite source must declare its count); then assert in `status_eval`.
 - [ ] `min_count`/completeness: overview must report received vs expected counts
       (and a finite source must declare its count); then assert in `status_eval`.
 - [ ] Link-overhead assertion. **Do not reinvent the measurement** — it already

@@ -344,12 +344,21 @@ class StatusAggregator:
         expect = topic_spec.get("expect") or {}
         mode = str(expect.get("mode", "stream")).strip().lower() or "stream"
         if overall != OK and mode in ("latched", "existence"):
-            delivered = bool(stage_results) and stage_results[-1]["state"] in (FLOWING, STALE)
-            if mode == "latched" and delivered:
-                overall = OK
-                blocked_at = None
-                next_topic = None
-                diagnosis = f"latched value delivered (reached '{reached_stage}'); not expected to tick"
+            if mode == "latched":
+                # Receiver (inbound): the held value must have reached the final
+                # stage. Sender (outbound): a one-shot held value need only have
+                # been produced/latched -- its OTA send is not continuously observed.
+                if topic_spec.get("direction") == "outbound":
+                    relaxed = any(s["state"] in (FLOWING, STALE) for s in stage_results)
+                    msg = "latched value produced and held; not expected to tick"
+                else:
+                    relaxed = bool(stage_results) and stage_results[-1]["state"] in (FLOWING, STALE)
+                    msg = f"latched value delivered (reached '{reached_stage}'); not expected to tick"
+                if relaxed:
+                    overall = OK
+                    blocked_at = None
+                    next_topic = None
+                    diagnosis = msg
             elif mode == "existence" and any_publisher:
                 overall = OK
                 blocked_at = None

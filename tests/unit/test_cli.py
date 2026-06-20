@@ -1011,6 +1011,9 @@ def test_start_and_stop_scenario_manage_manifest_and_component_order(
         rosotacom, "_create_scenario_tmux", lambda *args, **kwargs: calls.append("tmux-start") or "demo-a"
     )
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "detached")
+    # Detached scenario start now blocks until the comm container is ready
+    # (parity with start_session); the readiness probe is irrelevant here.
+    monkeypatch.setattr(rosotacom, "_wait_for_container_ready", lambda *args, **kwargs: None)
 
     args = argparse.Namespace(
         scenario="demo",

@@ -1355,6 +1355,17 @@ def _ota_run(
     return result
 
 
+def _ota_print_failure_output(label: str, result: subprocess.CompletedProcess[str]) -> None:
+    """Echo a failed verify step's captured output so OTA smoke failures are
+    diagnosable. ``_ota_run`` captures stdout/stderr for non-tty steps and, for
+    ``check=False`` verify calls, never surfaces them on its own."""
+    detail = ((result.stdout or "") + (result.stderr or "")).strip()
+    if detail:
+        print(f"--- {label} output (exit {result.returncode}) ---", file=sys.stderr)
+        print(detail, file=sys.stderr)
+        print(f"--- end {label} output ---", file=sys.stderr)
+
+
 def _ota_project_cli_args(plan: OtaSmokePlan) -> list[str]:
     return ["--rosotacom-config", plan.project]
 
@@ -1960,6 +1971,7 @@ def _ota_verify_delivery(
         command = _ota_rosotacom_command(plan, _ota_test_parts(target, instance_id))
         result = _ota_run(peer, command, label=f"{peer_name}: rosotacom test", dry_run=dry_run, check=False)
         if result.returncode != 0:
+            _ota_print_failure_output(f"{peer_name}: rosotacom test", result)
             errors.append(f"{peer_name}: rosotacom test failed")
     return errors
 
@@ -1979,6 +1991,7 @@ def _ota_verify_isolation(
     publish = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=False))
     published = _ota_run(source, publish, label=f"{source_name}: publish isolation probe", dry_run=dry_run, check=False)
     if published.returncode != 0:
+        _ota_print_failure_output(f"{source_name}: publish isolation probe", published)
         errors.append(f"{source_name}: isolation probe publisher failed")
         return errors
     check = _ota_rosotacom_command(plan, _ota_probe_check_parts(target, receiver_name, peer_args))
@@ -1990,6 +2003,7 @@ def _ota_verify_isolation(
         check=False,
     )
     if checked.returncode != 0:
+        _ota_print_failure_output(f"{receiver_name}: check isolation probe absent", checked)
         errors.append(f"{receiver_name}: isolation probe crossed OTA boundary")
     stop = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=True))
     _ota_run(source, stop, label=f"{source_name}: stop isolation probe", dry_run=dry_run, check=False)
@@ -3225,9 +3239,11 @@ def _resolve_scenario_context(
         raise RuntimeError("Missing --identity. Provide --identity <peer> or allow auto identity.")
     if identity not in peers:
         raise RuntimeError(f"--identity must be one of peers={list(peers.keys())}")
-    applications = definition.applications.get(identity)
-    if applications is None:
-        raise RuntimeError(f"Scenario '{resolved.name}' has no applications entry for identity '{identity}'.")
+    # A scenario peer may legitimately run no local application -- a pure
+    # receiver (e.g. remote_assist's `center`/a only consumes OTA telemetry).
+    # `identity in peers` already validated it is a real peer, so a missing
+    # applications entry just means "communication session only".
+    applications = definition.applications.get(identity, ())
     return runtime, resolved, definition, session, cfg, identity, applications
 
 
@@ -3381,6 +3397,15 @@ def start_scenario(args: argparse.Namespace) -> int:
     if mode == "attach":
         subprocess.run(_tmux_command(runtime, "attach-session", "-t", created_session), check=True)
     else:
+        # Parity with `start_session` (detached): the catmux session builds the
+        # image and ROS workspace asynchronously, so a bare detached start would
+        # return before the communication bridge is up. Block until the comm
+        # container has sourced its overlay so callers (the OTA smoke harness in
+        # particular) verify against a ready bridge instead of racing a cold
+        # image/workspace build. Generous ceiling: a scenario may build both the
+        # communication and application images from scratch on a first run.
+        print(f"Waiting for communication container to become ready: {communication_container}")
+        _wait_for_container_ready(communication_container, timeout_s=600)
         print("Attach with: rosotacom scenario attach")
     return 0
 

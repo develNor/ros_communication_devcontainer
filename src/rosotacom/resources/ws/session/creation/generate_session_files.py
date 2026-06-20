@@ -149,6 +149,17 @@ _DDS_CFG_KEYS = {"config", "easy_mode_ip"}
 _ZEN_OTA_CFG_KEYS = {"main_peer", "main_port"}
 _ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
 
+# OTA is cross-host by definition. The bare `cyclone`/`fastdds` OTA shortcuts
+# would otherwise fall back to default DDS discovery (multicast on an
+# auto-selected interface), which does not deliver across multi-homed hosts or
+# overlay/tunnel networks that drop multicast. Default each DDS OTA side to its
+# interface-pinned, unicast-peer config so cross-host delivery works out of the
+# box; an explicit `ota: {cyclone|fastdds: {config: ...}}` still overrides this.
+_DDS_OTA_DEFAULT_CONFIG = {
+    "cyclone": "cyclonedds_tuned.xml",
+    "fastdds": "fastdds_unicast.xml",
+}
+
 
 def _is_native_zenoh_ota(impl: Optional[str]) -> bool:
     return impl in _NATIVE_ZENOH_OTA_SHORTS
@@ -1903,10 +1914,11 @@ def func(
         items.append(("use_zenoh_rmw", _is_native_zenoh_ota(ota.impl) or local.impl == "zenoh"))
         # zenoh_bridge_ros2dds router (Z2D window): enabled for OTA only.
         items.append(("use_zenoh_ros2dds", ota.impl == "zenoh_ros2dds"))
-        if ota.dds_config:
-            items.append(("ota_config_template", ota.dds_config))
+        ota_dds_config = ota.dds_config or _DDS_OTA_DEFAULT_CONFIG.get(ota.impl or "")
+        if ota_dds_config:
+            items.append(("ota_config_template", ota_dds_config))
             items.append(("ota_config_file", "${peer_dir}/ota_dds.xml"))
-            if ota.impl == "fastdds" and ota.dds_config == "fastdds_easy_mode.xml":
+            if ota.impl == "fastdds" and ota_dds_config == "fastdds_easy_mode.xml":
                 items.append(
                     (
                         "ota_easy_mode_ip",

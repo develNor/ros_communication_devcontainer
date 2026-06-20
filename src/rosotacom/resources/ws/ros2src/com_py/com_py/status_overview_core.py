@@ -337,6 +337,25 @@ class StatusAggregator:
                     + self._stage_diagnosis(blocked)
                 )
 
+        # Mode-aware reinterpretation (mirrors status_eval.evaluate_report so the
+        # live display agrees with `rosotacom test`). A latched/static topic that
+        # delivered its value and now idles is OK, not STALLED; an existence-only
+        # topic is OK as soon as it is present in the graph. See RFC 0002.
+        expect = topic_spec.get("expect") or {}
+        mode = str(expect.get("mode", "stream")).strip().lower() or "stream"
+        if overall != OK and mode in ("latched", "existence"):
+            delivered = bool(stage_results) and stage_results[-1]["state"] in (FLOWING, STALE)
+            if mode == "latched" and delivered:
+                overall = OK
+                blocked_at = None
+                next_topic = None
+                diagnosis = f"latched value delivered (reached '{reached_stage}'); not expected to tick"
+            elif mode == "existence" and any_publisher:
+                overall = OK
+                blocked_at = None
+                next_topic = None
+                diagnosis = "present in graph (existence)"
+
         if topic_spec.get("direction") == "outbound" and overall == OK:
             diagnosis += " | OTA activity inferred locally; remote delivery not observed (Phase 1)"
 

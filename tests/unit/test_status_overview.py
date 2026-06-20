@@ -215,6 +215,47 @@ def test_rollup_ok_when_all_stages_flow(tmp_path: Path) -> None:
     assert snap["summary"]["OK"] == 1
 
 
+def _sr(stage: str, topic: str, state: str, publishers: int = 1) -> dict:
+    return {"stage": stage, "topic": topic, "state": state, "publishers": publishers, "produced_by": "relay"}
+
+
+def test_rollup_latched_delivered_then_stale_is_ok(tmp_path: Path) -> None:
+    # mode: latched -- a static topic that delivered its value and now idles is
+    # OK, not STALLED (mirrors status_eval; RFC 0002).
+    agg = _build({}, tmp_path)
+    spec = {"direction": "inbound", "expect": {"mode": "latched"}}
+    stages = [
+        _sr("ota_recv", "/ota/b/site/latched", core.STALE),
+        _sr("com_in", "/com/in/b/site/latched", core.STALE),
+        _sr("app_in", "/b/site/latched", core.STALE),
+    ]
+    roll = agg.rollup(spec, stages)
+    assert roll["overall"] == core.OK
+    assert roll["blocked_at"] is None
+    assert "latched" in roll["diagnosis"]
+
+
+def test_rollup_latched_never_delivered_still_stalled(tmp_path: Path) -> None:
+    agg = _build({}, tmp_path)
+    spec = {"direction": "inbound", "expect": {"mode": "latched"}}
+    stages = [_sr("ota_recv", "/ota/b/site/latched", core.IDLE), _sr("app_in", "/b/site/latched", core.IDLE)]
+    assert agg.rollup(spec, stages)["overall"] == core.STALLED
+
+
+def test_rollup_existence_present_is_ok(tmp_path: Path) -> None:
+    agg = _build({}, tmp_path)
+    spec = {"direction": "inbound", "expect": {"mode": "existence"}}
+    roll = agg.rollup(spec, [_sr("app_in", "/b/diag", core.IDLE, publishers=1)])
+    assert roll["overall"] == core.OK
+    assert "existence" in roll["diagnosis"]
+
+
+def test_rollup_without_mode_keeps_stalled(tmp_path: Path) -> None:
+    # No mode (default stream): a delivered-then-stale topic is STALLED as before.
+    agg = _build({}, tmp_path)
+    assert agg.rollup({"direction": "inbound"}, [_sr("app_in", "/b/x", core.STALE)])["overall"] == core.STALLED
+
+
 def test_inbound_ota_receipt_is_inferred_from_com_in(tmp_path: Path) -> None:
     now = 100.0
     spec = {

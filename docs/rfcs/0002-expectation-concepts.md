@@ -97,8 +97,51 @@ Implemented in `status_eval.py` (`evaluate_report`, pure + unit-tested in
 `tests/unit/test_status_eval.py`). `expect` already accepts arbitrary keys
 (generate_session_files validates it only as a mapping), so no schema change was
 needed. NOTE: this changes only the **test verdict** (`rosotacom test`). The live
-status overview (`status_overview_core.py`, in-container) still *displays* latched
-topics as STALLED — making the live display mode-aware is a follow-up (below).
+status overview (`status_overview_core.py`, in-container) is also being made
+mode-aware so the live display agrees with the verdict (latched/existence show OK).
+
+## Live vs replay (rosbag) tests
+
+These are two fundamentally different test situations, separated by **how much of
+the future is known**:
+
+| | **Live** | **Replay (rosbag)** |
+|---|---|---|
+| Source | real running system | a recorded, finite, deterministic bag |
+| Future | unknown | known exactly (every message, count, size, time) |
+| Core question | "is it within bounds *right now*?" | "did the *known* input arrive intact, and is the link healthy?" |
+| Assertions | hz / latency / presence bounds (monitoring) | all of live **plus** completeness, loss%, content, contract-vs-ground-truth |
+| A failure means | the system degraded | a transmission problem **or** a wrong expectation **or** a config bug |
+
+The current `expect` model is a *live* model: it watches an open-ended stream and
+warns on out-of-bounds. That model is shared by both situations — but a replay
+test *knows the ground truth*, which unlocks assertions a live test fundamentally
+cannot make:
+
+- **Completeness / loss.** Only a known finite source lets you assert "all N
+  messages of topic X arrived" or "loss ≤ p%". Live can only infer from rate dips.
+- **Contract self-validation (calibration).** A replay run knows each topic's
+  actual delivered hz / size / latency, so it can *report* them to author or
+  verify the `expect` block — catching wrong expectations (exactly our `/tf`
+  `hz>=40` vs an 18 Hz reality). A reference replay can even *emit* a suggested
+  `expect`.
+- **Content integrity.** Received messages can be compared to the sent ground
+  truth (byte-equal, or equal after a declared transform). Live has no oracle.
+- **True link latency vs payload-stamp latency.** Live latency is
+  `now − header.stamp` and needs clock sync. In replay the bag's stamps are
+  historical and `restamp` rewrites them to "now", so payload-stamp latency only
+  measures the *local* pipeline, not the link. Measuring true OTA latency in
+  replay needs a send-time injected at the relay (a sidecar stamp), independent
+  of the payload header.
+- **Determinism.** Replay is reproducible, so flakiness isolates a transmission /
+  RMW / QoS problem from source variability — the right shape for a CI gate.
+
+**Does the distinction need to surface in the framework?** Partly. The per-topic
+`expect` (mode/presence/hz/latency) stays shared. Replay adds a *layer* of
+ground-truth assertions (completeness/loss/content/calibration) and a different
+latency source. The framework can detect replay mode from the presence of a bag
+source (a scenario application that replays a bag) or an explicit session flag,
+and only then enable the replay-only assertions. See the TODOs below.
 
 ## Feature → example → test roadmap
 
@@ -131,17 +174,28 @@ headerless topics; `/tf` rate floored). The latched topics carry
 **contract** level. Two delivery bugs remain (flip the `optional`s to required
 once fixed):
 
-1. **Latched OTA delivery.** Bag records statics as **volatile ~1 Hz**; `latch`
-   collapses them to on-change. Across the multi-hop com pipeline
-   (latch_relay → relay_out `ota_pub` → domain_bridge 47↔48 → OTA → domain_bridge
-   48↔46) the held value does not reach the receiver: ROS `domain_bridge` does not
-   reliably carry `transient_local` across domains, and the bag's volatile native
-   one-shot is missed by the `latch_sub` (volatile) if it subscribes late. Added
-   per-topic `for_role.ota_pub/ota_sub: transient_local` + long lifespan (correct
-   and kept) but it is not sufficient. **Fix:** make `latch_sub` transient_local so
-   it catches the bag's held value, and pin per-topic `transient_local` QoS on the
-   domain_bridge hops (or relay the latched value through a transient_local-aware
-   bridge). Needs in-container iteration.
+1. **Latched OTA delivery.** Sharpened by the live `status.txt` of the
+   mode-aware run (b side): a latched topic whose value *changes* delivers fine —
+   `/gnss_reference` streams native→processed→com_out→ota_sent all FLOWING at
+   10 Hz (it is never actually reduced to on-change). The bug is specific to
+   **truly-constant** statics (`/site`, `/type`, `/vehicle`, native 1 Hz): the
+   `latch_relay` fires **once** (`processed` = `/site/latched` STALE, 0 Hz, ~25 s
+   old, transient_local held) and that held value **never propagates downstream**
+   — `com_out` (`relay_out` `forward_sub`) stays IDLE, so it never reaches OTA.
+   Two further wrinkles: `/mission/debug/drive_to_state` (latch+trickle) never
+   fires at all (`processed` IDLE — latch change-detection / trickle not
+   re-publishing), and `/tf_static` never reaches `native`. So the path has
+   distinct sub-bugs: (a) the transient_local held value is not forwarded across
+   relay hops to a late `forward_sub` (relays don't replay history; or a
+   subscribe-order race; or `latch_pub`/`forward_sub` durability is not actually
+   transient_local at runtime — verify live with `ros2 topic info -v`); (b)
+   `latch_relay` change-detection / `trickle_hz` re-publish is inconsistent. Per-
+   topic `for_role.ota_pub/ota_sub: transient_local` was added (correct, kept) but
+   only covers the `/com/out`→OTA hop, not `latch_pub`→`forward_sub`. **Fix
+   directions:** trickle the latch output at a low rate so static topics become a
+   continuous stream (no reliance on transient_local history — the robust path),
+   and/or make every relay hop forward transient_local history. Needs in-container
+   iteration with live QoS inspection.
 2. **Center OUTBOUND relay.** `a_to_b` topics reach `native` (mock publishes) but
    the center's outbound relay does not forward: `/planning/free/reset` produces no
    `/com/out`, and `/move_base_free/goal`'s `framebridge: global_to_local` emits no
@@ -167,3 +221,19 @@ once fixed):
 - [ ] Fix the two remote_assist delivery bugs above; flip its `optional`s to
       required.
 - [ ] Decide testability of framebridge / ffmpeg video (existence vs throughput).
+
+### Replay-only (ground-truth) assertions — from "Live vs replay" above
+
+- [ ] Detect replay mode (bag source present, or an explicit session flag) and
+      only then enable the replay-only assertions below.
+- [ ] Completeness / loss%: with the bag's per-topic message count as ground
+      truth, assert `received ≥ ratio · sent` (subsumes `min_count`). Pairs with
+      the receiver-side counts the overview must start reporting.
+- [ ] Contract calibration: a reference replay run reports each topic's actual
+      delivered hz / size / latency, to author and to *validate* `expect` (flag
+      contradictory bounds, e.g. an hz floor above the achievable rate). Optional:
+      emit a suggested `expect` block from a reference run.
+- [ ] True OTA latency under replay: inject a send-time at the relay (sidecar
+      stamp) so latency reflects the link, not the restamped payload header.
+- [ ] Content integrity (advanced): compare received payloads to the sent
+      ground truth (byte-equal, or equal after a declared transform).

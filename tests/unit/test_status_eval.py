@@ -291,3 +291,63 @@ def test_link_ratio_none_skipped() -> None:
     # No payload in a direction -> ratio None -> not asserted.
     rep = _report_with_link({"overhead_ratio_out": None, "overhead_ratio_in": None})
     assert evaluate_report(rep, {}, {"max_ratio": 1.0}) == []
+
+
+# --- replay: completeness vs bag native rate + suggested expect ---------------
+
+from rosotacom.status_eval import suggest_expectations  # noqa: E402
+
+
+def _counted2(stage: str, hz: float, count: int, state: str = "FLOWING") -> dict:
+    return {"stage": stage, "hz": hz, "latency_ms": None, "state": state, "publishers": 1, "messages_total": count}
+
+
+def test_bag_completeness_below_ratio_fails() -> None:
+    # /tf delivered 5 Hz vs bag native 100 Hz = 5% < vs_bag_ratio 0.1.
+    topic = {"base": "/tf", "direction": "inbound", "overall": "OK", "stages": [_counted2("app_in", 5.0, 100)]}
+    gt = {"/tf": {"native_hz": 100.0}}
+    failures = evaluate_report(
+        {"peer": "a", "topics": [topic]}, {"/tf": {"completeness": {"vs_bag_ratio": 0.1}}}, None, gt
+    )
+    assert len(failures) == 1 and "native" in failures[0] and "/tf" in failures[0]
+
+
+def test_bag_completeness_above_ratio_passes() -> None:
+    topic = {"base": "/tf", "direction": "inbound", "overall": "OK", "stages": [_counted2("app_in", 20.0, 100)]}
+    gt = {"/tf": {"native_hz": 100.0}}
+    assert (
+        evaluate_report({"peer": "a", "topics": [topic]}, {"/tf": {"completeness": {"vs_bag_ratio": 0.1}}}, None, gt)
+        == []
+    )
+
+
+def test_bag_completeness_skipped_without_ground_truth() -> None:
+    topic = {"base": "/tf", "direction": "inbound", "overall": "OK", "stages": [_counted2("app_in", 1.0, 100)]}
+    assert (
+        evaluate_report({"peer": "a", "topics": [topic]}, {"/tf": {"completeness": {"vs_bag_ratio": 0.9}}}, None, None)
+        == []
+    )
+
+
+def test_suggest_stream_topic_emits_hz_band() -> None:
+    rep = {"peer": "a", "topics": [_topic("/tf", "inbound", "OK", [_stage("app_in", 10.0, 30.0)])]}
+    s = suggest_expectations({"a": rep})
+    assert "/tf" in s and s["/tf"]["hz"]["min"] == 6.0 and s["/tf"]["hz"]["max"] == 15.0
+    assert s["/tf"]["latency_ms"]["max"] == 110  # 30*2+50
+
+
+def test_suggest_latched_for_delivered_but_idle() -> None:
+    rep = {"peer": "a", "topics": [_topic("/site", "inbound", "OK", [_stage("app_in", 0.0, None, "STALE")])]}
+    assert suggest_expectations({"a": rep})["/site"] == {"mode": "latched"}
+
+
+def test_suggest_optional_for_undelivered_and_skips_outbound() -> None:
+    rep = {
+        "peer": "a",
+        "topics": [
+            _topic("/cmd", "inbound", "STALLED", [_stage("app_in", 0.0, None, "ABSENT", publishers=0)]),
+            _topic("/out", "outbound", "OK", [_stage("native", 10.0, None)]),
+        ],
+    }
+    s = suggest_expectations({"a": rep})
+    assert s["/cmd"] == {"presence": "optional"} and "/out" not in s

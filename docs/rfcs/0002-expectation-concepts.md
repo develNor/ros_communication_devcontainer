@@ -162,7 +162,8 @@ delivery + isolation.
 | optional / required | `presence: optional` absent ⇒ pass | remote_assist a_to_b | done |
 | **completeness** | `min_count` + per-peer `completeness.min_ratio` | remote_assist `/tf` | done |
 | **link overhead** | wire bytes / ROS payload ratio | remote_assist (status `link`) | done |
-| framebridge, ffmpeg video | existence / throughput | maybe out of scope pass 1 | **TODO** |
+| framebridge | local↔global transform delivered | remote_assist (`/tf`, `/move_base_free/goal`) | done |
+| ffmpeg video | existence / throughput | n/a -- no video feature in the codebase | n/a |
 
 ## remote_assist status (private parent repo)
 
@@ -297,10 +298,30 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
       (the OTA link only thins, never amplifies -- e.g. the original `/tf` `min 40`
       that prompted the recalibration), and a static transient_local topic (≈ once,
       held) described as a stream. Verified on remote_assist (20 expectations
-      consistent). Still optional: emitting a *suggested* `expect` block, and using a
-      reference run's *delivered* hz/size/latency (status.json) as the complementary
-      observed-ground-truth source.
+      consistent).
+- [x] Completeness / loss% vs the bag's native rate. `expect.completeness.vs_bag_ratio: R`
+      asserts the receiver's delivered hz >= R * the bag's native hz, i.e. at least R
+      of the source crossed the link -- catching loss BEFORE the first observed stage
+      (e.g. best_effort decimation at the send QoS), which the within-peer ratio can't
+      see. Wired via `rosotacom test --bag <dir>` (loads the ground truth and threads it
+      to `status_eval`). Verified on remote_assist `/tf`: delivered 19 Hz of 107 Hz native
+      (18%) -- `vs_bag_ratio 0.1` passes, `0.5` fails with an "excessive OTA loss" message.
+- [x] Suggested-`expect` emitter. `rosotacom test --suggest` reads the current run's
+      status.json and prints a starter `expect` block per inbound topic from the observed
+      hz/latency (a delivered-but-idle topic → `mode: latched`; an undelivered one →
+      `presence: optional`). `status_eval.suggest_expectations`. Verified on remote_assist
+      (/tf → hz 11–28, /can/twist → +latency 94 ms, /site → latched).
 - [ ] True OTA latency under replay: inject a send-time at the relay (sidecar
       stamp) so latency reflects the link, not the restamped payload header.
-- [ ] Content integrity (advanced): compare received payloads to the sent
-      ground truth (byte-equal, or equal after a declared transform).
+      **Note:** `restamp` already delivers true OTA latency for *headered* topics
+      (it stamps send-now; the receiver measures recv−send -- verified 22 ms on
+      10_restamp and remote_assist `/can/twist`). The sidecar only adds value for
+      *headerless* topics, of which the OTA contracts currently have no latency-bearing
+      consumer, so it is deferred (it needs send-time injection in the OTA wrapper +
+      a matching read in the monitor).
+- [ ] Content integrity (advanced): compare received payloads to the sent ground
+      truth. Byte-equality only holds for pass-through topics (no restamp/framebridge/
+      compress); a bag-driven check must be transform-aware (compare after the declared
+      transform), and needs a receiver-side recorder. Scoped but not built -- the largest
+      remaining item; the isolation-probe mechanism (publish a known payload, verify on
+      receipt) is the natural seed for a pass-through byte-equal first cut.

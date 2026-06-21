@@ -212,10 +212,43 @@ def _check_completeness(peer: str, base: str, topic: dict[str, Any], expect: dic
     return failures
 
 
+def _check_bag_completeness(
+    peer: str,
+    base: str,
+    stage: dict[str, Any],
+    expect: dict[str, Any],
+    ground_truth: dict[str, Any] | None,
+) -> list[str]:
+    """Cross-reference the delivered rate against the bag's known native rate (replay).
+
+    `expect.completeness.vs_bag_ratio: R` asserts delivered_hz >= R * native_hz, i.e.
+    at least R of the source actually crossed the OTA link. Unlike the within-peer
+    completeness ratio, this catches loss that happens BEFORE the first observed
+    stage (e.g. best_effort decimation at the send QoS). Only meaningful in a replay
+    test, so it is skipped unless a bag ground truth was supplied."""
+    comp = expect.get("completeness") or {}
+    vs_bag = comp.get("vs_bag_ratio")
+    if vs_bag is None or not ground_truth:
+        return []
+    gt = ground_truth.get(base) or {}
+    native_hz = gt.get("native_hz")
+    if not native_hz or native_hz <= 0:
+        return []
+    delivered_hz = stage.get("hz") or 0.0
+    ratio = delivered_hz / native_hz
+    if ratio < float(vs_bag):
+        return [
+            f"[{peer}] {base}: delivered {delivered_hz:.1f} Hz is {ratio:.0%} of the bag's "
+            f"native {native_hz:.1f} Hz (< vs_bag_ratio {vs_bag}) -- excessive OTA loss."
+        ]
+    return []
+
+
 def evaluate_report(
     report: dict[str, Any],
     expect_by_topic: dict[str, dict[str, Any]],
     link_expect: dict[str, Any] | None = None,
+    ground_truth: dict[str, Any] | None = None,
 ) -> list[str]:
     """Failures for one peer's status.json (empty == all good)."""
     peer = report.get("peer", "?")
@@ -244,6 +277,7 @@ def evaluate_report(
                 if expect and topic.get("direction") == "inbound" and stage is not None:
                     failures += _check_expect(peer, base, stage, expect)
                     failures += _check_completeness(peer, base, topic, expect)
+                    failures += _check_bag_completeness(peer, base, stage, expect, ground_truth)
             continue
 
         # overall != OK -- reinterpret per the declared delivery mode.
@@ -270,9 +304,52 @@ def evaluate_reports(
     reports: dict[str, dict[str, Any]],
     expect_by_topic: dict[str, dict[str, Any]],
     link_expect: dict[str, Any] | None = None,
+    ground_truth: dict[str, Any] | None = None,
 ) -> list[str]:
     """Failures across every peer's status.json (empty == all good)."""
     failures: list[str] = []
     for report in reports.values():
-        failures += evaluate_report(report, expect_by_topic, link_expect)
+        failures += evaluate_report(report, expect_by_topic, link_expect, ground_truth)
     return failures
+
+
+def _suggest_one(topic: dict[str, Any]) -> dict[str, Any] | None:
+    """A suggested `expect` block for one delivered inbound topic, from observation."""
+    stage = _final_stage(topic)
+    if stage is None or stage.get("state") not in _DELIVERED_STATES:
+        # Never delivered in the reference run -> a one-directional/no-source topic.
+        return {"presence": "optional"}
+    hz = stage.get("hz")
+    if not hz or hz <= 0:
+        # Delivered but not ticking -> a static/latched held value.
+        return {"mode": "latched"}
+    expect: dict[str, Any] = {
+        # A band around the observed rate: wide enough to tolerate run-to-run
+        # jitter, tight enough to catch a regression. Author should narrow these.
+        "hz": {"min": max(0.1, round(hz * 0.6, 1)), "max": round(hz * 1.5, 1)}
+    }
+    lat = stage.get("latency_ms")
+    if lat is not None:
+        expect["latency_ms"] = {"max": int(round(lat * 2 + 50))}
+    return expect
+
+
+def suggest_expectations(reports: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Suggest an `expect` block per topic from a reference run's status.json(s).
+
+    Uses the inbound (receiver) view -- the side where the contract is asserted --
+    and the deepest delivered stage's observed hz/latency. A starting point to
+    author/`calibrate` a contract, not a substitute for human judgement. Pure and
+    order-stable; topics seen only outbound (no inbound observation) are skipped."""
+    out: dict[str, dict[str, Any]] = {}
+    for report in reports.values():
+        for topic in report.get("topics", []):
+            if topic.get("direction") != "inbound":
+                continue
+            base = topic.get("base")
+            if not base or base in out:
+                continue
+            suggestion = _suggest_one(topic)
+            if suggestion is not None:
+                out[str(base)] = suggestion
+    return out

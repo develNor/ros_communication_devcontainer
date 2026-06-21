@@ -4645,13 +4645,30 @@ def test_command(args: argparse.Namespace) -> int:
     interval = max(0.5, float(getattr(args, "interval", 2.0)))
     expect_by_topic = status_eval.expectations_from_cfg(cfg)
     link_expect = status_eval.link_expect_from_cfg(cfg)
+    ground_truth: dict[str, Any] | None = None
+    bag = getattr(args, "bag", None)
+    if bag:
+        from . import bag_ground_truth
+
+        ground_truth = bag_ground_truth.bag_ground_truth(bag)
     reports: dict[str, Any] = {}
     failures: list[str] = []
+
+    # --suggest: emit a starter `expect` block from the current run instead of asserting.
+    if getattr(args, "suggest", False):
+        reports = _load_status_reports(logs_dir) if logs_dir.is_dir() else {}
+        if not reports:
+            print(f"rosotacom test --suggest: no status.json under {logs_dir}.", file=sys.stderr)
+            return 1
+        suggestions = status_eval.suggest_expectations(reports)
+        print("# Suggested expect blocks from this run (author/narrow before committing):")
+        print(yaml.safe_dump(suggestions, sort_keys=True, default_flow_style=False).rstrip())
+        return 0
 
     while True:
         reports = _load_status_reports(logs_dir) if logs_dir.is_dir() else {}
         if reports:
-            failures = status_eval.evaluate_reports(reports, expect_by_topic, link_expect)
+            failures = status_eval.evaluate_reports(reports, expect_by_topic, link_expect, ground_truth)
             if not failures:
                 topic_count = sum(len(r.get("topics", [])) for r in reports.values())
                 print(f"TEST OK: {len(reports)} peer(s), {topic_count} topic(s) meet status + expectations")
@@ -5724,6 +5741,15 @@ def main(argv: list[str] | None = None) -> int:
     test_parser.add_argument("--instance-id", help="Evaluate a specific instance id (default: most recent).")
     test_parser.add_argument("--timeout", type=float, default=30.0, help="Seconds to wait for status to settle.")
     test_parser.add_argument("--interval", type=float, default=2.0, help="Polling interval while waiting (s).")
+    test_parser.add_argument(
+        "--bag",
+        help="Replay bag dir/metadata.yaml: enables completeness.vs_bag_ratio assertions against the native rate.",
+    )
+    test_parser.add_argument(
+        "--suggest",
+        action="store_true",
+        help="Print a suggested `expect` block per topic from the current run instead of asserting.",
+    )
     test_parser.set_defaults(func=test_command)
 
     calibrate_parser = subparsers.add_parser(

@@ -1710,6 +1710,27 @@ def test_smoke_crossed_topics_include_native_chatter_direction() -> None:
     assert "export ROS_DOMAIN_ID=47" in rosotacom._smoke_ros_setup("/config", cfg, "b")
 
 
+def test_smoke_native_publish_rate_override() -> None:
+    # A rate-changing feature drives its source from expect.smoke_native_hz, not
+    # the (lower) asserted received bounds.
+    assert rosotacom._smoke_native_publish_rate({"smoke_native_hz": 10, "hz": {"min": 3, "max": 7}}) == 10.0
+    # Without the override it falls back to the derived rate (midpoint of bounds).
+    assert rosotacom._smoke_native_publish_rate({"hz": {"min": 4, "max": 6}}) == 5.0
+
+
+def test_drop_example_source_publishes_at_native_rate() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "8_drop" / "session-definition.yaml").read_text(encoding="utf-8")
+    )
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, "a") if s.publish_topic]
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.publish_topic == "/drop_demo"
+    # Source runs at the declared native 10 Hz so drop 1-of-2 yields the asserted ~5 Hz.
+    assert spec.publish_rate == 10.0
+    assert (spec.hz_min, spec.hz_max) == (3, 7)
+
+
 def test_publish_test_topics_command_starts_and_stops_identity_publishers(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

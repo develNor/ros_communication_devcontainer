@@ -3994,6 +3994,20 @@ def _smoke_publish_rate(expect: Any) -> float:
     return 5.0
 
 
+def _smoke_native_publish_rate(expect: Any) -> float:
+    """The rate the synthetic source should publish the NATIVE topic at.
+
+    For rate-preserving topics this is derived from the expect hz bounds. But a
+    rate-changing feature (drop/throttle) needs the native rate to be HIGHER than
+    the asserted (received) rate, so an example may declare `expect.smoke_native_hz`
+    to drive the source faster than the post-processing bounds it asserts."""
+    if isinstance(expect, dict):
+        native_hz = expect.get("smoke_native_hz")
+        if native_hz is not None:
+            return float(native_hz)
+    return _smoke_publish_rate(expect)
+
+
 def _smoke_rmw_spec(cfg: dict[str, Any]) -> Any:
     peers = cfg.get("peers", {}) or {}
     if not isinstance(peers, dict):
@@ -4147,7 +4161,7 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
                         ),
                         publish_topic=entry.base,
                         publish_type=entry.msg_type,
-                        publish_rate=_smoke_publish_rate(entry.expect),
+                        publish_rate=_smoke_native_publish_rate(entry.expect),
                         hz_min=expect_hz_min,
                         hz_max=expect_hz_max,
                         max_delay_s=expect_max_delay_s,

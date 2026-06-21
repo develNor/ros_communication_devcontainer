@@ -155,8 +155,8 @@ delivery + isolation.
 | stream delivery, isolation | hz/latency | 1_heartbeat, 2_native_chatter | done |
 | compression, sized payload | hz + size preserved | 3_/5_/4_/6_ | done |
 | **latched / transient_local** | `mode: latched`, late-subscriber held value | TODO: `7_latched_static` | **TODO** |
-| **drop N of M** | resulting hz within bounds | TODO: `8_drop` | **TODO** |
-| **throttle** | resulting hz ≤ max | TODO: `9_throttle` | **TODO** |
+| **drop N of M** | resulting hz within bounds | `8_drop` | done (10→5.00 Hz verified) |
+| **throttle** | resulting hz ≤ max | `9_throttle` | done (20→5 Hz cap) |
 | **restamp** | latency measurable after restamp | TODO: `10_restamp` | **TODO** |
 | **trickle (receive side)** | local re-publish hz (native only) | TODO: `11_trickle` | **TODO** |
 | optional / required | `presence: optional` absent ⇒ pass | remote_assist a_to_b | done |
@@ -240,7 +240,15 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
       (sender ships the global `/globalframe` topic as its native = OTA `final`; b's
       framebridge produces the local base as `native_in`). Both commands are now
       `presence: required` and green on a+b. See the remote_assist section above.
-- [ ] Curated public example sessions per feature (table above) + e2e assertions.
+- [~] Curated public example sessions per feature (table above) + e2e assertions.
+      Done: `8_drop`, `9_throttle` (both verified cross-host green). Enabled by a
+      reusable smoke-source hook: `expect.smoke_native_hz` drives the synthetic
+      publisher faster than the asserted (post-processing) rate, so a rate-changing
+      feature can be exercised end-to-end (`cli._smoke_native_publish_rate`). Still
+      to add: `7_latched_static` (needs a slow/once or on-change synthetic source —
+      the default source is a continuous stream, which a latch just passes through),
+      `10_restamp` (needs a stale-stamp source — a live synthetic source already
+      stamps ~now, so restamp is a no-op to observe), `11_trickle`.
 - [x] `min_count` + per-peer `completeness.min_ratio` (RFC concept "completeness").
       The status overview already records `messages_total` per stage, so `status_eval`
       asserts (a) the delivered final stage saw >= `min_count` messages and (b) within

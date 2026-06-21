@@ -154,11 +154,11 @@ delivery + isolation.
 |---|---|---|---|
 | stream delivery, isolation | hz/latency | 1_heartbeat, 2_native_chatter | done |
 | compression, sized payload | hz + size preserved | 3_/5_/4_/6_ | done |
-| **latched / transient_local** | `mode: latched`, late-subscriber held value | TODO: `7_latched_static` | **TODO** |
+| **latched / transient_local** | `mode: latched`, held value | `7_latched_static` | done (delivered+held verified) |
 | **drop N of M** | resulting hz within bounds | `8_drop` | done (10→5.00 Hz verified) |
-| **throttle** | resulting hz ≤ max | `9_throttle` | done (20→5 Hz cap) |
-| **restamp** | latency measurable after restamp | TODO: `10_restamp` | **TODO** |
-| **trickle (receive side)** | local re-publish hz (native only) | TODO: `11_trickle` | **TODO** |
+| **throttle** | resulting hz ≤ max | `9_throttle` | done (20→4.33 Hz cap) |
+| **restamp** | latency measurable after restamp | `10_restamp` | done (1970 stamp → 22 ms verified) |
+| **trickle (receive side)** | local re-publish hz (now a stage) | `11_trickle` | done (1→~5 Hz upsample) |
 | optional / required | `presence: optional` absent ⇒ pass | remote_assist a_to_b | done |
 | **completeness** | `min_count` + per-peer `completeness.min_ratio` | remote_assist `/tf` | done |
 | **link overhead** | wire bytes / ROS payload ratio | remote_assist (status `link`) | done |
@@ -240,15 +240,21 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
       (sender ships the global `/globalframe` topic as its native = OTA `final`; b's
       framebridge produces the local base as `native_in`). Both commands are now
       `presence: required` and green on a+b. See the remote_assist section above.
-- [~] Curated public example sessions per feature (table above) + e2e assertions.
-      Done: `8_drop`, `9_throttle` (both verified cross-host green). Enabled by a
-      reusable smoke-source hook: `expect.smoke_native_hz` drives the synthetic
-      publisher faster than the asserted (post-processing) rate, so a rate-changing
-      feature can be exercised end-to-end (`cli._smoke_native_publish_rate`). Still
-      to add: `7_latched_static` (needs a slow/once or on-change synthetic source —
-      the default source is a continuous stream, which a latch just passes through),
-      `10_restamp` (needs a stale-stamp source — a live synthetic source already
-      stamps ~now, so restamp is a no-op to observe), `11_trickle`.
+- [x] Curated public example sessions per feature (table above) + e2e assertions.
+      All five processing features now have a verified cross-host example:
+      `7_latched_static` (held value delivered, STALE between ticks), `8_drop`
+      (10→5.00 Hz), `9_throttle` (20→4.33 Hz cap), `10_restamp` (1970 stamp → 22 ms
+      measured latency), `11_trickle` (1 Hz source → 5.00 Hz delivered). Three
+      enablers landed:
+      - `expect.smoke_native_hz` (`cli._smoke_native_publish_rate`): drive the
+        synthetic source faster/slower than the asserted (post-processing) rate.
+      - A stale-stamped `geometry_msgs/msg/PointStamped` smoke source (1970 stamp)
+        so restamp has an observable effect (the monitor guards absurd ages to a
+        null latency, which a `latency_ms` contract fails without restamp).
+      - **Trickle made observable**: the receiver-side trickle re-publish
+        (`<final>/trickle`) is now a first-class monitored `native_in` stage
+        (`generate_session_files._postprocessed_topic` + `cli._smoke_postprocessed_topic`),
+        so its rate can be asserted — previously it was a status blind spot.
 - [x] `min_count` + per-peer `completeness.min_ratio` (RFC concept "completeness").
       The status overview already records `messages_total` per stage, so `status_eval`
       asserts (a) the delivered final stage saw >= `min_count` messages and (b) within

@@ -1731,6 +1731,38 @@ def test_drop_example_source_publishes_at_native_rate() -> None:
     assert (spec.hz_min, spec.hz_max) == (3, 7)
 
 
+def test_restamp_example_uses_stale_stamped_header_source() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "10_restamp" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, "a") if s.publish_topic]
+    assert len(specs) == 1
+    assert specs[0].publish_topic == "/restamp_demo"
+    assert specs[0].publish_type == "geometry_msgs/msg/PointStamped"
+    # The synthetic message carries a stale (1970) stamp so restamp has an effect.
+    msg = rosotacom._smoke_publish_message("geometry_msgs/msg/PointStamped")
+    assert "sec: 1000" in msg and "point" in msg
+
+
+def test_trickle_example_asserts_the_trickle_output_stage() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "11_trickle" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, "a") if s.publish_topic]
+    assert len(specs) == 1
+    spec = specs[0]
+    # Source publishes the base topic at 1 Hz...
+    assert spec.publish_topic == "/trickle_demo"
+    assert spec.publish_rate == 1.0
+    # ...but the asserted received stage is the receiver-side trickle re-publish.
+    assert spec.topic == "/trickle_demo/trickle"
+    assert (spec.hz_min, spec.hz_max) == (2, 8)
+
+
 def test_publish_test_topics_command_starts_and_stops_identity_publishers(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

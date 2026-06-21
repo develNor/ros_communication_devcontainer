@@ -1299,6 +1299,13 @@ def _build_status_pipeline_spec(
         return None
 
     def _postprocessed_topic(pipe: Dict[str, Any], final: str) -> str:
+        if pipe.get("trickle_hz") is not None:
+            # Receiver-side trickle re-publishes the delivered OTA `final` at a fixed
+            # rate to `<final>/trickle` (the trickle node's trickle_topic_suffix). That
+            # republished topic is the real delivered output, so it is the monitored
+            # native_in stage -- otherwise the trickle re-publish is an observability
+            # blind spot (its rate cannot be asserted).
+            return final + "/trickle"
         if pipe.get("compress"):
             return str(pipe["comp_in"])
         if pipe.get("ota_wrap"):

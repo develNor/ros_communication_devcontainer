@@ -3963,6 +3963,11 @@ def _smoke_topic_pipeline(cfg: dict[str, Any], entry: Any) -> dict[str, Any]:
 
 
 def _smoke_postprocessed_topic(entry: Any, pipe: dict[str, Any]) -> str:
+    if pipe.get("trickle_hz") is not None:
+        # Mirror generate_session_files._postprocessed_topic: the receiver-side
+        # trickle republishes the delivered topic at <final>/trickle, and that is
+        # the stage the smoke should drive/assert.
+        return str(pipe["final"]) + "/trickle"
     if pipe.get("compress"):
         return str(pipe["comp_in"])
     if pipe.get("ota_wrap"):
@@ -4236,6 +4241,12 @@ def _smoke_publish_message(msg_type: str) -> str:
             "info: {resolution: 0.5, width: 4, height: 4, origin: {orientation: {w: 1.0}}}, "
             "data: [0, 0, 0, 0, 0, 25, 50, 0, 0, 50, 100, 0, -1, -1, -1, -1]}"
         )
+    if normalized in {"geometry_msgs/msg/PointStamped", "geometry_msgs/PointStamped"}:
+        # A deliberately STALE header.stamp (epoch+1000s == 1970) so the restamp
+        # example is meaningful: without restamp the monitor sees an absurd age and
+        # guards it to None (a latency_ms contract then fails); restamp rewrites the
+        # stamp to "now" at send time, making OTA latency small and measurable.
+        return "{header: {stamp: {sec: 1000, nanosec: 0}, frame_id: map}, point: {x: 1.0}}"
     raise RuntimeError(f"Smoke cannot synthesize a publisher for message type {msg_type!r}.")
 
 

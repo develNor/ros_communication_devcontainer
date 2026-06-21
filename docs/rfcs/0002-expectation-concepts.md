@@ -1,7 +1,9 @@
 # RFC 0002 — Richer expectation concepts (presence / mode / completeness / overhead)
 
-**Status:** Partially implemented · **Scope:** test/example architecture · extends
-[RFC 0001](0001-expectation-driven-test-suite.md)
+**Status:** Implemented & verified — every roadmap item below is built and verified
+cross-host (examples 1–13 pass; remote_assist 100% green). The only forward-looking
+note is content-integrity's transform-aware / non-String *extension*. · **Scope:**
+test/example architecture · extends [RFC 0001](0001-expectation-driven-test-suite.md)
 
 ## Summary
 
@@ -171,7 +173,9 @@ OTA transport works (cyclone) and the streaming contract passes after
 recalibration (`restamp_if` added where headers exist; `latency_ms` dropped from
 headerless topics; `/tf` rate floored). The latched topics carry `mode: latched`
 and the `a_to_b` commands are now `presence: required` (driven by a mock center
-publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains:
+publisher). **remote_assist is now 100% green -- every topic `presence: required`,
+nothing optional, OK=22 / STALLED=0 on both peers.** The delivery issues that were
+once `optional` are all fixed:
 
 1. **Latched OTA delivery — FIXED** (on-change latch preserved; no
    retransmission). Root cause found via the b-side catmux logs:
@@ -193,11 +197,10 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
    `shared.latch_keepalive_hz`, default 0, remains as an escape hatch for OTA
    paths that genuinely cannot carry transient_local — but it is NOT used here, as
    re-streaming would defeat the latch's bandwidth purpose.)
-   *Still optional:* `/tf_static` (restamp/framebridge, not a latch topic — its
-   bag publisher is transient_local so it needs a transient_local `latch_sub`, not
-   the volatile one used for 1 Hz statics) and `/execution/debug/switchbox_state`
-   (trickle; needs a send-side latch with a bag-matched `latch_sub` durability).
-   Both want a per-topic `latch_sub` durability matching their recorded QoS.
+   *`/tf_static` + `/execution/debug/switchbox_state` are now `presence: required`
+   too* — see the Open-TODO item below: the earlier "needs a transient_local
+   latch_sub" theory was wrong; they are simply published late in the bag (88 s /
+   60 s) and are caught live once the loop reaches them within the test window.
 2. **Center OUTBOUND relay — FIXED** (both `a_to_b` commands `presence: required`,
    green on a+b). The center peer never carried outbound traffic before, so two
    generation bugs hid in `generate_session_files`:
@@ -225,16 +228,17 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
       + direction-aware `mode: latched`). See the remote_assist section above.
 - [x] Live status overview made mode-aware (latched/existence show OK; latched is
       direction-aware) in `status_overview_core.py` rollup.
-- [ ] `/tf_static` and `/execution/debug/switchbox_state` (recorded reliable +
-      transient_local; published essentially once): on b the pipeline never even
-      observes `native` (`reached: None, blocked: native`), unlike the 1 Hz statics
-      whose native is a continuous stream the latch catches live. Root question:
-      whether `ros2 bag play` actually re-offers these as transient_local across
-      `--loop` (so a transient_local sub catches the held value), or publishes them
-      volatile-once. Likely needs a bag-play `--qos-profile-overrides-path` or a
-      send-side latch with a transient_local `latch_sub`. The domain_bridge fix is
-      now general (pins transient_local for any transient_local topic, not just
-      `/latched`), so it is ready once b observes the value.
+- [x] `/tf_static` and `/execution/debug/switchbox_state` fixed -- and it was NOT a
+      QoS bug (every transient_local / bag-play-cache theory was wrong and reverted).
+      Reading the MCAP per-message timestamps showed these are published LATE in the
+      bag (`/tf_static` at 88.2 s, `/switchbox_state` at 59.8 s of the 100 s recording),
+      not at t=0. The smoke collected artifacts the instant the *required* topics went
+      green (well before 60 s of bag time), so those two simply had not been published
+      yet. Fix: flip them to `presence: required`; the looping bag reaches their publish
+      point within the 120 s test window and the held value is caught live (subscribers
+      long since connected). Both are now `mode: latched, presence: required` and green
+      on a+b. Lesson: when a bag topic looks undeliverable, check WHEN it is published
+      (mcap timestamps) before blaming QoS.
 - [x] Center OUTBOUND relay (a_to_b) fixed — OUT `native`/`processed` stages carry
       the `/to_<remote>` `target_prefix` so they agree with `relay_out`'s
       subscription; and `global_to_local` is modelled as a receiver-side transform
@@ -279,17 +283,27 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
       `_kick_link_measurement`, which was broken anyway -- tshark is not in the
       image) is deleted, removing the duplicate ROS-bandwidth + link code.
 - [x] remote_assist center OUTBOUND (a_to_b) bug fixed; both commands flipped to
-      `presence: required`. Only the `/tf_static` + `/switchbox_state` bag-play-QoS
-      latch edge (above) stays `optional`.
-- [ ] Decide testability of framebridge / ffmpeg video (existence vs throughput).
+      `presence: required`. (And the `/tf_static` + `/switchbox_state` late-publish
+      edge is now fixed too — see above — so remote_assist has no `optional` topics
+      left: OK=22 / STALLED=0 on both peers.)
+- [x] framebridge / ffmpeg video testability decided. framebridge is exercised
+      end-to-end by remote_assist (`/tf` local→global, `/move_base_free/goal`
+      global→local, both delivered to `native_in`); ffmpeg video is n/a -- there is no
+      video/ffmpeg feature anywhere in the codebase, so there is nothing to test.
 
 ### Replay-only (ground-truth) assertions — from "Live vs replay" above
 
-- [ ] Detect replay mode (bag source present, or an explicit session flag) and
-      only then enable the replay-only assertions below.
-- [ ] Completeness / loss%: with the bag's per-topic message count as ground
-      truth, assert `received ≥ ratio · sent` (subsumes `min_count`). Pairs with
-      the receiver-side counts the overview must start reporting.
+- [x] Replay mode is enabled by an explicit `--bag <dir>` flag on `rosotacom test`
+      (and `calibrate`): the replay-only assertions run only when a bag ground truth is
+      supplied, otherwise they skip cleanly. (An explicit flag is the "explicit session
+      flag" option; auto-detecting a bag source is unnecessary on top of it.)
+- [x] Completeness / loss% vs the bag -- `expect.completeness.vs_bag_ratio: R` asserts
+      `delivered_hz ≥ R · native_hz` (wired via `test --bag`, which threads the bag's
+      native rate into `status_eval`). This is the *rate* form of `received ≥ ratio·sent`
+      (rate = count / window), equivalent to and subsuming `min_count` while avoiding the
+      count/loop-window alignment fragility of raw counts -- and the overview already
+      reports per-stage counts (`messages_total`). Verified on `/tf`: delivered 19 Hz of
+      107 Hz native (18%) → `0.1` passes, `0.5` fails with "excessive OTA loss".
 - [x] Contract calibration (bag-as-ground-truth). `rosotacom calibrate --bag <dir>
       [<session>]` reads the bag's own `metadata.yaml` (pure YAML -- no rosbag2/mcap
       decode, `src/rosotacom/bag_ground_truth.py`) and reports per-topic ground truth

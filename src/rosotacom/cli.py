@@ -4588,6 +4588,45 @@ def _load_status_reports(logs_dir: Path) -> dict[str, Any]:
     return reports
 
 
+def calibrate_command(args: argparse.Namespace) -> int:
+    """Report a replay bag's per-topic ground truth and (optionally) validate a
+    session's `expect` against it -- the replay-only "contract calibration" of
+    docs/rfcs/0002. Pure: reads only the bag's metadata.yaml, runs nothing."""
+    from . import bag_ground_truth, status_eval
+
+    gt = bag_ground_truth.bag_ground_truth(args.bag)
+    if not gt:
+        print(f"No topics found in bag metadata: {args.bag}", file=sys.stderr)
+        return 1
+
+    width = max(len(t) for t in gt)
+    print(f"Bag ground truth ({len(gt)} topics) from {args.bag}:")
+    for topic in sorted(gt):
+        g = gt[topic]
+        hz = f"{g['native_hz']:.1f} Hz" if g["native_hz"] is not None else "   -   "
+        print(
+            f"  {topic:<{width}}  {g['count']:>7} msgs  {hz:>10}  "
+            f"{(g.get('durability') or ''):<16} {g.get('msg_type') or ''}"
+        )
+
+    warnings: list[str] = []
+    session_dir = getattr(args, "session_dir", None)
+    if session_dir:
+        runtime = _load_runtime_config(args)
+        session = _resolve_session(session_dir, runtime)
+        cfg = _effective_session_config(session.host_dir, runtime)
+        expect_by_topic = status_eval.expectations_from_cfg(cfg)
+        warnings = bag_ground_truth.validate_expect_against_bag(expect_by_topic, gt)
+        print()
+        if warnings:
+            print(f"CALIBRATION WARNINGS ({len(warnings)}):")
+            for w in warnings:
+                print(f"  ! {w}")
+        else:
+            print(f"OK: {len(expect_by_topic)} topic expectation(s) are consistent with the bag.")
+    return 1 if warnings else 0
+
+
 def test_command(args: argparse.Namespace) -> int:
     """Assert a running/recent session meets its status + per-topic `expect` contract.
 
@@ -5550,6 +5589,7 @@ def main(argv: list[str] | None = None) -> int:
         "ota-smoke",
         "status",
         "test",
+        "calibrate",
         "verify",  # retired; keep guarded so it is not rewritten as `start verify`.
         "probe-publish",
         "probe-check",
@@ -5685,6 +5725,15 @@ def main(argv: list[str] | None = None) -> int:
     test_parser.add_argument("--timeout", type=float, default=30.0, help="Seconds to wait for status to settle.")
     test_parser.add_argument("--interval", type=float, default=2.0, help="Polling interval while waiting (s).")
     test_parser.set_defaults(func=test_command)
+
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="Report a replay bag's per-topic ground truth and validate a session's expect against it.",
+    )
+    _add_common_config_args(calibrate_parser)
+    calibrate_parser.add_argument("--bag", required=True, help="Path to a rosbag2 bag directory or its metadata.yaml.")
+    _add_session_arg(calibrate_parser, "session_dir", nargs="?", default=None)
+    calibrate_parser.set_defaults(func=calibrate_command)
 
     probe_publish_parser = subparsers.add_parser(
         "probe-publish", help="Publish a local-only probe topic in a running peer's local domain (isolation)."

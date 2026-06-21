@@ -289,10 +289,17 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
 - [ ] Completeness / loss%: with the bag's per-topic message count as ground
       truth, assert `received ≥ ratio · sent` (subsumes `min_count`). Pairs with
       the receiver-side counts the overview must start reporting.
-- [ ] Contract calibration: a reference replay run reports each topic's actual
-      delivered hz / size / latency, to author and to *validate* `expect` (flag
-      contradictory bounds, e.g. an hz floor above the achievable rate). Optional:
-      emit a suggested `expect` block from a reference run.
+- [x] Contract calibration (bag-as-ground-truth). `rosotacom calibrate --bag <dir>
+      [<session>]` reads the bag's own `metadata.yaml` (pure YAML -- no rosbag2/mcap
+      decode, `src/rosotacom/bag_ground_truth.py`) and reports per-topic ground truth
+      (count, native hz, msg type, durability). Given a session it validates `expect`
+      against the bag and flags contradictions: an `hz.min` above the native rate
+      (the OTA link only thins, never amplifies -- e.g. the original `/tf` `min 40`
+      that prompted the recalibration), and a static transient_local topic (≈ once,
+      held) described as a stream. Verified on remote_assist (20 expectations
+      consistent). Still optional: emitting a *suggested* `expect` block, and using a
+      reference run's *delivered* hz/size/latency (status.json) as the complementary
+      observed-ground-truth source.
 - [ ] True OTA latency under replay: inject a send-time at the relay (sidecar
       stamp) so latency reflects the link, not the restamped payload header.
 - [ ] Content integrity (advanced): compare received payloads to the sent

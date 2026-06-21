@@ -351,3 +351,44 @@ def test_suggest_optional_for_undelivered_and_skips_outbound() -> None:
     }
     s = suggest_expectations({"a": rep})
     assert s["/cmd"] == {"presence": "optional"} and "/out" not in s
+
+
+# --- latency_ms.stage (true OTA latency at the wrapper's send-stamp stage) -----
+
+
+def _wrapped_topic() -> dict:
+    # com_in carries the OtaStamped send-stamp (latency measurable); the final
+    # unwrapped app_in is headerless (latency None).
+    return {
+        "base": "/wrapped",
+        "direction": "inbound",
+        "overall": "OK",
+        "stages": [
+            {"stage": "com_in", "state": "FLOWING", "hz": 5.0, "latency_ms": 30.0},
+            {"stage": "app_in", "state": "FLOWING", "hz": 5.0, "latency_ms": None},
+        ],
+    }
+
+
+def test_latency_stage_asserts_named_stage_passes() -> None:
+    rep = {"peer": "a", "topics": [_wrapped_topic()]}
+    assert evaluate_report(rep, {"/wrapped": {"latency_ms": {"max": 100, "stage": "com_in"}}}) == []
+
+
+def test_latency_stage_exceeded_fails_at_named_stage() -> None:
+    rep = {"peer": "a", "topics": [_wrapped_topic()]}
+    f = evaluate_report(rep, {"/wrapped": {"latency_ms": {"max": 10, "stage": "com_in"}}})
+    assert len(f) == 1 and "com_in" in f[0] and "30" in f[0]
+
+
+def test_latency_default_stage_is_final_and_headerless_fails() -> None:
+    # Without a stage, latency is checked on the final (headerless) stage -> None -> fail.
+    rep = {"peer": "a", "topics": [_wrapped_topic()]}
+    f = evaluate_report(rep, {"/wrapped": {"latency_ms": {"max": 100}}})
+    assert len(f) == 1 and "latency None" in f[0]
+
+
+def test_latency_unknown_stage_errors() -> None:
+    rep = {"peer": "a", "topics": [_wrapped_topic()]}
+    f = evaluate_report(rep, {"/wrapped": {"latency_ms": {"max": 100, "stage": "nope"}}})
+    assert len(f) == 1 and "not in pipeline" in f[0]

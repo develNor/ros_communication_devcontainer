@@ -24,7 +24,11 @@ Per-topic `expect` supports (all optional):
                          publisher exists). For irregular topics where neither
                          rate nor a held value is meaningful.
   hz:       { min, max }           (stream only)
-  latency_ms: { max }              (stream only)
+  latency_ms: { max, stage }       (stream only) -- asserted on the final delivered
+            stage by default; `stage: <name>` redirects it to a named pipeline stage.
+            Use `stage: com_in` for a wrapped (use_ota_wrapper) topic so true OTA
+            transit latency is read from the OtaStamped send-time the relay injects,
+            even when the final unwrapped payload is headerless.
   min_count: N                     (stream only) -- the delivered (final flowing)
             stage must have observed at least N messages over the run. A floor on
             volume: distinguishes a real stream that crossed end-to-end from a
@@ -162,16 +166,38 @@ def _has_publisher(topic: dict[str, Any]) -> bool:
     return any((s.get("publishers") or 0) > 0 for s in stages)
 
 
-def _check_expect(peer: str, base: str, stage: dict[str, Any], expect: dict[str, Any]) -> list[str]:
+def _named_stage(topic: dict[str, Any], name: str) -> dict[str, Any] | None:
+    for s in topic.get("stages") or []:
+        if s.get("stage") == name:
+            return s
+    return None
+
+
+def _check_expect(
+    peer: str, base: str, topic: dict[str, Any], stage: dict[str, Any], expect: dict[str, Any]
+) -> list[str]:
     failures: list[str] = []
     hz, hz_exp = stage.get("hz"), expect.get("hz") or {}
     if "min" in hz_exp and (hz is None or hz < hz_exp["min"]):
         failures.append(f"[{peer}] {base}: hz {hz} < expected min {hz_exp['min']}")
     if "max" in hz_exp and (hz is None or hz > hz_exp["max"]):
         failures.append(f"[{peer}] {base}: hz {hz} > expected max {hz_exp['max']}")
-    lat, lat_exp = stage.get("latency_ms"), expect.get("latency_ms") or {}
+    lat_exp = expect.get("latency_ms") or {}
+    # latency_ms.stage redirects the latency check to a named stage -- e.g. `com_in`,
+    # where a wrapped (OtaStamped) topic carries the relay's injected send-time, so
+    # TRUE OTA latency is assertable even when the final unwrapped payload is headerless.
+    lat_stage = stage
+    stage_name = lat_exp.get("stage")
+    if stage_name:
+        named = _named_stage(topic, stage_name)
+        if named is None:
+            failures.append(f"[{peer}] {base}: latency_ms.stage '{stage_name}' not in pipeline")
+            return failures
+        lat_stage = named
+    lat = lat_stage.get("latency_ms")
     if "max" in lat_exp and (lat is None or lat > lat_exp["max"]):
-        failures.append(f"[{peer}] {base}: latency {lat}ms > expected max {lat_exp['max']}ms")
+        where = f" at '{stage_name}'" if stage_name else ""
+        failures.append(f"[{peer}] {base}: latency {lat}ms{where} > expected max {lat_exp['max']}ms")
     return failures
 
 
@@ -275,7 +301,7 @@ def evaluate_report(
                     failures.append(f"[{peer}] {base}: contract violated (quality BAD{detail})")
                     continue
                 if expect and topic.get("direction") == "inbound" and stage is not None:
-                    failures += _check_expect(peer, base, stage, expect)
+                    failures += _check_expect(peer, base, topic, stage, expect)
                     failures += _check_completeness(peer, base, topic, expect)
                     failures += _check_bag_completeness(peer, base, stage, expect, ground_truth)
             continue

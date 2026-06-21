@@ -311,14 +311,17 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
       hz/latency (a delivered-but-idle topic → `mode: latched`; an undelivered one →
       `presence: optional`). `status_eval.suggest_expectations`. Verified on remote_assist
       (/tf → hz 11–28, /can/twist → +latency 94 ms, /site → latched).
-- [ ] True OTA latency under replay: inject a send-time at the relay (sidecar
-      stamp) so latency reflects the link, not the restamped payload header.
-      **Note:** `restamp` already delivers true OTA latency for *headered* topics
-      (it stamps send-now; the receiver measures recv−send -- verified 22 ms on
-      10_restamp and remote_assist `/can/twist`). The sidecar only adds value for
-      *headerless* topics, of which the OTA contracts currently have no latency-bearing
-      consumer, so it is deferred (it needs send-time injection in the OTA wrapper +
-      a matching read in the monitor).
+- [x] True OTA latency via an injected send-time. Two complementary paths, both
+      reflecting the link rather than a payload-stamp's age:
+      - *headered* topics: `restamp` stamps send-now; the receiver measures recv−send
+        (verified 22 ms on 10_restamp and remote_assist `/can/twist`).
+      - *headerless* topics: the OTA wrapper (`use_ota_wrapper`) already sets the
+        OtaStamped header to the relay's SEND time -- an out-of-band send-time sidecar.
+        New `expect.latency_ms.stage` redirects the latency assertion to the stage
+        carrying that stamp (`com_in`), so true OTA transit latency is assertable even
+        for a headerless payload. Example `13_link_latency` (a plain String): verified
+        com_in latency 98.8 ms cross-host, asserted < 2000 ms, while the unwrapped
+        native_in (headerless) is correctly latency-null.
 - [x] Content integrity (first cut: pass-through byte-equality). A new smoke step
       `_ota_verify_content_integrity` echoes each delivered PASS-THROUGH String topic
       on the receiver (`rosotacom probe-content --topic --type --field --expect`) and

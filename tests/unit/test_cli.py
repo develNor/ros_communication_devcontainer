@@ -1968,3 +1968,42 @@ def test_create_session_yaml_injects_catmux_logging_command(tmp_path: Path) -> N
     assert "catmux_log_setup.sh" in before_commands[0]
     assert "ROSOTACOM_CATMUX_LOG_DIR=/session/instances/run/logs/a/catmux" in before_commands[0]
     assert before_commands[1] == "echo existing"
+
+
+# --- content integrity (RFC 0002 replay-only) ---------------------------------
+
+
+def test_content_matches_normalizes_quotes_and_separator() -> None:
+    assert rosotacom.content_matches("rosotacom smoke\n", "rosotacom smoke")
+    assert rosotacom.content_matches("'rosotacom smoke'\n---", "rosotacom smoke")
+    assert rosotacom.content_matches('"hello"', "hello")
+    assert not rosotacom.content_matches("corrupted", "rosotacom smoke")
+    assert not rosotacom.content_matches("", "rosotacom smoke")
+
+
+def test_smoke_expected_field_extracts_string_payload() -> None:
+    assert rosotacom._smoke_expected_field("std_msgs/msg/String", "data") == "rosotacom smoke"
+    # A field the synthetic payload doesn't have -> None (skip the check).
+    assert rosotacom._smoke_expected_field("std_msgs/msg/String", "nope") is None
+
+
+def test_content_integrity_specs_selects_passthrough_string() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "12_content_integrity" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    specs = rosotacom._content_integrity_specs(cfg, "a")
+    assert specs == [("/integrity_demo", "std_msgs/msg/String", "data", "rosotacom smoke")]
+    # b receives nothing in this one-directional example.
+    assert rosotacom._content_integrity_specs(cfg, "b") == []
+
+
+def test_content_integrity_skips_transformed_topics() -> None:
+    # 10_restamp transforms (restamp) so the received topic != base -> not byte-equal.
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "10_restamp" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert rosotacom._content_integrity_specs(cfg, "a") == []

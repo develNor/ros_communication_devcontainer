@@ -319,9 +319,15 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
       *headerless* topics, of which the OTA contracts currently have no latency-bearing
       consumer, so it is deferred (it needs send-time injection in the OTA wrapper +
       a matching read in the monitor).
-- [ ] Content integrity (advanced): compare received payloads to the sent ground
-      truth. Byte-equality only holds for pass-through topics (no restamp/framebridge/
-      compress); a bag-driven check must be transform-aware (compare after the declared
-      transform), and needs a receiver-side recorder. Scoped but not built -- the largest
-      remaining item; the isolation-probe mechanism (publish a known payload, verify on
-      receipt) is the natural seed for a pass-through byte-equal first cut.
+- [x] Content integrity (first cut: pass-through byte-equality). A new smoke step
+      `_ota_verify_content_integrity` echoes each delivered PASS-THROUGH String topic
+      on the receiver (`rosotacom probe-content --topic --type --field --expect`) and
+      asserts the field byte-equals what the sender published -- catching silent
+      corruption / truncation / wrong serialization that presence/rate/latency miss.
+      Restricted to untransformed topics (received name == published base), since a
+      transform (restamp/framebridge/compress) is intentionally not byte-equal. Built
+      on the isolation-probe pattern + the synthetic publishers' known payloads (the
+      ground truth); pure compare in `cli.content_matches`. Example `12_content_integrity`
+      verified cross-host (`/integrity_demo` == "rosotacom smoke"). **Still future:**
+      transform-aware comparison (compare after the declared transform) and non-String
+      types, which need a receiver-side recorder + per-type decode.

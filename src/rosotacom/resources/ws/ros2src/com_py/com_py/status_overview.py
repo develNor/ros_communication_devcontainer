@@ -67,6 +67,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.serialization import serialize_message
 from rosidl_runtime_py.utilities import get_message
 
+from com_py.link_bytes import LinkByteSampler, find_interface_for_ip
 from com_py.status_overview_core import (
     StageObservation,
     StatusAggregator,
@@ -176,6 +177,12 @@ class StatusOverview(Node):
         self.declare_parameter("refresh_interval_s", 5.0)
         self.declare_parameter("delay_good_ms", 100.0)
         self.declare_parameter("delay_bad_ms", 200.0)
+        # OTA link interface for link-overhead measurement (e.g. the VPN tunnel).
+        # Prefer ota_local_ip (the peer's OTA address) and resolve the interface
+        # from it; ota_interface is an explicit override. Both empty -> disabled
+        # (the snapshot's `link` block is null).
+        self.declare_parameter("ota_interface", "")
+        self.declare_parameter("ota_local_ip", "")
 
         spec_file = str(self.get_parameter("status_spec_file").value or "").strip()
         output_dir = str(self.get_parameter("output_dir").value or "").strip()
@@ -243,6 +250,23 @@ class StatusOverview(Node):
                 f"{ota_domain_id} (no payload subscriptions)"
             )
 
+        ota_interface = str(self.get_parameter("ota_interface").value or "").strip()
+        ota_local_ip = str(self.get_parameter("ota_local_ip").value or "").strip()
+        if not ota_interface and ota_local_ip:
+            ota_interface = find_interface_for_ip(ota_local_ip) or ""
+            if not ota_interface:
+                self.get_logger().info(
+                    f"status_overview: no interface found for OTA address '{ota_local_ip}'; "
+                    "link-overhead measurement disabled"
+                )
+        link_sampler = None
+        if ota_interface:
+            link_sampler = LinkByteSampler(ota_interface)
+            self.get_logger().info(
+                f"status_overview: link-overhead sampling on interface '{ota_interface}'"
+                + (f" (resolved from {ota_local_ip})" if ota_local_ip else "")
+            )
+
         self.aggregator = StatusAggregator(
             self.get_logger(),
             self.spec,
@@ -252,6 +276,7 @@ class StatusOverview(Node):
             stale_after_s=float(self.get_parameter("stale_after_s").value),
             delay_good_ms=float(self.get_parameter("delay_good_ms").value),
             delay_bad_ms=float(self.get_parameter("delay_bad_ms").value),
+            link_sampler=link_sampler,
         )
 
         self.create_timer(self.write_interval_s, self._on_write)

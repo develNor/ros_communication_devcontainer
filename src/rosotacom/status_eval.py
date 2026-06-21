@@ -25,6 +25,18 @@ Per-topic `expect` supports (all optional):
                          rate nor a held value is meaningful.
   hz:       { min, max }           (stream only)
   latency_ms: { max }              (stream only)
+  min_count: N                     (stream only) -- the delivered (final flowing)
+            stage must have observed at least N messages over the run. A floor on
+            volume: distinguishes a real stream that crossed end-to-end from a
+            single sample that trickled through. Robust to clock skew (one peer's
+            own cumulative count).
+  completeness: { min_ratio: R }   (stream only) -- within THIS peer's pipeline,
+            final_stage_count / first_flowing_stage_count >= R. Catches a stage
+            that is FLOWING but dropping (a lossy relay/framebridge/transport):
+            the messages enter the pipeline but a fraction never reach the end.
+            Uses a single monitor's counts, so there is no cross-peer timing
+            fragility. For the true cross-peer "did every bag message arrive",
+            see the replay-only section of docs/rfcs/0002.
 """
 
 from __future__ import annotations
@@ -51,6 +63,54 @@ def expectations_from_cfg(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
             if isinstance(item, dict) and isinstance(item.get("expect"), dict) and item.get("topic"):
                 out[str(item["topic"])] = item["expect"]
     return out
+
+
+def link_expect_from_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The session-level link-overhead expectation, from a top-level `link:` block.
+
+    e.g.  link: { max_ratio: 4.0 }              # both directions
+          link: { max_ratio_out: 3, max_ratio_in: 6 }
+    """
+    link = cfg.get("link")
+    return link if isinstance(link, dict) else {}
+
+
+def _check_link(peer: str, link: dict[str, Any] | None, expect: dict[str, Any]) -> list[str]:
+    """Assert the measured link/payload overhead ratio stays under its bound.
+
+    Skips silently when there is no link sample (sampling disabled / no interface)
+    or no payload in a direction (ratio is None): the ratio is only meaningful
+    when both the wire and the ROS payload are flowing."""
+    if not link or not expect:
+        return []
+    failures: list[str] = []
+    default_max = expect.get("max_ratio")
+    checks = [
+        (
+            "outbound",
+            link.get("overhead_ratio_out"),
+            expect.get("max_ratio_out", default_max),
+            link.get("link_tx_kbps"),
+            link.get("ros_payload_out_kbps"),
+        ),
+        (
+            "inbound",
+            link.get("overhead_ratio_in"),
+            expect.get("max_ratio_in", default_max),
+            link.get("link_rx_kbps"),
+            link.get("ros_payload_in_kbps"),
+        ),
+    ]
+    for direction, ratio, max_ratio, link_kbps, payload_kbps in checks:
+        if max_ratio is None or ratio is None:
+            continue
+        if ratio > float(max_ratio):
+            failures.append(
+                f"[{peer}] link overhead ({direction}) ratio {ratio} > max {max_ratio} "
+                f"(wire {link_kbps} kbps vs ROS payload {payload_kbps} kbps -- "
+                f"retransmits / shadow connections / bad QoS?)"
+            )
+    return failures
 
 
 def _topic_mode(expect: dict[str, Any]) -> str:
@@ -115,13 +175,54 @@ def _check_expect(peer: str, base: str, stage: dict[str, Any], expect: dict[str,
     return failures
 
 
-def evaluate_report(report: dict[str, Any], expect_by_topic: dict[str, dict[str, Any]]) -> list[str]:
+def _stage_count(stage: dict[str, Any]) -> int:
+    try:
+        return int(stage.get("messages_total") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _check_completeness(peer: str, base: str, topic: dict[str, Any], expect: dict[str, Any]) -> list[str]:
+    """Volume/loss assertions over a single peer's own per-stage message counts."""
+    failures: list[str] = []
+    min_count = expect.get("min_count")
+    comp = expect.get("completeness") or {}
+    min_ratio = comp.get("min_ratio")
+    if min_count is None and min_ratio is None:
+        return failures
+
+    delivered = [s for s in (topic.get("stages") or []) if s.get("state") in _DELIVERED_STATES]
+    if not delivered:
+        return failures  # presence/mode already account for nothing being delivered
+    final_count = _stage_count(delivered[-1])
+
+    if min_count is not None and final_count < int(min_count):
+        failures.append(f"[{peer}] {base}: delivered {final_count} msgs < expected min_count {int(min_count)}")
+    if min_ratio is not None:
+        first = delivered[0]
+        first_count = _stage_count(first)
+        if first_count > 0:
+            ratio = final_count / first_count
+            if ratio < float(min_ratio):
+                failures.append(
+                    f"[{peer}] {base}: completeness {final_count}/{first_count}={ratio:.2f} "
+                    f"< expected min_ratio {min_ratio} (dropping between "
+                    f"'{first.get('stage')}' and '{delivered[-1].get('stage')}')"
+                )
+    return failures
+
+
+def evaluate_report(
+    report: dict[str, Any],
+    expect_by_topic: dict[str, dict[str, Any]],
+    link_expect: dict[str, Any] | None = None,
+) -> list[str]:
     """Failures for one peer's status.json (empty == all good)."""
     peer = report.get("peer", "?")
     topics = report.get("topics", [])
     if not topics:
         return [f"[{peer}] status report has no topics"]
-    failures: list[str] = []
+    failures: list[str] = _check_link(peer, report.get("link"), link_expect or {})
     for topic in topics:
         base = topic.get("base", "?")
         expect = expect_by_topic.get(base) or {}
@@ -142,6 +243,7 @@ def evaluate_report(report: dict[str, Any], expect_by_topic: dict[str, dict[str,
                     continue
                 if expect and topic.get("direction") == "inbound" and stage is not None:
                     failures += _check_expect(peer, base, stage, expect)
+                    failures += _check_completeness(peer, base, topic, expect)
             continue
 
         # overall != OK -- reinterpret per the declared delivery mode.
@@ -164,9 +266,13 @@ def evaluate_report(report: dict[str, Any], expect_by_topic: dict[str, dict[str,
     return failures
 
 
-def evaluate_reports(reports: dict[str, dict[str, Any]], expect_by_topic: dict[str, dict[str, Any]]) -> list[str]:
+def evaluate_reports(
+    reports: dict[str, dict[str, Any]],
+    expect_by_topic: dict[str, dict[str, Any]],
+    link_expect: dict[str, Any] | None = None,
+) -> list[str]:
     """Failures across every peer's status.json (empty == all good)."""
     failures: list[str] = []
     for report in reports.values():
-        failures += evaluate_report(report, expect_by_topic)
+        failures += evaluate_report(report, expect_by_topic, link_expect)
     return failures

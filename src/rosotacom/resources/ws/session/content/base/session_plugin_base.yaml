@@ -334,12 +334,15 @@ windows:
       - commands:
         - status_out_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/status"
         - mkdir -p "$status_out_dir"
+        # Pass the local OTA address; the node resolves the link interface from it
+        # for link-overhead measurement (empty address -> `link` block stays null).
         - ros2 run com_py status_overview --ros-args
             -p status_spec_file:=${status_spec_file}
             -p output_dir:="$status_out_dir"
             -p write_interval_s:=${status_write_interval_s}
             -p liveness_window_s:=${status_liveness_window_s}
             -p stale_after_s:=${status_stale_after_s}
+            -p ota_local_ip:=${ip_local}
   - name: NET
     if: network_monitor
     splits:

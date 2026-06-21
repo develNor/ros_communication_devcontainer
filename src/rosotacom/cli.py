@@ -4580,13 +4580,14 @@ def test_command(args: argparse.Namespace) -> int:
     deadline = time.time() + max(0.0, float(getattr(args, "timeout", 30.0)))
     interval = max(0.5, float(getattr(args, "interval", 2.0)))
     expect_by_topic = status_eval.expectations_from_cfg(cfg)
+    link_expect = status_eval.link_expect_from_cfg(cfg)
     reports: dict[str, Any] = {}
     failures: list[str] = []
 
     while True:
         reports = _load_status_reports(logs_dir) if logs_dir.is_dir() else {}
         if reports:
-            failures = status_eval.evaluate_reports(reports, expect_by_topic)
+            failures = status_eval.evaluate_reports(reports, expect_by_topic, link_expect)
             if not failures:
                 topic_count = sum(len(r.get("topics", [])) for r in reports.values())
                 print(f"TEST OK: {len(reports)} peer(s), {topic_count} topic(s) meet status + expectations")

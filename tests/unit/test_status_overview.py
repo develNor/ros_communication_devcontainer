@@ -635,3 +635,39 @@ def test_heartbeat_monitor_thresholds_default_without_expect(tmp_path: Path) -> 
     # No override emitted -> the plugin base template defaults apply.
     assert "heartbeat_delay_bad_ms" not in plugin
     assert "heartbeat_loss3_bad_pct" not in plugin
+
+
+# ---------------------------------------------------------------------------
+# link overhead (compute_link_overview, ROS-independent)
+# ---------------------------------------------------------------------------
+
+
+def _stage(stage: str, state: str, size: float, hz: float) -> dict:
+    return {"stage": stage, "state": state, "mean_size_bytes": size, "hz": hz}
+
+
+def test_compute_link_overview_none_without_sample() -> None:
+    assert core.compute_link_overview([], None) is None
+
+
+def test_compute_link_overview_ratios() -> None:
+    # outbound payload at com_out: 1024 B x 10 Hz = 80 kbit/s; wire tx 160 -> ratio 2.0
+    # inbound  payload at com_in:  512 B  x 10 Hz = 40 kbit/s; wire rx 40  -> ratio 1.0
+    topics = [
+        {"direction": "outbound", "stages": [_stage("com_out", "FLOWING", 1024, 10.0)]},
+        {"direction": "inbound", "stages": [_stage("com_in", "FLOWING", 512, 10.0)]},
+    ]
+    link = core.compute_link_overview(topics, {"interface": "tun1", "tx_kbps": 160.0, "rx_kbps": 40.0, "window_s": 2.0})
+    assert link["interface"] == "tun1"
+    assert link["ros_payload_out_kbps"] == 80.0
+    assert link["ros_payload_in_kbps"] == 40.0
+    assert link["overhead_ratio_out"] == 2.0
+    assert link["overhead_ratio_in"] == 1.0
+
+
+def test_compute_link_overview_ratio_none_when_no_payload() -> None:
+    # No flowing payload in a direction -> ratio is None (not a div-by-zero).
+    topics = [{"direction": "outbound", "stages": [_stage("com_out", "IDLE", 1024, 0.0)]}]
+    link = core.compute_link_overview(topics, {"tx_kbps": 50.0, "rx_kbps": 0.0})
+    assert link["ros_payload_out_kbps"] == 0.0
+    assert link["overhead_ratio_out"] is None

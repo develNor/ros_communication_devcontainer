@@ -68,6 +68,66 @@ PARTIAL = "PARTIAL"
 STALLED = "STALLED"
 
 
+# --- Link overhead (session-level) -----------------------------------------
+
+def _payload_kbps(stage: Optional[Dict[str, Any]]) -> float:
+    """Application payload bandwidth at a stage: mean size x rate, in Kbit/s."""
+    if not stage or stage.get("state") not in (FLOWING, STALE):
+        return 0.0
+    size = float(stage.get("mean_size_bytes") or 0.0)
+    hz = float(stage.get("hz") or 0.0)
+    return size * 8.0 / 1024.0 * hz
+
+
+def _stage_named(topic: Dict[str, Any], stage_name: str) -> Optional[Dict[str, Any]]:
+    for s in topic.get("stages") or []:
+        if s.get("stage") == stage_name:
+            return s
+    return None
+
+
+def compute_link_overview(
+    topics: List[Dict[str, Any]], link_sample: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Session-level link overhead: wire bandwidth (from a LinkByteSampler) vs the
+    ROS application payload crossing the OTA boundary -- summed from the per-stage
+    sizes/rates the overview *already* measures, so there is no second measurement
+    path. Returns None when no link sample is available.
+
+    Directional: outbound payload is summed at each topic's `com_out` stage (the
+    last local stage before bridge_out -> OTA) and compared with the interface tx
+    rate; inbound payload at `com_in` (just after bridge_in) vs the rx rate. The
+    ratio link/payload is ~1 when the wire carries little beyond the payload and
+    grows with retransmits / shadow connections / discovery chatter / bad QoS.
+    (Small messages have a naturally higher ratio from per-packet RTPS/UDP/IP
+    headers, so the assertion in status_eval is an upper bound, not equality.)
+    """
+    if not link_sample:
+        return None
+    payload_out = sum(
+        _payload_kbps(_stage_named(t, "com_out")) for t in topics if t.get("direction") == "outbound"
+    )
+    payload_in = sum(
+        _payload_kbps(_stage_named(t, "com_in")) for t in topics if t.get("direction") == "inbound"
+    )
+    tx = float(link_sample.get("tx_kbps") or 0.0)
+    rx = float(link_sample.get("rx_kbps") or 0.0)
+
+    def _ratio(link_kbps: float, payload: float) -> Optional[float]:
+        return round(link_kbps / payload, 3) if payload > 0.0 else None
+
+    return {
+        "interface": link_sample.get("interface"),
+        "window_s": round(float(link_sample.get("window_s") or 0.0), 3),
+        "link_tx_kbps": round(tx, 3),
+        "link_rx_kbps": round(rx, 3),
+        "ros_payload_out_kbps": round(payload_out, 3),
+        "ros_payload_in_kbps": round(payload_in, 3),
+        "overhead_ratio_out": _ratio(tx, payload_out),
+        "overhead_ratio_in": _ratio(rx, payload_in),
+    }
+
+
 @dataclass
 class StageObservation:
     """Live observation of a single stage topic within one ROS domain."""
@@ -133,7 +193,8 @@ class StatusAggregator:
     def __init__(self, logger, spec: Dict[str, Any], output_dir: str,
                  observers_by_domain: Dict[str, Any],
                  *, liveness_window_s: float = 3.0, stale_after_s: float = 3.0,
-                 delay_good_ms: float = 100.0, delay_bad_ms: float = 200.0):
+                 delay_good_ms: float = 100.0, delay_bad_ms: float = 200.0,
+                 link_sampler: Any = None):
         self._log = logger
         self._spec = spec
         self._output_dir = output_dir
@@ -142,6 +203,10 @@ class StatusAggregator:
         self._stale_after_s = stale_after_s
         self._delay_good_ms = delay_good_ms
         self._delay_bad_ms = delay_bad_ms
+        # Optional object with a .sample() -> {interface, rx_kbps, tx_kbps,
+        # window_s} | None (a link_bytes.LinkByteSampler). Injected so the core
+        # stays free of any I/O and is unit-testable.
+        self._link_sampler = link_sampler
         self._prev_states: Dict[str, Dict[str, Any]] = {}
         os.makedirs(self._output_dir, exist_ok=True)
         self._json_path = os.path.join(self._output_dir, "status.json")
@@ -401,7 +466,9 @@ class StatusAggregator:
         return f"{topic}: {st}"
 
     # -- snapshot + write --
-    def build_snapshot(self, now_mono: Optional[float] = None) -> Dict[str, Any]:
+    def build_snapshot(
+        self, now_mono: Optional[float] = None, link_sample: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         if now_mono is None:
             now_mono = time.monotonic()
         now_wall = datetime.datetime.now().isoformat(timespec="milliseconds")
@@ -447,6 +514,7 @@ class StatusAggregator:
             "ota_domain_id": self._spec.get("ota_domain_id"),
             "uses_domain_bridge": self._spec.get("uses_domain_bridge"),
             "summary": counts,
+            "link": compute_link_overview(topics_out, link_sample),
             "topics": topics_out,
         }
 
@@ -541,7 +609,14 @@ class StatusAggregator:
 
     def write(self, now_mono: Optional[float] = None) -> int:
         """Build a snapshot, write artifacts, and return number of transition events."""
-        snapshot = self.build_snapshot(now_mono)
+        link_sample = None
+        if self._link_sampler is not None:
+            try:
+                link_sample = self._link_sampler.sample()
+            except Exception as exc:  # pragma: no cover - defensive
+                if self._log is not None:
+                    self._log.warning(f"status_overview: link sampling failed: {exc}")
+        snapshot = self.build_snapshot(now_mono, link_sample=link_sample)
         events = self.detect_transitions(snapshot)
         try:
             self._atomic_write(self._json_path, json.dumps(snapshot, indent=2) + "\n")

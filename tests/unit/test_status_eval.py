@@ -188,3 +188,106 @@ def test_invalid_mode_raises() -> None:
     report = {"peer": "a", "topics": [_stalled("/x", state="STALE", publishers=1)]}
     with pytest.raises(ValueError):
         evaluate_report(report, {"/x": {"mode": "bogus"}})
+
+
+# --- completeness: min_count + completeness.min_ratio -----------------------
+
+
+def _counted_stage(stage: str, count: int, state: str = "FLOWING") -> dict:
+    return {"stage": stage, "hz": 10.0, "latency_ms": 5.0, "state": state, "publishers": 1, "messages_total": count}
+
+
+def _counted_inbound(base: str, counts: list[tuple[str, int]], overall: str = "OK") -> dict:
+    stages = [_counted_stage(s, c) for s, c in counts]
+    return {"base": base, "direction": "inbound", "overall": overall, "stages": stages}
+
+
+def test_min_count_met_passes() -> None:
+    report = {"peer": "b", "topics": [_counted_inbound("/tf", [("app_in", 100), ("native_in", 95)])]}
+    assert evaluate_report(report, {"/tf": {"min_count": 50}}) == []
+
+
+def test_min_count_short_fails() -> None:
+    report = {"peer": "b", "topics": [_counted_inbound("/tf", [("app_in", 3), ("native_in", 3)])]}
+    failures = evaluate_report(report, {"/tf": {"min_count": 50}})
+    assert len(failures) == 1 and "min_count" in failures[0] and "3 msgs" in failures[0]
+
+
+def test_completeness_ratio_met_passes() -> None:
+    # 95/100 = 0.95 >= 0.9
+    report = {"peer": "b", "topics": [_counted_inbound("/tf", [("app_in", 100), ("native_in", 95)])]}
+    assert evaluate_report(report, {"/tf": {"completeness": {"min_ratio": 0.9}}}) == []
+
+
+def test_completeness_ratio_lossy_pipeline_fails() -> None:
+    # 40/100 = 0.4 < 0.9 -- a stage that is FLOWING but dropping 60%.
+    report = {"peer": "b", "topics": [_counted_inbound("/tf", [("app_in", 100), ("native_in", 40)])]}
+    failures = evaluate_report(report, {"/tf": {"completeness": {"min_ratio": 0.9}}})
+    assert len(failures) == 1 and "completeness" in failures[0] and "app_in" in failures[0]
+
+
+def test_completeness_uses_first_flowing_stage_only() -> None:
+    # A leading non-delivered stage must not be the ratio denominator.
+    stages = [
+        {"stage": "ota_recv", "state": "ABSENT", "publishers": 0, "messages_total": 0, "hz": 0.0, "latency_ms": None},
+        _counted_stage("com_in", 100),
+        _counted_stage("native_in", 96),
+    ]
+    report = {"peer": "b", "topics": [{"base": "/tf", "direction": "inbound", "overall": "OK", "stages": stages}]}
+    assert evaluate_report(report, {"/tf": {"completeness": {"min_ratio": 0.9}}}) == []
+
+
+def test_completeness_not_asserted_on_outbound() -> None:
+    # Like hz/latency, volume/loss is asserted on the receiving (inbound) side.
+    stages = [_counted_stage("native", 3), _counted_stage("ota_sent", 3)]
+    report = {"peer": "a", "topics": [{"base": "/tf", "direction": "outbound", "overall": "OK", "stages": stages}]}
+    assert evaluate_report(report, {"/tf": {"min_count": 50}}) == []
+
+
+# --- session-level link overhead -------------------------------------------
+
+from rosotacom.status_eval import link_expect_from_cfg  # noqa: E402
+
+
+def _report_with_link(link: dict | None) -> dict:
+    rep = {"peer": "a", "topics": [_topic("/x", "inbound", "OK", [_stage("app_in", 10.0, 5.0)])]}
+    rep["link"] = link
+    return rep
+
+
+def test_link_expect_from_cfg_reads_top_level() -> None:
+    assert link_expect_from_cfg({"link": {"max_ratio": 4.0}}) == {"max_ratio": 4.0}
+    assert link_expect_from_cfg({}) == {}
+
+
+def test_link_ratio_within_bound_passes() -> None:
+    rep = _report_with_link(
+        {"overhead_ratio_out": 2.0, "overhead_ratio_in": 1.5, "link_tx_kbps": 100, "ros_payload_out_kbps": 50}
+    )
+    assert evaluate_report(rep, {}, {"max_ratio": 4.0}) == []
+
+
+def test_link_ratio_exceeded_fails() -> None:
+    rep = _report_with_link(
+        {"overhead_ratio_out": 9.0, "overhead_ratio_in": 1.0, "link_tx_kbps": 900, "ros_payload_out_kbps": 100}
+    )
+    failures = evaluate_report(rep, {}, {"max_ratio": 4.0})
+    assert len(failures) == 1 and "link overhead (outbound)" in failures[0] and "9.0" in failures[0]
+
+
+def test_link_direction_specific_bounds() -> None:
+    rep = _report_with_link({"overhead_ratio_out": 3.0, "overhead_ratio_in": 8.0})
+    # out under its bound, in over its own tighter bound -> only the inbound fails.
+    failures = evaluate_report(rep, {}, {"max_ratio_out": 5.0, "max_ratio_in": 6.0})
+    assert len(failures) == 1 and "inbound" in failures[0]
+
+
+def test_link_skipped_when_no_sample_or_no_expect() -> None:
+    assert evaluate_report(_report_with_link(None), {}, {"max_ratio": 1.0}) == []
+    assert evaluate_report(_report_with_link({"overhead_ratio_out": 99.0}), {}, {}) == []
+
+
+def test_link_ratio_none_skipped() -> None:
+    # No payload in a direction -> ratio None -> not asserted.
+    rep = _report_with_link({"overhead_ratio_out": None, "overhead_ratio_in": None})
+    assert evaluate_report(rep, {}, {"max_ratio": 1.0}) == []

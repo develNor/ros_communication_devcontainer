@@ -159,9 +159,9 @@ delivery + isolation.
 | **throttle** | resulting hz ≤ max | TODO: `9_throttle` | **TODO** |
 | **restamp** | latency measurable after restamp | TODO: `10_restamp` | **TODO** |
 | **trickle (receive side)** | local re-publish hz (native only) | TODO: `11_trickle` | **TODO** |
-| **optional / required** | `presence: optional` absent ⇒ pass | TODO: fold into above | **TODO** |
-| **completeness** | `min_count` / all bag msgs arrived | needs overview counts | **TODO** |
-| **link overhead** | OTA bytes ≈ ROS payload bytes | needs link-bytes probe | **TODO** |
+| optional / required | `presence: optional` absent ⇒ pass | remote_assist a_to_b | done |
+| **completeness** | `min_count` + per-peer `completeness.min_ratio` | remote_assist `/tf` | done |
+| **link overhead** | wire bytes / ROS payload ratio | remote_assist (status `link`) | done |
 | framebridge, ffmpeg video | existence / throughput | maybe out of scope pass 1 | **TODO** |
 
 ## remote_assist status (private parent repo)
@@ -241,16 +241,28 @@ publisher). Two delivery bugs are now **fixed**; one optional-latch edge remains
       framebridge produces the local base as `native_in`). Both commands are now
       `presence: required` and green on a+b. See the remote_assist section above.
 - [ ] Curated public example sessions per feature (table above) + e2e assertions.
-- [ ] `min_count`/completeness: overview must report received vs expected counts
-      (and a finite source must declare its count); then assert in `status_eval`.
-- [ ] Link-overhead assertion. **Do not reinvent the measurement** — it already
-      exists in `com_py/topic_monitor.py`: `measure_peer_bytes(...)` /
-      `_kick_link_measurement()` measure actual link bytes between `host_ip`↔
-      `peer_ip` on the OTA interface (→ `_link_last_kbps`), and `print_stats()`
-      already computes `ros_topic_bw` = summed per-topic payload Kbit/s. Remaining
-      work: surface both into status.json and assert the ratio
-      `link_kbps / ros_topic_bw` (≈1 good; ≫1 ⇒ retransmits / shadow connections /
-      bad RMW or QoS) — likely a session-level expect, not per-topic.
+- [x] `min_count` + per-peer `completeness.min_ratio` (RFC concept "completeness").
+      The status overview already records `messages_total` per stage, so `status_eval`
+      asserts (a) the delivered final stage saw >= `min_count` messages and (b) within
+      one peer's pipeline `final_stage_count / first_flowing_stage_count >= min_ratio`
+      (catches a stage that is FLOWING but dropping, with no cross-peer clock-skew).
+      Applied live to remote_assist `/tf` (`min_count: 50`, `min_ratio: 0.7`): verified
+      203/203 delivered (ratio 1.000). The true cross-peer "did every bag message
+      arrive" (exact source count) stays in the replay-only section below.
+- [x] Link-overhead assertion (clean rewrite, single measurement authority). The
+      status overview *already* measures per-stage size×rate, so it owns the ROS
+      payload side; the only thing missing was the wire side. New `com_py/
+      link_bytes.py` reads the kernel's interface byte counters (`/proc/net/dev`
+      `rx_bytes`/`tx_bytes` deltas) -- **no tshark, no sudo, no extra node** --
+      and `status_overview_core.compute_link_overview` divides directionally:
+      `link_tx / Σ com_out payload` (out) and `link_rx / Σ com_in payload` (in),
+      emitting a session-level `link` block in status.json. `status_eval` asserts
+      it via a top-level `link: { max_ratio | max_ratio_out | max_ratio_in }`
+      (≈1 good; ≫1 ⇒ retransmits / shadow connections / bad QoS). `topic_monitor`
+      was improved at the same time: it now reuses the same `link_bytes` sampler
+      and its `sudo tshark` path (`measure_peer_bytes` / `tshark_cmd` /
+      `_kick_link_measurement`, which was broken anyway -- tshark is not in the
+      image) is deleted, removing the duplicate ROS-bandwidth + link code.
 - [x] remote_assist center OUTBOUND (a_to_b) bug fixed; both commands flipped to
       `presence: required`. Only the `/tf_static` + `/switchbox_state` bag-play-QoS
       latch edge (above) stays `optional`.

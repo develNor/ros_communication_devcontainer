@@ -48,78 +48,14 @@ import re
 from rosidl_runtime_py.utilities import get_message
 from rclpy.serialization import serialize_message
 from std_msgs.msg import Float64
-import subprocess
-import shutil
-import threading
 from typing import Optional
+
+from com_py.link_bytes import LinkByteSampler
 
 
 def is_internal_transport_topic(topic_name: str) -> bool:
     parts = topic_name.strip("/").split("/")
     return any(part.startswith("_buf_") for part in parts)
-
-
-def tshark_cmd(interface: str, host_ip: str, peer_ip: str, direction: str, duration: int):
-    if direction == "up":
-        flt = f"src host {host_ip} and dst host {peer_ip} and ip"
-    elif direction == "down":
-        flt = f"src host {peer_ip} and dst host {host_ip} and ip"
-    else:
-        raise ValueError("direction must be 'up' or 'down'")
-    return [
-        "sudo", "tshark", "-i", interface, "-n",
-        "-f", flt,
-        "-a", f"duration:{duration}",
-        "-T", "fields",
-        "-e", "ip.len",
-    ]
-
-
-def measure_peer_bytes(
-    interface: str,
-    host_ip: str,
-    peer_ip: str,
-    direction: str,
-    print_interval: float,
-    window_s: float,
-) -> int:
-    """
-    Returns up_bytes (host_ip -> peer_ip) if direction='out',
-    or down_bytes (peer_ip -> host_ip) if direction='in', over window_s using ip.len.
-    """
-    if shutil.which("tshark") is None:
-        raise RuntimeError("tshark not found (sudo apt install tshark)")
-
-    duration = max(1, int(round(window_s)))
-
-    def run_and_sum(direction: str):
-        cmd = tshark_cmd(interface, host_ip, peer_ip, direction, duration)
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=True,
-            timeout=print_interval,
-        )
-        total = 0
-        for line in proc.stdout.splitlines():
-            ln = line.strip()
-            try:
-                ln_i = int(ln)
-                total += ln_i
-            except ValueError:
-                continue
-        return total
-
-    if direction == "out":
-        # host_ip -> peer_ip (up)
-        return run_and_sum("up")
-    elif direction == "in":
-        # peer_ip -> host_ip (down)
-        return run_and_sum("down")
-    else:
-        raise ValueError("direction must be 'in' or 'out'")
 
 
 class TopicStats:
@@ -166,8 +102,10 @@ class TopicMonitor(Node):
         self.declare_parameter('to_adressant', '')  # optional, e.g., 'shuttle_ella' for /to_shuttle_ella
         self.declare_parameter("ip_local", "")
         self.declare_parameter("ip_remote", "")
-        self.declare_parameter("interface", "")      # optional override
-        self.declare_parameter("link_duration_buffer_s", 1.0) # buffer subtracted from print_interval for tshark capture
+        self.declare_parameter("interface", "")      # OTA link interface (e.g. the VPN tunnel)
+        # Accepted for launch compatibility; the /proc/net/dev sampler needs no
+        # capture window, so this tshark-era buffer is no longer used.
+        self.declare_parameter("link_duration_buffer_s", 1.0)
 
         self.refresh_interval = self.get_parameter('refresh_interval').value
         self.print_interval = self.get_parameter('print_interval').value
@@ -177,18 +115,9 @@ class TopicMonitor(Node):
         self.host_ip = self.get_parameter("ip_local").value
         self.peer_ip = self.get_parameter("ip_remote").value
         self.interface = self.get_parameter("interface").value
-        self.link_duration_buffer_s = float(self.get_parameter("link_duration_buffer_s").value)
-        self.link_window_s = max(0.1, self.print_interval - self.link_duration_buffer_s)
 
         # Track actual elapsed time between prints (avoid timer drift issues)
         self._last_print_t = time.monotonic()
-
-        # Link measurement async state
-        self._link_lock = threading.Lock()
-        self._link_event = threading.Event()
-        self._link_inflight = False
-        self._link_last_kbps: Optional[float] = None
-        self._link_last_err: Optional[Exception] = None
 
         # Validate parameters
         if not self.sourcename:
@@ -205,14 +134,13 @@ class TopicMonitor(Node):
         else:
             self.topic_prefix = f"/com/{self.direction}/{self.sourcename}/"
 
-        if not self.host_ip:
-            raise ValueError("Parameter 'ip_local' is required for link bandwidth measurement")
-
-        if not self.peer_ip:
-            raise ValueError("Parameter 'ip_remote' is required for link bandwidth measurement")
-
         if not self.interface:
             raise ValueError("Parameter 'interface' is required for link bandwidth measurement")
+
+        # Link bandwidth is measured from the kernel's own interface byte counters
+        # (/proc/net/dev) via the shared link_bytes sampler -- no tshark, no sudo,
+        # and no per-peer IP filter needed (the OTA interface is a dedicated link).
+        self._link_sampler = LinkByteSampler(self.interface)
 
         # Publisher for link bandwidth (direction-specific)
         self.link_bandwidth_topic = f"/topic_monitor/{self.direction}/{self.sourcename}/link_bandwidth_kbps"
@@ -241,8 +169,8 @@ class TopicMonitor(Node):
         self.get_logger().info(f"Publishing ROS topic bandwidth to: {self.ros_topic_bandwidth_topic}")
         self.get_logger().info(f"Publishing link bandwidth to: {self.link_bandwidth_topic}")
 
-        # Start the first link measurement immediately so the first print has a chance to show it
-        self._kick_link_measurement()
+        # Prime the link sampler so the first print reports a real delta.
+        self._link_sampler.sample()
 
     def refresh_subscriptions(self):
         all_topics = self.get_topic_names_and_types()
@@ -315,54 +243,6 @@ class TopicMonitor(Node):
 
         return callback
 
-    def _kick_link_measurement(self):
-        # Do not start a new measurement if one is still running (avoid overlap)
-        if self._link_inflight:
-            return
-
-        self._link_inflight = True
-        self._link_event.clear()
-
-        def worker():
-            self.get_logger().info(f"Starting link measurement ({self.direction}) with window {self.link_window_s} seconds.")
-            link_kbps = None
-            link_exception = None
-            try:
-                iface = self.interface
-                if self.direction == 'out':
-                    up_bytes = measure_peer_bytes(
-                        interface=self.interface,
-                        host_ip=self.host_ip,
-                        peer_ip=self.peer_ip,
-                        direction="out",
-                        window_s=self.link_window_s,
-                        print_interval=self.print_interval,
-                    )
-                    link_kbps = (up_bytes * 8.0 / 1024.0) / max(1e-9, self.link_window_s)
-                else:  # direction == 'in'
-                    down_bytes = measure_peer_bytes(
-                        interface=iface,
-                        host_ip=self.host_ip,
-                        peer_ip=self.peer_ip,
-                        direction="in",
-                        window_s=self.link_window_s,
-                        print_interval=self.print_interval,
-                    )
-                    link_kbps = (down_bytes * 8.0 / 1024.0) / max(1e-9, self.link_window_s)
-            except Exception as e:
-                link_exception = e
-                self.get_logger().warning(f"Link bandwidth measurement failed: {e}")
-
-            with self._link_lock:
-                self._link_last_kbps = link_kbps
-                self._link_last_err = link_exception
-
-            self.get_logger().info(f"Link measurement ({self.direction}) finished. Publishing results later on print_stats()")
-            self._link_inflight = False
-            self._link_event.set()
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def print_stats(self):
         # Use actual elapsed time to compute Hz/bandwidth correctly even if timers slip
         now = time.monotonic()
@@ -418,28 +298,17 @@ class TopicMonitor(Node):
         bandwidth_msg.data = float(ros_topic_bw)
         self.ros_topic_bandwidth_pub.publish(bandwidth_msg)
 
-        # Wait for the link measurement that was started after the previous print_stats()
-        wait_timeout = 0.0
-        if not self._link_event.wait(timeout=wait_timeout):
-            self.get_logger().warning(f"Link Bandwidth: not ready yet (still measuring) after {wait_timeout} seconds. Skipping publication. Increase link_duration_buffer_s parameter to avoid this issue.")
-        else:
-            with self._link_lock:
-                link_kbps = self._link_last_kbps
-                link_exception = self._link_last_err
-
-            if link_exception is not None:
-                self.get_logger().warning(f"Link bandwidth measurement failed: {link_exception}")
-            elif link_kbps is not None:
-                self.get_logger().info(f"Link Bandwidth: {link_kbps:7.1f} Kbit/s")
-
-                m = Float64()
-                m.data = float(link_kbps)
-                self.link_bandwidth_pub.publish(m)
+        # Link bandwidth over this print interval, from the interface counters.
+        # direction 'out' -> tx (host -> peer), 'in' -> rx (peer -> host).
+        sample = self._link_sampler.sample()
+        if sample is not None:
+            link_kbps = sample["tx_kbps"] if self.direction == "out" else sample["rx_kbps"]
+            self.get_logger().info(f"Link Bandwidth: {link_kbps:7.1f} Kbit/s")
+            m = Float64()
+            m.data = float(link_kbps)
+            self.link_bandwidth_pub.publish(m)
 
         self.get_logger().info("")
-
-        # Trigger next link measurement for the next print cycle
-        self._kick_link_measurement()
 
 
 def main(args=None):

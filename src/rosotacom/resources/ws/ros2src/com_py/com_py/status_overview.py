@@ -69,10 +69,19 @@ from rosidl_runtime_py.utilities import get_message
 
 from com_py.link_bytes import LinkByteSampler, find_interface_for_ip
 from com_py.status_overview_core import (
+    ClockOffsetEstimator,
     StageObservation,
     StatusAggregator,
+    collect_stage_metadata,
     collect_stage_topics,
 )
+
+ECHO_HEARTBEAT_TYPE = "com_msgs/msg/EchoHeartbeat"
+OTA_STAMPED_TYPE = "com_msgs/msg/OtaStamped"
+
+
+def _stamp_seconds(stamp) -> float:
+    return float(stamp.sec) + float(stamp.nanosec) / 1e9
 
 
 class StageObserver(Node):
@@ -87,7 +96,9 @@ class StageObserver(Node):
 
     def __init__(self, node_name: str, context: Optional[Context],
                  topics: Dict[str, Optional[str]], refresh_interval_s: float,
-                 *, subscribe_to_messages: bool = True):
+                 *, subscribe_to_messages: bool = True,
+                 stage_metadata: Optional[Dict[str, list[dict]]] = None,
+                 clock_estimator: Optional[ClockOffsetEstimator] = None):
         super().__init__(node_name, context=context)
         self.observations: Dict[str, StageObservation] = {
             t: StageObservation(type_str=hint, graph_only=not subscribe_to_messages)
@@ -95,6 +106,8 @@ class StageObserver(Node):
         }
         self._refresh_interval_s = refresh_interval_s
         self._subscribe_to_messages = subscribe_to_messages
+        self._stage_metadata = stage_metadata or {}
+        self.clock_estimator = clock_estimator or ClockOffsetEstimator()
         self.create_timer(self._refresh_interval_s, self._refresh)
         self._refresh()
 
@@ -141,23 +154,104 @@ class StageObserver(Node):
 
     def _make_cb(self, topic: str):
         def cb(msg):
+            obs = self.observations[topic]
             try:
                 size = len(serialize_message(msg))
             except Exception:
                 size = 0
+            now_ros = self.get_clock().now()
+            now_ros_s = now_ros.nanoseconds / 1e9
             delay_s: Optional[float] = None
-            header = getattr(msg, "header", None)
-            stamp = getattr(header, "stamp", None) if header is not None else None
-            if stamp is not None:
-                try:
-                    now = self.get_clock().now()
-                    msg_time = rclpy.time.Time.from_msg(stamp)
-                    d = (now - msg_time).nanoseconds / 1e9
-                    if -1.0 < d < 1000.0:  # guard unsynced clocks / zero stamps
-                        delay_s = d
-                except Exception:
-                    delay_s = None
-            self.observations[topic].record(size, delay_s)
+            raw_delay_s: Optional[float] = None
+            preprocess_s: Optional[float] = None
+            rtt_s: Optional[float] = None
+            clock_offset_s: Optional[float] = None
+            seq: Optional[int] = None
+            transit = None
+
+            if obs.type_str == ECHO_HEARTBEAT_TYPE:
+                contexts = self._stage_metadata.get(topic, [])
+                is_inbound = any(
+                    context.get("direction") == "inbound" for context in contexts
+                )
+                if is_inbound:
+                    seq = int(msg.seq)
+                    if bool(msg.echo_valid):
+                        self.clock_estimator.update(
+                            t1_s=_stamp_seconds(msg.echo_t1),
+                            t2_s=_stamp_seconds(msg.echo_t2),
+                            t3_s=_stamp_seconds(msg.echo_t3),
+                            t4_s=now_ros_s,
+                            sample_id=int(msg.echo_seq),
+                        )
+                    estimate = self.clock_estimator.estimate()
+                    if estimate is not None:
+                        clock_offset_s = estimate["offset_s"]
+                        rtt_s = estimate["rtt_s"]
+                        delay_s = (
+                            now_ros_s
+                            + clock_offset_s
+                            - _stamp_seconds(msg.header.stamp)
+                        )
+                        if delay_s < 0.0:
+                            delay_s = None
+                else:
+                    delay_s = now_ros_s - _stamp_seconds(msg.header.stamp)
+            elif obs.type_str == OTA_STAMPED_TYPE:
+                contexts = self._stage_metadata.get(topic, [])
+                com_in = next(
+                    (
+                        context
+                        for context in contexts
+                        if context.get("stage") == "com_in"
+                        and context.get("direction") == "inbound"
+                    ),
+                    None,
+                )
+                if com_in is not None:
+                    seq = int(msg.seq)
+                    t_source_s = _stamp_seconds(msg.source_stamp)
+                    t_wrap_s = _stamp_seconds(msg.header.stamp)
+                    raw_delay_s = now_ros_s - t_wrap_s
+                    preprocess_s = t_wrap_s - t_source_s
+                    estimate = self.clock_estimator.estimate()
+                    if estimate is not None:
+                        clock_offset_s = estimate["offset_s"]
+                        rtt_s = estimate["rtt_s"]
+                        delay_s = now_ros_s + clock_offset_s - t_wrap_s
+                    transit = {
+                        "peer": com_in.get("peer"),
+                        "source": com_in.get("source"),
+                        "target": com_in.get("target"),
+                        "topic": com_in.get("base"),
+                        "direction": com_in.get("direction"),
+                        "stage": com_in.get("stage"),
+                        "t_source": t_source_s,
+                        "t_wrap": t_wrap_s,
+                        "t_com_in": now_ros_s,
+                    }
+            else:
+                header = getattr(msg, "header", None)
+                stamp = getattr(header, "stamp", None) if header is not None else None
+                if stamp is not None:
+                    try:
+                        msg_time = rclpy.time.Time.from_msg(stamp)
+                        d = (now_ros - msg_time).nanoseconds / 1e9
+                        if -1.0 < d < 1000.0:  # guard unsynced clocks / zero stamps
+                            delay_s = d
+                    except Exception:
+                        delay_s = None
+
+            obs.record(
+                size,
+                delay_s,
+                seq=seq,
+                raw_delay_s=raw_delay_s,
+                preprocess_s=preprocess_s,
+                rtt_s=rtt_s,
+                clock_offset_s=clock_offset_s,
+                transit=transit,
+            )
 
         return cb
 
@@ -202,6 +296,8 @@ class StatusOverview(Node):
         need_ota_ctx = ota_domain_id is not None and ota_domain_id != local_domain_id
 
         by_domain = collect_stage_topics(self.spec)
+        metadata_by_domain = collect_stage_metadata(self.spec)
+        clock_estimator = ClockOffsetEstimator()
 
         self._ota_context: Optional[Context] = None
         self._ota_executor: Optional[MultiThreadedExecutor] = None
@@ -213,7 +309,12 @@ class StatusOverview(Node):
         # Local-domain stages are sampled for payload metrics.
         local_topics = dict(by_domain.get("local", {}))
         self._local_observer = StageObserver(
-            "status_overview_local_obs", None, local_topics, self.refresh_interval_s
+            "status_overview_local_obs",
+            None,
+            local_topics,
+            self.refresh_interval_s,
+            stage_metadata=metadata_by_domain.get("local"),
+            clock_estimator=clock_estimator,
         )
         observers["local"] = self._local_observer
 
@@ -277,6 +378,7 @@ class StatusOverview(Node):
             delay_good_ms=float(self.get_parameter("delay_good_ms").value),
             delay_bad_ms=float(self.get_parameter("delay_bad_ms").value),
             link_sampler=link_sampler,
+            clock_estimator=clock_estimator,
         )
 
         self.create_timer(self.write_interval_s, self._on_write)

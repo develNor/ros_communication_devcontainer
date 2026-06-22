@@ -60,15 +60,16 @@ parameters:
   status_write_interval_s: 2.0
   status_liveness_window_s: 3.0
   status_stale_after_s: 3.0
+  metric_stage_bag: false
+  metric_stage_topics:
 
   network_monitor: false
 
   heartbeat: false
-  heartbeat_out_topics:
+  heartbeat_local_topic:
+  heartbeat_remote_topic:
   heartbeat_out_hz: 10.0
-  heartbeat_in_topic:
-  heartbeat_in_hz_window_s: 1.0
-  # heartbeat_in_monitor status thresholds; overridden from shared.heartbeat.expect.
+  # heartbeat_echo status thresholds; overridden from shared.heartbeat.expect.
   heartbeat_delay_bad_ms: 200.0
   heartbeat_loss3_bad_pct: 10.0
 
@@ -349,18 +350,23 @@ windows:
       - commands:
         - interface=$(ip -o addr | awk '/'${ip_local//./\\.}'\/[0-9]+/ {print $2; exit}')
         - sudo iftop -i "$interface" -f "host ${ip_local} and host ${ip_remote}"
+  - name: METRIC_BAG
+    if: metric_stage_bag
+    splits:
+      - commands:
+        - metric_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/metrics"
+        - mkdir -p "$metric_dir"
+        - topics="${metric_stage_topics}"; ros2 bag record -s mcap -o "$metric_dir/stages_$(date +%Y%m%d_%H%M%S)" ${topics//,/ }
   - name: BEAT
     if: heartbeat
     layout: even-vertical
     splits:
       - commands:
-        - ros2 run com_py heartbeat_out_publisher --ros-args -p topic_names:=[${heartbeat_out_topics}] -p qos_config_file:='${qos_config_file}' -p hz:=${heartbeat_out_hz}
+        - ros2 run com_py heartbeat_echo --ros-args -p local_topic:=${heartbeat_local_topic} -p remote_topic:=${heartbeat_remote_topic} -p qos_config_file:='${qos_config_file}' -p hz:=${heartbeat_out_hz} -p delay_bad_ms:=${heartbeat_delay_bad_ms} -p loss_bad_pct:=${heartbeat_loss3_bad_pct}
       - commands:
-        - ros2 run com_py heartbeat_in_monitor --ros-args -p heartbeat_topic:=${heartbeat_in_topic} -p hz_window_s:=${heartbeat_in_hz_window_s} -p qos_config_file:='${qos_config_file}' -p expected_hz:=${heartbeat_out_hz} -p delay_bad_ms:=${heartbeat_delay_bad_ms} -p loss3_bad_pct:=${heartbeat_loss3_bad_pct}
+        - ros2 topic delay ${heartbeat_remote_topic}
       - commands:
-        - ros2 topic delay ${heartbeat_in_topic}
-      - commands:
-        - ros2 topic hz ${heartbeat_in_topic}
+        - ros2 topic hz ${heartbeat_remote_topic}
   - name: RS
     if: rs
     splits:

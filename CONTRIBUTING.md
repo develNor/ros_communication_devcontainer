@@ -63,6 +63,11 @@ Keep the change small and coherent. Update tests, README, docs, examples, and
 packaging metadata when CLI, config, package, Docker, or public runtime behavior
 changes.
 
+When implementing an RFC, first turn its build plan into actionable checkboxes.
+Update those checkboxes, design decisions, and reality checks during the work,
+not afterward. The RFC should always describe the current implementation state
+and leave enough self-contained context for another contributor to resume.
+
 Moving validated development work to `main` is a deliberate maintainer action.
 It may require an external OTA gate supplied by the repository operator; it is
 not triggered by an arbitrary commit in this repository.

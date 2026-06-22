@@ -64,16 +64,14 @@ topics:
       expect:
         hz:         { min: 1, max: 5 }    # formalizes today's "2–5hz (OK)" comments
         latency_ms: { max: 300 }
-        loss_pct:   { max: 5 }            # heartbeat payloads only
+        loss_pct:   { max: 5 }            # echo heartbeat or wrapped topic
 ```
 
 It belongs in the user-facing `session-definition.yaml` because it has a **runtime
 role**, consumed by three things:
 
 - **The live status overview** → the `status` node warns when a topic violates its
-  contract. Already implemented for heartbeats (`heartbeat_in_monitor` declares
-  `expected_hz`, `delay_bad_ms`, `loss3_*`); generalize `topic_monitor` to read
-  per-topic `expect`. *(follow-up)*
+  contract, including exact sequence loss for echo heartbeats and wrapped topics.
 - **`rosotacom test`** → assert the contract holds (this PR).
 - **User configs** → because it is runtime config, `rosotacom test my_session`
   works for any session, not just packaged examples.
@@ -150,7 +148,7 @@ per-session marker.
 - `rosotacom test` leans on that verdict: a delivered topic whose final stage is
   `quality: BAD` fails (in addition to the raw-metric check).
 - Heartbeat `expect` (`shared.heartbeat.expect`) drives both the status overview
-  and the dedicated `heartbeat_in_monitor`: its `delay_bad_ms` / `loss3_bad_pct`
+  and `heartbeat_echo`: its `delay_bad_ms` / `loss_bad_pct`
   come from `latency_ms.max` / `loss_pct.max`, and `expected_hz` tracks the
   publish rate. This is also where `loss_pct` is enforced.
 - The two-axis `test_tiers` marker is retired. OTA membership is default; the
@@ -163,11 +161,10 @@ per-session marker.
 - The full local suite runs nightly; the external OTA suite remains a manual
   promotion gate.
 
-**Not feasible as written**
-- `loss_pct` for *non-heartbeat* topics: ROS 2 messages carry no sequence number
-  (only `header.stamp`), so the generic status node cannot detect gaps. Loss is
-  only computable where the payload carries an explicit sequence (the heartbeat,
-  handled above).
+**RFC 0003 correction**
+- Native ROS messages still have no generic sequence, but wrapped topics carry
+  `OtaStamped.seq`. Exact `loss_pct` is implemented at inbound `com_in`, before
+  unwrap, alongside heartbeat sequence loss.
 
 ## Notes / open
 

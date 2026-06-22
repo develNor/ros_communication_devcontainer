@@ -1753,6 +1753,20 @@ def test_restamp_example_uses_stale_stamped_header_source() -> None:
     assert "sec: 1000" in msg and "point" in msg
 
 
+def test_named_stage_latency_is_left_to_status_oracle() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "13_link_latency" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    specs = [
+        spec for spec in rosotacom._received_crossed_topics(cfg, "a") if spec.publish_topic == "/link_latency_demo"
+    ]
+    assert len(specs) == 1
+    assert specs[0].hz_min == 2.0
+    assert specs[0].max_delay_s is None
+
+
 def test_trickle_example_asserts_the_trickle_output_stage() -> None:
     cfg = yaml.safe_load(
         (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "11_trickle" / "session-definition.yaml").read_text(

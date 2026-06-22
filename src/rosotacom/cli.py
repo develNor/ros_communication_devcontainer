@@ -4074,7 +4074,9 @@ def _smoke_expect_bounds(expect: Any) -> tuple[float | None, float | None, float
     hz_min = float(hz["min"]) if isinstance(hz, dict) and hz.get("min") is not None else None
     hz_max = float(hz["max"]) if isinstance(hz, dict) and hz.get("max") is not None else None
     max_delay_s = (
-        float(latency["max"]) / 1000.0 if isinstance(latency, dict) and latency.get("max") is not None else None
+        float(latency["max"]) / 1000.0
+        if isinstance(latency, dict) and latency.get("max") is not None and not latency.get("stage")
+        else None
     )
     return hz_min, hz_max, max_delay_s
 
@@ -5611,6 +5613,23 @@ def status(args: argparse.Namespace) -> int:
         return 0
 
 
+def metrics_command(args: argparse.Namespace) -> int:
+    from rosotacom.transit import (
+        join_transit_records,
+        load_transit_records,
+        summarize_transit_records,
+    )
+
+    paths = [Path(path).expanduser().resolve() for path in args.events]
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"events file not found: {', '.join(missing)}")
+    records = load_transit_records(paths)
+    payload = join_transit_records(records) if args.records else summarize_transit_records(records)
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
 def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--rosotacom-config",
@@ -5771,6 +5790,7 @@ def main(argv: list[str] | None = None) -> int:
         "smoke",
         "ota-smoke",
         "status",
+        "metrics",
         "test",
         "calibrate",
         "verify",  # retired; keep guarded so it is not rewritten as `start verify`.
@@ -5899,6 +5919,15 @@ def main(argv: list[str] | None = None) -> int:
     status_parser.add_argument("--watch", action="store_true", help="Continuously refresh the view.")
     status_parser.add_argument("--watch-interval", type=float, default=2.0, help="Watch refresh interval (s).")
     status_parser.set_defaults(func=status)
+
+    metrics_parser = subparsers.add_parser(
+        "metrics", help="Join and summarize RFC 0003 transit records from events.jsonl files."
+    )
+    metrics_parser.add_argument("events", nargs="+", help="One or more status/events.jsonl files.")
+    metrics_parser.add_argument(
+        "--records", action="store_true", help="Emit joined per-(topic, seq) records instead of a summary."
+    )
+    metrics_parser.set_defaults(func=metrics_command)
 
     test_parser = subparsers.add_parser(
         "test", help="Assert a running/recent session meets its status + per-topic expect contract."

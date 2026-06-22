@@ -284,18 +284,30 @@ Default heartbeat topic per peer: `/heartbeat_<com-name>`
 Override: `peer_settings.<peer>.heartbeat_topic`
 Placement in topic list: per direction via `shared.heartbeat_position` (default `prepend`).
 
+The heartbeat is a symmetric `com_msgs/msg/EchoHeartbeat`. Each fixed-rate
+message is both a new probe and a piggybacked response to the latest peer probe,
+so request/response measurement does not double the configured rate. It supplies
+RTT, sequence loss, health, and a minimum-RTT estimate of peer clock offset.
+One-direction delay explicitly assumes symmetric paths.
+
+Wrapped-topic offset-corrected latency requires `use_heartbeat: true`. Without
+an echo estimate, exact sequence loss and uncorrected delay remain available,
+while corrected latency is `null` rather than silently skew-dependent.
+
 #### Status overview behavior
 If `use_status_overview: true`:
 - The generator emits a per-peer `pipeline_spec.yaml` enumerating, for each
   configured topic, the ordered pipeline stages observable on that peer.
 - A `status_overview` node (catmux `STAT` window) tracks, per topic, the
   furthest stage reached and the first stage that is missing/broken, plus live
-  metrics (last-message age, Hz, mean size, latency).
+  metrics (last-message age, Hz, mean size, latency, sequence loss/reordering,
+  RTT, and clock offset).
 - It writes, under `session-instances/.../logs/<peer>/status/`:
   - `status.json` — machine-readable snapshot (source of truth), rewritten on a
     short interval and on every state transition;
   - `status.txt` — human-rendered table regenerated alongside the JSON;
-  - `events.jsonl` — append-only, one line per state transition.
+  - `events.jsonl` — append-only state transitions and per-message wrapped-topic
+    transit records.
 - Read it from the host with `rosotacom status [<session>] [--json] [--watch]`.
 
 Phase 1 samples local-domain stages directly. OTA-domain observation is
@@ -306,6 +318,19 @@ inferred in the status output. Remote-side confirmation is reserved for a later
 phase and reported as `unknown`. OTA graph observation assumes same-host
 discovery of the OTA `ROS_DOMAIN_ID` (works for the bundled DDS /
 `zenoh_ros2dds` examples; native `rmw_zenoh` OTA is not observed in Phase 1).
+
+Optional deep local-stage measurement:
+
+```yaml
+shared:
+  use_status_overview: true
+  metric_backbone:
+    record_stages: true
+```
+
+This records all generated local stages as MCAP under `logs/<peer>/metrics/`.
+The in-container `stage_latency` tool joins ordered stage receive timestamps by
+message index.
 
 ##### Phase 2 (planned, not implemented)
 

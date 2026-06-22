@@ -48,10 +48,10 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, Hashable, List, Optional, Tuple
 
 
-# --- State vocabulary (aligned with heartbeat_in_monitor) ---
+# --- State vocabulary shared with heartbeat health ---
 ABSENT = "ABSENT"        # no publisher and never received a message
 IDLE = "IDLE"            # publisher present but no message observed yet
 FLOWING = "FLOWING"      # messages within the liveness window
@@ -66,6 +66,87 @@ BAD = "BAD"
 OK = "OK"
 PARTIAL = "PARTIAL"
 STALLED = "STALLED"
+
+
+def _pct(numerator: int, denominator: int) -> float:
+    return (100.0 * numerator / denominator) if denominator > 0 else 0.0
+
+
+class ClockOffsetEstimator:
+    """Minimum-RTT NTP-style peer-clock estimator.
+
+    ``offset_s`` is peer clock minus local clock. A timestamp received locally
+    from the peer is therefore corrected with ``local_time + offset_s`` before
+    comparing it with a peer timestamp.
+    """
+
+    def __init__(self, window_s: float = 60.0) -> None:
+        self.window_s = window_s
+        self._samples: Deque[Tuple[float, float, float]] = deque()
+        self._seen: set[Hashable] = set()
+        self._seen_order: Deque[Hashable] = deque()
+        self._best_rtt_s: Optional[float] = None
+        self._offset_s: Optional[float] = None
+        self._updated_mono: Optional[float] = None
+        self._lock = threading.Lock()
+
+    def update(
+        self,
+        *,
+        t1_s: float,
+        t2_s: float,
+        t3_s: float,
+        t4_s: float,
+        now_mono: Optional[float] = None,
+        sample_id: Optional[Hashable] = None,
+    ) -> bool:
+        now = time.monotonic() if now_mono is None else now_mono
+        rtt_s = (t4_s - t1_s) - (t3_s - t2_s)
+        if rtt_s < 0.0:
+            return False
+        offset_s = ((t2_s - t1_s) + (t3_s - t4_s)) / 2.0
+        with self._lock:
+            if sample_id is not None:
+                if sample_id in self._seen:
+                    return False
+                self._seen.add(sample_id)
+                self._seen_order.append(sample_id)
+                while len(self._seen_order) > 4096:
+                    self._seen.discard(self._seen_order.popleft())
+            self._samples.append((now, rtt_s, offset_s))
+            self._prune_locked(now)
+            self._select_best_locked()
+        return True
+
+    def _prune_locked(self, now_mono: float) -> None:
+        cutoff = now_mono - self.window_s
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+    def _select_best_locked(self) -> None:
+        if not self._samples:
+            self._best_rtt_s = None
+            self._offset_s = None
+            self._updated_mono = None
+            return
+        at, rtt_s, offset_s = min(self._samples, key=lambda sample: sample[1])
+        self._best_rtt_s = rtt_s
+        self._offset_s = offset_s
+        self._updated_mono = at
+
+    def estimate(self, now_mono: Optional[float] = None) -> Optional[Dict[str, float]]:
+        now = time.monotonic() if now_mono is None else now_mono
+        with self._lock:
+            self._prune_locked(now)
+            self._select_best_locked()
+            if self._offset_s is None or self._best_rtt_s is None or self._updated_mono is None:
+                return None
+            return {
+                "offset_s": self._offset_s,
+                "rtt_s": self._best_rtt_s,
+                "age_s": max(0.0, now - self._updated_mono),
+                "samples": float(len(self._samples)),
+            }
 
 
 # --- Link overhead (session-level) -----------------------------------------
@@ -141,32 +222,190 @@ class StageObservation:
     last_recv_mono: Optional[float] = None
     last_recv_wall: Optional[float] = None
     last_delay_s: Optional[float] = None
+    last_raw_delay_s: Optional[float] = None
+    last_preprocess_s: Optional[float] = None
+    last_rtt_s: Optional[float] = None
+    last_clock_offset_s: Optional[float] = None
     # (t_mono, size_bytes, delay_s_or_None)
     events: Deque[Tuple[float, int, Optional[float]]] = field(default_factory=deque)
+    # (t_mono, expected_delta, missing_delta, reordered_delta, burst_missing)
+    sequence_events: Deque[Tuple[float, int, int, int, int]] = field(default_factory=deque)
+    expected_next_seq: Optional[int] = None
+    last_seq: Optional[int] = None
+    tracks_sequence: bool = False
+    total_expected: int = 0
+    total_missing: int = 0
+    total_reordered: int = 0
+    max_burst_missing: int = 0
+    transit_records: Deque[Dict[str, Any]] = field(default_factory=deque)
+    last_transit_recv_wall: Optional[float] = None
+    last_inter_arrival_s: Optional[float] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def record(self, size: int, delay_s: Optional[float], now_mono: Optional[float] = None,
-               now_wall: Optional[float] = None) -> None:
+    def record(
+        self,
+        size: int,
+        delay_s: Optional[float],
+        now_mono: Optional[float] = None,
+        now_wall: Optional[float] = None,
+        *,
+        seq: Optional[int] = None,
+        raw_delay_s: Optional[float] = None,
+        preprocess_s: Optional[float] = None,
+        rtt_s: Optional[float] = None,
+        clock_offset_s: Optional[float] = None,
+        transit: Optional[Dict[str, Any]] = None,
+    ) -> None:
         now = time.monotonic() if now_mono is None else now_mono
+        wall = time.time() if now_wall is None else now_wall
         with self.lock:
             self.msg_total += 1
             self.last_recv_mono = now
-            self.last_recv_wall = time.time() if now_wall is None else now_wall
+            self.last_recv_wall = wall
             self.last_delay_s = delay_s
+            self.last_raw_delay_s = raw_delay_s
+            self.last_preprocess_s = preprocess_s
+            self.last_rtt_s = rtt_s
+            self.last_clock_offset_s = clock_offset_s
             self.events.append((now, size, delay_s))
+            sequence_status = "delivered"
+            missing_start: Optional[int] = None
+            missing = 0
+            reordered = 0
+            expected_delta = 0
+            if seq is not None:
+                self.tracks_sequence = True
+                seq = int(seq)
+                if self.expected_next_seq is None:
+                    expected_delta = 1
+                    self.expected_next_seq = seq + 1
+                elif seq == 0 and self.expected_next_seq > 1:
+                    # A publisher restart begins a new sequence epoch. Without
+                    # an explicit boot id, zero is the only unambiguous reset.
+                    expected_delta = 1
+                    self.expected_next_seq = 1
+                elif seq >= self.expected_next_seq:
+                    missing = seq - self.expected_next_seq
+                    missing_start = self.expected_next_seq if missing else None
+                    expected_delta = 1 + missing
+                    self.expected_next_seq = seq + 1
+                else:
+                    reordered = 1
+                    sequence_status = "reordered"
+                self.last_seq = seq
+                self.total_expected += expected_delta
+                self.total_missing += missing
+                self.total_reordered += reordered
+                self.max_burst_missing = max(self.max_burst_missing, missing)
+                self.sequence_events.append((now, expected_delta, missing, reordered, missing))
+
+            if transit is not None and seq is not None:
+                common = {
+                    "kind": "transit",
+                    "peer": transit.get("peer"),
+                    "source": transit.get("source"),
+                    "target": transit.get("target"),
+                    "topic": transit.get("topic"),
+                    "direction": transit.get("direction"),
+                    "stage": transit.get("stage"),
+                }
+                if missing_start is not None:
+                    for missing_seq in range(missing_start, int(seq)):
+                        self.transit_records.append(
+                            {
+                                **common,
+                                "seq": missing_seq,
+                                "status": "lost",
+                                "t_source": None,
+                                "t_wrap": None,
+                                "t_com_in": None,
+                                "clock_offset_ms": None,
+                                "sections": {"preprocess_ms": None, "ota_hop_ms": None},
+                                "size_bytes": None,
+                                "inter_arrival_ms": None,
+                                "jitter_ms": None,
+                            }
+                        )
+                inter_arrival_s = (
+                    wall - self.last_transit_recv_wall
+                    if self.last_transit_recv_wall is not None
+                    else None
+                )
+                jitter_s = (
+                    abs(inter_arrival_s - self.last_inter_arrival_s)
+                    if inter_arrival_s is not None and self.last_inter_arrival_s is not None
+                    else None
+                )
+                if inter_arrival_s is not None:
+                    self.last_inter_arrival_s = inter_arrival_s
+                self.last_transit_recv_wall = wall
+                self.transit_records.append(
+                    {
+                        **common,
+                        "seq": int(seq),
+                        "status": sequence_status,
+                        "t_source": transit.get("t_source"),
+                        "t_wrap": transit.get("t_wrap"),
+                        "t_com_in": transit.get("t_com_in"),
+                        "clock_offset_ms": (
+                            round(clock_offset_s * 1000.0, 3)
+                            if clock_offset_s is not None
+                            else None
+                        ),
+                        "sections": {
+                            "preprocess_ms": (
+                                round(preprocess_s * 1000.0, 3)
+                                if preprocess_s is not None
+                                else None
+                            ),
+                            "ota_hop_ms": (
+                                round(delay_s * 1000.0, 3) if delay_s is not None else None
+                            ),
+                            "ota_hop_uncorrected_ms": (
+                                round(raw_delay_s * 1000.0, 3)
+                                if raw_delay_s is not None
+                                else None
+                            ),
+                        },
+                        "size_bytes": size,
+                        "inter_arrival_ms": (
+                            round(inter_arrival_s * 1000.0, 3)
+                            if inter_arrival_s is not None
+                            else None
+                        ),
+                        "jitter_ms": (
+                            round(jitter_s * 1000.0, 3) if jitter_s is not None else None
+                        ),
+                    }
+                )
 
     def metrics(self, now_mono: float, window_s: float) -> Dict[str, Any]:
         with self.lock:
             cutoff = now_mono - window_s
             while self.events and self.events[0][0] < cutoff:
                 self.events.popleft()
+            while self.sequence_events and self.sequence_events[0][0] < cutoff:
+                self.sequence_events.popleft()
             count = len(self.events)
             total_bytes = sum(e[1] for e in self.events)
             delays = [e[2] for e in self.events if e[2] is not None]
+            expected = sum(e[1] for e in self.sequence_events)
+            missing = sum(e[2] for e in self.sequence_events)
+            reordered = sum(e[3] for e in self.sequence_events)
+            max_burst_missing = max((e[4] for e in self.sequence_events), default=0)
             last_recv_mono = self.last_recv_mono
             last_recv_wall = self.last_recv_wall
             last_delay = self.last_delay_s
+            last_raw_delay = self.last_raw_delay_s
+            last_preprocess = self.last_preprocess_s
+            last_rtt = self.last_rtt_s
+            last_clock_offset = self.last_clock_offset_s
             msg_total = self.msg_total
+            tracks_sequence = self.tracks_sequence
+            total_expected = self.total_expected
+            total_missing = self.total_missing
+            total_reordered = self.total_reordered
+            total_max_burst = self.max_burst_missing
         hz = count / window_s if window_s > 0 else 0.0
         mean_size = (total_bytes / count) if count > 0 else 0.0
         age = (now_mono - last_recv_mono) if last_recv_mono is not None else None
@@ -174,11 +413,27 @@ class StageObservation:
             "hz": hz,
             "mean_size_bytes": mean_size,
             "last_delay_s": last_delay,
+            "last_raw_delay_s": last_raw_delay,
+            "last_preprocess_s": last_preprocess,
+            "last_rtt_s": last_rtt,
+            "last_clock_offset_s": last_clock_offset,
             "delays_in_window": delays,
             "age_s": age,
             "last_recv_wall": last_recv_wall,
             "msg_total": msg_total,
+            "loss_pct": _pct(missing, expected) if tracks_sequence else None,
+            "reordered": reordered if tracks_sequence else None,
+            "max_burst_missing": max_burst_missing if tracks_sequence else None,
+            "loss_total_pct": _pct(total_missing, total_expected) if tracks_sequence else None,
+            "reordered_total": total_reordered if tracks_sequence else None,
+            "max_burst_missing_total": total_max_burst if tracks_sequence else None,
         }
+
+    def drain_transit_records(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            records = list(self.transit_records)
+            self.transit_records.clear()
+        return records
 
 
 class StatusAggregator:
@@ -194,7 +449,7 @@ class StatusAggregator:
                  observers_by_domain: Dict[str, Any],
                  *, liveness_window_s: float = 3.0, stale_after_s: float = 3.0,
                  delay_good_ms: float = 100.0, delay_bad_ms: float = 200.0,
-                 link_sampler: Any = None):
+                 link_sampler: Any = None, clock_estimator: Any = None):
         self._log = logger
         self._spec = spec
         self._output_dir = output_dir
@@ -207,6 +462,7 @@ class StatusAggregator:
         # window_s} | None (a link_bytes.LinkByteSampler). Injected so the core
         # stays free of any I/O and is unit-testable.
         self._link_sampler = link_sampler
+        self._clock_estimator = clock_estimator
         self._prev_states: Dict[str, Dict[str, Any]] = {}
         os.makedirs(self._output_dir, exist_ok=True)
         self._json_path = os.path.join(self._output_dir, "status.json")
@@ -235,6 +491,16 @@ class StatusAggregator:
             "hz": 0.0,
             "mean_size_bytes": 0.0,
             "latency_ms": None,
+            "latency_uncorrected_ms": None,
+            "preprocess_ms": None,
+            "rtt_ms": None,
+            "clock_offset_ms": None,
+            "loss_pct": None,
+            "loss_total_pct": None,
+            "reordered": None,
+            "reordered_total": None,
+            "max_burst_missing": None,
+            "max_burst_missing_total": None,
             "age_s": None,
             "last_message_wall": None,
             "messages_total": 0,
@@ -256,6 +522,23 @@ class StatusAggregator:
         result["age_s"] = round(m["age_s"], 3) if m["age_s"] is not None else None
         if m["last_delay_s"] is not None:
             result["latency_ms"] = round(m["last_delay_s"] * 1000.0, 1)
+        if m["last_raw_delay_s"] is not None:
+            result["latency_uncorrected_ms"] = round(m["last_raw_delay_s"] * 1000.0, 1)
+        if m["last_preprocess_s"] is not None:
+            result["preprocess_ms"] = round(m["last_preprocess_s"] * 1000.0, 1)
+        if m["last_rtt_s"] is not None:
+            result["rtt_ms"] = round(m["last_rtt_s"] * 1000.0, 1)
+        if m["last_clock_offset_s"] is not None:
+            result["clock_offset_ms"] = round(m["last_clock_offset_s"] * 1000.0, 3)
+        for key in (
+            "loss_pct",
+            "loss_total_pct",
+            "reordered",
+            "reordered_total",
+            "max_burst_missing",
+            "max_burst_missing_total",
+        ):
+            result[key] = m[key]
         if m["last_recv_wall"] is not None:
             result["last_message_wall"] = datetime.datetime.fromtimestamp(
                 m["last_recv_wall"]
@@ -283,6 +566,16 @@ class StatusAggregator:
             "hz",
             "mean_size_bytes",
             "latency_ms",
+            "latency_uncorrected_ms",
+            "preprocess_ms",
+            "rtt_ms",
+            "clock_offset_ms",
+            "loss_pct",
+            "loss_total_pct",
+            "reordered",
+            "reordered_total",
+            "max_burst_missing",
+            "max_burst_missing_total",
             "age_s",
             "last_message_wall",
             "messages_total",
@@ -329,6 +622,7 @@ class StatusAggregator:
         expect = expect or {}
         hz_exp = expect.get("hz") or {}
         lat_exp = expect.get("latency_ms") or {}
+        loss_exp = expect.get("loss_pct") or {}
 
         # Latency: a declared `expect.latency_ms.max` overrides the global bad
         # threshold; the good band stays the default so a tight contract still
@@ -340,6 +634,11 @@ class StatusAggregator:
                 return BAD, "latency"
             if delay_ms > self._delay_good_ms:
                 return DEGRADED, "latency"
+
+        loss_pct = m.get("loss_pct")
+        if loss_pct is not None and "max" in loss_exp:
+            if loss_pct > float(loss_exp["max"]):
+                return BAD, "loss"
 
         # Hz: a declared `expect.hz` {min,max} is a hard contract; otherwise fall
         # back to the derived expected_hz heuristic.
@@ -505,7 +804,7 @@ class StatusAggregator:
             )
 
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "phase": 1,
             "generated_at": now_wall,
             "peer": self._spec.get("peer"),
@@ -515,7 +814,23 @@ class StatusAggregator:
             "uses_domain_bridge": self._spec.get("uses_domain_bridge"),
             "summary": counts,
             "link": compute_link_overview(topics_out, link_sample),
+            "clock_sync": self._clock_snapshot(now_mono),
             "topics": topics_out,
+        }
+
+    def _clock_snapshot(self, now_mono: float) -> Optional[Dict[str, Any]]:
+        if self._clock_estimator is None:
+            return None
+        estimate = self._clock_estimator.estimate(now_mono)
+        if estimate is None:
+            return None
+        return {
+            "method": "echo_min_rtt",
+            "peer_offset_ms": round(estimate["offset_s"] * 1000.0, 3),
+            "rtt_ms": round(estimate["rtt_s"] * 1000.0, 3),
+            "sample_age_s": round(estimate["age_s"], 3),
+            "samples": int(estimate["samples"]),
+            "assumption": "symmetric_path",
         }
 
     def detect_transitions(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -533,6 +848,7 @@ class StatusAggregator:
                 if prev is not None:
                     events.append(
                         {
+                            "kind": "state_transition",
                             "at": snapshot["generated_at"],
                             "peer": snapshot["peer"],
                             "topic": t["base"],
@@ -552,6 +868,18 @@ class StatusAggregator:
                     )
                 self._prev_states[key] = cur
         return events
+
+    def collect_transit_records(self) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+        for observer in self._observers.values():
+            for obs in observer.observations.values():
+                identity = id(obs)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                records.extend(obs.drain_transit_records())
+        return records
 
     def render_text(self, snapshot: Dict[str, Any]) -> str:
         lines: List[str] = []
@@ -584,6 +912,10 @@ class StatusAggregator:
                     parts = [f"{st['hz']:.1f}Hz"]
                     if st["latency_ms"] is not None:
                         parts.append(f"{st['latency_ms']:.0f}ms")
+                    elif st["latency_uncorrected_ms"] is not None:
+                        parts.append(f"{st['latency_uncorrected_ms']:.0f}ms(raw)")
+                    if st["loss_pct"] is not None:
+                        parts.append(f"loss {st['loss_pct']:.1f}%")
                     if st["mean_size_bytes"]:
                         parts.append(f"{st['mean_size_bytes']:.0f}B")
                     if st["age_s"] is not None:
@@ -618,12 +950,13 @@ class StatusAggregator:
                     self._log.warning(f"status_overview: link sampling failed: {exc}")
         snapshot = self.build_snapshot(now_mono, link_sample=link_sample)
         events = self.detect_transitions(snapshot)
+        transit_records = self.collect_transit_records()
         try:
             self._atomic_write(self._json_path, json.dumps(snapshot, indent=2) + "\n")
             self._atomic_write(self._txt_path, self.render_text(snapshot))
-            if events:
+            if events or transit_records:
                 with open(self._events_path, "a", encoding="utf-8") as fp:
-                    for ev in events:
+                    for ev in [*events, *transit_records]:
                         fp.write(json.dumps(ev) + "\n")
         except Exception as exc:  # pragma: no cover - defensive
             if self._log is not None:
@@ -641,4 +974,25 @@ def collect_stage_topics(spec: Dict[str, Any]) -> Dict[str, Dict[str, Optional[s
             by_domain.setdefault(domain, {})
             existing = by_domain[domain].get(stage["topic"])
             by_domain[domain][stage["topic"]] = existing or stage.get("type") or type_hint
+    return by_domain
+
+
+def collect_stage_metadata(spec: Dict[str, Any]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    """Return observation context for each concrete stage topic."""
+    by_domain: Dict[str, Dict[str, List[Dict[str, Any]]]] = {"local": {}, "ota": {}}
+    for topic_spec in spec.get("topics", []):
+        for stage in topic_spec.get("stages", []):
+            domain = stage.get("domain", "local")
+            by_domain.setdefault(domain, {})
+            by_domain[domain].setdefault(stage["topic"], []).append(
+                {
+                    "base": topic_spec.get("base"),
+                    "peer": spec.get("peer"),
+                    "direction": topic_spec.get("direction"),
+                    "source": topic_spec.get("source"),
+                    "target": topic_spec.get("target"),
+                    "stage": stage.get("stage"),
+                    "type": stage.get("type") or topic_spec.get("type"),
+                }
+            )
     return by_domain

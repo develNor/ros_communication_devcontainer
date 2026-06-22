@@ -78,7 +78,7 @@ _package-smoke:
 	    "resources/examples/sessions/1_heartbeat/session-definition.yaml",
 	    "resources/examples/scenarios/2_native_chatter/scenario-definition.yaml",
 	    "resources/ws/session/creation/run_session.py",
-	    "resources/ws/ros2src/com_msgs/msg/Heartbeat.msg",
+	    "resources/ws/ros2src/com_msgs/msg/EchoHeartbeat.msg",
 	)
 	missing = [
 	    path

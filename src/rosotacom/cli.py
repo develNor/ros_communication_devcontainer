@@ -1463,6 +1463,48 @@ def _ota_start_parts(
     return parts
 
 
+def _ota_communication_start_parts(
+    target: InteractiveSmokeTarget,
+    identity: str,
+    instance_id: str,
+    peer_args: list[str],
+    *,
+    mode: str,
+    force: bool = True,
+) -> list[str]:
+    parts = [
+        "start",
+        _ota_target_session_arg(target),
+        "--identity",
+        identity,
+        "--mode",
+        mode,
+        "--instance-id",
+        instance_id,
+        "--smoke-managed",
+    ]
+    parts.append("--force" if force else "--no-force")
+    for override in peer_args:
+        parts.extend(["--peer-address", override])
+    return parts
+
+
+def _ota_application_parts(
+    target: InteractiveSmokeTarget,
+    identity: str,
+    application: ScenarioApplication,
+) -> list[str]:
+    return [
+        "scenario",
+        "_run-application",
+        target.name,
+        "--identity",
+        identity,
+        "--application",
+        application.name,
+    ]
+
+
 def _ota_stop_parts(
     target: InteractiveSmokeTarget,
     identity: str,
@@ -2178,26 +2220,36 @@ def _ota_verify_only(args: argparse.Namespace) -> int:
     return 0
 
 
-def _ota_application_attach_script(
+def _ota_wait_for_running_container_suffix_script(suffix: str, label: str) -> str:
+    pattern = shlex.quote(f"{re.escape(suffix)}$")
+    quoted_label = shlex.quote(label)
+    return (
+        "container=''; "
+        f"until container=$(docker ps --filter status=running --format '{{{{.Names}}}}' "
+        f"| grep -E {pattern} | head -n 1) "
+        '&& [ -n "$container" ]; do '
+        f"echo '[INFO] waiting for running container:' {quoted_label}; "
+        "sleep 2; "
+        "done; "
+        'echo "[INFO] found running container: $container"'
+    )
+
+
+def _ota_application_run_script(
+    plan: OtaSmokePlan,
     target: InteractiveSmokeTarget,
     peer_name: str,
     application: ScenarioApplication,
 ) -> str:
-    suffix = _sanitize_docker_name(f"_scenario_{target.name}_{peer_name}_{application.name}")
-    pattern = shlex.quote(f"{re.escape(suffix)}$")
-    label = shlex.quote(f"{peer_name}:{application.name}")
+    communication_suffix = _sanitize_docker_name(f"_com_to_{_remote_peer_name(target.cfg, peer_name)}")
+    label = f"{peer_name}:{application.name}"
+    command = _ota_rosotacom_command(plan, _ota_application_parts(target, peer_name, application))
     return (
-        f"echo '[INFO] waiting for native application container:' {label}; "
-        "container=''; "
-        f"until container=$(docker ps --format '{{{{.Names}}}}' | grep -E {pattern} | head -n 1) "
-        '&& [ -n "$container" ]; do '
-        f"echo '[INFO] still waiting for native application container:' {label}; "
-        "sleep 2; "
-        "done; "
-        'echo "[INFO] attaching native application container: $container"; '
-        'docker attach "$container"; '
+        f"{_ota_wait_for_running_container_suffix_script(communication_suffix, f'{peer_name}:communication')}; "
+        f"echo '[INFO] starting native application container:' {shlex.quote(label)}; "
+        f"{command}; "
         "rc=$?; "
-        "echo; echo '[INFO] native application attach exited with status' \"$rc\"; "
+        "echo; echo '[INFO] native application exited with status' \"$rc\"; "
         "exec bash"
     )
 
@@ -2215,7 +2267,7 @@ def _ota_create_tmux(
     first_peer = peers[0]
     first_start = _ota_rosotacom_command(
         plan,
-        _ota_start_parts(target, first_peer.name, instance.instance_id, peer_args, mode="attach"),
+        _ota_communication_start_parts(target, first_peer.name, instance.instance_id, peer_args, mode="attach"),
     )
     first_script = (
         "set -e; "
@@ -2287,7 +2339,7 @@ def _ota_create_tmux(
     for peer in peers[1:]:
         start = _ota_rosotacom_command(
             plan,
-            _ota_start_parts(target, peer.name, instance.instance_id, peer_args, mode="attach"),
+            _ota_communication_start_parts(target, peer.name, instance.instance_id, peer_args, mode="attach"),
         )
         script = (
             "set -e; "
@@ -2326,7 +2378,7 @@ def _ota_create_tmux(
     if target.scenario_definition:
         for peer in peers:
             for application in target.scenario_definition.applications.get(peer.name, ()):
-                application_script = _ota_application_attach_script(target, peer.name, application)
+                application_script = _ota_application_run_script(plan, target, peer.name, application)
                 created_application = subprocess.run(
                     _tmux_command(
                         runtime,

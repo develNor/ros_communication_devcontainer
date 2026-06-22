@@ -1,7 +1,8 @@
 # RFC 0005 — Benchmark genres & CI distribution
 
-**Status:** Draft — design agreed, not yet implemented · **Scope:** the
-characterize/sweep question-mode and its place in the cadence · extends
+**Status:** Implemented (pure driver/verdict logic + host tests in
+`rosotacom.benchmark`; live runs and the nightly runner remain FZI-private) ·
+**Scope:** the characterize/sweep question-mode and its place in the cadence · extends
 [RFC 0001](0001-expectation-driven-test-suite.md) (cadence), consumes
 [RFC 0003](0003-metric-backbone.md) (the oracle) and
 [RFC 0004](0004-network-profiles.md) (the environments it runs against)
@@ -149,24 +150,63 @@ harness, not in this public repo.
 Roughly in dependency order; the capacity driver is the smallest self-contained
 slice and reuses RFC 0003 + 0004.
 
-- [ ] Extend `sized_publisher` with an a/b size pattern (e.g. `4×0 B + 1×70 KB`) to
-  drive irregular-size load.
-- [ ] Build the capacity binary-search driver: sweep size/rate against the backbone
+- [x] Extend `sized_publisher` with an a/b size pattern (e.g. `4×0 B + 1×70 KB`) to
+  drive irregular-size load (`sized_publisher` `pattern`/`size_a`/`size_b`; pure
+  expansion in `benchmark.expand_size_pattern`).
+- [x] Build the capacity binary-search driver: sweep size/rate against the backbone
   oracle (`loss < p` **and** `latency < L` over a window) → the breakpoint per
-  profile, with the slice (size/rate) stated.
-- [ ] Bound every sweep with a configured max (size / rate / bandwidth) and a
+  profile, with the slice (size/rate) stated (`benchmark.capacity_binary_search`,
+  `find_capacity`, `oracle_passes` / `oracle_passes_topic`).
+- [x] Bound every sweep with a configured max (size / rate / bandwidth) and a
   shared-link guard, so an unshaped / LAN run never saturates the shared network;
   the sweep's focus is the emulated degraded profiles, not a pristine link's
-  ceiling.
-- [ ] Add the budget store (per `(SHA, profile, genre)`) and the regression compare
-  against a recorded baseline ± tolerance.
-- [ ] Build the recovery driver on timeline profiles (RFC 0004) + the recovery
+  ceiling (`benchmark.SweepBounds`, `size_ceiling`, `guard_shared_link`).
+- [x] Add the budget store (per `(SHA, profile, genre)`) and the regression compare
+  against a recorded baseline ± tolerance (`benchmark.BudgetEntry`/`save_budget`/
+  `load_budget`/`find_baseline`, `compare_to_budget`).
+- [x] Build the recovery driver on timeline profiles (RFC 0004) + the recovery
   metric set (`t_recover`, `t_steady`, backlog/burst, lost-during-outage, latched
-  re-arrival).
-- [ ] Add coarse linear-ramp curves (latency-vs-load) for trend.
+  re-arrival) (`benchmark.recovery_metrics`; arming the timeline profile is RFC
+  0004 / the harness, the metric extraction is here).
+- [x] Add coarse linear-ramp curves (latency-vs-load) for trend
+  (`benchmark.linear_ramp`).
 - [ ] Wire the nightly benchmark run as a **monitor** (alerts on budget regression,
-  never blocks); the harness wires the actual runner.
-- [ ] Cover the driver oracle, budget compare, and recovery metrics with tests.
+  never blocks); the harness wires the actual runner. *(FZI-private — see below.)*
+- [x] Cover the driver oracle, budget compare, and recovery metrics with tests
+  (`tests/unit/test_benchmark.py`).
+
+## Validation checklist
+
+How each capability will be proven once built (forward-looking). The drivers and
+verdict logic are pure and host-testable; the runs themselves are **nightly
+monitors, not gates** (the determinism rule), so their *output* is trended/manually
+reviewed rather than asserted in a blocking test.
+
+- [x] **a/b size-pattern publisher** — host unit test on the pattern generation
+  (e.g. `4×0 B + 1×70 KB` sequence); advertised-topic check in CI smoke.
+  Automatable. *(`test_size_pattern_generation_matches_a_b_sequence`.)*
+- [x] **Capacity binary-search driver + oracle** (`loss < p` **and** `latency < L`
+  over a window → breakpoint per profile) — host unit test driving the search
+  against a stubbed metric source so the breakpoint is deterministic. Automatable.
+  *(`test_capacity_binary_search_finds_the_breakpoint`, `test_oracle_*`.)*
+- [x] **Sweep bounds + shared-link guard** (configured max size/rate/bandwidth; an
+  unshaped run never saturates the LAN) — host unit test on the bound logic.
+  Automatable. *(`test_shared_link_guard_*`,
+  `test_find_capacity_never_searches_past_the_shared_link_budget`.)*
+- [x] **Budget store + regression compare** (per `(SHA, profile, genre)`, ±
+  tolerance) — host unit test on the compare against a recorded baseline fixture.
+  Automatable. *(`test_budget_compare_*`, `test_budget_store_roundtrip_*`.)*
+- [x] **Recovery driver + metric set** (`t_recover`, `t_steady`, backlog/burst,
+  lost-during-outage, latched re-arrival) — host unit test extracting the metrics
+  from a synthetic timeline of transit records (RFC 0003); the **live recovery run
+  is a nightly monitor** + operator review. *(`test_recovery_metrics_*`.)*
+- [x] **Coarse linear-ramp curves** — curve builder host-tested
+  (`test_linear_ramp_builds_the_response_curve`); the trend output stays
+  **monitor-only**: nightly, reviewed, not gated.
+- [ ] **Nightly benchmark run wired as a monitor** (alerts on budget regression,
+  never blocks) — **operator/harness check**: the public repo defines the genre;
+  the actual runner topology is FZI-private, so the wiring is confirmed manually in
+  the harness, not by a public CI assertion.
 
 ## Open questions
 

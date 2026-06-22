@@ -211,6 +211,47 @@ risk — a stuck `qdisc` silently corrupts every later result on the machine.
 - [ ] Cover schema parsing, arm/teardown (including crash teardown), per-direction
   application, and `per_profile` evaluation with tests.
 
+## Validation checklist
+
+How each capability will be proven once built (forward-looking — fill in and check
+off during implementation). Notes whether automation is feasible; privileged
+`tc`/`netem` arming is the part that resists pure host testing.
+
+- [ ] **Profile schema parsing** (static + per-direction fields) — host unit test
+  on the parser. Fully automatable.
+- [ ] **Selection resolution** (`--profile` / `shared.profile` / `none`, and the
+  *reject a profile on a real-deployment run* rule) — host unit test. Automatable.
+- [ ] **`tc`/`netem` command generation** — host unit test asserting the argv built
+  for a given profile/direction (rate/delay/jitter/loss/correlation → `tbf`+`netem`
+  string), without touching a real interface. Automatable.
+- [ ] **Fail-safe teardown** (revert on stop, on error, on safety max-duration; the
+  idempotent `tc qdisc del … root` always runs; data-interface-only, never the
+  SSH/control interface) — host unit test on the teardown/targeting logic; **plus a
+  manual bench check** that a killed run leaves no `qdisc` behind. Highest-risk
+  item — the manual check is required, not optional.
+- [ ] **Per-direction application** (uplink on the sender's OTA egress, downlink on
+  the receiver's) — host unit test on the peer→direction mapping; live application
+  is an **operator bench check** (privileged, needs two shaped interfaces).
+- [ ] **Invariant/conditional split + `expect.per_profile` evaluation** — host unit
+  test in `status_eval` (invariant asserted under every profile; `P`'s conditional
+  used under `--profile P`, default conditional where `P` has no override).
+  Automatable.
+- [ ] **Timeline profiles** (ordered segments + `outage`) — host unit test on the
+  schedule expansion; live stepping is a **bench check** (and the substrate for the
+  RFC 0005 recovery genre).
+- [ ] **`rosotacom calibrate --profile P`** — host unit test that a reference
+  status/bag fixture yields the expected conditional band (reuses RFC 0002
+  calibrate machinery). Automatable.
+- [ ] **Emulated-profile gate (rung 2)** — an example session run under one
+  canonical profile in the per-promotion CI smoke, asserting a conditional bound
+  that differs from the unshaped run. Automatable in the smoke matrix.
+- [ ] **Link sampler reads post-shaping wire bytes** — **manual bench check** under
+  an armed `tbf`/`netem` interface that `/proc/net/dev` byte counts reflect shaped
+  bytes (can't be meaningfully emulated in a host test).
+- [ ] **Emulation-vs-truth calibration (rungs 3–4)** — **operator manual /
+  monitor-only**; real WLAN/cellular characterization calibrates the profile shape
+  and never gates (non-deterministic by design).
+
 ## Open questions
 
 - **Config home.** Project-scoped `profiles.yaml` referenced from `rosotacom.yaml`

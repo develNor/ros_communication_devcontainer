@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -56,6 +57,9 @@ SIZED_PAYLOAD_SMOKE_SESSIONS = [
 ]
 ZEN_SIZED_PAYLOAD_SMOKE_SESSIONS = [
     pytest.param(name, id="sized-payload-zenoh") for name in SMOKE_SESSIONS if name == "6_sized_payload_zen"
+]
+LINK_LATENCY_SMOKE_SESSIONS = [
+    pytest.param(name, id="link-latency") for name in SMOKE_SESSIONS if name == "13_link_latency"
 ]
 
 EXPECTED_HEARTBEAT_CHECKS = (
@@ -380,6 +384,91 @@ def _assert_metric_within_bounds(
     )
     assert isinstance(metric["delay_s"], float) and metric["delay_s"] < max_delay_s, (
         f"{label} ({topic}) delay {metric['delay_s']} >= {max_delay_s}s for {session_name}"
+    )
+
+
+def _load_status_json(artifact_dir: Path, peer: str) -> dict[str, object]:
+    path = artifact_dir / "logs" / peer / "status" / "status.json"
+    assert path.is_file(), f"no status.json for peer {peer} under {artifact_dir}"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _find_inbound_stage(status: dict[str, object], *, base_suffix: str, stage: str) -> dict[str, object] | None:
+    """The named pipeline stage of the inbound topic whose base ends with base_suffix."""
+    for topic in status.get("topics", []):  # type: ignore[union-attr]
+        if topic.get("direction") != "inbound" or not str(topic.get("base", "")).endswith(base_suffix):
+            continue
+        for st in topic.get("stages", []):
+            if st.get("stage") == stage:
+                return st
+    return None
+
+
+def _read_transit_records(artifact_dir: Path, peer: str) -> list[dict[str, object]]:
+    path = artifact_dir / "logs" / peer / "status" / "events.jsonl"
+    assert path.is_file(), f"no events.jsonl for peer {peer} under {artifact_dir}"
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if event.get("kind") == "transit":
+            rows.append(event)
+    return rows
+
+
+@pytest.mark.parametrize("session_name", LINK_LATENCY_SMOKE_SESSIONS)
+def test_local_link_latency_smoke_exposes_metric_backbone(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    """RFC 0003 end-to-end on the running nodes: the echo heartbeat yields a
+    clock-sync estimate, offset correction fires on the wrapped headerless topic
+    at com_in, and per-(topic, seq) transit records reach events.jsonl and the
+    `rosotacom metrics` digest. Guards the live wiring that the unit tests, which
+    run on synthetic rows, cannot see."""
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    artifact_dir = _artifact_dir(result.stdout)
+    assert list((artifact_dir / "logs").glob("*/catmux/*/*.log"))
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+
+    # /link_latency_demo is published b->a, so peer 'a' is the receiver that
+    # observes the wrapped OtaStamped at com_in and writes the metric backbone.
+    status_a = _load_status_json(artifact_dir, "a")
+
+    # Mechanism 2: the symmetric echo produced a min-RTT clock-sync estimate.
+    clock_sync = status_a.get("clock_sync")
+    assert isinstance(clock_sync, dict), f"no clock_sync block in status.json for {session_name}:\n{status_a}"
+    assert clock_sync.get("method") == "echo_min_rtt"
+    assert isinstance(clock_sync.get("peer_offset_ms"), (int, float)), f"no peer offset: {clock_sync}"
+    assert isinstance(clock_sync.get("rtt_ms"), (int, float)), f"no RTT: {clock_sync}"
+
+    # Mechanism 3: offset-corrected OTA latency fired at com_in for a headerless
+    # topic, and the uncorrected value remains a separate field (no silent fallback).
+    com_in = _find_inbound_stage(status_a, base_suffix="link_latency_demo", stage="com_in")
+    assert com_in is not None, f"no inbound com_in stage for /link_latency_demo in {session_name}:\n{status_a}"
+    assert com_in.get("latency_ms") is not None, f"corrected com_in latency missing (offset not applied): {com_in}"
+    assert com_in.get("latency_uncorrected_ms") is not None, f"uncorrected com_in latency missing: {com_in}"
+
+    # Mechanism 1 + forensics: events.jsonl carries per-(topic, seq) transit rows.
+    transit_rows = _read_transit_records(artifact_dir, "a")
+    assert transit_rows, f"no transit records in events.jsonl for {session_name}"
+    assert any(row.get("status") == "delivered" for row in transit_rows), (
+        f"no delivered transit record for {session_name}: {transit_rows[:3]}"
+    )
+
+    # The `rosotacom metrics` digest joins those rows into a non-empty summary.
+    events_path = artifact_dir / "logs" / "a" / "status" / "events.jsonl"
+    metrics_result = _run(
+        [sys.executable, "-m", "rosotacom", "metrics", str(events_path)],
+        timeout=60,
+    )
+    summary = json.loads(metrics_result.stdout)
+    assert summary.get("topics"), f"empty metrics digest for {session_name}:\n{metrics_result.stdout}"
+    assert any("link_latency_demo" in label for label in summary["topics"]), (
+        f"link_latency_demo missing from metrics digest for {session_name}:\n{metrics_result.stdout}"
     )
 
 

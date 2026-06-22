@@ -837,7 +837,7 @@ def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal pane_number
         calls.append(command)
-        if "new-session" in command or "new-window" in command:
+        if "new-session" in command or "new-window" in command or "split-window" in command:
             pane_number += 1
             return subprocess.CompletedProcess(command, 0, f"%{pane_number}\n", "")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -867,7 +867,9 @@ def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
     assert "docker attach" not in joined
     assert "scenario start demo --identity a --mode attach" not in joined
     assert "scenario start demo --identity b --mode attach" not in joined
-    assert not any("split-window" in command for command in calls)
+    assert "status demo --identity a --instance-id ota-interactive --watch" in joined
+    assert "status demo --identity b --instance-id ota-interactive --watch" in joined
+    assert any("split-window" in command for command in calls)
     assert "ota-smoke demo --state-file" in joined
     assert "--verify-only" in joined
 

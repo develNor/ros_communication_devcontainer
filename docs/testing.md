@@ -102,8 +102,8 @@ Use `rosotacom ota-smoke TARGET --peer-address ... --peer-ssh ...` for a
 configuration-free operator run, or map peers to named hosts with `--peer`
 through the active project's deployment file. Add `--interactive` to open a
 local control tmux for the same run; each peer gets an attachable
-communication/catmux window, and scenario targets also get native
-application-container windows. Stop it with
+communication/catmux window with a live status pane below it, and scenario
+targets also get native application-container windows. Stop it with
 `rosotacom ota-smoke TARGET --interactive --stop`.
 
 External runners should use `ota_suite_sessions()` to discover the scenario set

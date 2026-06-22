@@ -68,6 +68,15 @@ Update those checkboxes, design decisions, and reality checks during the work,
 not afterward. The RFC should always describe the current implementation state
 and leave enough self-contained context for another contributor to resume.
 
+Every RFC also carries a **Validation checklist** beside its implementation
+checklist: one entry per capability it introduces, naming the test, example, or CI
+lane that proves it — or, where automation is genuinely impossible, a referenced
+manual check. Prefer automated verification (unit/contract test > an example run in
+CI smoke > a scripted check) and treat manual checks as the explicit fallback.
+Check a validation item only once that verification actually exists and runs, and
+add it in the same change as the behaviour it covers. See
+[docs/rfcs/README.md](docs/rfcs/README.md) for the required RFC sections.
+
 Moving validated development work to `main` is a deliberate maintainer action.
 It may require an external OTA gate supplied by the repository operator; it is
 not triggered by an arbitrary commit in this repository.

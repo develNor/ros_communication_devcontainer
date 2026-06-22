@@ -2027,12 +2027,52 @@ def _ota_stage_text(peer: OtaSmokePeer, text: str, destination: str, *, dry_run:
         path.write_text(text, encoding="utf-8")
 
 
-def _ota_remote_project_config(runtime: RuntimeConfig) -> str:
+def _ota_remap_config_roots(
+    raw: Any, key: str, project_root: Path, source_checkout: Path | None, staged_source: str
+) -> Any:
+    """Rewrite config-root paths so they resolve on the remote staged tree.
+
+    - relative roots resolve under the staged project, so keep them verbatim;
+    - absolute roots inside the project become relative (staged with the project);
+    - absolute roots inside the staged rosotacom source point at the remote source
+      path (``{workdir}/source/...``), since the examples are staged there;
+    - anything else is left untouched (it cannot be staged automatically and will
+      surface as a clear "Path does not exist" on the remote).
+    """
+    values = list(_path_values(raw, key))
+    scalar = not isinstance(raw, (list, tuple)) and not (isinstance(raw, str) and "," in raw)
+    remapped: list[str] = []
+    for value in values:
+        path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+        if not path.is_absolute():
+            remapped.append(str(value))
+            continue
+        path = path.resolve()
+        rel_to_project = _relative_to(path, project_root)
+        if rel_to_project is not None:
+            remapped.append(rel_to_project.as_posix())
+            continue
+        rel_to_source = _relative_to(path, source_checkout) if source_checkout else None
+        if rel_to_source is not None:
+            remapped.append(f"{staged_source}/{rel_to_source.as_posix()}")
+            continue
+        remapped.append(str(value))
+    if scalar:
+        return remapped[0] if remapped else raw
+    return remapped
+
+
+def _ota_remote_project_config(runtime: RuntimeConfig, plan: OtaSmokePlan, source_checkout: Path | None) -> str:
     if not runtime.rosotacom_config:
         raise RuntimeError("ota-smoke requires an active rosotacom.yaml project.")
     raw = _load_yaml_file(runtime.rosotacom_config)
-    if runtime.deployment and _relative_to(runtime.deployment, runtime.rosotacom_config.parent) is None:
+    project_root = runtime.rosotacom_config.parent
+    if runtime.deployment and _relative_to(runtime.deployment, project_root) is None:
         raw["deployment"] = ".rosotacom/deployment.yaml"
+    staged_source = f"{plan.workdir}/source"
+    for key in ("session_configs_dir", "scenario_configs_dir"):
+        if raw.get(key) is not None:
+            raw[key] = _ota_remap_config_roots(raw[key], key, project_root, source_checkout, staged_source)
     return yaml.safe_dump(raw, sort_keys=False)
 
 
@@ -2084,7 +2124,7 @@ def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: O
             )
             _ota_stage_text(
                 peer,
-                _ota_remote_project_config(runtime),
+                _ota_remote_project_config(runtime, plan, source_checkout),
                 f"{plan.workdir}/{plan.project}",
                 dry_run=dry_run,
                 label=f"{peer.name}: write staged project config",
@@ -2224,6 +2264,14 @@ def _ota_verify_content_integrity(
     """For each peer's PASS-THROUGH String topic, assert the delivered payload is
     byte-identical to what the sender published (the synthetic publishers are still
     running from the test phase, so their known payload is the ground truth)."""
+    if target.target_type != "session":
+        # The byte-equality ground truth is the synthetic publisher payload, which
+        # only runs for session targets (see _ota_start_session_publishers).
+        # Scenarios drive their own application publishers with no fixed payload,
+        # so there is nothing to byte-compare against; delivery + isolation already
+        # cover the OTA guarantee for them.
+        print("OTA smoke: skipping content integrity (scenario uses application publishers).")
+        return []
     peer_args = _ota_peer_address_args(plan)
     errors: list[str] = []
     for receiver_name, receiver in plan.peers.items():
@@ -2339,6 +2387,22 @@ def _ota_application_run_script(
     )
 
 
+def _ota_status_parts(target: InteractiveSmokeTarget, instance_id: str, identity: str, *, watch: bool) -> list[str]:
+    parts = ["status", _ota_target_session_arg(target), "--identity", identity, "--instance-id", instance_id]
+    if watch:
+        parts.append("--watch")
+    return parts
+
+
+def _ota_status_watch_script(
+    plan: OtaSmokePlan,
+    target: InteractiveSmokeTarget,
+    instance_id: str,
+    peer_name: str,
+) -> str:
+    return _ota_rosotacom_command(plan, _ota_status_parts(target, instance_id, peer_name, watch=True))
+
+
 def _ota_create_tmux(
     runtime: RuntimeConfig,
     target: InteractiveSmokeTarget,
@@ -2360,7 +2424,7 @@ def _ota_create_tmux(
         "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
         f"{first_start}; "
         "echo; "
-        f"echo '[INFO] remote peer {first_peer.name} communication exited'; "
+        f"echo '[INFO] remote peer {first_peer.name} communication exited; live status is in the lower pane'; "
         "exec bash"
     )
     created = subprocess.run(
@@ -2420,6 +2484,29 @@ def _ota_create_tmux(
         first_pane,
         instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-communication.log",
     )
+    first_status = _ota_status_watch_script(plan, target, instance.instance_id, first_peer.name)
+    first_status_script = (
+        f"echo '[INFO] starting live remote status watch for {first_peer.name}'; "
+        f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
+        f"exec {first_status}"
+    )
+    _create_tmux_split_below(
+        runtime,
+        first_pane,
+        f"{first_peer.name}:status",
+        _ota_quote_cmd(_ota_remote_argv(first_peer, first_status_script, tty=bool(first_peer.ssh))),
+        log_path=instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-status.log",
+    )
+    subprocess.run(
+        _tmux_command(
+            runtime,
+            "select-layout",
+            "-t",
+            f"{session_name}:{_safe_path_token(f'{first_peer.name}_communication')}",
+            "even-vertical",
+        ),
+        check=True,
+    )
 
     for peer in peers[1:]:
         start = _ota_rosotacom_command(
@@ -2432,7 +2519,7 @@ def _ota_create_tmux(
             "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
             f"{start}; "
             "echo; "
-            f"echo '[INFO] remote peer {peer.name} communication exited'; "
+            f"echo '[INFO] remote peer {peer.name} communication exited; live status is in the lower pane'; "
             "exec bash"
         )
         created_window = subprocess.run(
@@ -2459,6 +2546,29 @@ def _ota_create_tmux(
             check=True,
         )
         _attach_tmux_pipe(runtime, pane_id, instance.logs_host_dir / "ota-smoke" / f"{peer.name}-communication.log")
+        status = _ota_status_watch_script(plan, target, instance.instance_id, peer.name)
+        status_script = (
+            f"echo '[INFO] starting live remote status watch for {peer.name}'; "
+            f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
+            f"exec {status}"
+        )
+        _create_tmux_split_below(
+            runtime,
+            pane_id,
+            f"{peer.name}:status",
+            _ota_quote_cmd(_ota_remote_argv(peer, status_script, tty=bool(peer.ssh))),
+            log_path=instance.logs_host_dir / "ota-smoke" / f"{peer.name}-status.log",
+        )
+        subprocess.run(
+            _tmux_command(
+                runtime,
+                "select-layout",
+                "-t",
+                f"{session_name}:{_safe_path_token(f'{peer.name}_communication')}",
+                "even-vertical",
+            ),
+            check=True,
+        )
 
     if target.scenario_definition:
         for peer in peers:

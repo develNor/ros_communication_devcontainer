@@ -167,7 +167,8 @@ def _has_publisher(topic: dict[str, Any]) -> bool:
 
 
 def _named_stage(topic: dict[str, Any], name: str) -> dict[str, Any] | None:
-    for s in topic.get("stages") or []:
+    stages: list[dict[str, Any]] = topic.get("stages") or []
+    for s in stages:
         if s.get("stage") == name:
             return s
     return None

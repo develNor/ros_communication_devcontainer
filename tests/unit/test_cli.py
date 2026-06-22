@@ -792,7 +792,7 @@ def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
         for command in calls
         if ("new-session" in command or "new-window" in command) and "-n" in command
     ]
-    assert window_names == ["a_communication", "b_communication", "a_shell", "b_shell", "verification"]
+    assert window_names == ["a_communication", "b_communication", "a_local_app", "b_local_app", "verification"]
     assert any(command[-2:] == ["@rosotacom_ota_smoke_target", "demo"] for command in calls)
     assert any(command[-2:] == ["@rosotacom_ota_smoke_target_type", "scenario"] for command in calls)
     assert any(command[-2:] == ["@rosotacom_ota_smoke_instance", "ota-interactive"] for command in calls)
@@ -800,9 +800,9 @@ def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
     joined = "\n".join(" ".join(command) for command in calls)
     assert "scenario start demo --identity a --mode attach --instance-id ota-interactive" in joined
     assert "scenario start demo --identity b --mode attach --instance-id ota-interactive" in joined
-    assert "status demo --identity a --instance-id ota-interactive --watch" in joined
-    assert "status demo --identity b --instance-id ota-interactive --watch" in joined
-    assert any("split-window" in command for command in calls)
+    assert "waiting for native application container" in joined
+    assert "docker attach" in joined
+    assert not any("split-window" in command for command in calls)
     assert "ota-smoke demo --state-file" in joined
     assert "--verify-only" in joined
 

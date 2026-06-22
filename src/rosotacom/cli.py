@@ -1515,13 +1515,6 @@ def _ota_test_parts(target: InteractiveSmokeTarget, instance_id: str) -> list[st
     ]
 
 
-def _ota_status_parts(target: InteractiveSmokeTarget, instance_id: str, identity: str, *, watch: bool) -> list[str]:
-    parts = ["status", _ota_target_session_arg(target), "--identity", identity, "--instance-id", instance_id]
-    if watch:
-        parts.append("--watch")
-    return parts
-
-
 def _ota_probe_publish_parts(
     target: InteractiveSmokeTarget,
     identity: str,
@@ -2185,20 +2178,27 @@ def _ota_verify_only(args: argparse.Namespace) -> int:
     return 0
 
 
-def _ota_status_watch_script(
-    plan: OtaSmokePlan,
+def _ota_application_attach_script(
     target: InteractiveSmokeTarget,
-    instance_id: str,
     peer_name: str,
+    application: ScenarioApplication,
 ) -> str:
-    return _ota_rosotacom_command(plan, _ota_status_parts(target, instance_id, peer_name, watch=True))
-
-
-def _ota_debug_shell_script(plan: OtaSmokePlan) -> str:
+    suffix = _sanitize_docker_name(f"_scenario_{target.name}_{peer_name}_{application.name}")
+    pattern = shlex.quote(f"{re.escape(suffix)}$")
+    label = shlex.quote(f"{peer_name}:{application.name}")
     return (
-        f"cd {shlex.quote(plan.workdir)} && "
-        f"echo '[INFO] debug shell for OTA smoke workdir: {shlex.quote(plan.workdir)}' && "
-        'exec "${SHELL:-bash}"'
+        f"echo '[INFO] waiting for native application container:' {label}; "
+        "container=''; "
+        f"until container=$(docker ps --format '{{{{.Names}}}}' | grep -E {pattern} | head -n 1) "
+        '&& [ -n "$container" ]; do '
+        f"echo '[INFO] still waiting for native application container:' {label}; "
+        "sleep 2; "
+        "done; "
+        'echo "[INFO] attaching native application container: $container"; '
+        'docker attach "$container"; '
+        "rc=$?; "
+        "echo; echo '[INFO] native application attach exited with status' \"$rc\"; "
+        "exec bash"
     )
 
 
@@ -2217,14 +2217,13 @@ def _ota_create_tmux(
         plan,
         _ota_start_parts(target, first_peer.name, instance.instance_id, peer_args, mode="attach"),
     )
-    first_status = _ota_status_watch_script(plan, target, instance.instance_id, first_peer.name)
     first_script = (
         "set -e; "
         f"echo '[INFO] starting interactive communication for remote peer {first_peer.name}'; "
         "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
         f"{first_start}; "
         "echo; "
-        f"echo '[INFO] remote peer {first_peer.name} communication exited; live status is in the lower pane'; "
+        f"echo '[INFO] remote peer {first_peer.name} communication exited'; "
         "exec bash"
     )
     created = subprocess.run(
@@ -2271,7 +2270,7 @@ def _ota_create_tmux(
             "-t",
             session_name,
             "status-right",
-            " ota smoke | windows: C-b n/p | peer tmux/catmux: C-b C-b ",
+            " ota smoke | windows: C-b n/p | inner catmux: C-b C-b ",
         ),
         check=True,
     )
@@ -2284,42 +2283,19 @@ def _ota_create_tmux(
         first_pane,
         instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-communication.log",
     )
-    first_status_script = (
-        f"echo '[INFO] starting live remote status watch for {first_peer.name}'; "
-        f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
-        f"exec {first_status}"
-    )
-    _create_tmux_split_below(
-        runtime,
-        first_pane,
-        f"{first_peer.name}:status",
-        _ota_quote_cmd(_ota_remote_argv(first_peer, first_status_script, tty=bool(first_peer.ssh))),
-        log_path=instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-status.log",
-    )
-    subprocess.run(
-        _tmux_command(
-            runtime,
-            "select-layout",
-            "-t",
-            f"{session_name}:{_safe_path_token(f'{first_peer.name}_communication')}",
-            "even-vertical",
-        ),
-        check=True,
-    )
 
     for peer in peers[1:]:
         start = _ota_rosotacom_command(
             plan,
             _ota_start_parts(target, peer.name, instance.instance_id, peer_args, mode="attach"),
         )
-        status = _ota_status_watch_script(plan, target, instance.instance_id, peer.name)
         script = (
             "set -e; "
             f"echo '[INFO] starting interactive communication for remote peer {peer.name}'; "
             "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
             f"{start}; "
             "echo; "
-            f"echo '[INFO] remote peer {peer.name} communication exited; live status is in the lower pane'; "
+            f"echo '[INFO] remote peer {peer.name} communication exited'; "
             "exec bash"
         )
         created_window = subprocess.run(
@@ -2346,51 +2322,48 @@ def _ota_create_tmux(
             check=True,
         )
         _attach_tmux_pipe(runtime, pane_id, instance.logs_host_dir / "ota-smoke" / f"{peer.name}-communication.log")
-        status_script = (
-            f"echo '[INFO] starting live remote status watch for {peer.name}'; "
-            f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
-            f"exec {status}"
-        )
-        _create_tmux_split_below(
-            runtime,
-            pane_id,
-            f"{peer.name}:status",
-            _ota_quote_cmd(_ota_remote_argv(peer, status_script, tty=bool(peer.ssh))),
-            log_path=instance.logs_host_dir / "ota-smoke" / f"{peer.name}-status.log",
-        )
-        subprocess.run(
-            _tmux_command(
-                runtime,
-                "select-layout",
-                "-t",
-                f"{session_name}:{_safe_path_token(f'{peer.name}_communication')}",
-                "even-vertical",
-            ),
-            check=True,
-        )
 
-    for peer in peers:
-        shell_script = _ota_debug_shell_script(plan)
-        created_shell = subprocess.run(
-            _tmux_command(
-                runtime,
-                "new-window",
-                "-d",
-                "-P",
-                "-F",
-                "#{pane_id}",
-                "-t",
-                session_name,
-                "-n",
-                _safe_path_token(f"{peer.name}_shell"),
-                _ota_quote_cmd(_ota_remote_argv(peer, shell_script, tty=bool(peer.ssh))),
-            ),
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        pane_id = created_shell.stdout.strip()
-        subprocess.run(_tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"{peer.name}:shell"), check=True)
+    if target.scenario_definition:
+        for peer in peers:
+            for application in target.scenario_definition.applications.get(peer.name, ()):
+                application_script = _ota_application_attach_script(target, peer.name, application)
+                created_application = subprocess.run(
+                    _tmux_command(
+                        runtime,
+                        "new-window",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                        "-t",
+                        session_name,
+                        "-n",
+                        _safe_path_token(f"{peer.name}_{application.name}"),
+                        _ota_quote_cmd(_ota_remote_argv(peer, application_script, tty=bool(peer.ssh))),
+                    ),
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                pane_id = created_application.stdout.strip()
+                subprocess.run(
+                    _tmux_command(
+                        runtime,
+                        "select-pane",
+                        "-t",
+                        pane_id,
+                        "-T",
+                        f"{peer.name}:application:{application.name}",
+                    ),
+                    check=True,
+                )
+                _attach_tmux_pipe(
+                    runtime,
+                    pane_id,
+                    instance.logs_host_dir
+                    / "ota-smoke"
+                    / f"{peer.name}-application-{_safe_path_token(application.name)}.log",
+                )
 
     verify_parts = [
         sys.executable,

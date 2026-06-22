@@ -223,7 +223,6 @@ class StageObservation:
     last_recv_wall: Optional[float] = None
     last_delay_s: Optional[float] = None
     last_raw_delay_s: Optional[float] = None
-    last_preprocess_s: Optional[float] = None
     last_rtt_s: Optional[float] = None
     last_clock_offset_s: Optional[float] = None
     # (t_mono, size_bytes, delay_s_or_None)
@@ -251,7 +250,6 @@ class StageObservation:
         *,
         seq: Optional[int] = None,
         raw_delay_s: Optional[float] = None,
-        preprocess_s: Optional[float] = None,
         rtt_s: Optional[float] = None,
         clock_offset_s: Optional[float] = None,
         transit: Optional[Dict[str, Any]] = None,
@@ -264,7 +262,6 @@ class StageObservation:
             self.last_recv_wall = wall
             self.last_delay_s = delay_s
             self.last_raw_delay_s = raw_delay_s
-            self.last_preprocess_s = preprocess_s
             self.last_rtt_s = rtt_s
             self.last_clock_offset_s = clock_offset_s
             self.events.append((now, size, delay_s))
@@ -316,11 +313,10 @@ class StageObservation:
                                 **common,
                                 "seq": missing_seq,
                                 "status": "lost",
-                                "t_source": None,
                                 "t_wrap": None,
                                 "t_com_in": None,
                                 "clock_offset_ms": None,
-                                "sections": {"preprocess_ms": None, "ota_hop_ms": None},
+                                "sections": {"ota_hop_ms": None},
                                 "size_bytes": None,
                                 "inter_arrival_ms": None,
                                 "jitter_ms": None,
@@ -344,7 +340,6 @@ class StageObservation:
                         **common,
                         "seq": int(seq),
                         "status": sequence_status,
-                        "t_source": transit.get("t_source"),
                         "t_wrap": transit.get("t_wrap"),
                         "t_com_in": transit.get("t_com_in"),
                         "clock_offset_ms": (
@@ -353,11 +348,6 @@ class StageObservation:
                             else None
                         ),
                         "sections": {
-                            "preprocess_ms": (
-                                round(preprocess_s * 1000.0, 3)
-                                if preprocess_s is not None
-                                else None
-                            ),
                             "ota_hop_ms": (
                                 round(delay_s * 1000.0, 3) if delay_s is not None else None
                             ),
@@ -397,7 +387,6 @@ class StageObservation:
             last_recv_wall = self.last_recv_wall
             last_delay = self.last_delay_s
             last_raw_delay = self.last_raw_delay_s
-            last_preprocess = self.last_preprocess_s
             last_rtt = self.last_rtt_s
             last_clock_offset = self.last_clock_offset_s
             msg_total = self.msg_total
@@ -414,7 +403,6 @@ class StageObservation:
             "mean_size_bytes": mean_size,
             "last_delay_s": last_delay,
             "last_raw_delay_s": last_raw_delay,
-            "last_preprocess_s": last_preprocess,
             "last_rtt_s": last_rtt,
             "last_clock_offset_s": last_clock_offset,
             "delays_in_window": delays,
@@ -492,7 +480,6 @@ class StatusAggregator:
             "mean_size_bytes": 0.0,
             "latency_ms": None,
             "latency_uncorrected_ms": None,
-            "preprocess_ms": None,
             "rtt_ms": None,
             "clock_offset_ms": None,
             "loss_pct": None,
@@ -524,8 +511,6 @@ class StatusAggregator:
             result["latency_ms"] = round(m["last_delay_s"] * 1000.0, 1)
         if m["last_raw_delay_s"] is not None:
             result["latency_uncorrected_ms"] = round(m["last_raw_delay_s"] * 1000.0, 1)
-        if m["last_preprocess_s"] is not None:
-            result["preprocess_ms"] = round(m["last_preprocess_s"] * 1000.0, 1)
         if m["last_rtt_s"] is not None:
             result["rtt_ms"] = round(m["last_rtt_s"] * 1000.0, 1)
         if m["last_clock_offset_s"] is not None:
@@ -567,7 +552,6 @@ class StatusAggregator:
             "mean_size_bytes",
             "latency_ms",
             "latency_uncorrected_ms",
-            "preprocess_ms",
             "rtt_ms",
             "clock_offset_ms",
             "loss_pct",

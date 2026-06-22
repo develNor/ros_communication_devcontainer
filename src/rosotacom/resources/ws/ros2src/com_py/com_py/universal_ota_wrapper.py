@@ -129,18 +129,12 @@ class UniversalOtaWrapperNode(Node):
 
     def wrapper_callback(self, msg, publisher, source_topic: str, msg_type_str: str):
         try:
-            input_stamp = self.get_clock().now().to_msg()
-            source_stamp = input_stamp
             header = getattr(msg, 'header', None)
-            stamp = getattr(header, 'stamp', None) if header is not None else None
-            if stamp is not None and (int(stamp.sec) != 0 or int(stamp.nanosec) != 0):
-                source_stamp = stamp
 
             serialized = serialize_message(msg)
 
             out_msg = OtaStamped()
             out_msg.header.stamp = self.get_clock().now().to_msg()
-            out_msg.source_stamp = source_stamp
             if header is not None:
                 out_msg.header.frame_id = header.frame_id
             out_msg.seq = self._next_sequence(source_topic)

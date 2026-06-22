@@ -16,7 +16,7 @@ def _record(seq: int, status: str, ota_ms: float | None = None) -> dict:
         "topic": "/x",
         "seq": seq,
         "status": status,
-        "sections": {"preprocess_ms": 1.0, "ota_hop_ms": ota_ms},
+        "sections": {"ota_hop_ms": ota_ms},
         "jitter_ms": 2.0 if ota_ms is not None else None,
     }
 

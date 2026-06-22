@@ -150,7 +150,7 @@ def _outbound_spec() -> dict:
                 "direction": "outbound",
                 "source": "a",
                 "target": "b",
-                "type": "com_msgs/msg/Heartbeat",
+                "type": "com_msgs/msg/EchoHeartbeat",
                 "expected_hz": None,
                 "stages": [
                     {"stage": "native", "topic": "/heartbeat_a", "domain": "local", "produced_by": "application"},
@@ -619,7 +619,7 @@ def test_pipeline_spec_carries_heartbeat_expect(tmp_path: Path) -> None:
 
 
 def test_heartbeat_monitor_thresholds_overridden_from_expect(tmp_path: Path) -> None:
-    # latency/loss from shared.heartbeat.expect override the heartbeat_in_monitor
+    # latency/loss from shared.heartbeat.expect override heartbeat_echo
     # status thresholds (delay_bad_ms / loss3_bad_pct).
     cfg = _heartbeat_cfg()
     cfg["shared"]["heartbeat"] = {"expect": {"latency_ms": {"max": 150}, "loss_pct": {"max": 3}}}
@@ -627,6 +627,8 @@ def test_heartbeat_monitor_thresholds_overridden_from_expect(tmp_path: Path) -> 
     plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
     assert "heartbeat_delay_bad_ms: 150.0" in plugin
     assert "heartbeat_loss3_bad_pct: 3.0" in plugin
+    assert "heartbeat_local_topic: /heartbeat_a" in plugin
+    assert "heartbeat_remote_topic: /heartbeat_b" in plugin
 
 
 def test_heartbeat_monitor_thresholds_default_without_expect(tmp_path: Path) -> None:
@@ -671,3 +673,97 @@ def test_compute_link_overview_ratio_none_when_no_payload() -> None:
     link = core.compute_link_overview(topics, {"tx_kbps": 50.0, "rx_kbps": 0.0})
     assert link["ros_payload_out_kbps"] == 0.0
     assert link["overhead_ratio_out"] is None
+
+
+# ---------------------------------------------------------------------------
+# RFC 0003 metric backbone
+# ---------------------------------------------------------------------------
+
+
+def test_sequence_loss_reorder_and_transit_records() -> None:
+    obs = core.StageObservation(type_str="com_msgs/msg/OtaStamped")
+    transit = {
+        "topic": "/wrapped",
+        "direction": "inbound",
+        "stage": "com_in",
+        "t_source": 1.0,
+        "t_wrap": 1.01,
+        "t_com_in": 1.05,
+    }
+    obs.record(
+        100,
+        0.04,
+        now_mono=10.0,
+        now_wall=1.05,
+        seq=10,
+        raw_delay_s=0.04,
+        preprocess_s=0.01,
+        clock_offset_s=0.0,
+        transit=transit,
+    )
+    obs.record(
+        100,
+        0.05,
+        now_mono=11.0,
+        now_wall=1.10,
+        seq=13,
+        raw_delay_s=0.05,
+        preprocess_s=0.01,
+        clock_offset_s=0.0,
+        transit={**transit, "t_com_in": 1.10},
+    )
+    obs.record(100, 0.06, now_mono=11.5, now_wall=1.11, seq=12, transit=transit)
+
+    metrics = obs.metrics(12.0, 3.0)
+    assert metrics["loss_pct"] == 50.0
+    assert metrics["reordered"] == 1
+    assert metrics["max_burst_missing"] == 2
+    records = obs.drain_transit_records()
+    assert [(record["seq"], record["status"]) for record in records] == [
+        (10, "delivered"),
+        (11, "lost"),
+        (12, "lost"),
+        (13, "delivered"),
+        (12, "reordered"),
+    ]
+    assert records[1]["t_wrap"] is None
+    assert records[3]["sections"]["ota_hop_ms"] == 50.0
+
+
+def test_clock_offset_estimator_uses_minimum_rtt_sample() -> None:
+    estimator = core.ClockOffsetEstimator(window_s=60.0)
+    assert estimator.update(t1_s=10.0, t2_s=10.12, t3_s=10.13, t4_s=10.06, now_mono=1.0)
+    assert estimator.update(t1_s=20.0, t2_s=20.20, t3_s=20.21, t4_s=20.21, now_mono=2.0)
+    estimate = estimator.estimate(now_mono=2.0)
+    assert estimate is not None
+    assert estimate["rtt_s"] == pytest.approx(0.05)
+    assert estimate["offset_s"] == pytest.approx(0.095)
+
+
+def test_sequence_zero_starts_new_epoch_after_publisher_restart() -> None:
+    obs = core.StageObservation()
+    obs.record(1, None, now_mono=1.0, seq=40)
+    obs.record(1, None, now_mono=2.0, seq=41)
+    obs.record(1, None, now_mono=3.0, seq=0)
+    obs.record(1, None, now_mono=4.0, seq=1)
+    metrics = obs.metrics(4.0, 10.0)
+    assert metrics["reordered"] == 0
+    assert metrics["loss_pct"] == 0.0
+
+
+def test_loss_expect_classifies_wrapped_stage_bad(tmp_path: Path) -> None:
+    agg = _build({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path)
+    metrics = {"hz": 10.0, "last_delay_s": 0.01, "loss_pct": 4.0}
+    assert agg._classify_quality(metrics, None, {"loss_pct": {"max": 3.0}}) == (
+        core.BAD,
+        "loss",
+    )
+
+
+def test_metric_stage_bag_is_generated_from_local_pipeline(tmp_path: Path) -> None:
+    cfg = _heartbeat_cfg()
+    cfg["shared"]["metric_backbone"] = {"record_stages": True}
+    _generate(cfg, tmp_path)
+    plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert "metric_stage_bag: true" in plugin
+    assert "metric_stage_topics: /heartbeat_a,/com/out/a/heartbeat_a" in plugin

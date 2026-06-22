@@ -335,7 +335,8 @@ Enable a continuously-updated, per-topic pipeline overview by setting
 ready-made `1_heartbeat_status` example). For every configured topic it tracks
 where the topic currently is in the communication pipeline (furthest stage
 reached and the first stage that is missing/broken), plus last-message age, Hz,
-mean size, and latency.
+mean size, latency, exact wrapped-topic sequence loss/reordering, and echo-derived
+RTT/clock offset.
 
 The running session writes, under
 `session-instances/.../logs/<peer>/status/`:
@@ -343,7 +344,9 @@ The running session writes, under
 - `status.json` — machine-readable snapshot (source of truth) for tools/agents,
   refreshed on a short interval and on every state transition,
 - `status.txt` — a human-rendered table, and
-- `events.jsonl` — one line per state transition (when/where a topic stalled).
+- `events.jsonl` — state transitions plus per-`(topic, seq)` transit records for
+  wrapped topics (delivered/lost/reordered, section latency, size, inter-arrival,
+  and jitter).
 
 Read it from the host with the `status` command:
 
@@ -352,6 +355,31 @@ rosotacom status 1_heartbeat_status            # human-readable table
 rosotacom status 1_heartbeat_status --json     # machine-readable, for tools/agents
 rosotacom status 1_heartbeat_status --watch    # live refresh
 ```
+
+Join one or more peer timelines after a run:
+
+```bash
+rosotacom metrics session-instances/.../logs/a/status/events.jsonl \
+  session-instances/.../logs/b/status/events.jsonl
+```
+
+Use `--records` for joined per-message rows instead of the loss and p50/p95
+summary. Wrapped-topic corrected latency requires `shared.use_heartbeat: true`;
+`status.json.clock_sync` reports the selected minimum-RTT sample, peer offset,
+sample age, and symmetric-path assumption. Uncorrected OTA delay remains a
+separate field.
+
+For opt-in local per-step latency, record generated local stage topics:
+
+```yaml
+shared:
+  use_status_overview: true
+  metric_backbone:
+    record_stages: true
+```
+
+The MCAP is written under `logs/<peer>/metrics/`. Analyze an ordered pipeline
+with `ros2 run com_py stage_latency BAG TOPIC...`.
 
 Phase 1 samples local-domain stages directly. OTA stages are graph-only and
 their activity is inferred from adjacent local flow, so the status overview

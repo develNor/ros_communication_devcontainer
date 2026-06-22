@@ -392,3 +392,27 @@ def test_latency_unknown_stage_errors() -> None:
     rep = {"peer": "a", "topics": [_wrapped_topic()]}
     f = evaluate_report(rep, {"/wrapped": {"latency_ms": {"max": 100, "stage": "nope"}}})
     assert len(f) == 1 and "not in pipeline" in f[0]
+
+
+# --- exact seq loss ---------------------------------------------------------
+
+
+def test_loss_pct_uses_first_sequence_aware_stage() -> None:
+    topic = _wrapped_topic()
+    topic["stages"][0]["loss_pct"] = 2.5
+    rep = {"peer": "a", "topics": [topic]}
+    assert evaluate_report(rep, {"/wrapped": {"loss_pct": {"max": 3.0}}}) == []
+
+
+def test_loss_pct_exceeded_fails() -> None:
+    topic = _wrapped_topic()
+    topic["stages"][0]["loss_pct"] = 7.5
+    rep = {"peer": "a", "topics": [topic]}
+    failures = evaluate_report(rep, {"/wrapped": {"loss_pct": {"max": 3.0}}})
+    assert len(failures) == 1 and "loss 7.5%" in failures[0]
+
+
+def test_loss_pct_without_sequence_metric_fails_honestly() -> None:
+    rep = {"peer": "a", "topics": [_wrapped_topic()]}
+    failures = evaluate_report(rep, {"/wrapped": {"loss_pct": {"max": 3.0}}})
+    assert len(failures) == 1 and "loss None" in failures[0]

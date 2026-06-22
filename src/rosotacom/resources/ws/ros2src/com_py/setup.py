@@ -30,8 +30,7 @@ setup(
             'universal_decompressor = com_py.universal_decompressor:main',
             'universal_ota_unwrapper = com_py.universal_ota_unwrapper:main',
             'universal_ota_wrapper = com_py.universal_ota_wrapper:main',
-            'heartbeat_out_publisher = com_py.heartbeat_out_publisher:main',
-            'heartbeat_in_monitor = com_py.heartbeat_in_monitor:main',
+            'heartbeat_echo = com_py.heartbeat_echo:main',
             'topic_monitor = com_py.topic_monitor:main',
             'status_overview = com_py.status_overview:main',
             'bridge_in = com_py.bridge_in:main',
@@ -50,6 +49,7 @@ setup(
             'latch_relay = com_py.latch_relay:main',
             'trickle = com_py.trickle:main',
             'sized_publisher = com_py.sized_publisher:main',
+            'stage_latency = com_py.stage_latency:main',
         ],
     },
 )

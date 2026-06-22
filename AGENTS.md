@@ -20,3 +20,14 @@ Shared workflow:
 - Keep docs reachable: every doc must be linkable from `README.md` (directly, or via a doc already linked there — e.g. a new RFC goes in `docs/rfcs/README.md`). Link new docs in the same change, and link any orphan you notice.
 - Do not skip, weaken, or delete tests/CI to make a change pass.
 - Default to a draft review PR unless autonomous merge is explicitly requested.
+
+Working with RFCs:
+
+- Before implementation, make sure the RFC contains actionable checkbox tasks.
+  Add, rephrase, or deduce them when the design is only prose.
+- Keep the RFC open while implementing. Record relevant discoveries, reality
+  checks, and necessary design changes as they arise.
+- Check off completed work immediately and leave unfinished work explicit.
+- Treat the RFC as the resumable source of truth: progress and replans must be
+  current and self-contained enough for another contributor to continue from
+  the exact stopping point.

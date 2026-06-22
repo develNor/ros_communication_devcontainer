@@ -28,11 +28,18 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
         "resources/ws/session/creation/strip_ansi.py",
         "resources/ws/ota_configs/cyclonedds_tuned.xml.template",
         "resources/ws/ota_configs/fastdds_unicast.xml.template",
-        "resources/ws/ros2src/com_msgs/msg/Heartbeat.msg",
+        "resources/ws/ros2src/com_msgs/msg/EchoHeartbeat.msg",
     )
 
     missing = [path for path in expected if not package.joinpath(path).is_file()]
     assert not missing
+
+    ota_stamped = package.joinpath("resources/ws/ros2src/com_msgs/msg/OtaStamped.msg").read_text(encoding="utf-8")
+    echo = package.joinpath("resources/ws/ros2src/com_msgs/msg/EchoHeartbeat.msg").read_text(encoding="utf-8")
+    assert "builtin_interfaces/Time source_stamp" in ota_stamped
+    assert "builtin_interfaces/Time echo_t1" in echo
+    assert "builtin_interfaces/Time echo_t2" in echo
+    assert "builtin_interfaces/Time echo_t3" in echo
 
 
 def test_cli_resource_constants_point_inside_package_resources() -> None:

@@ -30,7 +30,7 @@ shared:
 topics:
   b_to_a:
     - topic: "/heartbeat_b"
-      type: "com_msgs/msg/Heartbeat"
+      type: "com_msgs/msg/EchoHeartbeat"
       zen_qos:
         priority: real_time
     - topic: "/costmap/costmap"

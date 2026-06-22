@@ -29,6 +29,9 @@ Per-topic `expect` supports (all optional):
             Use `stage: com_in` for a wrapped (use_ota_wrapper) topic so true OTA
             transit latency is read from the OtaStamped send-time the relay injects,
             even when the final unwrapped payload is headerless.
+  loss_pct:  { max, stage }        (stream only) -- exact sequence-gap loss for
+            EchoHeartbeat and wrapped OtaStamped streams. Defaults to the first
+            stage exposing sequence metrics (normally inbound `com_in`).
   min_count: N                     (stream only) -- the delivered (final flowing)
             stage must have observed at least N messages over the run. A floor on
             volume: distinguishes a real stream that crossed end-to-end from a
@@ -199,6 +202,25 @@ def _check_expect(
     if "max" in lat_exp and (lat is None or lat > lat_exp["max"]):
         where = f" at '{stage_name}'" if stage_name else ""
         failures.append(f"[{peer}] {base}: latency {lat}ms{where} > expected max {lat_exp['max']}ms")
+
+    loss_exp = expect.get("loss_pct") or {}
+    if "max" in loss_exp:
+        loss_stage = None
+        loss_stage_name = loss_exp.get("stage")
+        if loss_stage_name:
+            loss_stage = _named_stage(topic, loss_stage_name)
+            if loss_stage is None:
+                failures.append(f"[{peer}] {base}: loss_pct.stage '{loss_stage_name}' not in pipeline")
+                return failures
+        else:
+            loss_stage = next(
+                (candidate for candidate in topic.get("stages") or [] if candidate.get("loss_pct") is not None),
+                None,
+            )
+        loss = loss_stage.get("loss_pct") if loss_stage is not None else None
+        if loss is None or loss > loss_exp["max"]:
+            where = f" at '{loss_stage_name}'" if loss_stage_name else ""
+            failures.append(f"[{peer}] {base}: loss {loss}%{where} > expected max {loss_exp['max']}%")
     return failures
 
 

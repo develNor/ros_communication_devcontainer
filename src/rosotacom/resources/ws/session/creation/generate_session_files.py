@@ -60,7 +60,7 @@ RMW_ALIASES = {
     "fastdds": "rmw_fastrtps_cpp",
     "zenoh": "rmw_zenoh_cpp",
 }
-HEARTBEAT_MSG_TYPE = "com_msgs/msg/Heartbeat"
+HEARTBEAT_MSG_TYPE = "com_msgs/msg/EchoHeartbeat"
 COMPRESSED_MSG_TYPE = "com_msgs/msg/CompressedData"
 OTA_STAMPED_MSG_TYPE = "com_msgs/msg/OtaStamped"
 TRANSPORT_OUTPUT_TYPES = {
@@ -948,6 +948,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "use_status_overview",
                 "use_heartbeat",
                 "heartbeat",
+                "metric_backbone",
                 "use_in",
                 "use_out",
                 "rmw",
@@ -1228,7 +1229,7 @@ def _final_topic_type(entry: TopicEntry, pipe: Dict[str, Any]) -> str:
 
 
 def _heartbeat_monitor_overrides(heartbeat_expect: Optional[Dict[str, Any]]) -> List[Tuple[str, Any]]:
-    """Override the heartbeat_in_monitor status thresholds from a declared
+    """Override the heartbeat_echo status thresholds from a declared
     `shared.heartbeat.expect`. Only latency and loss map cleanly to the monitor's
     threshold model; the expected rate is the publish rate (heartbeat_out_hz) and
     `expect.hz` (min/max) is enforced separately by the status overview."""
@@ -1825,6 +1826,21 @@ def func(
     use_topic_monitor = bool(shared.get("use_topic_monitor", False))
     use_status_overview = bool(shared.get("use_status_overview", False))
     use_heartbeat = bool(shared.get("use_heartbeat", False))
+    metric_backbone = shared.get("metric_backbone", {}) or {}
+    if not isinstance(metric_backbone, dict):
+        raise RuntimeError("shared.metric_backbone must be a mapping if provided.")
+    unknown_metric_keys = sorted(set(metric_backbone) - {"record_stages"})
+    if unknown_metric_keys:
+        raise RuntimeError(
+            f"shared.metric_backbone has unsupported keys {unknown_metric_keys}. "
+            "Allowed: ['record_stages']."
+        )
+    record_metric_stages = bool(metric_backbone.get("record_stages", False))
+    if record_metric_stages and not use_status_overview:
+        raise RuntimeError(
+            "shared.metric_backbone.record_stages requires shared.use_status_overview=true "
+            "so the generated pipeline defines the stage topics."
+        )
     shared_use_in = shared.get("use_in", None)
     shared_use_out = shared.get("use_out", None)
 
@@ -2115,8 +2131,8 @@ def func(
                         "heartbeat",
                         [
                             ("heartbeat", True),
-                            ("heartbeat_out_topics", hb_topic[local]),
-                            ("heartbeat_in_topic", hb_topic[remote]),
+                            ("heartbeat_local_topic", hb_topic[local]),
+                            ("heartbeat_remote_topic", hb_topic[remote]),
                             *_heartbeat_monitor_overrides((shared.get("heartbeat") or {}).get("expect")),
                         ],
                     )
@@ -2746,6 +2762,25 @@ def func(
                     ],
                 )
             )
+            if record_metric_stages:
+                status_spec = yaml.safe_load(per_peer_status_spec_yaml[local] or "") or {}
+                metric_stage_topics = _dedup_keep_order(
+                    [
+                        str(stage["topic"])
+                        for topic in status_spec.get("topics", [])
+                        for stage in topic.get("stages", [])
+                        if stage.get("domain", "local") == "local"
+                    ]
+                )
+                blocks.append(
+                    PluginBlock(
+                        "metric_stage_bag",
+                        [
+                            ("metric_stage_bag", True),
+                            ("metric_stage_topics", ",".join(metric_stage_topics)),
+                        ],
+                    )
+                )
 
         if use_heartbeat:
             # Heartbeat topics are base topics, but may be explicitly targeted on outbound and/or source-prefixed on inbound.
@@ -2760,8 +2795,8 @@ def func(
                     "heartbeat",
                     [
                         ("heartbeat", True),
-                        ("heartbeat_out_topics", hb_out),
-                        ("heartbeat_in_topic", hb_in),
+                        ("heartbeat_local_topic", hb_out),
+                        ("heartbeat_remote_topic", hb_in),
                         *_heartbeat_monitor_overrides((shared.get("heartbeat") or {}).get("expect")),
                     ],
                 )

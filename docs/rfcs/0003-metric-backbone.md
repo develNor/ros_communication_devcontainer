@@ -1,6 +1,6 @@
 # RFC 0003 — Metric backbone (per-message transit records, offset-aware latency, real loss)
 
-**Status:** Draft — design agreed, not yet implemented · **Scope:** measurement
+**Status:** Implemented · **Scope:** measurement
 architecture (the layer *below* the verdict) · extends
 [RFC 0001](0001-expectation-driven-test-suite.md) and
 [RFC 0002](0002-expectation-concepts.md)
@@ -53,7 +53,8 @@ Every metric on the wishlist is a projection of one recorded object per message:
   status      — delivered | lost | reordered                        [from seq gap]
   sections:
     preprocess = t_wrap   − t_source            (sender-local, exact, no sync)
-    ota_hop    = (t_com_in − θ) − t_wrap         (θ = clock offset from echo)
+    ota_hop    = (t_com_in + θ) − t_wrap         (θ = sender/peer − receiver/local)
+  inter_arrival / jitter         — receiver-local regularity
 ```
 
 | Wishlist item | Projection of the record |
@@ -65,8 +66,9 @@ Every metric on the wishlist is a projection of one recorded object per message:
 
 **Live** = the per-stage aggregates already in `status.json` (hz / latency /
 **loss** per stage). **Forensic** = the per-`(topic, seq)` records dumped per run.
-The status overview already writes an `events.jsonl` next to `status.json`
-(`status_overview_core.py`), so the forensic dump has a home.
+The status overview writes the forensic rows into `events.jsonl` next to
+`status.json`. Rows carry `kind: transit` or `kind: state_transition`, so one
+append-only timeline contains both message evidence and pipeline state changes.
 
 ## Metric tiers (priority order, from the operator)
 
@@ -94,9 +96,8 @@ cross the OTA link?" — **no**:
 `StageObservation` (`status_overview_core.py`) already deserializes each message
 to record size and `header.stamp`. When the stage topic type is
 `com_msgs/OtaStamped`, the observer additionally reads `msg.seq` and maintains a
-per-stage sequence tracker — exactly the `expected_next_seq` / `missing` /
-`reordered` / `max_burst_missing` math already written in
-`heartbeat_in_monitor.py` (`WindowCounters`). `metrics()` then emits `loss_pct`
+per-stage sequence tracker using the same `expected_next_seq` / `missing` /
+`reordered` / `max_burst_missing` model as heartbeat monitoring. `metrics()` then emits `loss_pct`
 (windowed) and `reordered`; `classify_stage` surfaces them alongside the existing
 `latency_ms` / `messages_total`; `status_eval` gains a generic
 `expect.loss_pct: { max }` for **any** wrapped topic.
@@ -116,19 +117,24 @@ the cheap live gate; the seq form gives the exact lost-seq list for forensics.
 
 ### 2. Echo heartbeat — RTT, health, and a bounded clock offset
 
-Replace the one-way heartbeat (`heartbeat_out_publisher` → `heartbeat_in_monitor`)
-with a two-way echo. A new low-rate message carries four timestamps across an
-A→B→A round trip (`t1` A-send, `t2` B-recv, `t3` B-send, `t4` A-recv, plus `seq`):
+Replace the one-way heartbeat with a symmetric piggyback echo. Every fixed-rate
+`EchoHeartbeat` is both a fresh probe and the reply to the latest peer probe:
+`header.stamp` is the current send time, and `echo_t1` / `echo_t2` / `echo_t3`
+carry the echoed probe's send, peer receive, and peer reply times. The local
+receive time is `t4`. This keeps each direction at the configured heartbeat rate
+instead of doubling traffic with separate request/response streams:
 
 ```
 θ (offset) = ((t2 − t1) + (t3 − t4)) / 2        RTT = (t4 − t1) − (t3 − t2)
 ```
 
 This is the NTP/PTP measurement run *inside ROS over the OTA link*. `θ` is
-min-filtered over a window (the minimum-RTT sample carries the least queuing
-noise) and is the only cross-host correction the latency decomposition needs. The
-echo **subsumes** the one-way heartbeat: hz / loss / `status`
-(GOOD/DEGRADED/BAD/LOST) all still derive from the same stream.
+min-RTT-filtered over a 60-second window and is the only cross-host correction
+the latency decomposition needs. The echo subsumes the one-way heartbeat:
+Hz, sequence loss, RTT, offset, and `GOOD` / `BAD` / `LOST` health derive from
+the same stream. Wrapped-topic offset correction requires
+`shared.use_heartbeat: true`; echo-free load tests still get exact sequence loss
+and an explicitly uncorrected delay, while corrected latency remains `null`.
 
 **What the echo is actually for.** Not asymmetry correction (see Limits) and not
 even primarily offset correction — field data puts the bench offset in the low
@@ -147,22 +153,22 @@ cross-check — a bonus, never a dependency.
 
 ### 3. Latency decomposition — two sections free, the rest local
 
-Add **one** field to `OtaStamped`: `source_stamp` (the original `header.stamp`
-*before* wrapping, today recoverable only by deserializing the payload). At
+Add **one** field to `OtaStamped`: `source_stamp` (the original nonzero
+`header.stamp` before wrapping, or the wrapper input time for headerless/zero-
+stamped messages). At
 `com_in` this yields two sections per message with no sidecar:
 
 - `preprocess = t_wrap − source_stamp` — sender-local, exact, no sync.
-- `ota_hop = (t_com_in − θ) − t_wrap` — the single offset-corrected cross-host
+- `ota_hop = (t_com_in + θ) − t_wrap` — the single offset-corrected cross-host
   section.
 
 Deeper decomposition of the *local* pipeline (per-step cost of restamp / drop /
-compress / framebridge / transport) does **not** need a new in-band field. Each
-step already republishes on a suffixed stage topic; recording those stage topics
-into a **local rosbag** and diffing consecutive stages offline gives every step's
-cost. The join key is the **message index**, valid because the intra-host
-pipeline is single-clock, lossless and in-order (no `seq` and no `θ` needed for
-local steps). Per-stage `hz` and `mean_size_bytes` already exist in the status
-overview, so only per-step *latency* is new, and it is an offline read.
+compress / framebridge / transport) does **not** need a new in-band field. Set
+`shared.metric_backbone.record_stages: true` to record every generated local
+stage topic into an MCAP rosbag under the run's `logs/<peer>/metrics/` directory.
+`ros2 run com_py stage_latency BAG TOPIC...` joins bag receive timestamps by
+message index and reports consecutive-stage costs. The index join is valid
+because this path is single-clock, lossless, and in-order.
 
 > This is the systematic form of what is already done by hand: reading
 > `ros2 topic delay` on successive suffixed stage topics and subtracting.
@@ -186,10 +192,10 @@ overview, so only per-step *latency* is new, and it is an offline read.
 - **Loss vs. intended decimation** are both `seq` gaps — correctly so (both mean
   "did not cross"), which is why loss must never be read downstream of intended
   `drop` / `throttle` (see mechanism 1).
-- **Wrap-point placement decides loss semantics.** Wrapping *after* shaping makes
-  `loss_pct` mean pure unintended OTA loss. The exact current ordering of
-  shaping vs. wrap in `generate_session_files` must be verified before relying on
-  this (open question below).
+- **Wrap-point placement decides loss semantics.** The implemented pipeline runs
+  restamp/latch/drop/throttle/pixel/frame transforms before compression and
+  wrapping. Therefore `com_in` sequence gaps exclude intended pre-wrap shaping
+  and measure failure after the wrap point.
 - **`θ` drifts.** Re-estimate continuously; fine for short runs, relevant for
   hour-long sessions.
 - **Head-of-line blocking is the real failure mode.** Field data: a heavy message
@@ -223,37 +229,44 @@ These belong in the RFC as *motivation*; the calibrated per-profile numbers are 
 **budget** maintained per network profile (see RFC 0001/0002 expectations and the
 profile work), not hardcoded here.
 
-## Build order (smallest lever first)
+## Implementation checklist
 
-1. **`seq`-loss in `StageObservation` + `expect.loss_pct`.** Pure extension of
-   existing code (the math exists in `heartbeat_in_monitor`; the `seq` exists in
-   `OtaStamped`; the gap detection exists in the unwrapper). Immediately
-   gate-able. Closes the RFC 0001 "not feasible" item. *(small, biggest
-   immediate value)*
-2. **`OtaStamped.source_stamp` + the two-section decomposition at `com_in`.**
-   Cheap envelope change; gives per-message OTA-hop latency cleanly, headerless
-   payloads included.
-3. **Echo heartbeat + `θ`.** New message + monitor; the largest conceptual piece;
-   unlocks RTT, health, and offset correction. Subsumes the one-way heartbeat.
-4. **Forensic dump + offline joiner.** Per-`(topic, seq)` transit records into
-   `events.jsonl`; an offline tool joins them for "exactly what happened after
-   the run". Plus the local stage-rosbag per-step reader (mechanism 3). Pure
-   analysis code, no ROS runtime change.
+- [x] Track `OtaStamped.seq` at inbound `com_in`; expose window and run-total
+  loss, reorder count, and maximum missing burst in `status.json`.
+- [x] Implement generic `expect.loss_pct: { max, stage? }` evaluation.
+- [x] Add `OtaStamped.source_stamp` and populate it from the payload stamp or
+  wrapper-input time.
+- [x] Emit corrected/uncorrected OTA hop, preprocessing, offset, RTT, size,
+  inter-arrival, and jitter data.
+- [x] Replace the one-way heartbeat implementation with `EchoHeartbeat` and a
+  symmetric piggyback echo node.
+- [x] Continuously estimate peer offset from the minimum-RTT sample and state the
+  symmetric-path assumption in artifacts.
+- [x] Append per-`(topic, seq)` delivered/lost/reordered forensic records to
+  `events.jsonl`.
+- [x] Add `rosotacom metrics EVENTS...` to join duplicate rows and summarize
+  exact loss plus p50/p95 section latency and jitter.
+- [x] Add opt-in local stage rosbag recording and the message-index latency
+  reader.
+- [x] Verify shaping precedes wrapping and record the resulting loss semantics.
+- [x] Cover sequence math, offset math, contracts, forensic joining, generated
+  configuration, and stage joins with host tests.
 
-Steps 1–2 are >80 % wired already; step 3 is the real new development; step 4 is
-analysis tooling.
+## Implementation decisions and reality checks
 
-## Open questions
-
-- **Where does the loss computation live** — extend `StageObservation` (one
-  measurement authority, flows straight into `status.json`) or a dedicated
-  inbound monitor node? Leaning toward `StageObservation` for single-authority.
-- **Verify the shaping-vs-wrap ordering** in `generate_session_files` so the
-  `loss_pct` measurement point (mechanism 1) means what this RFC claims.
-- **Exact `Echo` message fields** — three explicit `builtin_interfaces/Time`
-  fields + `seq`, vs. reusing `header.stamp` for one of them.
-- **Live OTA digest: yes or no?** The always-on transit-record digest is small
-  enough to optionally cross the link for a live remote view — but per the
-  transport/measurement separation it must be best-effort and never on the
-  transport's critical path. Default: keep it local; send a digest only if a
-  live remote view is explicitly wanted.
+- **Measurement authority:** sequence and transit accounting lives in
+  `StageObservation`; the status overview remains the single writer of live and
+  forensic artifacts.
+- **Echo wire format:** `EchoHeartbeat.header.stamp` is the current probe's send
+  time. The explicit `echo_t1/t2/t3` fields reply to the newest peer probe.
+- **Offset sign:** artifacts report `peer_offset_ms = peer_clock − local_clock`.
+  Corrected inbound delay is `t_com_in(local) + peer_offset − t_wrap(peer)`.
+- **No silent fallback:** without a valid echo estimate, corrected OTA latency is
+  `null`; the uncorrected value remains visible separately.
+- **Echo is explicit for load isolation:** wrapped-payload benchmarks may keep
+  `use_heartbeat: false` when even the small probe stream would contaminate the
+  load surface. They retain exact loss; only offset-aware latency is unavailable.
+- **Digest placement:** forensic rows stay local and never create another OTA
+  payload stream. Combining peer artifacts remains an offline operation.
+- **Sequence caveat:** a gap is materialized when a later sequence arrives. A
+  missing tail at shutdown is not inferable without a sender-side end marker.

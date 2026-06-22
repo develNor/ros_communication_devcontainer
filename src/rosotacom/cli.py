@@ -2841,6 +2841,12 @@ def _scenario_communication_command(
         command.extend(["--peer", assignment])
     for override in getattr(args, "peer_address", []) or []:
         command.extend(["--peer-address", override])
+    network_name = getattr(args, "network_name", None)
+    if network_name:
+        command.extend(["--network-name", network_name])
+    network_ip = getattr(args, "network_ip", None)
+    if network_ip:
+        command.extend(["--network-ip", network_ip])
     return command
 
 
@@ -2892,6 +2898,7 @@ def _create_scenario_tmux(
     instance: SessionInstance,
     identity: str,
     applications: tuple[ScenarioApplication, ...],
+    communication_container: str,
     args: argparse.Namespace,
 ) -> str:
     session_name = _scenario_tmux_session(resolved.name, identity)
@@ -2968,6 +2975,20 @@ def _create_scenario_tmux(
     )
 
     for application in applications:
+        application_network = f"container:{communication_container}" if getattr(args, "network_name", None) else None
+        application_command = shlex.join(
+            _scenario_application_command(
+                runtime,
+                resolved,
+                identity,
+                application,
+                network_name=application_network,
+            )
+        )
+        if application_network:
+            application_command = (
+                f"{_wait_for_container_running_script(communication_container)}; {application_command}"
+            )
         created_window = subprocess.run(
             _tmux_command(
                 runtime,
@@ -2980,7 +3001,7 @@ def _create_scenario_tmux(
                 session_name,
                 "-n",
                 _safe_path_token(application.name),
-                shlex.join(_scenario_application_command(runtime, resolved, identity, application)),
+                application_command,
             ),
             text=True,
             capture_output=True,
@@ -3256,6 +3277,8 @@ def stop_session(args: argparse.Namespace) -> None:
 
 def _resolve_scenario_context(
     args: argparse.Namespace,
+    *,
+    require_bindings: bool = True,
 ) -> tuple[
     RuntimeConfig,
     ResolvedScenario,
@@ -3270,12 +3293,6 @@ def _resolve_scenario_context(
     definition = _load_scenario_definition(resolved)
     session = _resolve_session(definition.session, runtime)
     cfg = _effective_session_config(session.host_dir, runtime)
-    bindings = _resolve_bindings(
-        cfg,
-        runtime,
-        peer=getattr(args, "peer", None),
-        peer_address=getattr(args, "peer_address", None),
-    )
     peers = cfg.get("peers")
     if not isinstance(peers, dict):
         raise RuntimeError("Scenario session must define a peers mapping.")
@@ -3287,8 +3304,21 @@ def _resolve_scenario_context(
         )
     identity = getattr(args, "identity", None)
     if not identity and getattr(args, "auto_identity", True):
+        bindings = _resolve_bindings(
+            cfg,
+            runtime,
+            peer=getattr(args, "peer", None),
+            peer_address=getattr(args, "peer_address", None),
+        )
         identity = _auto_identity(bindings)
         print(f"Auto-selected identity: {identity}")
+    elif require_bindings:
+        _resolve_bindings(
+            cfg,
+            runtime,
+            peer=getattr(args, "peer", None),
+            peer_address=getattr(args, "peer_address", None),
+        )
     if not identity:
         raise RuntimeError("Missing --identity. Provide --identity <peer> or allow auto identity.")
     if identity not in peers:
@@ -3442,6 +3472,7 @@ def start_scenario(args: argparse.Namespace) -> int:
         instance,
         identity,
         applications,
+        communication_container,
         args,
     )
     print(f"rosotacom scenario instance: {instance.host_dir}")
@@ -3467,7 +3498,10 @@ def start_scenario(args: argparse.Namespace) -> int:
 def attach_scenario(args: argparse.Namespace) -> int:
     _require_tmux()
     _infer_active_scenario_selector(args, require_active=True)
-    runtime, resolved, _definition, _session, _cfg, identity, _applications = _resolve_scenario_context(args)
+    runtime, resolved, _definition, _session, _cfg, identity, _applications = _resolve_scenario_context(
+        args,
+        require_bindings=False,
+    )
     tmux_session = _scenario_tmux_session(resolved.name, identity)
     if not _tmux_session_exists(runtime, tmux_session):
         raise RuntimeError(f"Scenario tmux session is not running: {tmux_session}")
@@ -3479,7 +3513,10 @@ def stop_scenario(args: argparse.Namespace) -> int:
     _require_ros2docker()
     if not getattr(args, "scenario", None) or not getattr(args, "identity", None):
         _infer_active_scenario_selector(args, require_active=False)
-    runtime, resolved, _definition, _session, cfg, identity, applications = _resolve_scenario_context(args)
+    runtime, resolved, _definition, _session, cfg, identity, applications = _resolve_scenario_context(
+        args,
+        require_bindings=False,
+    )
     _stop_scenario_components(
         runtime,
         resolved,
@@ -5971,6 +6008,8 @@ def main(argv: list[str] | None = None) -> int:
     scenario_start_parser.add_argument("--force", dest="force", action="store_true")
     scenario_start_parser.add_argument("--rewrite-formatting", action="store_true")
     scenario_start_parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
+    scenario_start_parser.add_argument("--network-name", help=argparse.SUPPRESS)
+    scenario_start_parser.add_argument("--network-ip", help=argparse.SUPPRESS)
     scenario_start_parser.set_defaults(func=start_scenario, force=True)
 
     scenario_attach_parser = scenario_subparsers.add_parser(

@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -173,6 +174,32 @@ def rmw_matrix_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
 # CI's "Upload smoke session artifacts" step (path: session-instances/) actually
 # captures catmux/domain-bridge logs when a smoke check fails.
 SESSION_INSTANCES_DIR = PACKAGE_ROOT / "session-instances"
+SCENARIO_NETWORK_SUBNET = "10.139.0.0/24"
+SCENARIO_PEER_IPS = {"a": "10.139.0.2", "b": "10.139.0.3"}
+
+
+@pytest.fixture
+def scenario_network() -> Iterator[str]:
+    network_name = "rosotacom-scenario-e2e"
+    subprocess.run(
+        ["docker", "network", "rm", network_name],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    _run(
+        ["docker", "network", "create", "--subnet", SCENARIO_NETWORK_SUBNET, network_name],
+        timeout=30,
+    )
+    try:
+        yield network_name
+    finally:
+        subprocess.run(
+            ["docker", "network", "rm", network_name],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 def _smoke_command(project: Path, session_name: str) -> list[str]:
@@ -191,7 +218,13 @@ def _smoke_command(project: Path, session_name: str) -> list[str]:
     ]
 
 
-def _scenario_command(project: Path, action: str, identity: str, instance_id: str) -> list[str]:
+def _scenario_command(
+    project: Path,
+    action: str,
+    identity: str,
+    instance_id: str,
+    network_name: str | None = None,
+) -> list[str]:
     return [
         sys.executable,
         "-m",
@@ -208,10 +241,21 @@ def _scenario_command(project: Path, action: str, identity: str, instance_id: st
         "--instance-id",
         instance_id,
         "--peer-address",
-        "a=127.0.0.1",
+        f"a={SCENARIO_PEER_IPS['a']}",
         "--peer-address",
-        "b=127.0.0.1",
-        *(["--mode", "detached"] if action == "start" else []),
+        f"b={SCENARIO_PEER_IPS['b']}",
+        *(
+            [
+                "--mode",
+                "detached",
+                "--network-name",
+                network_name,
+                "--network-ip",
+                SCENARIO_PEER_IPS[identity],
+            ]
+            if action == "start" and network_name
+            else []
+        ),
     ]
 
 
@@ -405,11 +449,21 @@ def test_local_native_chatter_smoke_from_copied_example_project(
 
 def test_native_chatter_scenario_starts_apps_and_communication_together(
     copied_example_project: Path,
+    scenario_network: str,
 ) -> None:
     instance_id = f"scenario-pilot-{time.time_ns()}"
     try:
         for identity in ("a", "b"):
-            result = _run(_scenario_command(copied_example_project, "start", identity, instance_id), timeout=900)
+            result = _run(
+                _scenario_command(
+                    copied_example_project,
+                    "start",
+                    identity,
+                    instance_id,
+                    scenario_network,
+                ),
+                timeout=900,
+            )
             assert "rosotacom scenario started: 2_native_chatter" in result.stdout
             assert "inner catmux prefix with Ctrl-b Ctrl-b" in result.stdout
 

@@ -89,12 +89,12 @@ _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 class RuntimeConfig:
     rosotacom_config: Path | None
     ros2docker_config: Path
-    session_configs_dir: Path | None
+    session_configs_dir: tuple[Path, ...]
     deployment: Path | None
     install_id: str
     session_instances_dir: Path | None = None
     project_source: str | None = None
-    scenario_configs_dir: Path | None = None
+    scenario_configs_dir: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -216,9 +216,36 @@ def _load_yaml_file(path: Path | None) -> dict[str, Any]:
 
 def _first_value(*values: Any) -> Any:
     for value in values:
-        if value is not None and value != "":
+        if value is None or value == "":
+            continue
+        if isinstance(value, list | tuple) and not value:
+            continue
+        else:
             return value
     return None
+
+
+def _path_values(raw: Any, key: str) -> tuple[str | os.PathLike[str], ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, list | tuple):
+        values = raw
+    elif isinstance(raw, str) and "," in raw:
+        values = tuple(part.strip() for part in raw.split(","))
+    else:
+        values = (raw,)
+
+    clean_values: list[str | os.PathLike[str]] = []
+    for value in values:
+        if isinstance(value, str):
+            if value.strip():
+                clean_values.append(value)
+            continue
+        if isinstance(value, os.PathLike):
+            clean_values.append(value)
+            continue
+        raise RuntimeError(f"{key} entries must be paths, got: {value!r}")
+    return tuple(clean_values)
 
 
 def _resolve_path(raw: str | os.PathLike[str] | None, base_dir: Path, *, must_exist: bool = True) -> Path | None:
@@ -236,6 +263,15 @@ def _resolve_path(raw: str | os.PathLike[str] | None, base_dir: Path, *, must_ex
     if must_exist and not path.exists():
         raise FileNotFoundError(f"Path does not exist: {raw!r} (resolved to {path})")
     return path
+
+
+def _resolve_path_list(raw: Any, base_dir: Path, key: str, *, must_exist: bool = True) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for value in _path_values(raw, key):
+        path = _resolve_path(value, base_dir, must_exist=must_exist)
+        if path is not None:
+            paths.append(path)
+    return tuple(paths)
 
 
 def _install_id(scope_path: Path | None = None) -> str:
@@ -393,12 +429,22 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
     return RuntimeConfig(
         rosotacom_config=rosotacom_config,
         ros2docker_config=ros2docker_config,
-        session_configs_dir=_resolve_path(session_configs_dir_raw, config_base, must_exist=True),
+        session_configs_dir=_resolve_path_list(
+            session_configs_dir_raw,
+            config_base,
+            "session_configs_dir",
+            must_exist=True,
+        ),
         deployment=_resolve_path(deployment_raw, config_base, must_exist=True),
         install_id=_install_id(rosotacom_config),
         session_instances_dir=session_instances_dir,
         project_source=project_source,
-        scenario_configs_dir=_resolve_path(scenario_configs_dir_raw, config_base, must_exist=True),
+        scenario_configs_dir=_resolve_path_list(
+            scenario_configs_dir_raw,
+            config_base,
+            "scenario_configs_dir",
+            must_exist=True,
+        ),
     )
 
 
@@ -450,10 +496,11 @@ def _session_instances_root(runtime: RuntimeConfig) -> Path:
 
 
 def _session_instance_slug(session: ResolvedSession, runtime: RuntimeConfig) -> str:
-    if runtime.session_configs_dir:
-        rel = _relative_to(session.host_dir, runtime.session_configs_dir)
+    for index, root in enumerate(runtime.session_configs_dir):
+        rel = _relative_to(session.host_dir, root)
         if rel is not None:
-            return _safe_path_token(rel.as_posix().replace("/", "_"))
+            prefix = "" if index == 0 else f"cfg{index + 1}_"
+            return _safe_path_token(f"{prefix}{rel.as_posix().replace('/', '_')}")
     return _safe_path_token(session.host_dir.name)
 
 
@@ -906,6 +953,27 @@ def _relative_to(path: Path, base: Path) -> Path | None:
         return None
 
 
+def _session_config_container_root(index: int) -> str:
+    if index == 0:
+        return SESSION_DEFINITION_CONTAINER_DIR
+    return f"{SESSION_DEFINITION_CONTAINER_DIR}-{index + 1}"
+
+
+def _configured_session_container_dir(host_dir: Path, runtime: RuntimeConfig) -> str | None:
+    for index, root in enumerate(runtime.session_configs_dir):
+        cfg_rel = _relative_to(host_dir, root)
+        if cfg_rel is not None:
+            return f"{_session_config_container_root(index)}/{cfg_rel.as_posix()}"
+    return None
+
+
+def _configured_session_container_root(host_dir: Path, runtime: RuntimeConfig) -> str | None:
+    for index, root in enumerate(runtime.session_configs_dir):
+        if _relative_to(host_dir, root) is not None:
+            return _session_config_container_root(index)
+    return None
+
+
 def _is_session_dir(path: Path) -> bool:
     return (path / "session-parametrization.yaml").exists() or (path / "session-definition.yaml").exists()
 
@@ -917,17 +985,19 @@ def _resolve_session(session_dir: str, runtime: RuntimeConfig) -> ResolvedSessio
     if raw.is_absolute():
         if str(raw).startswith("/ws/"):
             candidates.append((PROJECT_DIR / str(raw).lstrip("/"), "workspace"))
-        if str(raw).startswith(f"{SESSION_DEFINITION_CONTAINER_DIR}/") and runtime.session_configs_dir:
-            rel = Path(str(raw)[len(SESSION_DEFINITION_CONTAINER_DIR) :].lstrip("/"))
-            candidates.append((runtime.session_configs_dir / rel, "session_configs"))
+        for index, root in enumerate(runtime.session_configs_dir):
+            container_root = _session_config_container_root(index)
+            if str(raw).startswith(f"{container_root}/"):
+                rel = Path(str(raw)[len(container_root) :].lstrip("/"))
+                candidates.append((root / rel, "session_configs"))
         if str(raw).startswith(f"{SESSION_CONFIG_CONTAINER_DIR}/") and runtime.session_configs_dir:
             rel = Path(str(raw)[len(SESSION_CONFIG_CONTAINER_DIR) :].lstrip("/"))
-            candidates.append((runtime.session_configs_dir / rel, "session_configs"))
+            candidates.append((runtime.session_configs_dir[0] / rel, "session_configs"))
         candidates.append((raw, "absolute"))
     else:
         candidates.append((Path.cwd() / raw, "cwd"))
-        if runtime.session_configs_dir:
-            candidates.append((runtime.session_configs_dir / raw, "session_configs"))
+        for root in runtime.session_configs_dir:
+            candidates.append((root / raw, "session_configs"))
 
     for candidate, source in candidates:
         if candidate.is_dir() and _is_session_dir(candidate):
@@ -935,14 +1005,9 @@ def _resolve_session(session_dir: str, runtime: RuntimeConfig) -> ResolvedSessio
             ws_rel = _relative_to(host_dir, WS_DIR)
             if ws_rel is not None:
                 return ResolvedSession(host_dir, f"/ws/{ws_rel.as_posix()}", "workspace")
-            if runtime.session_configs_dir:
-                cfg_rel = _relative_to(host_dir, runtime.session_configs_dir)
-                if cfg_rel is not None:
-                    return ResolvedSession(
-                        host_dir,
-                        f"{SESSION_DEFINITION_CONTAINER_DIR}/{cfg_rel.as_posix()}",
-                        "session_configs",
-                    )
+            configured_container_dir = _configured_session_container_dir(host_dir, runtime)
+            if configured_container_dir is not None:
+                return ResolvedSession(host_dir, configured_container_dir, "session_configs")
             return ResolvedSession(host_dir, EXTERNAL_SESSION_CONTAINER_DIR, source)
 
     available = _format_available_sessions(runtime)
@@ -950,13 +1015,15 @@ def _resolve_session(session_dir: str, runtime: RuntimeConfig) -> ResolvedSessio
 
 
 def _format_available_sessions(runtime: RuntimeConfig) -> str:
-    parts: list[str] = []
-    if runtime.session_configs_dir and runtime.session_configs_dir.is_dir():
-        sessions = [p.name for p in sorted(runtime.session_configs_dir.iterdir()) if p.is_dir()]
-        if sessions:
-            parts.append("Configured sessions:\n  - " + "\n  - ".join(sessions))
-    if parts:
-        return "\n".join(parts)
+    lines: list[str] = []
+    for root in runtime.session_configs_dir:
+        if not root.is_dir():
+            continue
+        sessions = [path.name for path in sorted(root.iterdir()) if path.is_dir() and _is_session_dir(path)]
+        for name in sessions:
+            lines.append(f"  - {name} ({root})")
+    if lines:
+        return "Configured sessions:\n" + "\n".join(lines)
     return (
         "No configured session directories found. Create examples with "
         "`rosotacom examples create ./rosotacom_examples`, then enter that directory "
@@ -965,11 +1032,17 @@ def _format_available_sessions(runtime: RuntimeConfig) -> str:
 
 
 def _session_names(runtime: RuntimeConfig) -> list[str]:
-    if not runtime.session_configs_dir or not runtime.session_configs_dir.is_dir():
-        return []
-    return [
-        path.name for path in sorted(runtime.session_configs_dir.iterdir()) if path.is_dir() and _is_session_dir(path)
-    ]
+    names: list[str] = []
+    seen: set[str] = set()
+    for root in runtime.session_configs_dir:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.iterdir()):
+            if not path.is_dir() or not _is_session_dir(path) or path.name in seen:
+                continue
+            names.append(path.name)
+            seen.add(path.name)
+    return names
 
 
 def _session_name_completer(
@@ -1012,8 +1085,8 @@ def _resolve_scenario(scenario_name: str, runtime: RuntimeConfig) -> ResolvedSce
         candidates.append((raw, "absolute"))
     else:
         candidates.append((Path.cwd() / raw, "cwd"))
-        if runtime.scenario_configs_dir:
-            candidates.append((runtime.scenario_configs_dir / raw, "scenario_configs"))
+        for root in runtime.scenario_configs_dir:
+            candidates.append((root / raw, "scenario_configs"))
 
     for candidate, source in candidates:
         if candidate.is_file() and candidate.name == "scenario-definition.yaml":
@@ -1030,17 +1103,29 @@ def _resolve_scenario(scenario_name: str, runtime: RuntimeConfig) -> ResolvedSce
 
 
 def _scenario_names(runtime: RuntimeConfig) -> list[str]:
-    if not runtime.scenario_configs_dir or not runtime.scenario_configs_dir.is_dir():
-        return []
-    return [
-        path.name for path in sorted(runtime.scenario_configs_dir.iterdir()) if path.is_dir() and _is_scenario_dir(path)
-    ]
+    names: list[str] = []
+    seen: set[str] = set()
+    for root in runtime.scenario_configs_dir:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.iterdir()):
+            if not path.is_dir() or not _is_scenario_dir(path) or path.name in seen:
+                continue
+            names.append(path.name)
+            seen.add(path.name)
+    return names
 
 
 def _format_available_scenarios(runtime: RuntimeConfig) -> str:
-    names = _scenario_names(runtime)
-    if names:
-        return "Configured scenarios:\n  - " + "\n  - ".join(names)
+    lines: list[str] = []
+    for root in runtime.scenario_configs_dir:
+        if not root.is_dir():
+            continue
+        scenarios = [path.name for path in sorted(root.iterdir()) if path.is_dir() and _is_scenario_dir(path)]
+        for name in scenarios:
+            lines.append(f"  - {name} ({root})")
+    if lines:
+        return "Configured scenarios:\n" + "\n".join(lines)
     return "No configured scenarios found. Set scenario_configs_dir in rosotacom.yaml."
 
 
@@ -2950,10 +3035,10 @@ def _runtime_cli_args(runtime: RuntimeConfig) -> list[str]:
     if runtime.rosotacom_config:
         args.extend(["--rosotacom-config", str(runtime.rosotacom_config)])
     args.extend(["--ros2docker-config", str(runtime.ros2docker_config)])
-    if runtime.session_configs_dir:
-        args.extend(["--session-configs-dir", str(runtime.session_configs_dir)])
-    if runtime.scenario_configs_dir:
-        args.extend(["--scenario-configs-dir", str(runtime.scenario_configs_dir)])
+    for session_configs_dir in runtime.session_configs_dir:
+        args.extend(["--session-configs-dir", str(session_configs_dir)])
+    for scenario_configs_dir in runtime.scenario_configs_dir:
+        args.extend(["--scenario-configs-dir", str(scenario_configs_dir)])
     if runtime.session_instances_dir:
         args.extend(["--session-instances-dir", str(runtime.session_instances_dir)])
     if runtime.deployment:
@@ -3214,15 +3299,18 @@ def _base_extra_run_args(
 
     if not ros2docker_cfg.get("mount_ws"):
         args.extend(["-v", f"{WS_DIR.resolve()}:/ws", "-w", "/ws"])
+    for index, session_configs_dir in enumerate(runtime.session_configs_dir):
+        args.extend(["-v", f"{session_configs_dir}:{_session_config_container_root(index)}:ro"])
     if runtime.session_configs_dir:
+        session_container_root = _configured_session_container_root(session.host_dir, runtime)
+        if session_container_root is None:
+            session_container_root = _session_config_container_root(0)
         args.extend(
             [
-                "-v",
-                f"{runtime.session_configs_dir}:{SESSION_DEFINITION_CONTAINER_DIR}:ro",
                 "-e",
-                f"SESSION_DEFINITIONS_DIR={SESSION_DEFINITION_CONTAINER_DIR}",
+                f"SESSION_DEFINITIONS_DIR={session_container_root}",
                 "-e",
-                f"SESSION_CONFIGS_DIR={SESSION_DEFINITION_CONTAINER_DIR}",
+                f"SESSION_CONFIGS_DIR={session_container_root}",
             ]
         )
     if session.container_dir == EXTERNAL_SESSION_CONTAINER_DIR:
@@ -3922,11 +4010,17 @@ def doctor(args: argparse.Namespace) -> int:
         line("OK", "install id", runtime.install_id)
         line("OK", "workspace mount", f"{WS_DIR} -> /ws")
         if runtime.session_configs_dir:
-            line("OK", "session definitions", f"{runtime.session_configs_dir} -> {SESSION_DEFINITION_CONTAINER_DIR}")
+            for index, session_configs_dir in enumerate(runtime.session_configs_dir):
+                line(
+                    "OK",
+                    "session definitions",
+                    f"{session_configs_dir} -> {_session_config_container_root(index)}",
+                )
         else:
             line("INFO", "session definitions", "not configured")
         if runtime.scenario_configs_dir:
-            line("OK", "scenario definitions", str(runtime.scenario_configs_dir))
+            for scenario_configs_dir in runtime.scenario_configs_dir:
+                line("OK", "scenario definitions", str(scenario_configs_dir))
         else:
             line("INFO", "scenario definitions", "not configured")
         line("OK", "session instances", f"{_session_instances_root(runtime)} -> {SESSION_INSTANCE_CONTAINER_DIR}")
@@ -5857,8 +5951,16 @@ def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
         help="Path to rosotacom.yaml (overrides cwd discovery and the global default).",
     )
     parser.add_argument("-f", "--ros2docker-config", help="Path to ros2docker JSON config.")
-    parser.add_argument("--session-configs-dir", help="Host directory containing named session configs.")
-    parser.add_argument("--scenario-configs-dir", help="Host directory containing named scenario configs.")
+    parser.add_argument(
+        "--session-configs-dir",
+        action="append",
+        help="Host directory containing named session configs. Repeat to add more search paths.",
+    )
+    parser.add_argument(
+        "--scenario-configs-dir",
+        action="append",
+        help="Host directory containing named scenario configs. Repeat to add more search paths.",
+    )
     parser.add_argument("--session-instances-dir", help="Host directory for generated session instances and logs.")
     deployment = parser.add_argument("--deployment", help="Deployment YAML containing named hosts and values.")
     cast(Any, deployment).completer = DirectoriesCompleter()

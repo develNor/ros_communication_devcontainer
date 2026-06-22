@@ -111,3 +111,7 @@ Use `--identity b` on the second host. Alternatively copy
 - `scenarios/`: complete use cases that combine a session with local applications
 - `session-instances/`: ignored generated runtime configs, catmux logs, smoke logs, and rosbags
 - `scripts/`: convenience wrappers and external-node launchers
+
+`rosotacom.yaml` keeps session and scenario roots as ordered lists, so adapted
+projects can put their own directories first and this packaged example's
+directories later.

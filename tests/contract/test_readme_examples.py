@@ -23,8 +23,8 @@ def test_source_checkout_rosotacom_yaml_loads() -> None:
     runtime = cli._load_runtime_config(argparse.Namespace(rosotacom_config=str(PACKAGE_ROOT / "rosotacom.yaml")))
 
     assert runtime.ros2docker_config == cli.EXAMPLE_PROJECT_DIR / "ros2docker.json"
-    assert runtime.session_configs_dir == cli.EXAMPLE_PROJECT_DIR / "sessions"
-    assert runtime.scenario_configs_dir == cli.EXAMPLE_PROJECT_DIR / "scenarios"
+    assert runtime.session_configs_dir == (cli.EXAMPLE_PROJECT_DIR / "sessions",)
+    assert runtime.scenario_configs_dir == (cli.EXAMPLE_PROJECT_DIR / "scenarios",)
     assert runtime.session_instances_dir == PACKAGE_ROOT / "session-instances"
     assert runtime.deployment is None
 
@@ -34,8 +34,8 @@ def test_packaged_example_setup_paths_are_relative_to_example_root() -> None:
 
     assert setup == {
         "ros2docker_config": "ros2docker.json",
-        "session_configs_dir": "sessions",
-        "scenario_configs_dir": "scenarios",
+        "session_configs_dir": ["sessions"],
+        "scenario_configs_dir": ["scenarios"],
         "session_instances_dir": "session-instances",
     }
 

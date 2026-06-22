@@ -501,11 +501,14 @@ def test_scenario_tmux_commands_keep_ctrl_b_and_use_full_windows(
         instance,
         "a",
         definition.applications["a"],
+        "rosotacom_test_com_to_b",
         argparse.Namespace(
             force=True,
             rewrite_formatting=False,
             overwrite_peers_via_remote_peer=None,
             peer_address=[],
+            network_name="scenario-net",
+            network_ip="10.139.0.2",
         ),
     )
 
@@ -516,8 +519,12 @@ def test_scenario_tmux_commands_keep_ctrl_b_and_use_full_windows(
     assert any(command[-2:] == ["@rosotacom_scenario", "demo"] for command in calls)
     assert any(command[-2:] == ["@rosotacom_identity", "a"] for command in calls)
     assert any("inner catmux: C-b C-b" in part for command in calls for part in command)
-    assert any("rosotacom start demo --identity a --mode attach" in " ".join(command) for command in calls)
-    assert any("scenario _run-application demo" in " ".join(command) for command in calls)
+    joined = "\n".join(" ".join(command) for command in calls)
+    assert "rosotacom start demo --identity a --mode attach" in joined
+    assert "--network-name scenario-net --network-ip 10.139.0.2" in joined
+    assert "scenario _run-application demo" in joined
+    assert "--network-name container:rosotacom_test_com_to_b" in joined
+    assert "waiting for container: rosotacom_test_com_to_b" in joined
     assert sum("new-window" in command for command in calls) == 1
     assert not any("split-window" in command for command in calls)
     assert any(
@@ -1003,7 +1010,7 @@ def test_start_and_stop_scenario_manage_manifest_and_component_order(
     context = (runtime, resolved, definition, session, cfg, "a", definition.applications["a"])
     monkeypatch.setattr(rosotacom, "_require_ros2docker", lambda: None)
     monkeypatch.setattr(rosotacom, "_require_tmux", lambda: None)
-    monkeypatch.setattr(rosotacom, "_resolve_scenario_context", lambda args: context)
+    monkeypatch.setattr(rosotacom, "_resolve_scenario_context", lambda args, **kwargs: context)
     monkeypatch.setattr(rosotacom, "_tmux_session_exists", lambda runtime, name: False)
     monkeypatch.setattr(rosotacom, "_resolve_session_instance", lambda *args, **kwargs: instance)
     monkeypatch.setattr(rosotacom, "_remote_peer_name", lambda cfg, identity: "b")

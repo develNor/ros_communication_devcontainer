@@ -326,11 +326,12 @@ rosotacom ota-smoke 2_native_chatter \
 installs the currently selected rosotacom version, stages the active project,
 runs delivery and isolation checks, collects artifacts, stops the run, and
 removes the remote workdir. Add `--interactive` for a local control tmux with
-one attachable communication/catmux window per peer and a status pane below each
-one. Stop an interactive run with `rosotacom ota-smoke TARGET --interactive
---stop`; pass the same peer/deployment arguments if the local tmux metadata is
-not available. Use `--keep-running` to leave components up, `--keep-workdir` to
-retain staged files, or `--reuse` to reuse an existing installation.
+one attachable communication/catmux window per peer. Scenario targets also get
+one native application-container window per scenario app. Stop an interactive run
+with `rosotacom ota-smoke TARGET --interactive --stop`; pass the same
+peer/deployment arguments if the local tmux metadata is not available. Use
+`--keep-running` to leave components up, `--keep-workdir` to retain staged
+files, or `--reuse` to reuse an existing installation.
 
 ### Live status / debugging overview
 

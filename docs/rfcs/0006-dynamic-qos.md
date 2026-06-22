@@ -96,6 +96,34 @@ stays latched end-to-end).
 - [ ] Tests: latched mirroring + hold-across-hop, stream policy, load-based
   reliability, override precedence, replay-vs-live source, conflict resolution.
 
+## Validation checklist
+
+How each capability will be proven once built (forward-looking). The resolver is a
+pure function — the bulk is host-testable; the live-graph read and the
+`remote_assist` migration need a running pipeline.
+
+- [ ] **Read native QoS from a bag's `offered_qos`** — host unit test on a bag
+  metadata fixture (`bag_ground_truth.py`). Automatable.
+- [ ] **Read native QoS from live publisher endpoints** — **e2e/manual**:
+  `get_publishers_info_by_topic` needs a running graph; assert in a smoke that a
+  live latched publisher resolves to `transient_local`.
+- [ ] **`qos: dynamic` derivation table** (mirror `durability`; default stream
+  policy best_effort/keep_last/depth 1/short lifespan; load-based `reliability`;
+  per-field/per-role override precedence; multi-publisher most-restrictive
+  conflict) — host unit tests over the resolver, one case per row of the table.
+  Fully automatable and the core of the coverage.
+- [ ] **Latched value holds across the OTA hop under dynamic QoS** — e2e smoke
+  extending `7_latched_static`: a latched topic with `qos: dynamic` (no explicit
+  `transient_local`) still arrives end-to-end. Automatable in the smoke matrix.
+- [ ] **`expect.mode: latched` set automatically for derived-latched topics** —
+  host unit test asserting the generated session config. Automatable.
+- [ ] **Live discovery race** (lazy resolution when the publisher appears) —
+  **e2e/manual**: assert a publisher that starts after rosotacom still resolves.
+- [ ] **`remote_assist` migration** (drop the repetitive `transient_local` /
+  `for_role` / `lifespan` blocks; delivery unchanged) — **operator manual check**
+  on the FZI-private session in the harness (not in this public repo); the latched
+  smoke above is the public proxy.
+
 ## Honest limits
 
 - **Live discovery race.** Live resolution needs the native publisher to exist when

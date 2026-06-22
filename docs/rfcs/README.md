@@ -14,3 +14,21 @@ self-contained; later ones extend earlier ones.
 
 Add a new RFC as `NNNN-title.md` and list it here, so it stays reachable from the
 README (see the documentation-traceability rule in `AGENTS.md`).
+
+## Required sections
+
+Beyond the design narrative, every RFC carries two checklists:
+
+- **Implementation checklist** — what to build, as actionable checkboxes.
+- **Validation checklist** — *how each capability is proven*. One entry per
+  capability the RFC introduces, naming the test, example session, or CI lane that
+  exercises it. Where automation is genuinely impossible or disproportionate, name
+  a referenced **manual check** instead (e.g. "operator confirmed the MCAP is
+  written under `logs/<peer>/metrics/`"), so the gap is explicit rather than
+  silent.
+
+Prefer automated verification — roughly host unit/contract test > an example run in
+the CI smoke matrix > a scripted check > a documented manual check. Add validation
+in the same change as the implementation, and check a box only once that
+verification actually exists and runs. The Validation checklist is what lets a
+reviewer confirm an "Implemented" RFC is genuinely covered, not merely asserted.

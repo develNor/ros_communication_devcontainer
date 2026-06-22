@@ -2387,6 +2387,22 @@ def _ota_application_run_script(
     )
 
 
+def _ota_status_parts(target: InteractiveSmokeTarget, instance_id: str, identity: str, *, watch: bool) -> list[str]:
+    parts = ["status", _ota_target_session_arg(target), "--identity", identity, "--instance-id", instance_id]
+    if watch:
+        parts.append("--watch")
+    return parts
+
+
+def _ota_status_watch_script(
+    plan: OtaSmokePlan,
+    target: InteractiveSmokeTarget,
+    instance_id: str,
+    peer_name: str,
+) -> str:
+    return _ota_rosotacom_command(plan, _ota_status_parts(target, instance_id, peer_name, watch=True))
+
+
 def _ota_create_tmux(
     runtime: RuntimeConfig,
     target: InteractiveSmokeTarget,
@@ -2408,7 +2424,7 @@ def _ota_create_tmux(
         "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
         f"{first_start}; "
         "echo; "
-        f"echo '[INFO] remote peer {first_peer.name} communication exited'; "
+        f"echo '[INFO] remote peer {first_peer.name} communication exited; live status is in the lower pane'; "
         "exec bash"
     )
     created = subprocess.run(
@@ -2468,6 +2484,29 @@ def _ota_create_tmux(
         first_pane,
         instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-communication.log",
     )
+    first_status = _ota_status_watch_script(plan, target, instance.instance_id, first_peer.name)
+    first_status_script = (
+        f"echo '[INFO] starting live remote status watch for {first_peer.name}'; "
+        f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
+        f"exec {first_status}"
+    )
+    _create_tmux_split_below(
+        runtime,
+        first_pane,
+        f"{first_peer.name}:status",
+        _ota_quote_cmd(_ota_remote_argv(first_peer, first_status_script, tty=bool(first_peer.ssh))),
+        log_path=instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-status.log",
+    )
+    subprocess.run(
+        _tmux_command(
+            runtime,
+            "select-layout",
+            "-t",
+            f"{session_name}:{_safe_path_token(f'{first_peer.name}_communication')}",
+            "even-vertical",
+        ),
+        check=True,
+    )
 
     for peer in peers[1:]:
         start = _ota_rosotacom_command(
@@ -2480,7 +2519,7 @@ def _ota_create_tmux(
             "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
             f"{start}; "
             "echo; "
-            f"echo '[INFO] remote peer {peer.name} communication exited'; "
+            f"echo '[INFO] remote peer {peer.name} communication exited; live status is in the lower pane'; "
             "exec bash"
         )
         created_window = subprocess.run(
@@ -2507,6 +2546,29 @@ def _ota_create_tmux(
             check=True,
         )
         _attach_tmux_pipe(runtime, pane_id, instance.logs_host_dir / "ota-smoke" / f"{peer.name}-communication.log")
+        status = _ota_status_watch_script(plan, target, instance.instance_id, peer.name)
+        status_script = (
+            f"echo '[INFO] starting live remote status watch for {peer.name}'; "
+            f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
+            f"exec {status}"
+        )
+        _create_tmux_split_below(
+            runtime,
+            pane_id,
+            f"{peer.name}:status",
+            _ota_quote_cmd(_ota_remote_argv(peer, status_script, tty=bool(peer.ssh))),
+            log_path=instance.logs_host_dir / "ota-smoke" / f"{peer.name}-status.log",
+        )
+        subprocess.run(
+            _tmux_command(
+                runtime,
+                "select-layout",
+                "-t",
+                f"{session_name}:{_safe_path_token(f'{peer.name}_communication')}",
+                "even-vertical",
+            ),
+            check=True,
+        )
 
     if target.scenario_definition:
         for peer in peers:

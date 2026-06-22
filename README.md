@@ -166,9 +166,11 @@ scripts/
 ```
 
 See the [example project README](src/rosotacom/resources/examples/README.md)
-for the copyable example layout and the
-[deployment configuration reference](deployment-configuration.md) for the
-machine-specific schema and peer-binding precedence.
+for the copyable example layout, the
+[session configuration reference](session-configuration.md) for the session
+schema, the [deployment configuration reference](deployment-configuration.md) for
+the machine-specific schema and peer-binding precedence, and
+[terminology.md](terminology.md) for the project vocabulary.
 
 The normal examples intentionally contain no machine addresses. `rosotacom
 smoke` injects isolated Docker-network addresses, while manual and OTA runs
@@ -399,6 +401,12 @@ For contributor setup, local checks, PR workflow, CI, and releases, see
 [CONTRIBUTING.md](CONTRIBUTING.md). CI behavior is summarized in
 [docs/ci.md](docs/ci.md), releases in [docs/release.md](docs/release.md), and
 issue-driven work tracking in [docs/work-items.md](docs/work-items.md).
+
+The test and measurement architecture is recorded in the
+[design RFCs](docs/rfcs/README.md); see [docs/testing.md](docs/testing.md) for the
+test taxonomy and [docs/quality-audit.md](docs/quality-audit.md) for the periodic
+quality audit. Quality rules live in
+[DEVELOPMENT_PRINCIPLES.md](DEVELOPMENT_PRINCIPLES.md).
 
 ## Choosing the Transport Layer: CycloneDDS or Zenoh
 

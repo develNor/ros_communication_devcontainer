@@ -17,5 +17,6 @@ Shared workflow:
 - Check `git status --short --branch` before editing.
 - Treat unrelated local changes as user-owned and do not revert them.
 - Update tests and docs when CLI, config, package, Docker, or public runtime behavior changes.
+- Keep docs reachable: every doc must be linkable from `README.md` (directly, or via a doc already linked there — e.g. a new RFC goes in `docs/rfcs/README.md`). Link new docs in the same change, and link any orphan you notice.
 - Do not skip, weaken, or delete tests/CI to make a change pass.
 - Default to a draft review PR unless autonomous merge is explicitly requested.

@@ -55,9 +55,44 @@ from session.creation import generate_session_files as session_gen
 _CATMUX_NO_SERVER_RE = re.compile(
     r"^error connecting to /tmp/tmux-\d+/catmux \(No such file or directory\)$"
 )
+# catmux's tmux wrapper swallows failed tmux calls: it prints this marker to
+# stdout and keeps going (exit 0) instead of raising. Treat it as a launch
+# failure so a half-built session surfaces loudly instead of silently.
+_CATMUX_SWALLOWED_ERROR = "Error while calling"
 
 
-def _run_catmux(full_command, attach: bool) -> None:
+def _report_catmux_failure(full_command, result, *, swallowed: bool, failure_log_path) -> None:
+    reason = (
+        "catmux swallowed a tmux error and left the session incomplete"
+        if swallowed and result.returncode == 0
+        else f"catmux_create_session exited with status {result.returncode}"
+    )
+    # Print to stdout: the stderr traceback can be captured/dropped by the layers
+    # above (the smoke harness), so keep the cause next to the failure on stdout.
+    detail = (result.stderr or "").strip() or (result.stdout or "").strip()
+    print("=" * 72)
+    print(f"catmux session launch FAILED: {reason}.")
+    if detail:
+        print("--- catmux output ---")
+        print(detail)
+        print("--- end catmux output ---")
+    if failure_log_path:
+        try:
+            os.makedirs(os.path.dirname(failure_log_path) or ".", exist_ok=True)
+            with open(failure_log_path, "w") as handle:
+                handle.write("command: " + " ".join(str(part) for part in full_command) + "\n")
+                handle.write(f"returncode: {result.returncode}\n\n")
+                handle.write("===== stdout =====\n")
+                handle.write(result.stdout or "")
+                handle.write("\n===== stderr =====\n")
+                handle.write(result.stderr or "")
+            print(f"Full catmux launch log: {failure_log_path}")
+        except OSError as exc:
+            print(f"(could not write catmux launch log to {failure_log_path}: {exc})")
+    print("=" * 72)
+
+
+def _run_catmux(full_command, attach: bool, failure_log_path=None) -> None:
     if attach:
         subprocess.run(full_command, check=True)
         return
@@ -74,8 +109,14 @@ def _run_catmux(full_command, attach: bool) -> None:
     if stderr_lines:
         print("\n".join(stderr_lines), file=sys.stderr)
 
-    if result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, full_command)
+    swallowed = _CATMUX_SWALLOWED_ERROR in (result.stdout or "")
+    if result.returncode != 0 or swallowed:
+        _report_catmux_failure(
+            full_command, result, swallowed=swallowed, failure_log_path=failure_log_path
+        )
+        raise subprocess.CalledProcessError(
+            result.returncode or 1, full_command, output=result.stdout, stderr=result.stderr
+        )
 
 
 def _parse_peer_address_overrides(overrides) -> Dict[str, str]:
@@ -261,12 +302,21 @@ def main(
     if not attach:
         full_command.append("--detach")
 
+    resolved_catmux_log_dir = catmux_log_dir or os.environ.get("ROSOTACOM_CATMUX_LOG_DIR")
+    failure_log_path = os.path.join(
+        resolved_catmux_log_dir or peer_dir, "catmux-launch-failure.log"
+    )
+
     # Execute the command
     try:
-        _run_catmux(full_command, attach)
+        _run_catmux(full_command, attach, failure_log_path=failure_log_path)
         print("Command executed successfully.")
     except subprocess.CalledProcessError as e:
-        print(f"An error occurred while executing the command: {e}")
+        print(
+            f"catmux_create_session failed (exit {e.returncode}); see the catmux "
+            f"output above and {failure_log_path}.",
+            file=sys.stderr,
+        )
         raise SystemExit(e.returncode)
 
 if __name__ == "__main__":

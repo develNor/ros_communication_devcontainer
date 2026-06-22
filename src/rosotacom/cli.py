@@ -1992,12 +1992,52 @@ def _ota_stage_text(peer: OtaSmokePeer, text: str, destination: str, *, dry_run:
         path.write_text(text, encoding="utf-8")
 
 
-def _ota_remote_project_config(runtime: RuntimeConfig) -> str:
+def _ota_remap_config_roots(
+    raw: Any, key: str, project_root: Path, source_checkout: Path | None, staged_source: str
+) -> Any:
+    """Rewrite config-root paths so they resolve on the remote staged tree.
+
+    - relative roots resolve under the staged project, so keep them verbatim;
+    - absolute roots inside the project become relative (staged with the project);
+    - absolute roots inside the staged rosotacom source point at the remote source
+      path (``{workdir}/source/...``), since the examples are staged there;
+    - anything else is left untouched (it cannot be staged automatically and will
+      surface as a clear "Path does not exist" on the remote).
+    """
+    values = list(_path_values(raw, key))
+    scalar = not isinstance(raw, (list, tuple)) and not (isinstance(raw, str) and "," in raw)
+    remapped: list[str] = []
+    for value in values:
+        path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+        if not path.is_absolute():
+            remapped.append(str(value))
+            continue
+        path = path.resolve()
+        rel_to_project = _relative_to(path, project_root)
+        if rel_to_project is not None:
+            remapped.append(rel_to_project.as_posix())
+            continue
+        rel_to_source = _relative_to(path, source_checkout) if source_checkout else None
+        if rel_to_source is not None:
+            remapped.append(f"{staged_source}/{rel_to_source.as_posix()}")
+            continue
+        remapped.append(str(value))
+    if scalar:
+        return remapped[0] if remapped else raw
+    return remapped
+
+
+def _ota_remote_project_config(runtime: RuntimeConfig, plan: OtaSmokePlan, source_checkout: Path | None) -> str:
     if not runtime.rosotacom_config:
         raise RuntimeError("ota-smoke requires an active rosotacom.yaml project.")
     raw = _load_yaml_file(runtime.rosotacom_config)
-    if runtime.deployment and _relative_to(runtime.deployment, runtime.rosotacom_config.parent) is None:
+    project_root = runtime.rosotacom_config.parent
+    if runtime.deployment and _relative_to(runtime.deployment, project_root) is None:
         raw["deployment"] = ".rosotacom/deployment.yaml"
+    staged_source = f"{plan.workdir}/source"
+    for key in ("session_configs_dir", "scenario_configs_dir"):
+        if raw.get(key) is not None:
+            raw[key] = _ota_remap_config_roots(raw[key], key, project_root, source_checkout, staged_source)
     return yaml.safe_dump(raw, sort_keys=False)
 
 
@@ -2049,7 +2089,7 @@ def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: O
             )
             _ota_stage_text(
                 peer,
-                _ota_remote_project_config(runtime),
+                _ota_remote_project_config(runtime, plan, source_checkout),
                 f"{plan.workdir}/{plan.project}",
                 dry_run=dry_run,
                 label=f"{peer.name}: write staged project config",
@@ -2189,6 +2229,14 @@ def _ota_verify_content_integrity(
     """For each peer's PASS-THROUGH String topic, assert the delivered payload is
     byte-identical to what the sender published (the synthetic publishers are still
     running from the test phase, so their known payload is the ground truth)."""
+    if target.target_type != "session":
+        # The byte-equality ground truth is the synthetic publisher payload, which
+        # only runs for session targets (see _ota_start_session_publishers).
+        # Scenarios drive their own application publishers with no fixed payload,
+        # so there is nothing to byte-compare against; delivery + isolation already
+        # cover the OTA guarantee for them.
+        print("OTA smoke: skipping content integrity (scenario uses application publishers).")
+        return []
     peer_args = _ota_peer_address_args(plan)
     errors: list[str] = []
     for receiver_name, receiver in plan.peers.items():

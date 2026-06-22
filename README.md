@@ -279,7 +279,8 @@ target is a scenario, it also opens one window per local application container;
 each application shares its peer communication container's isolated network
 namespace so local ROS discovery behaves like colocated processes. A
 `verification` window runs the local checks/status view while you inspect the
-system. The outer prefix is `Ctrl-b`; use `Ctrl-b n`/`Ctrl-b p` for windows and
+system. Its upper pane keeps the verification log; its lower pane watches live
+status. The outer prefix is `Ctrl-b`; use `Ctrl-b n`/`Ctrl-b p` for windows and
 `Ctrl-b Ctrl-b` for the inner catmux session.
 
 `rosotacom smoke TARGET --interactive` accepts either a session or a scenario.
@@ -324,9 +325,12 @@ rosotacom ota-smoke 2_native_chatter \
 `ota-smoke` accepts sessions and scenarios. It automatically stages and
 installs the currently selected rosotacom version, stages the active project,
 runs delivery and isolation checks, collects artifacts, stops the run, and
-removes the remote workdir. Add `--interactive` for the control tmux,
-`--keep-running` to leave components up, `--keep-workdir` to retain staged
-files, or `--reuse` to reuse an existing installation.
+removes the remote workdir. Add `--interactive` for a local control tmux with
+one attachable communication/catmux window per peer and a status pane below each
+one. Stop an interactive run with `rosotacom ota-smoke TARGET --interactive
+--stop`; pass the same peer/deployment arguments if the local tmux metadata is
+not available. Use `--keep-running` to leave components up, `--keep-workdir` to
+retain staged files, or `--reuse` to reuse an existing installation.
 
 ### Live status / debugging overview
 

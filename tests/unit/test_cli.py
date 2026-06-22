@@ -487,7 +487,7 @@ def test_scenario_tmux_commands_keep_ctrl_b_and_use_full_windows(
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal pane_number
         calls.append(command)
-        if "new-session" in command or "new-window" in command:
+        if "new-session" in command or "new-window" in command or "split-window" in command:
             pane_number += 1
             return subprocess.CompletedProcess(command, 0, f"%{pane_number}\n", "")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -564,7 +564,7 @@ def test_interactive_smoke_tmux_uses_full_windows_and_metadata(
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         nonlocal pane_number
         calls.append(command)
-        if "new-session" in command or "new-window" in command:
+        if "new-session" in command or "new-window" in command or "split-window" in command:
             pane_number += 1
             return subprocess.CompletedProcess(command, 0, f"%{pane_number}\n", "")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -792,19 +792,19 @@ def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
         for command in calls
         if ("new-session" in command or "new-window" in command) and "-n" in command
     ]
-    assert window_names == ["a_remote", "b_remote", "a_shell", "b_shell", "verification"]
+    assert window_names == ["a_communication", "b_communication", "a_shell", "b_shell", "verification"]
     assert any(command[-2:] == ["@rosotacom_ota_smoke_target", "demo"] for command in calls)
     assert any(command[-2:] == ["@rosotacom_ota_smoke_target_type", "scenario"] for command in calls)
     assert any(command[-2:] == ["@rosotacom_ota_smoke_instance", "ota-interactive"] for command in calls)
     assert any(command[-2:] == ["@rosotacom_ota_smoke_state", str(plan.state_path)] for command in calls)
     joined = "\n".join(" ".join(command) for command in calls)
-    assert "scenario start demo --identity a --mode detached --instance-id ota-interactive" in joined
-    assert "scenario start demo --identity b --mode detached --instance-id ota-interactive" in joined
+    assert "scenario start demo --identity a --mode attach --instance-id ota-interactive" in joined
+    assert "scenario start demo --identity b --mode attach --instance-id ota-interactive" in joined
     assert "status demo --identity a --instance-id ota-interactive --watch" in joined
     assert "status demo --identity b --instance-id ota-interactive --watch" in joined
+    assert any("split-window" in command for command in calls)
     assert "ota-smoke demo --state-file" in joined
     assert "--verify-only" in joined
-    assert "scenario attach" not in joined
 
 
 def test_ota_smoke_parser_accepts_stop_without_peer_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -848,6 +848,42 @@ def test_ota_smoke_stop_dry_run_does_not_kill_local_tmux(
 
     assert calls == ["remote-dry-run"]
     assert "Would stop OTA smoke tmux session: ota-smoke-scenario-demo" in capsys.readouterr().out
+
+
+def test_ota_smoke_stop_with_target_falls_back_to_peer_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    plan = _ota_plan(tmp_path)
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
+    calls: list[str] = []
+
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(rosotacom, "_active_ota_smoke_runs", lambda runtime: [])
+    monkeypatch.setattr(rosotacom, "_manifest_ota_smoke_runs", lambda runtime: [])
+    monkeypatch.setattr(rosotacom, "_resolve_ota_smoke_context", lambda args: (runtime, plan, target))
+    monkeypatch.setattr(rosotacom, "_ota_stop_peers", lambda *args, **kwargs: calls.append("remote-stop"))
+    monkeypatch.setattr(rosotacom, "_kill_scenario_tmux", lambda *args, **kwargs: calls.append("tmux") or False)
+    monkeypatch.setattr(rosotacom, "_ota_cleanup_hosts", lambda *args, **kwargs: calls.append("cleanup"))
+
+    assert (
+        rosotacom._stop_ota_smoke(
+            argparse.Namespace(
+                target="demo",
+                target_type="scenario",
+                state_file=None,
+                instance_id=None,
+                dry_run=False,
+                keep_workdir=False,
+            )
+        )
+        == 0
+    )
+
+    assert calls == ["remote-stop", "tmux", "cleanup"]
+    assert "No active OTA smoke run found" not in capsys.readouterr().err
 
 
 def test_noninteractive_ota_smoke_lifecycle_uses_generic_runner(

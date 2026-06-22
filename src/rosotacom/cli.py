@@ -1366,6 +1366,13 @@ def _ota_print_failure_output(label: str, result: subprocess.CompletedProcess[st
         print(f"--- end {label} output ---", file=sys.stderr)
 
 
+def _print_completed_output(result: subprocess.CompletedProcess[str]) -> None:
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.stderr:
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
+
+
 def _ota_project_cli_args(plan: OtaSmokePlan) -> list[str]:
     return ["--rosotacom-config", plan.project]
 
@@ -1689,12 +1696,49 @@ def _format_active_ota_smoke_runs(runs: list[ActiveOtaSmokeRun]) -> str:
     return "\n".join(lines)
 
 
+def _manifest_ota_smoke_runs(runtime: RuntimeConfig) -> list[ActiveOtaSmokeRun]:
+    root = _session_instances_root(runtime)
+    runs: list[ActiveOtaSmokeRun] = []
+    for manifest_path in sorted(root.glob("*/*/manifest.yaml"), reverse=True):
+        manifest = _load_yaml_file(manifest_path)
+        instance_id = str(manifest.get("instance_id") or manifest_path.parent.name.rsplit("_", 1)[-1])
+        for run in (manifest.get("ota_smoke_runs") or {}).values():
+            if not isinstance(run, dict):
+                continue
+            if run.get("stopped_at") or run.get("phase") == "stopped":
+                continue
+            target = str(run.get("target") or "")
+            target_type = str(run.get("target_type") or "")
+            state_path = str(run.get("deployment_state") or "")
+            if not target or not target_type or not state_path:
+                continue
+            tmux_session = str(run.get("tmux_session") or _ota_smoke_tmux_session(target_type, target))
+            runs.append(
+                ActiveOtaSmokeRun(
+                    target=target,
+                    target_type=target_type,
+                    tmux_session=tmux_session,
+                    instance_id=instance_id,
+                    state_path=state_path,
+                )
+            )
+    return sorted(runs, key=lambda run: (run.target_type, run.target, run.instance_id))
+
+
 def _infer_active_ota_smoke_run(
     runtime: RuntimeConfig,
     target_arg: str | None,
     target_type: str,
+    instance_id: str | None = None,
 ) -> ActiveOtaSmokeRun:
     runs = _active_ota_smoke_runs(runtime)
+    seen = {(run.target, run.target_type, run.instance_id) for run in runs}
+    runs.extend(
+        run for run in _manifest_ota_smoke_runs(runtime) if (run.target, run.target_type, run.instance_id) not in seen
+    )
+    if instance_id:
+        instance_token = _safe_path_token(instance_id)
+        runs = [run for run in runs if run.instance_id == instance_token]
     if target_arg:
         target = _resolve_interactive_smoke_target(target_arg, runtime, target_type)
         matches = [run for run in runs if run.target == target.name and run.target_type == target.target_type]
@@ -1963,12 +2007,16 @@ def _ota_start_session_publishers(
     dry_run: bool,
 ) -> None:
     if target.target_type != "session":
+        print("OTA smoke: target is a scenario; using its application publishers.")
         return
     peer_args = _ota_peer_address_args(plan)
     for peer_name in sorted(plan.peers):
         peer = plan.peers[peer_name]
         command = _ota_rosotacom_command(plan, _ota_publish_parts(target, peer_name, peer_args))
-        _ota_run(peer, command, label=f"{peer_name}: start synthetic publishers", dry_run=dry_run, check=False)
+        result = _ota_run(peer, command, label=f"{peer_name}: start synthetic publishers", dry_run=dry_run, check=False)
+        _print_completed_output(result)
+        if result.returncode != 0:
+            _ota_print_failure_output(f"{peer_name}: start synthetic publishers", result)
 
 
 def _ota_stop_session_publishers(
@@ -1994,6 +2042,7 @@ def _ota_verify_delivery(
     dry_run: bool,
 ) -> list[str]:
     errors: list[str] = []
+    print("OTA smoke: running status/expectation checks on every peer.")
     for peer_name in sorted(plan.peers):
         peer = plan.peers[peer_name]
         command = _ota_rosotacom_command(plan, _ota_test_parts(target, instance_id))
@@ -2001,6 +2050,8 @@ def _ota_verify_delivery(
         if result.returncode != 0:
             _ota_print_failure_output(f"{peer_name}: rosotacom test", result)
             errors.append(f"{peer_name}: rosotacom test failed")
+        else:
+            _print_completed_output(result)
     return errors
 
 
@@ -2016,12 +2067,14 @@ def _ota_verify_isolation(
     receiver = plan.peers[receiver_name]
     peer_args = _ota_peer_address_args(plan)
     errors: list[str] = []
+    print(f"OTA smoke: checking isolation from {source_name} to {receiver_name}.")
     publish = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=False))
     published = _ota_run(source, publish, label=f"{source_name}: publish isolation probe", dry_run=dry_run, check=False)
     if published.returncode != 0:
         _ota_print_failure_output(f"{source_name}: publish isolation probe", published)
         errors.append(f"{source_name}: isolation probe publisher failed")
         return errors
+    _print_completed_output(published)
     check = _ota_rosotacom_command(plan, _ota_probe_check_parts(target, receiver_name, peer_args))
     checked = _ota_run(
         receiver,
@@ -2033,8 +2086,11 @@ def _ota_verify_isolation(
     if checked.returncode != 0:
         _ota_print_failure_output(f"{receiver_name}: check isolation probe absent", checked)
         errors.append(f"{receiver_name}: isolation probe crossed OTA boundary")
+    else:
+        _print_completed_output(checked)
     stop = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=True))
-    _ota_run(source, stop, label=f"{source_name}: stop isolation probe", dry_run=dry_run, check=False)
+    stopped = _ota_run(source, stop, label=f"{source_name}: stop isolation probe", dry_run=dry_run, check=False)
+    _print_completed_output(stopped)
     return errors
 
 
@@ -2054,12 +2110,15 @@ def _ota_verify_content_integrity(
         for topic, msg_type, field, expected in _content_integrity_specs(cfg, receiver_name):
             parts = _ota_content_check_parts(target, receiver_name, peer_args, topic, msg_type, field, expected)
             cmd = _ota_rosotacom_command(plan, parts)
+            print(f"OTA smoke: checking content integrity for {receiver_name} {topic}.")
             result = _ota_run(
                 receiver, cmd, label=f"{receiver_name}: content integrity {topic}", dry_run=dry_run, check=False
             )
             if result.returncode != 0:
                 _ota_print_failure_output(f"{receiver_name}: content integrity {topic}", result)
                 errors.append(f"{receiver_name}: content integrity mismatch on {topic}")
+            else:
+                _print_completed_output(result)
     return errors
 
 
@@ -2113,6 +2172,8 @@ def _ota_verify_only(args: argparse.Namespace) -> int:
     if not instance_id:
         raise RuntimeError("ota-smoke --verify-only requires --instance-id.")
     dry_run = bool(getattr(args, "dry_run", False))
+    print(f"OTA smoke verification starting: {target.name} ({target.target_type}), instance={instance_id}")
+    print("OTA smoke: starting synthetic publishers where needed.")
     _ota_start_session_publishers(target, plan, dry_run=dry_run)
     errors = _ota_verify_delivery(target, plan, instance_id, dry_run=dry_run)
     errors += _ota_verify_isolation(target, plan, dry_run=dry_run)
@@ -2134,7 +2195,11 @@ def _ota_status_watch_script(
 
 
 def _ota_debug_shell_script(plan: OtaSmokePlan) -> str:
-    return f'cd {shlex.quote(plan.workdir)} && exec "${{SHELL:-bash}}"'
+    return (
+        f"cd {shlex.quote(plan.workdir)} && "
+        f"echo '[INFO] debug shell for OTA smoke workdir: {shlex.quote(plan.workdir)}' && "
+        'exec "${SHELL:-bash}"'
+    )
 
 
 def _ota_create_tmux(
@@ -2150,10 +2215,18 @@ def _ota_create_tmux(
     first_peer = peers[0]
     first_start = _ota_rosotacom_command(
         plan,
-        _ota_start_parts(target, first_peer.name, instance.instance_id, peer_args, mode="detached"),
+        _ota_start_parts(target, first_peer.name, instance.instance_id, peer_args, mode="attach"),
     )
     first_status = _ota_status_watch_script(plan, target, instance.instance_id, first_peer.name)
-    first_script = f"set -e; {first_start}; echo; echo '[INFO] live remote status follows'; {first_status}"
+    first_script = (
+        "set -e; "
+        f"echo '[INFO] starting interactive communication for remote peer {first_peer.name}'; "
+        "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
+        f"{first_start}; "
+        "echo; "
+        f"echo '[INFO] remote peer {first_peer.name} communication exited; live status is in the lower pane'; "
+        "exec bash"
+    )
     created = subprocess.run(
         _tmux_command(
             runtime,
@@ -2165,7 +2238,7 @@ def _ota_create_tmux(
             "-s",
             session_name,
             "-n",
-            _safe_path_token(f"{first_peer.name}_remote"),
+            _safe_path_token(f"{first_peer.name}_communication"),
             _ota_quote_cmd(_ota_remote_argv(first_peer, first_script, tty=bool(first_peer.ssh))),
         ),
         text=True,
@@ -2198,23 +2271,57 @@ def _ota_create_tmux(
             "-t",
             session_name,
             "status-right",
-            " ota smoke | windows: C-b n/p | remote tmux attach is opt-in ",
+            " ota smoke | windows: C-b n/p | peer tmux/catmux: C-b C-b ",
         ),
         check=True,
     )
     subprocess.run(
-        _tmux_command(runtime, "select-pane", "-t", first_pane, "-T", f"{first_peer.name}:remote"),
+        _tmux_command(runtime, "select-pane", "-t", first_pane, "-T", f"{first_peer.name}:communication"),
         check=True,
     )
-    _attach_tmux_pipe(runtime, first_pane, instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-remote.log")
+    _attach_tmux_pipe(
+        runtime,
+        first_pane,
+        instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-communication.log",
+    )
+    first_status_script = (
+        f"echo '[INFO] starting live remote status watch for {first_peer.name}'; "
+        f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
+        f"exec {first_status}"
+    )
+    _create_tmux_split_below(
+        runtime,
+        first_pane,
+        f"{first_peer.name}:status",
+        _ota_quote_cmd(_ota_remote_argv(first_peer, first_status_script, tty=bool(first_peer.ssh))),
+        log_path=instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-status.log",
+    )
+    subprocess.run(
+        _tmux_command(
+            runtime,
+            "select-layout",
+            "-t",
+            f"{session_name}:{_safe_path_token(f'{first_peer.name}_communication')}",
+            "even-vertical",
+        ),
+        check=True,
+    )
 
     for peer in peers[1:]:
         start = _ota_rosotacom_command(
             plan,
-            _ota_start_parts(target, peer.name, instance.instance_id, peer_args, mode="detached"),
+            _ota_start_parts(target, peer.name, instance.instance_id, peer_args, mode="attach"),
         )
         status = _ota_status_watch_script(plan, target, instance.instance_id, peer.name)
-        script = f"set -e; {start}; echo; echo '[INFO] live remote status follows'; {status}"
+        script = (
+            "set -e; "
+            f"echo '[INFO] starting interactive communication for remote peer {peer.name}'; "
+            "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
+            f"{start}; "
+            "echo; "
+            f"echo '[INFO] remote peer {peer.name} communication exited; live status is in the lower pane'; "
+            "exec bash"
+        )
         created_window = subprocess.run(
             _tmux_command(
                 runtime,
@@ -2226,7 +2333,7 @@ def _ota_create_tmux(
                 "-t",
                 session_name,
                 "-n",
-                _safe_path_token(f"{peer.name}_remote"),
+                _safe_path_token(f"{peer.name}_communication"),
                 _ota_quote_cmd(_ota_remote_argv(peer, script, tty=bool(peer.ssh))),
             ),
             text=True,
@@ -2234,8 +2341,33 @@ def _ota_create_tmux(
             check=True,
         )
         pane_id = created_window.stdout.strip()
-        subprocess.run(_tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"{peer.name}:remote"), check=True)
-        _attach_tmux_pipe(runtime, pane_id, instance.logs_host_dir / "ota-smoke" / f"{peer.name}-remote.log")
+        subprocess.run(
+            _tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"{peer.name}:communication"),
+            check=True,
+        )
+        _attach_tmux_pipe(runtime, pane_id, instance.logs_host_dir / "ota-smoke" / f"{peer.name}-communication.log")
+        status_script = (
+            f"echo '[INFO] starting live remote status watch for {peer.name}'; "
+            f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
+            f"exec {status}"
+        )
+        _create_tmux_split_below(
+            runtime,
+            pane_id,
+            f"{peer.name}:status",
+            _ota_quote_cmd(_ota_remote_argv(peer, status_script, tty=bool(peer.ssh))),
+            log_path=instance.logs_host_dir / "ota-smoke" / f"{peer.name}-status.log",
+        )
+        subprocess.run(
+            _tmux_command(
+                runtime,
+                "select-layout",
+                "-t",
+                f"{session_name}:{_safe_path_token(f'{peer.name}_communication')}",
+                "even-vertical",
+            ),
+            check=True,
+        )
 
     for peer in peers:
         shell_script = _ota_debug_shell_script(plan)
@@ -2276,7 +2408,13 @@ def _ota_create_tmux(
         *_runtime_cli_args(runtime),
     ]
     verify_cmd = _ota_quote_cmd(verify_parts)
-    verify_script = f"{verify_cmd}; rc=$?; echo; echo '[INFO] verification exited with status' \"$rc\"; exec bash"
+    verify_script = (
+        f"echo '[INFO] starting OTA smoke verification for {target.name}'; "
+        f"{verify_cmd}; rc=$?; "
+        "echo; echo '[INFO] verification exited with status' \"$rc\"; "
+        "echo '[INFO] verification log remains in this pane'; "
+        "exec bash"
+    )
     verification = subprocess.run(
         _tmux_command(
             runtime,
@@ -2366,17 +2504,17 @@ def _start_interactive_ota_smoke(args: argparse.Namespace) -> int:
     created = _ota_create_tmux(runtime, target, plan, instance)
     print(f"rosotacom OTA smoke instance: {instance.host_dir}")
     print(f"rosotacom OTA smoke started: {target.name} ({target.target_type})")
-    print("Local control tmux prefix: Ctrl-b. Remote scenario/catmux attach is opt-in from debug shells.")
+    print("Local control tmux prefix: Ctrl-b. Send the peer tmux/catmux prefix with Ctrl-b Ctrl-b.")
     if target.target_type == "scenario":
         for peer_name, peer in plan.peers.items():
             attach = _ota_rosotacom_command(plan, ["scenario", "attach", target.name, "--identity", peer_name])
             attach_cmd = _ota_quote_cmd(_ota_remote_argv(peer, attach, tty=bool(peer.ssh)))
-            print(f"Remote scenario attach for {peer_name}: {attach_cmd}")
+            print(f"Manual remote scenario reattach for {peer_name}: {attach_cmd}")
     if mode == "attach":
         subprocess.run(_tmux_command(runtime, "attach-session", "-t", created), check=True)
     else:
         print(f"Attach with: rosotacom ota-smoke {shlex.quote(target.name)} --interactive")
-        print(f"Stop with: rosotacom ota-smoke {shlex.quote(target.name)} --stop")
+        print(f"Stop with: rosotacom ota-smoke {shlex.quote(target.name)} --interactive --stop")
     return 0
 
 
@@ -2447,11 +2585,22 @@ def _stop_ota_smoke(args: argparse.Namespace) -> int:
     target_type = getattr(args, "target_type", "auto")
     active: ActiveOtaSmokeRun | None = None
     if not getattr(args, "state_file", None):
-        active = _infer_active_ota_smoke_run(runtime, target_arg, target_type)
-        args.state_file = active.state_path
-        args.instance_id = getattr(args, "instance_id", None) or active.instance_id
-        args.target = target_arg or active.target
-        args.target_type = active.target_type
+        try:
+            active = _infer_active_ota_smoke_run(
+                runtime,
+                target_arg,
+                target_type,
+                getattr(args, "instance_id", None),
+            )
+        except RuntimeError:
+            if not target_arg:
+                raise
+            active = None
+        else:
+            args.state_file = active.state_path
+            args.instance_id = getattr(args, "instance_id", None) or active.instance_id
+            args.target = target_arg or active.target
+            args.target_type = active.target_type
     runtime, plan, target = _resolve_ota_smoke_context(args)
     instance_id = getattr(args, "instance_id", None)
     _ota_stop_peers(target, plan, instance_id, dry_run=dry_run)
@@ -2889,6 +3038,38 @@ def _attach_tmux_pipe(runtime: RuntimeConfig, pane_id: str, log_path: Path) -> N
         _tmux_command(runtime, "pipe-pane", "-o", "-t", pane_id, f"cat >> {shlex.quote(str(log_path))}"),
         check=True,
     )
+
+
+def _create_tmux_split_below(
+    runtime: RuntimeConfig,
+    target_pane: str,
+    title: str,
+    command: str,
+    *,
+    log_path: Path | None = None,
+) -> str:
+    created = subprocess.run(
+        _tmux_command(
+            runtime,
+            "split-window",
+            "-d",
+            "-v",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            target_pane,
+            command,
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    pane_id = created.stdout.strip()
+    subprocess.run(_tmux_command(runtime, "select-pane", "-t", pane_id, "-T", title), check=True)
+    if log_path is not None:
+        _attach_tmux_pipe(runtime, pane_id, log_path)
+    return pane_id
 
 
 def _create_scenario_tmux(
@@ -4290,6 +4471,7 @@ def _verify_received_topics(
     for spec in _received_crossed_topics(cfg, receiver_peer_key):
         topic = spec.topic
         label = spec.label
+        log_line(f"Waiting for {label} ({topic}) in {container_name}")
         output = _wait_for_topic_hz(container_name, ros_setup, topic)
         if detail_log:
             detail_log(f"\n--- {label} ({topic}) in {container_name} ---\n{output}")
@@ -4432,6 +4614,10 @@ def _start_smoke_topic_publishers(
         container = containers[spec.source_peer_key]
         ros_setup = ros_setups[spec.source_peer_key]
         cmd = _smoke_publisher_command(spec, ros_setup, duration)
+        log_line(
+            f"Starting smoke publisher {spec.source_peer_key}->{spec.receiver_peer_key} "
+            f"{spec.publish_topic} ({spec.publish_type}) in {container}"
+        )
         subprocess.run(
             ["docker", "exec", "-d", container, "bash", "-lc", cmd],
             capture_output=True,
@@ -4516,16 +4702,19 @@ def _verify_isolation(
 ) -> list[str]:
     """Publish a local-only topic in pub_container's local domain and assert it
     never appears in check_container's local domain."""
+    log_line(f"Starting isolation probe {topic} in {pub_container}")
     _publish_isolation_probe(pub_container, pub_setup, topic)
     try:
         live = False
         for _ in range(8):
+            log_line(f"Waiting for isolation probe {topic} to advertise in {pub_container}")
             if _topic_present(pub_container, pub_setup, topic):
                 live = True
                 break
             time.sleep(1)
         if not live:
             return [f"isolation check inconclusive: {topic} never advertised in {pub_container}"]
+        log_line(f"Checking that isolation probe {topic} is absent in {check_container}")
         if _topic_present(check_container, check_setup, topic):
             return [f"isolation breach: {topic} from {pub_container} leaked to {check_container}"]
         log_line(f"OK: isolation holds ({topic} from {pub_container} not visible in {check_container})")
@@ -4833,9 +5022,15 @@ def test_command(args: argparse.Namespace) -> int:
         print(yaml.safe_dump(suggestions, sort_keys=True, default_flow_style=False).rstrip())
         return 0
 
+    wait_timeout = max(0.0, float(getattr(args, "timeout", 30.0)))
+    print(f"rosotacom test: waiting up to {wait_timeout:g}s for status reports under {logs_dir}")
+    saw_reports = False
     while True:
         reports = _load_status_reports(logs_dir) if logs_dir.is_dir() else {}
         if reports:
+            if not saw_reports:
+                print(f"rosotacom test: evaluating {len(reports)} peer status report(s)")
+                saw_reports = True
             failures = status_eval.evaluate_reports(reports, expect_by_topic, link_expect, ground_truth)
             if not failures:
                 topic_count = sum(len(r.get("topics", [])) for r in reports.values())
@@ -5164,8 +5359,9 @@ def _create_interactive_smoke_tmux(
     verify = shlex.join(_interactive_smoke_verify_command(runtime, target, instance, peer_ips))
     status_watch = shlex.join(_interactive_smoke_status_command(runtime, target, instance))
     verify_script = (
+        f"echo '[INFO] starting interactive smoke verification for {target.name}'; "
         f"{verify}; rc=$?; echo; echo '[INFO] one-shot verification exited with status' \"$rc\"; "
-        f"echo '[INFO] live status follows (Ctrl-C in this pane only stops the watch)'; exec {status_watch}"
+        "echo '[INFO] verification log remains in this pane'; exec bash"
     )
     verification = subprocess.run(
         _tmux_command(
@@ -5188,6 +5384,22 @@ def _create_interactive_smoke_tmux(
     verification_pane = verification.stdout.strip()
     subprocess.run(_tmux_command(runtime, "select-pane", "-t", verification_pane, "-T", "verification"), check=True)
     _attach_tmux_pipe(runtime, verification_pane, _interactive_smoke_log_path(instance, None, "verification"))
+    status_script = (
+        f"echo '[INFO] starting live status watch for {target.name}'; "
+        f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
+        f"exec {status_watch}"
+    )
+    _create_tmux_split_below(
+        runtime,
+        verification_pane,
+        "status",
+        _host_shell(status_script),
+        log_path=_interactive_smoke_log_path(instance, None, "status-watch"),
+    )
+    subprocess.run(
+        _tmux_command(runtime, "select-layout", "-t", f"{session_name}:verification", "even-vertical"),
+        check=True,
+    )
     subprocess.run(_tmux_command(runtime, "select-window", "-t", f"{session_name}:verification"), check=True)
     return session_name
 
@@ -5227,11 +5439,15 @@ def _interactive_smoke_verify(args: argparse.Namespace) -> int:
 
     peers = _require_two_peer_smoke_cfg(target.cfg, target.name)
     containers = {peer: _container_name(_remote_peer_name(target.cfg, peer), runtime) for peer in peers}
-    for container in containers.values():
+    log_line(f"Interactive smoke verification starting: {target.name} ({target.target_type})")
+    log_line(f"Verification artifacts: {instance.host_dir}")
+    for peer, container in containers.items():
+        log_line(f"Waiting for communication container {peer}: {container}")
         _wait_for_container_ready(container, timeout_s=360)
     ros_setups = {peer: _smoke_ros_setup(instance.config_container_dir, target.cfg, peer) for peer in peers}
 
     if target.target_type == "session":
+        log_line("Starting synthetic publishers for session target")
         _start_smoke_topic_publishers(
             containers,
             ros_setups,
@@ -5242,6 +5458,7 @@ def _interactive_smoke_verify(args: argparse.Namespace) -> int:
 
     errors: list[str] = []
     for peer in peers:
+        log_line(f"Checking crossed topic delivery for receiver {peer}")
         errors += _verify_received_topics(
             containers[peer],
             ros_setups[peer],
@@ -5258,6 +5475,7 @@ def _interactive_smoke_verify(args: argparse.Namespace) -> int:
         ISOLATION_PROBE_TOPIC,
         log_line=log_line,
     )
+    log_line("Running rosotacom test against status reports")
     test_rc = test_command(
         argparse.Namespace(
             rosotacom_config=args.rosotacom_config,
@@ -5474,6 +5692,7 @@ def smoke(args: argparse.Namespace) -> int:
         errors += _verify_isolation(
             a_container, ros_setup_a, b_container, ros_setup_b, ISOLATION_PROBE_TOPIC, log_line=log_line
         )
+        log_line("Running rosotacom test against status reports")
         test_rc = test_command(
             argparse.Namespace(
                 rosotacom_config=args.rosotacom_config,

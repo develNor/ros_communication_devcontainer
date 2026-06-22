@@ -61,6 +61,14 @@ still passes, per profile.
   pattern** (e.g. `4×0 B + 1×70 KB`) so it reproduces the irregular-size
   head-of-line behaviour the baseline identifies as the real failure mode (this
   extension is already on the operator's wishlist).
+- **Bounded, not unbounded.** Every sweep stops at an operationally-relevant
+  ceiling (a configured max size / rate / bandwidth), not "until it breaks at any
+  cost." These are **OTA tests**: the goal is behaviour under realistic —
+  especially **simulated-degraded** — networks, not the theoretical maximum of a
+  pristine link. On the unshaped / LAN rung in particular the sweep must stay
+  within a bounded budget and **never saturate the shared LAN**; push the limits on
+  the emulated bad-network profiles instead, where the profile's own rate cap
+  bounds the offered load.
 
 ### Genre 2 — Perturbation / recovery (transient response)
 
@@ -136,17 +144,29 @@ harness, not in this public repo.
   are only visible per-message (RFC 0003) and under irregular load (the a/b
   pattern) — a benchmark on averages would miss exactly what matters.
 
-## Build order
+## Implementation checklist
 
-1. **Capacity binary-search driver** — `sized_publisher` + a/b pattern + the
-   backbone oracle → "largest reliable message" per profile. Smallest slice;
-   reuses RFC 0003 + 0004. *(start here)*
-2. **Budget store + regression compare** — the nightly monitor verdict.
-3. **Recovery driver** on timeline profiles (RFC 0004 step 4) + the recovery metric
-   set.
-4. **Linear-ramp curves** — the latency-vs-load surface, for trend.
-5. **Wire the nightly monitor into CI** — gate-vs-monitor; the harness wires the
-   actual runner.
+Roughly in dependency order; the capacity driver is the smallest self-contained
+slice and reuses RFC 0003 + 0004.
+
+- [ ] Extend `sized_publisher` with an a/b size pattern (e.g. `4×0 B + 1×70 KB`) to
+  drive irregular-size load.
+- [ ] Build the capacity binary-search driver: sweep size/rate against the backbone
+  oracle (`loss < p` **and** `latency < L` over a window) → the breakpoint per
+  profile, with the slice (size/rate) stated.
+- [ ] Bound every sweep with a configured max (size / rate / bandwidth) and a
+  shared-link guard, so an unshaped / LAN run never saturates the shared network;
+  the sweep's focus is the emulated degraded profiles, not a pristine link's
+  ceiling.
+- [ ] Add the budget store (per `(SHA, profile, genre)`) and the regression compare
+  against a recorded baseline ± tolerance.
+- [ ] Build the recovery driver on timeline profiles (RFC 0004) + the recovery
+  metric set (`t_recover`, `t_steady`, backlog/burst, lost-during-outage, latched
+  re-arrival).
+- [ ] Add coarse linear-ramp curves (latency-vs-load) for trend.
+- [ ] Wire the nightly benchmark run as a **monitor** (alerts on budget regression,
+  never blocks); the harness wires the actual runner.
+- [ ] Cover the driver oracle, budget compare, and recovery metrics with tests.
 
 ## Open questions
 

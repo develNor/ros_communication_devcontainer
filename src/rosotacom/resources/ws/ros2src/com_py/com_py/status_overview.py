@@ -163,7 +163,6 @@ class StageObserver(Node):
             now_ros_s = now_ros.nanoseconds / 1e9
             delay_s: Optional[float] = None
             raw_delay_s: Optional[float] = None
-            preprocess_s: Optional[float] = None
             rtt_s: Optional[float] = None
             clock_offset_s: Optional[float] = None
             seq: Optional[int] = None
@@ -210,10 +209,8 @@ class StageObserver(Node):
                 )
                 if com_in is not None:
                     seq = int(msg.seq)
-                    t_source_s = _stamp_seconds(msg.source_stamp)
                     t_wrap_s = _stamp_seconds(msg.header.stamp)
                     raw_delay_s = now_ros_s - t_wrap_s
-                    preprocess_s = t_wrap_s - t_source_s
                     estimate = self.clock_estimator.estimate()
                     if estimate is not None:
                         clock_offset_s = estimate["offset_s"]
@@ -226,7 +223,6 @@ class StageObserver(Node):
                         "topic": com_in.get("base"),
                         "direction": com_in.get("direction"),
                         "stage": com_in.get("stage"),
-                        "t_source": t_source_s,
                         "t_wrap": t_wrap_s,
                         "t_com_in": now_ros_s,
                     }
@@ -247,7 +243,6 @@ class StageObserver(Node):
                 delay_s,
                 seq=seq,
                 raw_delay_s=raw_delay_s,
-                preprocess_s=preprocess_s,
                 rtt_s=rtt_s,
                 clock_offset_s=clock_offset_s,
                 transit=transit,

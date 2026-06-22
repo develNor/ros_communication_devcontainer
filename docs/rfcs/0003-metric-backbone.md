@@ -47,19 +47,22 @@ Every metric on the wishlist is a projection of one recorded object per message:
 
 ```
 (topic, seq):
-  t_source    (sender clock)     — original header.stamp, or the wrap-input time
-  t_wrap      (sender clock)     — OtaStamped.header.stamp           [exists today]
+  t_wrap      (sender clock)     — OtaStamped.header.stamp
   t_com_in    (receiver clock)   — arrival immediately after bridge_in
   status      — delivered | lost | reordered                        [from seq gap]
   sections:
-    preprocess = t_wrap   − t_source            (sender-local, exact, no sync)
-    ota_hop    = (t_com_in + θ) − t_wrap         (θ = sender/peer − receiver/local)
+    ota_hop   = (t_com_in + θ) − t_wrap          (θ = sender/peer − receiver/local)
   inter_arrival / jitter         — receiver-local regularity
 ```
 
+The envelope carries only what the cross-host **OTA hop** needs (`t_wrap` +
+`seq`). Local / per-stage latency — including the message's pre-OTA pipeline cost —
+is read uniformly from the `stage_latency` join (mechanism 3), **not** from an
+in-band stamp.
+
 | Wishlist item | Projection of the record |
 |---|---|
-| "latency split per processing section incl. OTA" | `sections` |
+| "latency split per processing section incl. OTA" | OTA hop from `sections`; per-step local split from `stage_latency` |
 | "the time-sync error was X" | `θ` (echo-heartbeat) |
 | "N messages lost, per topic" | `status` over the seq range |
 | "say exactly, after a test drive, that …" | per-message, recorded, joined offline |
@@ -75,8 +78,9 @@ append-only timeline contains both message evidence and pipeline state changes.
 1. **OTA characteristics** — loss, size, bandwidth, latency *across the OTA hop*.
    The most important tier. Measured at `com_in` from `seq` + the echo RTT.
    **Always-on.**
-2. **End-to-end latency** — `t_source` → final delivery (one cross-host hop, the
-   rest local). **Always-on.**
+2. **End-to-end latency** — composed, not a single in-band field: a headered final
+   stage already reports `now − header.stamp`, and the full per-stage split comes
+   from `stage_latency`; the transit record contributes the OTA hop.
 3. **Pre-/post-processing overhead** — the cost of each local step (restamp,
    drop, compress, framebridge, transport). **Opt-in.**
 
@@ -85,7 +89,7 @@ cross the OTA link?" — **no**:
 
 | | Always-on, light | Opt-in, deep |
 |---|---|---|
-| What | transit-record digest: OTA loss/size/bw/latency + e2e | local stage-rosbag: every step separately |
+| What | transit-record digest: OTA loss/size/bw/latency | local stage-rosbag: every step separately |
 | Key | `(topic, seq)`, cross-host | message index, intra-host |
 | Where | small enough for `status.json` (optionally a live OTA digest) | stays local; pulled only for an analysis run |
 
@@ -151,27 +155,37 @@ inferring it from two independent internet-NTP syncs. Where an endpoint is
 GPS-time-disciplined, its stamps are UTC-true and provide a free ground-truth
 cross-check — a bonus, never a dependency.
 
-### 3. Latency decomposition — two sections free, the rest local
+### 3. Latency decomposition — the OTA hop in-band, all local timing via `stage_latency`
 
-Add **one** field to `OtaStamped`: `source_stamp` (the original nonzero
-`header.stamp` before wrapping, or the wrapper input time for headerless/zero-
-stamped messages). At
-`com_in` this yields two sections per message with no sidecar:
+The transit record carries exactly **one** per-message section: the cross-host
+`ota_hop = (t_com_in + θ) − t_wrap`. That is all the envelope needs — `t_wrap`
+(`OtaStamped.header.stamp`) plus `seq`.
 
-- `preprocess = t_wrap − source_stamp` — sender-local, exact, no sync.
-- `ota_hop = (t_com_in + θ) − t_wrap` — the single offset-corrected cross-host
-  section.
-
-Deeper decomposition of the *local* pipeline (per-step cost of restamp / drop /
-compress / framebridge / transport) does **not** need a new in-band field. Set
-`shared.metric_backbone.record_stages: true` to record every generated local
-stage topic into an MCAP rosbag under the run's `logs/<peer>/metrics/` directory.
-`ros2 run com_py stage_latency BAG TOPIC...` joins bag receive timestamps by
-message index and reports consecutive-stage costs. The index join is valid
-because this path is single-clock, lossless, and in-order.
+**All local / per-stage latency is read uniformly from the `stage_latency`
+join**, not from an in-band stamp. Set `shared.metric_backbone.record_stages:
+true` to record every generated local stage topic into an MCAP rosbag under the
+run's `logs/<peer>/metrics/` directory; `ros2 run com_py stage_latency BAG
+TOPIC...` joins bag receive timestamps **by message index** and reports
+consecutive-stage costs. This works because the local path is single-clock and
+in-order.
 
 > This is the systematic form of what is already done by hand: reading
 > `ros2 topic delay` on successive suffixed stage topics and subtracting.
+
+> **Earlier design, reverted.** A first cut added an `OtaStamped.source_stamp`
+> field to surface a `preprocess = t_wrap − source_stamp` section in-band. It was
+> removed: the number was misleading (≈ the wrap step only for headerless topics;
+> source-staleness incl. pre-rosotacom age for headered), redundant with the
+> payload stamp where one exists, and already covered by `stage_latency`. Local
+> timing now has a single, uniform home.
+>
+> **Index-join caveat.** The `stage_latency` index join is valid only across
+> **non-decimating (1:1) stages**. A `drop` / `throttle` stage gives the next
+> topic fewer messages, so positional index *i* stops referring to the same
+> message, and headerless messages carry no key to repair it. Per-step *timing* is
+> therefore meaningful across the latency-adding 1:1 steps (compress / framebridge
+> / transport); decimating steps are characterized by **rate**, not per-message
+> index.
 
 ## Honest limits (design notes)
 
@@ -234,10 +248,12 @@ profile work), not hardcoded here.
 - [x] Track `OtaStamped.seq` at inbound `com_in`; expose window and run-total
   loss, reorder count, and maximum missing burst in `status.json`.
 - [x] Implement generic `expect.loss_pct: { max, stage? }` evaluation.
-- [x] Add `OtaStamped.source_stamp` and populate it from the payload stamp or
-  wrapper-input time.
-- [x] Emit corrected/uncorrected OTA hop, preprocessing, offset, RTT, size,
-  inter-arrival, and jitter data.
+- [x] Read all local / per-stage latency from the `stage_latency` message-index
+  join; the transit record's only in-band section is the OTA hop. (An earlier
+  `OtaStamped.source_stamp` / `preprocess` section was added then **reverted** —
+  see mechanism 3.)
+- [x] Emit corrected/uncorrected OTA hop, offset, RTT, size, inter-arrival, and
+  jitter data.
 - [x] Replace the one-way heartbeat implementation with `EchoHeartbeat` and a
   symmetric piggyback echo node.
 - [x] Continuously estimate peer offset from the minimum-RTT sample and state the

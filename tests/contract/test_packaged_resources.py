@@ -36,7 +36,8 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
 
     ota_stamped = package.joinpath("resources/ws/ros2src/com_msgs/msg/OtaStamped.msg").read_text(encoding="utf-8")
     echo = package.joinpath("resources/ws/ros2src/com_msgs/msg/EchoHeartbeat.msg").read_text(encoding="utf-8")
-    assert "builtin_interfaces/Time source_stamp" in ota_stamped
+    assert "source_stamp" not in ota_stamped
+    assert "uint64 seq" in ota_stamped
     assert "builtin_interfaces/Time echo_t1" in echo
     assert "builtin_interfaces/Time echo_t2" in echo
     assert "builtin_interfaces/Time echo_t3" in echo

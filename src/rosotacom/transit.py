@@ -77,11 +77,6 @@ def summarize_transit_records(records: Iterable[dict[str, Any]]) -> dict[str, An
             for record in topic_records
             if isinstance(record.get("sections"), dict) and record["sections"].get("ota_hop_ms") is not None
         ]
-        preprocess = [
-            float(record["sections"]["preprocess_ms"])
-            for record in topic_records
-            if isinstance(record.get("sections"), dict) and record["sections"].get("preprocess_ms") is not None
-        ]
         jitter = [float(record["jitter_ms"]) for record in topic_records if record.get("jitter_ms") is not None]
         topics[topic] = {
             "expected": len(topic_records),
@@ -90,10 +85,6 @@ def summarize_transit_records(records: Iterable[dict[str, Any]]) -> dict[str, An
             "loss_pct": round(100.0 * lost / len(topic_records), 3) if topic_records else 0.0,
             "reordered": reordered,
             "ota_hop_ms": {"p50": _percentile(ota, 0.50), "p95": _percentile(ota, 0.95)},
-            "preprocess_ms": {
-                "p50": _percentile(preprocess, 0.50),
-                "p95": _percentile(preprocess, 0.95),
-            },
             "jitter_ms": {"p50": _percentile(jitter, 0.50), "p95": _percentile(jitter, 0.95)},
         }
     return {"schema_version": 1, "topics": topics}

@@ -331,7 +331,7 @@ once `optional` are all fixed:
         (verified 22 ms on 10_restamp and remote_assist `/can/twist`).
       - *headerless* topics: the OTA wrapper (`use_ota_wrapper`) already sets the
         OtaStamped header to the relay's SEND time -- an out-of-band send-time sidecar.
-        RFC 0003 adds `source_stamp` and echo-derived clock-offset correction.
+        RFC 0003 adds echo-derived clock-offset correction.
         New `expect.latency_ms.stage` redirects the latency assertion to the stage
         carrying that stamp (`com_in`), so offset-aware OTA transit latency is assertable even
         for a headerless payload. Example `13_link_latency` (a plain String): verified

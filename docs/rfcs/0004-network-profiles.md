@@ -185,20 +185,31 @@ RFC 0002's `calibrate` / `--suggest` machinery, **per profile**:
   reading per-direction *latency* back out still depends on the clock-offset
   handling in RFC 0003.
 
-## Build order
+## Implementation checklist
 
-1. **Profile schema + arm/teardown on the OTA egress**, fail-safe, `--profile` on
-   `ota-smoke`/`test`. The smallest end-to-end slice: a named static profile that
-   reliably applies and always tears down. *(highest risk is the teardown
-   guarantee — do it first)*
-2. **Per-direction (uplink/downlink) application** on each peer's egress.
-3. **`expect.per_profile` + the invariant/conditional split** in `status_eval`.
-4. **Timeline profiles** (segments + `outage`) — unlocks the recovery genre in
-   RFC 0005.
-5. **`calibrate --profile`** — per-profile conditional bands.
+Roughly in dependency order; the fail-safe teardown (second item) is the highest
+risk — a stuck `qdisc` silently corrupts every later result on the machine.
 
-Steps 1–3 make the gate profile-aware; 4–5 unlock benchmarking and live-contract
-derivation.
+- [ ] Define the profile schema (static + per-direction `{rate, delay, jitter,
+  distribution, loss, loss_correlation, reorder, duplicate}`) at project scope, and
+  resolve selection via `--profile <name>` / `shared.profile` / `none`.
+- [ ] Arm a named static profile on the OTA-interface egress with fail-safe
+  teardown (revert on stop, on error, and via a safety max-duration); target the
+  data interface only, never the SSH/control interface.
+- [ ] Apply profiles per direction — `uplink` on the sending peer's egress,
+  `downlink` on the receiver's — and reject profile selection on a real-deployment
+  run.
+- [ ] Add `expect.per_profile` overrides and the invariant/conditional split to
+  `status_eval`, so `rosotacom test --profile P` asserts the invariant block plus
+  `P`'s conditional band (default conditional where `P` has no override).
+- [ ] Add timeline profiles (ordered segments + `outage`) — the substrate for the
+  recovery genre in RFC 0005.
+- [ ] Add `rosotacom calibrate --profile P` to emit per-profile conditional bands
+  from a reference replay.
+- [ ] Confirm the `/proc/net/dev` link sampler (RFC 0003 / `link_bytes.py`) reports
+  post-shaping wire bytes so link-overhead stays meaningful under a profile.
+- [ ] Cover schema parsing, arm/teardown (including crash teardown), per-direction
+  application, and `per_profile` evaluation with tests.
 
 ## Open questions
 

@@ -686,7 +686,6 @@ def test_sequence_loss_reorder_and_transit_records() -> None:
         "topic": "/wrapped",
         "direction": "inbound",
         "stage": "com_in",
-        "t_source": 1.0,
         "t_wrap": 1.01,
         "t_com_in": 1.05,
     }
@@ -697,7 +696,6 @@ def test_sequence_loss_reorder_and_transit_records() -> None:
         now_wall=1.05,
         seq=10,
         raw_delay_s=0.04,
-        preprocess_s=0.01,
         clock_offset_s=0.0,
         transit=transit,
     )
@@ -708,7 +706,6 @@ def test_sequence_loss_reorder_and_transit_records() -> None:
         now_wall=1.10,
         seq=13,
         raw_delay_s=0.05,
-        preprocess_s=0.01,
         clock_offset_s=0.0,
         transit={**transit, "t_com_in": 1.10},
     )

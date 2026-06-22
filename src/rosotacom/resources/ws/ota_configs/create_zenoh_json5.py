@@ -7,13 +7,15 @@ import argparse
 ws_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(ws_dir)
 from ota_configs.utils import process_template
-from session.content.address_resolution import main as resolve_address_expressions
 
 def main(zen_mode, zen_endpoint_role, zen_transport, zen_main_ip, zen_main_port, zen_config_file, zen_pub_allow="", zen_sub_allow="", zen_qos_pub=""):
-    zen_main_ip_resolved_list = resolve_address_expressions(zen_main_ip)
-    if len(zen_main_ip_resolved_list) != 1:
-        raise ValueError("Host IP must resolve to exactly one IP address.")
-    zen_main_ip_resolved = zen_main_ip_resolved_list[0]
+    # Addresses reach the ws scripts already resolved to literal IPs (the host
+    # alias -> address resolution happens upstream in the rosotacom CLI /
+    # deployment layer; the old data_dict-based session.content.address_resolution
+    # was removed). Mirror get_ota_xml.py: just strip and validate.
+    zen_main_ip_resolved = zen_main_ip.strip()
+    if not zen_main_ip_resolved:
+        raise ValueError("Host IP must be a non-empty resolved address.")
 
     ros_domain_id = os.getenv('ROS_DOMAIN_ID')
 

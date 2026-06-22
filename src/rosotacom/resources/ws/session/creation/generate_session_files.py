@@ -149,6 +149,17 @@ _DDS_CFG_KEYS = {"config", "easy_mode_ip"}
 _ZEN_OTA_CFG_KEYS = {"main_peer", "main_port"}
 _ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
 
+# OTA is cross-host by definition. The bare `cyclone`/`fastdds` OTA shortcuts
+# would otherwise fall back to default DDS discovery (multicast on an
+# auto-selected interface), which does not deliver across multi-homed hosts or
+# overlay/tunnel networks that drop multicast. Default each DDS OTA side to its
+# interface-pinned, unicast-peer config so cross-host delivery works out of the
+# box; an explicit `ota: {cyclone|fastdds: {config: ...}}` still overrides this.
+_DDS_OTA_DEFAULT_CONFIG = {
+    "cyclone": "cyclonedds_tuned.xml",
+    "fastdds": "fastdds_unicast.xml",
+}
+
 
 def _is_native_zenoh_ota(impl: Optional[str]) -> bool:
     return impl in _NATIVE_ZENOH_OTA_SHORTS
@@ -1288,10 +1299,22 @@ def _build_status_pipeline_spec(
         return None
 
     def _postprocessed_topic(pipe: Dict[str, Any], final: str) -> str:
+        if pipe.get("trickle_hz") is not None:
+            # Receiver-side trickle re-publishes the delivered OTA `final` at a fixed
+            # rate to `<final>/trickle` (the trickle node's trickle_topic_suffix). That
+            # republished topic is the real delivered output, so it is the monitored
+            # native_in stage -- otherwise the trickle re-publish is an observability
+            # blind spot (its rate cannot be asserted).
+            return final + "/trickle"
         if pipe.get("compress"):
             return str(pipe["comp_in"])
         if pipe.get("ota_wrap"):
             return str(pipe["ota_in"])
+        if pipe.get("framebridge") == "global_to_local":
+            # global_to_local runs on the receiver: the OTA `final` is the global
+            # (globalframe) topic, and the framebridge transforms it down to the
+            # local base topic -- that base is the post-framebridge native_in.
+            return str(pipe["fb_g2l_base"])
         return final
 
     def _relay_in_local_topic(topic: str) -> str:
@@ -1322,21 +1345,34 @@ def _build_status_pipeline_spec(
             final = p.get("final", base)
             forward_final = f"/to_{remote_name}{final}" if use_target_prefix else final
             forward_ns = forward_final.lstrip("/")
-            app_native = f"/{local_name}{base}" if native_have_source_prefix else base
-            app_processed = f"/{local_name}{final}" if native_have_source_prefix else final
+            # The application publishes target-prefixed topics when use_target_prefix
+            # (native_have_outgoing_target_prefix == use_target_prefix, enforced
+            # above), so the native/processed stages -- and relay_out's input -- must
+            # carry that /to_<remote> prefix too, or the status `native` stage and
+            # the relay disagree and nothing forwards.
+            target_pfx = f"/to_{remote_name}" if use_target_prefix else ""
+            app_native = f"{target_pfx}/{local_name}{base}" if native_have_source_prefix else f"{target_pfx}{base}"
+            app_processed = f"{target_pfx}/{local_name}{final}" if native_have_source_prefix else f"{target_pfx}{final}"
             base_type = _safe_type(e, p, fallback_base_type=True)
             final_type = _safe_type(e, p)
+
+            # global_to_local is a receiver-side transform: the sender's application
+            # produces the global (globalframe) topic directly, so its native stage
+            # IS the OTA `final` and there is no sender-side preprocessing stage.
+            is_g2l = p.get("framebridge") == "global_to_local"
+            native_topic = app_processed if is_g2l else app_native
+            native_type = final_type if is_g2l else base_type
 
             stages: List[Dict[str, Any]] = [
                 {
                     "stage": "native",
-                    "topic": app_native,
-                    "type": base_type,
+                    "topic": native_topic,
+                    "type": native_type,
                     "domain": "local",
                     "produced_by": "application",
                 },
             ]
-            if final != base:
+            if final != base and not is_g2l:
                 stages.append(
                     {
                         "stage": "processed",
@@ -1599,9 +1635,15 @@ def _compute_pipeline(
             raise ValueError(f"Unknown framebridge '{framebridge}' for topic '{entry.base}'")
 
         if framebridge == "local_to_global":
+            # Sender-side transform: the globalframe topic is what crosses OTA.
             fb_l2g_in = topic
             topic = topic + globalframe_suffix
         else:
+            # global_to_local runs on the RECEIVER: the sender ships the global
+            # (globalframe) topic -- which IS the OTA `final` -- and the receiver's
+            # framebridge transforms it down to the local base topic (its native_in,
+            # see _postprocessed_topic). The center application produces the global
+            # topic directly, so there is no sender-side processing stage.
             fb_g2l_base = entry.base
             topic = entry.base + globalframe_suffix
 
@@ -1903,10 +1945,11 @@ def func(
         items.append(("use_zenoh_rmw", _is_native_zenoh_ota(ota.impl) or local.impl == "zenoh"))
         # zenoh_bridge_ros2dds router (Z2D window): enabled for OTA only.
         items.append(("use_zenoh_ros2dds", ota.impl == "zenoh_ros2dds"))
-        if ota.dds_config:
-            items.append(("ota_config_template", ota.dds_config))
+        ota_dds_config = ota.dds_config or _DDS_OTA_DEFAULT_CONFIG.get(ota.impl or "")
+        if ota_dds_config:
+            items.append(("ota_config_template", ota_dds_config))
             items.append(("ota_config_file", "${peer_dir}/ota_dds.xml"))
-            if ota.impl == "fastdds" and ota.dds_config == "fastdds_easy_mode.xml":
+            if ota.impl == "fastdds" and ota_dds_config == "fastdds_easy_mode.xml":
                 items.append(
                     (
                         "ota_easy_mode_ip",
@@ -2091,6 +2134,12 @@ def func(
         raise RuntimeError(f"shared.processing_suffixes must be a mapping if provided, got {type(suffixes)}")
     restamped_suffix = str(suffixes.get("restamped", "/restamped"))
     latched_suffix = str(suffixes.get("latched", "/latched"))
+    # Latch keepalive (OPT-IN, default OFF). The latch is on-change by design --
+    # that is the bandwidth feature, so we do NOT re-stream static values by
+    # default. This is only an escape hatch for an OTA path that cannot carry the
+    # held value via transient_local: set shared.latch_keepalive_hz > 0 to re-assert
+    # each held value at that rate. Prefer fixing transient_local delivery instead.
+    latch_keepalive_hz = shared.get("latch_keepalive_hz", 0.0) if isinstance(shared, dict) else 0.0
     globalframe_suffix = str(suffixes.get("framebridge_global", "/globalframe"))
     ota_suffix = str(suffixes.get("ota_stamped", "/ota_stamped"))
 
@@ -2295,6 +2344,10 @@ def func(
     # ---------------------------
     dir_topic_list: Dict[Tuple[str, str], List[str]] = {}
     dir_topic_list_with_types: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    # Effective durability of each forwarded topic (by its final name), so the
+    # domain_bridge can preserve transient_local instead of auto-detecting it
+    # (which races the publisher and defaults to volatile).
+    dir_durability: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
     for (src, dst), direction_key in direction_key_for.items():
         pos = _hb_position(direction_key)
         hb = hb_topic.get(src, "")
@@ -2311,6 +2364,10 @@ def func(
                 hb,
                 pos,
             )
+            dir_durability[(src, dst)] = {
+                p["final"]: ((e.qos or {}).get("durability") if isinstance(e.qos, dict) else None)
+                for e, p in zip(dir_entries[(src, dst)], dir_pipes[(src, dst)])
+            }
 
     # ---------------------------
     # Per-peer plugin.yaml generation
@@ -2580,23 +2637,37 @@ def func(
             ldid = peer_local_domain_id[local]
             assert ldid is not None and ota_domain_id is not None
 
+            def _db_entry(msg_type: str, from_domain: int, to_domain: int, durability: Optional[str]) -> Dict[str, Any]:
+                entry: Dict[str, Any] = {
+                    "type": msg_type,
+                    "from_domain": from_domain,
+                    "to_domain": to_domain,
+                }
+                # The stock domain_bridge auto-detects QoS from the live publisher
+                # and races it, defaulting to volatile -- which drops a transient_local
+                # held value (latched/static one-shots) and mismatches the
+                # transient_local OTA subscriber. Pin transient_local so the bridge
+                # carries the held value across domains. Volatile streams are left to
+                # the default (best_effort), which crosses fine.
+                if durability == "transient_local":
+                    entry["qos"] = {"durability": "transient_local", "reliability": "reliable"}
+                return entry
+
+            out_durability = dir_durability.get((local, remote), {})
+            in_durability = dir_durability.get((remote, local), {})
             domain_bridge_topics: Dict[str, Dict[str, Any]] = {}
             if out_enabled:
                 for topic_name, msg_type in out_list_with_types:
                     forward_topic = f"/to_{peer_name[remote]}{topic_name}" if use_target_prefix else topic_name
-                    domain_bridge_topics[_com_topic("out", peer_name[local], forward_topic)] = {
-                        "type": msg_type,
-                        "from_domain": ldid,
-                        "to_domain": ota_domain_id,
-                    }
+                    domain_bridge_topics[_com_topic("out", peer_name[local], forward_topic)] = _db_entry(
+                        msg_type, ldid, ota_domain_id, out_durability.get(topic_name)
+                    )
             if in_enabled:
                 for topic_name, msg_type in in_list_with_types:
                     forward_topic = f"/to_{peer_name[local]}{topic_name}" if remote_uses_target_prefix else topic_name
-                    domain_bridge_topics[_com_topic("in", peer_name[remote], forward_topic)] = {
-                        "type": msg_type,
-                        "from_domain": ota_domain_id,
-                        "to_domain": ldid,
-                    }
+                    domain_bridge_topics[_com_topic("in", peer_name[remote], forward_topic)] = _db_entry(
+                        msg_type, ota_domain_id, ldid, in_durability.get(topic_name)
+                    )
 
             if domain_bridge_topics:
                 per_peer_domain_bridge_yaml[local] = _render_domain_bridge_yaml(
@@ -2716,6 +2787,9 @@ def func(
                         ("lat", True),
                         ("lat_topics", ",".join(lat_topics)),
                         ("lat_topic_suffix", latched_suffix),
+                        # Keep latched statics alive as a low-rate stream so the
+                        # held value actually crosses the OTA pipeline.
+                        ("lat_keepalive_hz", latch_keepalive_hz),
                     ],
                 )
             )

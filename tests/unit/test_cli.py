@@ -1011,6 +1011,9 @@ def test_start_and_stop_scenario_manage_manifest_and_component_order(
         rosotacom, "_create_scenario_tmux", lambda *args, **kwargs: calls.append("tmux-start") or "demo-a"
     )
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "detached")
+    # Detached scenario start now blocks until the comm container is ready
+    # (parity with start_session); the readiness probe is irrelevant here.
+    monkeypatch.setattr(rosotacom, "_wait_for_container_ready", lambda *args, **kwargs: None)
 
     args = argparse.Namespace(
         scenario="demo",
@@ -1707,6 +1710,59 @@ def test_smoke_crossed_topics_include_native_chatter_direction() -> None:
     assert "export ROS_DOMAIN_ID=47" in rosotacom._smoke_ros_setup("/config", cfg, "b")
 
 
+def test_smoke_native_publish_rate_override() -> None:
+    # A rate-changing feature drives its source from expect.smoke_native_hz, not
+    # the (lower) asserted received bounds.
+    assert rosotacom._smoke_native_publish_rate({"smoke_native_hz": 10, "hz": {"min": 3, "max": 7}}) == 10.0
+    # Without the override it falls back to the derived rate (midpoint of bounds).
+    assert rosotacom._smoke_native_publish_rate({"hz": {"min": 4, "max": 6}}) == 5.0
+
+
+def test_drop_example_source_publishes_at_native_rate() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "8_drop" / "session-definition.yaml").read_text(encoding="utf-8")
+    )
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, "a") if s.publish_topic]
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.publish_topic == "/drop_demo"
+    # Source runs at the declared native 10 Hz so drop 1-of-2 yields the asserted ~5 Hz.
+    assert spec.publish_rate == 10.0
+    assert (spec.hz_min, spec.hz_max) == (3, 7)
+
+
+def test_restamp_example_uses_stale_stamped_header_source() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "10_restamp" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, "a") if s.publish_topic]
+    assert len(specs) == 1
+    assert specs[0].publish_topic == "/restamp_demo"
+    assert specs[0].publish_type == "geometry_msgs/msg/PointStamped"
+    # The synthetic message carries a stale (1970) stamp so restamp has an effect.
+    msg = rosotacom._smoke_publish_message("geometry_msgs/msg/PointStamped")
+    assert "sec: 1000" in msg and "point" in msg
+
+
+def test_trickle_example_asserts_the_trickle_output_stage() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "11_trickle" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    specs = [s for s in rosotacom._received_crossed_topics(cfg, "a") if s.publish_topic]
+    assert len(specs) == 1
+    spec = specs[0]
+    # Source publishes the base topic at 1 Hz...
+    assert spec.publish_topic == "/trickle_demo"
+    assert spec.publish_rate == 1.0
+    # ...but the asserted received stage is the receiver-side trickle re-publish.
+    assert spec.topic == "/trickle_demo/trickle"
+    assert (spec.hz_min, spec.hz_max) == (2, 8)
+
+
 def test_publish_test_topics_command_starts_and_stops_identity_publishers(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1912,3 +1968,42 @@ def test_create_session_yaml_injects_catmux_logging_command(tmp_path: Path) -> N
     assert "catmux_log_setup.sh" in before_commands[0]
     assert "ROSOTACOM_CATMUX_LOG_DIR=/session/instances/run/logs/a/catmux" in before_commands[0]
     assert before_commands[1] == "echo existing"
+
+
+# --- content integrity (RFC 0002 replay-only) ---------------------------------
+
+
+def test_content_matches_normalizes_quotes_and_separator() -> None:
+    assert rosotacom.content_matches("rosotacom smoke\n", "rosotacom smoke")
+    assert rosotacom.content_matches("'rosotacom smoke'\n---", "rosotacom smoke")
+    assert rosotacom.content_matches('"hello"', "hello")
+    assert not rosotacom.content_matches("corrupted", "rosotacom smoke")
+    assert not rosotacom.content_matches("", "rosotacom smoke")
+
+
+def test_smoke_expected_field_extracts_string_payload() -> None:
+    assert rosotacom._smoke_expected_field("std_msgs/msg/String", "data") == "rosotacom smoke"
+    # A field the synthetic payload doesn't have -> None (skip the check).
+    assert rosotacom._smoke_expected_field("std_msgs/msg/String", "nope") is None
+
+
+def test_content_integrity_specs_selects_passthrough_string() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "12_content_integrity" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    specs = rosotacom._content_integrity_specs(cfg, "a")
+    assert specs == [("/integrity_demo", "std_msgs/msg/String", "data", "rosotacom smoke")]
+    # b receives nothing in this one-directional example.
+    assert rosotacom._content_integrity_specs(cfg, "b") == []
+
+
+def test_content_integrity_skips_transformed_topics() -> None:
+    # 10_restamp transforms (restamp) so the received topic != base -> not byte-equal.
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "10_restamp" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert rosotacom._content_integrity_specs(cfg, "a") == []

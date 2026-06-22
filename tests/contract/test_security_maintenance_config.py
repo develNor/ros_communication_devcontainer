@@ -95,6 +95,13 @@ def test_local_check_derivation_and_generated_rmw_matrix_drive_test_configs() ->
         "4_comp_occ_grid_zen",
         "5_sized_payload",
         "6_sized_payload_zen",
+        "7_latched_static",
+        "8_drop",
+        "9_throttle",
+        "10_restamp",
+        "11_trickle",
+        "12_content_integrity",
+        "13_link_latency",
     }
     assert set(ota_suite_sessions(examples_dir)) == set(local_check_sessions(examples_dir))
 

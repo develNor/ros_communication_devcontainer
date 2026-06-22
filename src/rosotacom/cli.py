@@ -1355,6 +1355,17 @@ def _ota_run(
     return result
 
 
+def _ota_print_failure_output(label: str, result: subprocess.CompletedProcess[str]) -> None:
+    """Echo a failed verify step's captured output so OTA smoke failures are
+    diagnosable. ``_ota_run`` captures stdout/stderr for non-tty steps and, for
+    ``check=False`` verify calls, never surfaces them on its own."""
+    detail = ((result.stdout or "") + (result.stderr or "")).strip()
+    if detail:
+        print(f"--- {label} output (exit {result.returncode}) ---", file=sys.stderr)
+        print(detail, file=sys.stderr)
+        print(f"--- end {label} output ---", file=sys.stderr)
+
+
 def _ota_project_cli_args(plan: OtaSmokePlan) -> list[str]:
     return ["--rosotacom-config", plan.project]
 
@@ -1536,6 +1547,34 @@ def _ota_probe_check_parts(target: InteractiveSmokeTarget, identity: str, peer_a
         ISOLATION_PROBE_TOPIC,
         "--expect",
         "absent",
+    ]
+    for override in peer_args:
+        parts.extend(["--peer-address", override])
+    return parts
+
+
+def _ota_content_check_parts(
+    target: InteractiveSmokeTarget,
+    identity: str,
+    peer_args: list[str],
+    topic: str,
+    msg_type: str,
+    field: str,
+    expected: str,
+) -> list[str]:
+    parts = [
+        "probe-content",
+        _ota_target_session_arg(target),
+        "--identity",
+        identity,
+        "--topic",
+        topic,
+        "--type",
+        msg_type,
+        "--field",
+        field,
+        "--expect",
+        expected,
     ]
     for override in peer_args:
         parts.extend(["--peer-address", override])
@@ -1960,6 +1999,7 @@ def _ota_verify_delivery(
         command = _ota_rosotacom_command(plan, _ota_test_parts(target, instance_id))
         result = _ota_run(peer, command, label=f"{peer_name}: rosotacom test", dry_run=dry_run, check=False)
         if result.returncode != 0:
+            _ota_print_failure_output(f"{peer_name}: rosotacom test", result)
             errors.append(f"{peer_name}: rosotacom test failed")
     return errors
 
@@ -1979,6 +2019,7 @@ def _ota_verify_isolation(
     publish = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=False))
     published = _ota_run(source, publish, label=f"{source_name}: publish isolation probe", dry_run=dry_run, check=False)
     if published.returncode != 0:
+        _ota_print_failure_output(f"{source_name}: publish isolation probe", published)
         errors.append(f"{source_name}: isolation probe publisher failed")
         return errors
     check = _ota_rosotacom_command(plan, _ota_probe_check_parts(target, receiver_name, peer_args))
@@ -1990,9 +2031,35 @@ def _ota_verify_isolation(
         check=False,
     )
     if checked.returncode != 0:
+        _ota_print_failure_output(f"{receiver_name}: check isolation probe absent", checked)
         errors.append(f"{receiver_name}: isolation probe crossed OTA boundary")
     stop = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=True))
     _ota_run(source, stop, label=f"{source_name}: stop isolation probe", dry_run=dry_run, check=False)
+    return errors
+
+
+def _ota_verify_content_integrity(
+    target: InteractiveSmokeTarget,
+    plan: OtaSmokePlan,
+    cfg: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> list[str]:
+    """For each peer's PASS-THROUGH String topic, assert the delivered payload is
+    byte-identical to what the sender published (the synthetic publishers are still
+    running from the test phase, so their known payload is the ground truth)."""
+    peer_args = _ota_peer_address_args(plan)
+    errors: list[str] = []
+    for receiver_name, receiver in plan.peers.items():
+        for topic, msg_type, field, expected in _content_integrity_specs(cfg, receiver_name):
+            parts = _ota_content_check_parts(target, receiver_name, peer_args, topic, msg_type, field, expected)
+            cmd = _ota_rosotacom_command(plan, parts)
+            result = _ota_run(
+                receiver, cmd, label=f"{receiver_name}: content integrity {topic}", dry_run=dry_run, check=False
+            )
+            if result.returncode != 0:
+                _ota_print_failure_output(f"{receiver_name}: content integrity {topic}", result)
+                errors.append(f"{receiver_name}: content integrity mismatch on {topic}")
     return errors
 
 
@@ -2350,6 +2417,7 @@ def _start_noninteractive_ota_smoke(args: argparse.Namespace) -> int:
         _ota_start_session_publishers(target, plan, dry_run=dry_run)
         errors += _ota_verify_delivery(target, plan, instance.instance_id, dry_run=dry_run)
         errors += _ota_verify_isolation(target, plan, dry_run=dry_run)
+        errors += _ota_verify_content_integrity(target, plan, target.cfg, dry_run=dry_run)
         if errors:
             raise RuntimeError("OTA smoke verification failed:\n  - " + "\n  - ".join(errors))
         print("OTA SMOKE OK")
@@ -3225,9 +3293,11 @@ def _resolve_scenario_context(
         raise RuntimeError("Missing --identity. Provide --identity <peer> or allow auto identity.")
     if identity not in peers:
         raise RuntimeError(f"--identity must be one of peers={list(peers.keys())}")
-    applications = definition.applications.get(identity)
-    if applications is None:
-        raise RuntimeError(f"Scenario '{resolved.name}' has no applications entry for identity '{identity}'.")
+    # A scenario peer may legitimately run no local application -- a pure
+    # receiver (e.g. remote_assist's `center`/a only consumes OTA telemetry).
+    # `identity in peers` already validated it is a real peer, so a missing
+    # applications entry just means "communication session only".
+    applications = definition.applications.get(identity, ())
     return runtime, resolved, definition, session, cfg, identity, applications
 
 
@@ -3381,6 +3451,15 @@ def start_scenario(args: argparse.Namespace) -> int:
     if mode == "attach":
         subprocess.run(_tmux_command(runtime, "attach-session", "-t", created_session), check=True)
     else:
+        # Parity with `start_session` (detached): the catmux session builds the
+        # image and ROS workspace asynchronously, so a bare detached start would
+        # return before the communication bridge is up. Block until the comm
+        # container has sourced its overlay so callers (the OTA smoke harness in
+        # particular) verify against a ready bridge instead of racing a cold
+        # image/workspace build. Generous ceiling: a scenario may build both the
+        # communication and application images from scratch on a first run.
+        print(f"Waiting for communication container to become ready: {communication_container}")
+        _wait_for_container_ready(communication_container, timeout_s=600)
         print("Attach with: rosotacom scenario attach")
     return 0
 
@@ -3938,6 +4017,11 @@ def _smoke_topic_pipeline(cfg: dict[str, Any], entry: Any) -> dict[str, Any]:
 
 
 def _smoke_postprocessed_topic(entry: Any, pipe: dict[str, Any]) -> str:
+    if pipe.get("trickle_hz") is not None:
+        # Mirror generate_session_files._postprocessed_topic: the receiver-side
+        # trickle republishes the delivered topic at <final>/trickle, and that is
+        # the stage the smoke should drive/assert.
+        return str(pipe["final"]) + "/trickle"
     if pipe.get("compress"):
         return str(pipe["comp_in"])
     if pipe.get("ota_wrap"):
@@ -3967,6 +4051,20 @@ def _smoke_publish_rate(expect: Any) -> float:
     if hz_max is not None:
         return max(0.5, hz_max / 2.0)
     return 5.0
+
+
+def _smoke_native_publish_rate(expect: Any) -> float:
+    """The rate the synthetic source should publish the NATIVE topic at.
+
+    For rate-preserving topics this is derived from the expect hz bounds. But a
+    rate-changing feature (drop/throttle) needs the native rate to be HIGHER than
+    the asserted (received) rate, so an example may declare `expect.smoke_native_hz`
+    to drive the source faster than the post-processing bounds it asserts."""
+    if isinstance(expect, dict):
+        native_hz = expect.get("smoke_native_hz")
+        if native_hz is not None:
+            return float(native_hz)
+    return _smoke_publish_rate(expect)
 
 
 def _smoke_rmw_spec(cfg: dict[str, Any]) -> Any:
@@ -4122,7 +4220,7 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
                         ),
                         publish_topic=entry.base,
                         publish_type=entry.msg_type,
-                        publish_rate=_smoke_publish_rate(entry.expect),
+                        publish_rate=_smoke_native_publish_rate(entry.expect),
                         hz_min=expect_hz_min,
                         hz_max=expect_hz_max,
                         max_delay_s=expect_max_delay_s,
@@ -4197,7 +4295,41 @@ def _smoke_publish_message(msg_type: str) -> str:
             "info: {resolution: 0.5, width: 4, height: 4, origin: {orientation: {w: 1.0}}}, "
             "data: [0, 0, 0, 0, 0, 25, 50, 0, 0, 50, 100, 0, -1, -1, -1, -1]}"
         )
+    if normalized in {"geometry_msgs/msg/PointStamped", "geometry_msgs/PointStamped"}:
+        # A deliberately STALE header.stamp (epoch+1000s == 1970) so the restamp
+        # example is meaningful: without restamp the monitor sees an absurd age and
+        # guards it to None (a latency_ms contract then fails); restamp rewrites the
+        # stamp to "now" at send time, making OTA latency small and measurable.
+        return "{header: {stamp: {sec: 1000, nanosec: 0}, frame_id: map}, point: {x: 1.0}}"
     raise RuntimeError(f"Smoke cannot synthesize a publisher for message type {msg_type!r}.")
+
+
+def _smoke_expected_field(msg_type: str, field: str) -> str | None:
+    """The value of `field` in the synthetic payload this peer publishes for `msg_type`,
+    used as the content-integrity ground truth (what the receiver should observe)."""
+    try:
+        msg = yaml.safe_load(_smoke_publish_message(msg_type))
+    except (RuntimeError, yaml.YAMLError):
+        return None
+    return str(msg[field]) if isinstance(msg, dict) and field in msg else None
+
+
+def _content_integrity_specs(cfg: dict[str, Any], receiver_peer_key: str) -> list[tuple[str, str, str, str]]:
+    """(topic, msg_type, field, expected) for the receiver's PASS-THROUGH String topics.
+
+    Content integrity requires byte-equality, which only holds without a payload
+    transform -- so we take crossed topics whose received name equals the published
+    base (no restamp/framebridge/compress suffix) and whose payload field is known."""
+    out: list[tuple[str, str, str, str]] = []
+    for spec in _received_crossed_topics(cfg, receiver_peer_key):
+        if not spec.publish_topic or spec.publish_type not in {"std_msgs/msg/String", "std_msgs/String"}:
+            continue
+        if spec.topic != spec.publish_topic:  # a transform ran -> not byte-equal
+            continue
+        expected = _smoke_expected_field(spec.publish_type, "data")
+        if expected is not None:
+            out.append((spec.topic, spec.publish_type, "data", expected))
+    return out
 
 
 def _smoke_publisher_command(spec: SmokeTopicSpec, ros_setup: str, duration: float) -> str:
@@ -4495,6 +4627,53 @@ def probe_check_command(args: argparse.Namespace) -> int:
     return 0 if present == (args.expect == "present") else 1
 
 
+def _normalize_echo_value(text: str) -> str:
+    """The scalar value from a `ros2 topic echo --once --field <f>` output: the first
+    meaningful line, with the message separator and one layer of quotes removed."""
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s or s == "---":
+            continue
+        if len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]:
+            s = s[1:-1]
+        return s
+    return ""
+
+
+def content_matches(echo_stdout: str, expected: str) -> bool:
+    """True if a topic-echo'd field byte-equals the expected sent value (pure)."""
+    return _normalize_echo_value(echo_stdout) == str(expected).strip()
+
+
+def _topic_echo_field_once(
+    container: str, ros_setup: str, topic: str, msg_type: str, field: str, *, timeout_s: int = 20
+) -> str:
+    """Capture one delivered message's field via `ros2 topic echo --once`."""
+    cmd = (
+        f"{ros_setup} && timeout -k 2 {timeout_s} ros2 topic echo --once "
+        f"{shlex.quote(topic)} {shlex.quote(msg_type)} --field {shlex.quote(field)}"
+    )
+    return _run_container_shell(container, cmd, timeout_s=_TOPIC_PROBE_EXEC_TIMEOUT_S).stdout or ""
+
+
+def probe_content_command(args: argparse.Namespace) -> int:
+    """Content integrity: assert a delivered topic's field byte-equals an expected value.
+
+    Echoes one message of the delivered topic on this (receiver) peer and compares a
+    field to --expect. For a pass-through topic (no restamp/framebridge/compress) the
+    OTA must deliver the payload byte-identical, so this catches silent corruption /
+    truncation / a wrong serialization that a presence or rate check would miss."""
+    container, ros_setup, _ = _resolve_running_peer(args, args.identity)
+    captured = _topic_echo_field_once(container, ros_setup, args.topic, args.type, args.field)
+    ok = content_matches(captured, args.expect)
+    got = _normalize_echo_value(captured)
+    print(
+        f"{args.topic}.{args.field} in {container} (identity {args.identity}): "
+        f"got {got!r}, expected {args.expect!r} -> {'OK' if ok else 'MISMATCH'}"
+    )
+    return 0 if ok else 1
+
+
 def publish_test_topics_command(args: argparse.Namespace) -> int:
     """Start or stop synthetic local app publishers for the peer's crossed topics.
 
@@ -4538,6 +4717,45 @@ def _load_status_reports(logs_dir: Path) -> dict[str, Any]:
     return reports
 
 
+def calibrate_command(args: argparse.Namespace) -> int:
+    """Report a replay bag's per-topic ground truth and (optionally) validate a
+    session's `expect` against it -- the replay-only "contract calibration" of
+    docs/rfcs/0002. Pure: reads only the bag's metadata.yaml, runs nothing."""
+    from . import bag_ground_truth, status_eval
+
+    gt = bag_ground_truth.bag_ground_truth(args.bag)
+    if not gt:
+        print(f"No topics found in bag metadata: {args.bag}", file=sys.stderr)
+        return 1
+
+    width = max(len(t) for t in gt)
+    print(f"Bag ground truth ({len(gt)} topics) from {args.bag}:")
+    for topic in sorted(gt):
+        g = gt[topic]
+        hz = f"{g['native_hz']:.1f} Hz" if g["native_hz"] is not None else "   -   "
+        print(
+            f"  {topic:<{width}}  {g['count']:>7} msgs  {hz:>10}  "
+            f"{(g.get('durability') or ''):<16} {g.get('msg_type') or ''}"
+        )
+
+    warnings: list[str] = []
+    session_dir = getattr(args, "session_dir", None)
+    if session_dir:
+        runtime = _load_runtime_config(args)
+        session = _resolve_session(session_dir, runtime)
+        cfg = _effective_session_config(session.host_dir, runtime)
+        expect_by_topic = status_eval.expectations_from_cfg(cfg)
+        warnings = bag_ground_truth.validate_expect_against_bag(expect_by_topic, gt)
+        print()
+        if warnings:
+            print(f"CALIBRATION WARNINGS ({len(warnings)}):")
+            for w in warnings:
+                print(f"  ! {w}")
+        else:
+            print(f"OK: {len(expect_by_topic)} topic expectation(s) are consistent with the bag.")
+    return 1 if warnings else 0
+
+
 def test_command(args: argparse.Namespace) -> int:
     """Assert a running/recent session meets its status + per-topic `expect` contract.
 
@@ -4555,13 +4773,31 @@ def test_command(args: argparse.Namespace) -> int:
     deadline = time.time() + max(0.0, float(getattr(args, "timeout", 30.0)))
     interval = max(0.5, float(getattr(args, "interval", 2.0)))
     expect_by_topic = status_eval.expectations_from_cfg(cfg)
+    link_expect = status_eval.link_expect_from_cfg(cfg)
+    ground_truth: dict[str, Any] | None = None
+    bag = getattr(args, "bag", None)
+    if bag:
+        from . import bag_ground_truth
+
+        ground_truth = bag_ground_truth.bag_ground_truth(bag)
     reports: dict[str, Any] = {}
     failures: list[str] = []
+
+    # --suggest: emit a starter `expect` block from the current run instead of asserting.
+    if getattr(args, "suggest", False):
+        reports = _load_status_reports(logs_dir) if logs_dir.is_dir() else {}
+        if not reports:
+            print(f"rosotacom test --suggest: no status.json under {logs_dir}.", file=sys.stderr)
+            return 1
+        suggestions = status_eval.suggest_expectations(reports)
+        print("# Suggested expect blocks from this run (author/narrow before committing):")
+        print(yaml.safe_dump(suggestions, sort_keys=True, default_flow_style=False).rstrip())
+        return 0
 
     while True:
         reports = _load_status_reports(logs_dir) if logs_dir.is_dir() else {}
         if reports:
-            failures = status_eval.evaluate_reports(reports, expect_by_topic)
+            failures = status_eval.evaluate_reports(reports, expect_by_topic, link_expect, ground_truth)
             if not failures:
                 topic_count = sum(len(r.get("topics", [])) for r in reports.values())
                 print(f"TEST OK: {len(reports)} peer(s), {topic_count} topic(s) meet status + expectations")
@@ -5499,9 +5735,11 @@ def main(argv: list[str] | None = None) -> int:
         "ota-smoke",
         "status",
         "test",
+        "calibrate",
         "verify",  # retired; keep guarded so it is not rewritten as `start verify`.
         "probe-publish",
         "probe-check",
+        "probe-content",
         "publish-test-topics",
         "list-sessions",
         "scenario",
@@ -5633,7 +5871,25 @@ def main(argv: list[str] | None = None) -> int:
     test_parser.add_argument("--instance-id", help="Evaluate a specific instance id (default: most recent).")
     test_parser.add_argument("--timeout", type=float, default=30.0, help="Seconds to wait for status to settle.")
     test_parser.add_argument("--interval", type=float, default=2.0, help="Polling interval while waiting (s).")
+    test_parser.add_argument(
+        "--bag",
+        help="Replay bag dir/metadata.yaml: enables completeness.vs_bag_ratio assertions against the native rate.",
+    )
+    test_parser.add_argument(
+        "--suggest",
+        action="store_true",
+        help="Print a suggested `expect` block per topic from the current run instead of asserting.",
+    )
     test_parser.set_defaults(func=test_command)
+
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="Report a replay bag's per-topic ground truth and validate a session's expect against it.",
+    )
+    _add_common_config_args(calibrate_parser)
+    calibrate_parser.add_argument("--bag", required=True, help="Path to a rosbag2 bag directory or its metadata.yaml.")
+    _add_session_arg(calibrate_parser, "session_dir", nargs="?", default=None)
+    calibrate_parser.set_defaults(func=calibrate_command)
 
     probe_publish_parser = subparsers.add_parser(
         "probe-publish", help="Publish a local-only probe topic in a running peer's local domain (isolation)."
@@ -5662,6 +5918,21 @@ def main(argv: list[str] | None = None) -> int:
     probe_check_parser.add_argument("--topic", default=ISOLATION_PROBE_TOPIC)
     probe_check_parser.add_argument("--expect", choices=["present", "absent"], default="absent")
     probe_check_parser.set_defaults(func=probe_check_command)
+
+    probe_content_parser = subparsers.add_parser(
+        "probe-content",
+        help="Content integrity: assert a delivered topic's field byte-equals an expected value.",
+    )
+    _add_common_config_args(probe_content_parser)
+    _add_session_arg(probe_content_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
+    _add_identity_arg(probe_content_parser, required=True)
+    _add_peer_address_arg(probe_content_parser)
+    probe_content_parser.add_argument("--instance-id")
+    probe_content_parser.add_argument("--topic", required=True, help="Delivered topic to inspect on this peer.")
+    probe_content_parser.add_argument("--type", required=True, help="Message type (e.g. std_msgs/msg/String).")
+    probe_content_parser.add_argument("--field", default="data", help="Message field to compare (default: data).")
+    probe_content_parser.add_argument("--expect", required=True, help="Expected byte value of the field.")
+    probe_content_parser.set_defaults(func=probe_content_command)
 
     publish_test_topics_parser = subparsers.add_parser(
         "publish-test-topics",

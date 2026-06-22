@@ -83,10 +83,11 @@ rosotacom smoke 2_native_chatter --interactive --stop
 ```
 
 This opens an outer tmux session with full windows for each peer's communication
-container, each scenario application, and a verification/status view. Scenario
-applications share their peer communication container's isolated network
-namespace. The outer prefix is `Ctrl-b`; use `Ctrl-b Ctrl-b` for the inner
-catmux sessions.
+container, each scenario application, and a verification/status view. The
+verification window keeps the check log in one pane and live status in another.
+Scenario applications share their peer communication container's isolated
+network namespace. The outer prefix is `Ctrl-b`; use `Ctrl-b Ctrl-b` for the
+inner catmux sessions.
 
 ## Two-machine runs
 

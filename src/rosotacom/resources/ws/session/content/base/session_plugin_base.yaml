@@ -331,10 +331,12 @@ windows:
         - ros2 run com_py topic_monitor --ros-args -p sourcename:=${local_name} -p direction:=out -p to_adressant:='${tm_out_to_adressant}' -p ip_local:=${ip_local} -p ip_remote:=${ip_remote} -p interface:=${interface} -p link_duration_buffer_s:=${tm_link_duration_buffer_s}
   - name: STAT
     if: status_overview
+    layout: even-vertical
     splits:
       - commands:
         - status_out_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/status"
         - mkdir -p "$status_out_dir"
+        - echo "[INFO] starting status_overview node; writing $status_out_dir/status.{json,txt}"
         # Pass the local OTA address; the node resolves the link interface from it
         # for link-overhead measurement (empty address -> `link` block stays null).
         - ros2 run com_py status_overview --ros-args
@@ -344,6 +346,10 @@ windows:
             -p liveness_window_s:=${status_liveness_window_s}
             -p stale_after_s:=${status_stale_after_s}
             -p ota_local_ip:=${ip_local}
+      - commands:
+        - status_out_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/status"
+        - status_txt="$status_out_dir/status.txt"
+        - while true; do clear; echo "[INFO] watching status overview file: $status_txt"; if [ -f "$status_txt" ]; then cat "$status_txt"; else echo "[INFO] waiting for status_overview to write status.txt"; fi; sleep "${status_write_interval_s:-2.0}"; done
   - name: NET
     if: network_monitor
     splits:

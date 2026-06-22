@@ -10,9 +10,12 @@ ros2docker remains the generic Docker runner underneath.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import importlib.resources as importlib_resources
 import importlib.util
+import io
 import json
 import os
 import re
@@ -20,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from collections.abc import Callable
@@ -2307,16 +2311,56 @@ def _ota_collect_logs(
         'relative=${instance_dir#"$project_dir"/}; '
         'tar cz -C "$project_dir" "$relative" 2>/dev/null | base64; fi'
     )
-    out_dir = instance.logs_host_dir / "ota-smoke"
-    out_dir.mkdir(parents=True, exist_ok=True)
     for peer in plan.peers.values():
         result = _ota_run(peer, script, label=f"{peer.name}: collect session-instances", dry_run=dry_run, check=False)
         if dry_run or not result.stdout.strip():
             continue
-        (out_dir / f"{_safe_path_token(peer.name)}-session-instances.tar.gz.b64").write_text(
-            result.stdout,
-            encoding="utf-8",
-        )
+        _ota_extract_peer_artifacts(instance, peer, result.stdout)
+
+
+def _ota_extract_peer_artifacts(instance: SessionInstance, peer: OtaSmokePeer, encoded: str) -> None:
+    """Extract a peer's base64 ``session-instances/<date>/<name>`` tarball into the
+    local instance directory, reproducing the layout a local run writes
+    (``config/<id>``, ``logs/<id>/{catmux,status,launcher.log,...}``).
+
+    Each peer host names its instance directory with its own timestamp (only the
+    instance-id suffix matches), so the leading ``session-instances/<date>/<name>/``
+    prefix (3 path components) is stripped rather than matched. The per-peer
+    ``manifest.yaml`` is skipped so the orchestration manifest is preserved.
+    """
+    try:
+        raw = base64.b64decode(encoded, validate=False)
+    except (binascii.Error, ValueError):
+        print(f"OTA smoke: could not decode collected artifacts from peer {peer.name}", file=sys.stderr)
+        return
+    dest_root = instance.host_dir.resolve()
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+            for member in archive.getmembers():
+                parts = [part for part in member.name.split("/") if part not in ("", ".")]
+                if len(parts) <= 3:
+                    continue  # the stripped session-instances/<date>/<name> prefix itself
+                rel = Path(*parts[3:])
+                if str(rel) == "manifest.yaml":
+                    continue
+                target = (dest_root / rel).resolve()
+                try:
+                    target.relative_to(dest_root)
+                except ValueError:
+                    continue  # refuse paths escaping the instance directory
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isreg():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                with extracted, target.open("wb") as handle:
+                    shutil.copyfileobj(extracted, handle)
+    except tarfile.TarError:
+        print(f"OTA smoke: could not unpack collected artifacts from peer {peer.name}", file=sys.stderr)
 
 
 def _ota_stop_peers(
@@ -2387,22 +2431,6 @@ def _ota_application_run_script(
     )
 
 
-def _ota_status_parts(target: InteractiveSmokeTarget, instance_id: str, identity: str, *, watch: bool) -> list[str]:
-    parts = ["status", _ota_target_session_arg(target), "--identity", identity, "--instance-id", instance_id]
-    if watch:
-        parts.append("--watch")
-    return parts
-
-
-def _ota_status_watch_script(
-    plan: OtaSmokePlan,
-    target: InteractiveSmokeTarget,
-    instance_id: str,
-    peer_name: str,
-) -> str:
-    return _ota_rosotacom_command(plan, _ota_status_parts(target, instance_id, peer_name, watch=True))
-
-
 def _ota_create_tmux(
     runtime: RuntimeConfig,
     target: InteractiveSmokeTarget,
@@ -2424,7 +2452,7 @@ def _ota_create_tmux(
         "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
         f"{first_start}; "
         "echo; "
-        f"echo '[INFO] remote peer {first_peer.name} communication exited; live status is in the lower pane'; "
+        f"echo '[INFO] remote peer {first_peer.name} communication exited'; "
         "exec bash"
     )
     created = subprocess.run(
@@ -2484,29 +2512,6 @@ def _ota_create_tmux(
         first_pane,
         instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-communication.log",
     )
-    first_status = _ota_status_watch_script(plan, target, instance.instance_id, first_peer.name)
-    first_status_script = (
-        f"echo '[INFO] starting live remote status watch for {first_peer.name}'; "
-        f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
-        f"exec {first_status}"
-    )
-    _create_tmux_split_below(
-        runtime,
-        first_pane,
-        f"{first_peer.name}:status",
-        _ota_quote_cmd(_ota_remote_argv(first_peer, first_status_script, tty=bool(first_peer.ssh))),
-        log_path=instance.logs_host_dir / "ota-smoke" / f"{first_peer.name}-status.log",
-    )
-    subprocess.run(
-        _tmux_command(
-            runtime,
-            "select-layout",
-            "-t",
-            f"{session_name}:{_safe_path_token(f'{first_peer.name}_communication')}",
-            "even-vertical",
-        ),
-        check=True,
-    )
 
     for peer in peers[1:]:
         start = _ota_rosotacom_command(
@@ -2519,7 +2524,7 @@ def _ota_create_tmux(
             "echo '[INFO] this pane attaches to the peer communication/catmux session'; "
             f"{start}; "
             "echo; "
-            f"echo '[INFO] remote peer {peer.name} communication exited; live status is in the lower pane'; "
+            f"echo '[INFO] remote peer {peer.name} communication exited'; "
             "exec bash"
         )
         created_window = subprocess.run(
@@ -2546,29 +2551,6 @@ def _ota_create_tmux(
             check=True,
         )
         _attach_tmux_pipe(runtime, pane_id, instance.logs_host_dir / "ota-smoke" / f"{peer.name}-communication.log")
-        status = _ota_status_watch_script(plan, target, instance.instance_id, peer.name)
-        status_script = (
-            f"echo '[INFO] starting live remote status watch for {peer.name}'; "
-            f"echo '[INFO] waiting for status artifacts from instance {instance.instance_id}'; "
-            f"exec {status}"
-        )
-        _create_tmux_split_below(
-            runtime,
-            pane_id,
-            f"{peer.name}:status",
-            _ota_quote_cmd(_ota_remote_argv(peer, status_script, tty=bool(peer.ssh))),
-            log_path=instance.logs_host_dir / "ota-smoke" / f"{peer.name}-status.log",
-        )
-        subprocess.run(
-            _tmux_command(
-                runtime,
-                "select-layout",
-                "-t",
-                f"{session_name}:{_safe_path_token(f'{peer.name}_communication')}",
-                "even-vertical",
-            ),
-            check=True,
-        )
 
     if target.scenario_definition:
         for peer in peers:
@@ -2831,6 +2813,9 @@ def _stop_ota_smoke(args: argparse.Namespace) -> int:
         print(f"Stopped OTA smoke tmux session: {tmux_session}")
     if instance_id and not dry_run:
         instance = _resolve_session_instance(runtime, target.session, instance_id)
+        # Collect the full per-peer artifacts (config, catmux, status, launcher, ...)
+        # before the remote workdir is wiped below.
+        _ota_collect_logs(instance, plan, dry_run=dry_run)
         _ota_write_manifest(
             instance,
             target,

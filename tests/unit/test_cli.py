@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import os
 import subprocess
 import sys
+import tarfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -867,11 +870,100 @@ def test_interactive_ota_smoke_tmux_uses_control_windows_and_metadata(
     assert "docker attach" not in joined
     assert "scenario start demo --identity a --mode attach" not in joined
     assert "scenario start demo --identity b --mode attach" not in joined
-    assert "status demo --identity a --instance-id ota-interactive --watch" in joined
-    assert "status demo --identity b --instance-id ota-interactive --watch" in joined
-    assert any("split-window" in command for command in calls)
+    # Communication windows are full-screen now: no status-watch split pane.
+    assert "--watch" not in joined
+    assert not any("split-window" in command for command in calls)
     assert "ota-smoke demo --state-file" in joined
     assert "--verify-only" in joined
+
+
+def _make_session_instance(host_dir: Path, instance_id: str) -> rosotacom.SessionInstance:
+    return rosotacom.SessionInstance(
+        instance_id=instance_id,
+        host_dir=host_dir,
+        container_dir="/c",
+        config_host_dir=host_dir / "config",
+        config_container_dir="/c/config",
+        logs_host_dir=host_dir / "logs",
+        logs_container_dir="/c/logs",
+        rosbags_host_dir=host_dir / "rosbags",
+        rosbags_container_dir="/c/rosbags",
+    )
+
+
+def test_ota_extract_peer_artifacts_merges_full_layout_and_skips_manifest(tmp_path: Path) -> None:
+    host_dir = tmp_path / "inst"
+    host_dir.mkdir()
+    # The orchestration manifest must survive peer collection.
+    (host_dir / "manifest.yaml").write_text("orchestration: keep\n", encoding="utf-8")
+    instance = _make_session_instance(host_dir, "abcd")
+    peer = rosotacom.OtaSmokePeer("a", None, "10.0.0.10")
+
+    # The remote instance dir carries its own per-host timestamp (suffix matches only).
+    prefix = "session-instances/2026-06-22/sess_2026-06-22_00-00-09_abcd"
+    members = {
+        f"{prefix}/manifest.yaml": b"peer: should-be-skipped\n",
+        f"{prefix}/config/a/plugin.yaml": b"plugin: a\n",
+        f"{prefix}/logs/a/launcher.log": b"launcher\n",
+        f"{prefix}/logs/a/catmux/00-COM/0.log": b"com\n",
+        f"{prefix}/logs/a/status/events.jsonl": b'{"e":1}\n',
+    }
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        evil = b"evil\n"
+        escape = tarfile.TarInfo(f"{prefix}/../../escape.txt")
+        escape.size = len(evil)
+        archive.addfile(escape, io.BytesIO(evil))
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    rosotacom._ota_extract_peer_artifacts(instance, peer, encoded)
+
+    assert (host_dir / "config" / "a" / "plugin.yaml").read_text(encoding="utf-8") == "plugin: a\n"
+    assert (host_dir / "logs" / "a" / "launcher.log").read_text(encoding="utf-8") == "launcher\n"
+    assert (host_dir / "logs" / "a" / "catmux" / "00-COM" / "0.log").read_text(encoding="utf-8") == "com\n"
+    assert (host_dir / "logs" / "a" / "status" / "events.jsonl").read_text(encoding="utf-8") == '{"e":1}\n'
+    # Per-peer manifest skipped so the orchestration manifest stays intact.
+    assert (host_dir / "manifest.yaml").read_text(encoding="utf-8") == "orchestration: keep\n"
+    # Path-traversal members are refused.
+    assert not (tmp_path / "escape.txt").exists()
+    assert not (tmp_path.parent / "escape.txt").exists()
+
+
+def test_ota_collect_logs_extracts_each_peer_into_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_dir = tmp_path / "inst"
+    host_dir.mkdir()
+    instance = _make_session_instance(host_dir, "abcd")
+    plan = _ota_plan(tmp_path)
+
+    def encoded_for(identity: str) -> str:
+        prefix = f"session-instances/2026-06-22/sess_{identity}_abcd"
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            data = f"{identity}-launcher\n".encode()
+            info = tarfile.TarInfo(f"{prefix}/logs/{identity}/launcher.log")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    def fake_ota_run(
+        peer: rosotacom.OtaSmokePeer, *_args: object, **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 0, encoded_for(peer.name), "")
+
+    monkeypatch.setattr(rosotacom, "_ota_run", fake_ota_run)
+    rosotacom._ota_collect_logs(instance, plan, dry_run=False)
+
+    assert (host_dir / "logs" / "a" / "launcher.log").read_text(encoding="utf-8") == "a-launcher\n"
+    assert (host_dir / "logs" / "b" / "launcher.log").read_text(encoding="utf-8") == "b-launcher\n"
+    # No opaque base64 blob is left behind.
+    assert not list(host_dir.glob("**/*.tar.gz.b64"))
 
 
 def test_ota_smoke_parser_accepts_stop_without_peer_arguments(monkeypatch: pytest.MonkeyPatch) -> None:

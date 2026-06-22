@@ -72,7 +72,7 @@ def test_builtin_example_used_when_nothing_configured(tmp_path: Path, monkeypatc
     assert runtime.project_source == "built-in"
     # The packaged example is used in place (read-only), not copied into $HOME.
     assert runtime.rosotacom_config == (rosotacom.EXAMPLE_PROJECT_DIR / "rosotacom.yaml").resolve()
-    assert runtime.session_configs_dir is not None  # ships runnable sessions
+    assert runtime.session_configs_dir  # ships runnable sessions
     # Only the writable runtime output is redirected, to tmpfs (no $HOME writes).
     assert runtime.session_instances_dir == rosotacom._builtin_instances_dir()
     assert str(runtime.session_instances_dir).startswith(str(tmp_path / ".run"))
@@ -115,8 +115,10 @@ def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -
         "\n".join(
             [
                 "ros2docker_config: ros2docker.json",
-                "session_configs_dir: sessions",
-                "scenario_configs_dir: scenarios",
+                "session_configs_dir:",
+                "  - sessions",
+                "scenario_configs_dir:",
+                "  - scenarios",
                 "session_instances_dir: session-instances",
                 "deployment: deployment.yaml",
                 "",
@@ -129,8 +131,8 @@ def test_rosotacom_yaml_relative_paths_resolve_from_config_dir(tmp_path: Path) -
 
     assert runtime.rosotacom_config == config
     assert runtime.ros2docker_config == tmp_path / "ros2docker.json"
-    assert runtime.session_configs_dir == tmp_path / "sessions"
-    assert runtime.scenario_configs_dir == tmp_path / "scenarios"
+    assert runtime.session_configs_dir == (tmp_path / "sessions",)
+    assert runtime.scenario_configs_dir == (tmp_path / "scenarios",)
     assert runtime.session_instances_dir == tmp_path / "session-instances"
     assert runtime.deployment == tmp_path / "deployment.yaml"
 
@@ -157,7 +159,7 @@ def test_environment_config_is_used_when_no_config_arg(tmp_path: Path, monkeypat
     (tmp_path / "sessions").mkdir()
     config = tmp_path / "rosotacom.yaml"
     config.write_text(
-        "ros2docker_config: ros2docker.json\nsession_configs_dir: sessions\n",
+        "ros2docker_config: ros2docker.json\nsession_configs_dir:\n  - sessions\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("ROSOTACOM_CONFIG", str(config))
@@ -166,7 +168,7 @@ def test_environment_config_is_used_when_no_config_arg(tmp_path: Path, monkeypat
 
     assert runtime.rosotacom_config == config
     assert runtime.ros2docker_config == tmp_path / "ros2docker.json"
-    assert runtime.session_configs_dir == tmp_path / "sessions"
+    assert runtime.session_configs_dir == (tmp_path / "sessions",)
     assert runtime.session_instances_dir == tmp_path / "session-instances"
 
 
@@ -202,7 +204,7 @@ def test_session_name_resolves_through_configured_sessions_dir(tmp_path: Path) -
     runtime = rosotacom.RuntimeConfig(
         rosotacom_config=tmp_path / "rosotacom.yaml",
         ros2docker_config=rosotacom.DEFAULT_ROS2DOCKER_CONFIG,
-        session_configs_dir=tmp_path / "sessions",
+        session_configs_dir=(tmp_path / "sessions",),
         deployment=None,
         install_id="test",
     )
@@ -212,6 +214,63 @@ def test_session_name_resolves_through_configured_sessions_dir(tmp_path: Path) -
     assert resolved.host_dir == session.resolve()
     assert resolved.container_dir == "/session/definitions/1_heartbeat"
     assert resolved.source == "session_configs"
+
+
+def test_configured_session_and_scenario_paths_are_ordered_search_lists(tmp_path: Path) -> None:
+    local_sessions = tmp_path / "sessions"
+    example_sessions = tmp_path / "example-sessions"
+    local_scenarios = tmp_path / "scenarios"
+    example_scenarios = tmp_path / "example-scenarios"
+    for root in (local_sessions, example_sessions, local_scenarios, example_scenarios):
+        root.mkdir()
+
+    local_session = local_sessions / "local"
+    local_session.mkdir()
+    local_session.joinpath("session-definition.yaml").write_text("peers: {}\n", encoding="utf-8")
+    example_session = example_sessions / "integrated"
+    example_session.mkdir()
+    example_session.joinpath("session-definition.yaml").write_text("peers: {}\n", encoding="utf-8")
+    local_scenario = local_scenarios / "local_scenario"
+    local_scenario.mkdir()
+    local_scenario.joinpath("scenario-definition.yaml").write_text(
+        "schema_version: 1\nsession: local\napplications: {}\n",
+        encoding="utf-8",
+    )
+    example_scenario = example_scenarios / "integrated_scenario"
+    example_scenario.mkdir()
+    example_scenario.joinpath("scenario-definition.yaml").write_text(
+        "schema_version: 1\nsession: integrated\napplications: {}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ros2docker.json").write_text('{"image_name": "multi"}\n', encoding="utf-8")
+    config = tmp_path / "rosotacom.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "ros2docker_config: ros2docker.json",
+                "session_configs_dir:",
+                "  - sessions",
+                f"  - {example_sessions}",
+                "scenario_configs_dir:",
+                "  - scenarios",
+                f"  - {example_scenarios}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    runtime = rosotacom._load_runtime_config(argparse.Namespace(rosotacom_config=str(config)))
+    resolved_session = rosotacom._resolve_session("integrated", runtime)
+    resolved_scenario = rosotacom._resolve_scenario("integrated_scenario", runtime)
+
+    assert runtime.session_configs_dir == (local_sessions, example_sessions)
+    assert runtime.scenario_configs_dir == (local_scenarios, example_scenarios)
+    assert rosotacom._session_names(runtime) == ["local", "integrated"]
+    assert rosotacom._scenario_names(runtime) == ["local_scenario", "integrated_scenario"]
+    assert resolved_session.host_dir == example_session.resolve()
+    assert resolved_session.container_dir == "/session/definitions-2/integrated"
+    assert resolved_scenario.definition_path == (example_scenario / "scenario-definition.yaml").resolve()
 
 
 def test_session_name_completion_uses_active_project_and_prefix(
@@ -227,7 +286,7 @@ def test_session_name_completion_uses_active_project_and_prefix(
     (tmp_path / "ros2docker.json").write_text('{"image_name": "completion"}\n', encoding="utf-8")
     config = tmp_path / "rosotacom.yaml"
     config.write_text(
-        "ros2docker_config: ros2docker.json\nsession_configs_dir: sessions\n",
+        "ros2docker_config: ros2docker.json\nsession_configs_dir:\n  - sessions\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
@@ -299,11 +358,11 @@ def _write_test_scenario_project(tmp_path: Path) -> tuple[rosotacom.RuntimeConfi
     runtime = rosotacom.RuntimeConfig(
         rosotacom_config=tmp_path / "rosotacom.yaml",
         ros2docker_config=rosotacom.DEFAULT_ROS2DOCKER_CONFIG,
-        session_configs_dir=sessions,
+        session_configs_dir=(sessions,),
         deployment=None,
         install_id="test",
         session_instances_dir=tmp_path / "session-instances",
-        scenario_configs_dir=tmp_path / "scenarios",
+        scenario_configs_dir=(tmp_path / "scenarios",),
     )
     return runtime, rosotacom._resolve_scenario("demo", runtime)
 
@@ -353,8 +412,10 @@ def test_scenario_name_completion_uses_active_project(
         "\n".join(
             [
                 "ros2docker_config: ros2docker.json",
-                "session_configs_dir: sessions",
-                "scenario_configs_dir: scenarios",
+                "session_configs_dir:",
+                "  - sessions",
+                "scenario_configs_dir:",
+                "  - scenarios",
                 "",
             ]
         ),
@@ -1287,7 +1348,7 @@ def test_examples_have_logical_peers_without_default_deployment() -> None:
     runtime = rosotacom.RuntimeConfig(
         rosotacom_config=rosotacom.EXAMPLE_PROJECT_DIR / "rosotacom.yaml",
         ros2docker_config=rosotacom.EXAMPLE_PROJECT_DIR / "ros2docker.json",
-        session_configs_dir=rosotacom.EXAMPLE_PROJECT_DIR / "sessions",
+        session_configs_dir=(rosotacom.EXAMPLE_PROJECT_DIR / "sessions",),
         deployment=None,
         install_id="test",
     )
@@ -1411,7 +1472,7 @@ def test_peer_binding_identity_and_command_helpers(tmp_path: Path, monkeypatch: 
     runtime = rosotacom.RuntimeConfig(
         rosotacom_config=tmp_path / "rosotacom.yaml",
         ros2docker_config=rosotacom.DEFAULT_ROS2DOCKER_CONFIG,
-        session_configs_dir=None,
+        session_configs_dir=(),
         deployment=deployment,
         install_id="abc",
     )
@@ -1488,7 +1549,7 @@ def test_resolve_session_and_base_extra_run_args(tmp_path: Path, monkeypatch: py
     runtime = rosotacom.RuntimeConfig(
         rosotacom_config=tmp_path / "rosotacom.yaml",
         ros2docker_config=tmp_path / "ros2docker.json",
-        session_configs_dir=tmp_path / "sessions",
+        session_configs_dir=(tmp_path / "sessions",),
         deployment=None,
         install_id="id",
         session_instances_dir=tmp_path / "session-instances",
@@ -1506,13 +1567,13 @@ def test_resolve_session_and_base_extra_run_args(tmp_path: Path, monkeypatch: py
 
     assert resolved.container_dir == "/session/definitions/1_heartbeat"
     assert f"{rosotacom.WS_DIR.resolve()}:/ws" in args
-    assert f"{runtime.session_configs_dir}:/session/definitions:ro" in args
+    assert f"{runtime.session_configs_dir[0]}:/session/definitions:ro" in args
     assert f"{runtime.session_instances_dir}:/session/instances" in args
     assert "Configured sessions:" in rosotacom._format_available_sessions(runtime)
 
 
 def test_container_helpers_use_docker_and_ros2docker_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", None, None, "id")
+    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", (), None, "id")
     calls: list[object] = []
 
     monkeypatch.setattr(rosotacom, "_require_ros2docker", lambda: None)
@@ -1536,7 +1597,7 @@ def test_container_helpers_use_docker_and_ros2docker_stop(tmp_path: Path, monkey
 
 
 def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", None, None, "id", tmp_path / "instances")
+    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", (), None, "id", tmp_path / "instances")
     session = rosotacom.ResolvedSession(tmp_path, "/session/current", "absolute")
     cfg = {"peers": {"a": {}, "b": {"com-name": "remote"}}}
     calls: list[tuple[str, dict[str, object]]] = []
@@ -1581,7 +1642,7 @@ def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.Monkey
 
 
 def test_start_session_attach_dispatches_command_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", None, None, "id", tmp_path / "instances")
+    runtime = rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", (), None, "id", tmp_path / "instances")
     session = rosotacom.ResolvedSession(tmp_path, "/session/current", "absolute")
     cfg = {"peers": {"a": {}, "b": {}}}
     calls: list[tuple[str, dict[str, object]]] = []
@@ -1632,7 +1693,7 @@ def test_stop_list_doctor_and_smoke_host_flows(
     runtime = rosotacom.RuntimeConfig(
         None,
         tmp_path / "ros2docker.json",
-        tmp_path / "sessions",
+        (tmp_path / "sessions",),
         None,
         "id",
         tmp_path / "session-instances",

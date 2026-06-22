@@ -408,7 +408,10 @@ def _make_project(tmp_path: Path) -> tuple[argparse.Namespace, Path]:
     (tmp_path / "session-instances").mkdir()
     config = tmp_path / "rosotacom.yaml"
     config.write_text(
-        "ros2docker_config: ros2docker.json\nsession_configs_dir: sessions\nsession_instances_dir: session-instances\n",
+        "ros2docker_config: ros2docker.json\n"
+        "session_configs_dir:\n"
+        "  - sessions\n"
+        "session_instances_dir: session-instances\n",
         encoding="utf-8",
     )
     instance = tmp_path / "session-instances" / "2026-01-01" / "mysess_2026-01-01_00-00-00_abcd1234"

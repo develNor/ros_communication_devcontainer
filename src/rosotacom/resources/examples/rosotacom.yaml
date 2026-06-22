@@ -4,6 +4,8 @@
 # Enter this directory for automatic discovery, or pass this file with
 # `--project`.
 ros2docker_config: ros2docker.json
-session_configs_dir: sessions
-scenario_configs_dir: scenarios
+session_configs_dir:
+  - sessions
+scenario_configs_dir:
+  - scenarios
 session_instances_dir: session-instances

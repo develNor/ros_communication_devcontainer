@@ -165,6 +165,10 @@ session-instances/
 scripts/
 ```
 
+`session_configs_dir` and `scenario_configs_dir` are ordered YAML lists. Put
+project-local directories first and shared/example directories later when one
+project should discover both.
+
 See the [example project README](src/rosotacom/resources/examples/README.md)
 for the copyable example layout, the
 [session configuration reference](session-configuration.md) for the session

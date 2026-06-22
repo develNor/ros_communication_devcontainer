@@ -160,7 +160,8 @@ def rmw_matrix_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "\n".join(
             [
                 f"ros2docker_config: {EXAMPLE_PROJECT_DIR / 'ros2docker.json'}",
-                f"session_configs_dir: {RMW_MATRIX_DIR}",
+                "session_configs_dir:",
+                f"  - {RMW_MATRIX_DIR}",
                 "session_instances_dir: session-instances",
                 "",
             ]

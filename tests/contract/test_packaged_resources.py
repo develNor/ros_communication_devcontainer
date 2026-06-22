@@ -5,6 +5,8 @@ import subprocess
 from importlib import resources
 from pathlib import Path
 
+import yaml
+
 import rosotacom.cli as cli
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
@@ -71,6 +73,23 @@ def test_shell_entrypoints_pass_syntax_check() -> None:
         ["python3", "-m", "py_compile", str(cli.WS_DIR / "session" / "creation" / "strip_ansi.py")],
         check=True,
     )
+
+
+def test_base_plugin_catmux_commands_are_strings() -> None:
+    plugin = yaml.safe_load(
+        (cli.WS_DIR / "session" / "content" / "base" / "session_plugin_base.yaml").read_text(encoding="utf-8")
+    )
+
+    offenders: list[str] = []
+    for window in plugin["windows"]:
+        for split_index, split in enumerate(window.get("splits", [])):
+            for command_index, command in enumerate(split.get("commands", [])):
+                if not isinstance(command, str):
+                    offenders.append(
+                        f"{window.get('name', '<unnamed>')}.splits[{split_index}].commands[{command_index}]"
+                    )
+
+    assert not offenders
 
 
 def test_native_chatter_waiter_reads_topic_info_without_broken_pipe(tmp_path: Path) -> None:

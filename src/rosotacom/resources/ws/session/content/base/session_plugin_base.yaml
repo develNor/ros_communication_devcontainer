@@ -349,7 +349,7 @@ windows:
       - commands:
         - status_out_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/status"
         - status_txt="$status_out_dir/status.txt"
-        - while true; do clear; echo "[INFO] watching status overview file: $status_txt"; if [ -f "$status_txt" ]; then cat "$status_txt"; else echo "[INFO] waiting for status_overview to write status.txt"; fi; sleep "${status_write_interval_s:-2.0}"; done
+        - 'while true; do clear; echo "[INFO] watching status overview file: $status_txt"; if [ -f "$status_txt" ]; then cat "$status_txt"; else echo "[INFO] waiting for status_overview to write status.txt"; fi; sleep "${status_write_interval_s:-2.0}"; done'
   - name: NET
     if: network_monitor
     splits:

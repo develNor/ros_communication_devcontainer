@@ -168,6 +168,36 @@ slice and reuses RFC 0003 + 0004.
   never blocks); the harness wires the actual runner.
 - [ ] Cover the driver oracle, budget compare, and recovery metrics with tests.
 
+## Validation checklist
+
+How each capability will be proven once built (forward-looking). The drivers and
+verdict logic are pure and host-testable; the runs themselves are **nightly
+monitors, not gates** (the determinism rule), so their *output* is trended/manually
+reviewed rather than asserted in a blocking test.
+
+- [ ] **a/b size-pattern publisher** — host unit test on the pattern generation
+  (e.g. `4×0 B + 1×70 KB` sequence); advertised-topic check in CI smoke.
+  Automatable.
+- [ ] **Capacity binary-search driver + oracle** (`loss < p` **and** `latency < L`
+  over a window → breakpoint per profile) — host unit test driving the search
+  against a stubbed metric source so the breakpoint is deterministic. Automatable.
+- [ ] **Sweep bounds + shared-link guard** (configured max size/rate/bandwidth; an
+  unshaped run never saturates the LAN) — host unit test on the bound logic.
+  Automatable.
+- [ ] **Budget store + regression compare** (per `(SHA, profile, genre)`, ±
+  tolerance) — host unit test on the compare against a recorded baseline fixture.
+  Automatable.
+- [ ] **Recovery driver + metric set** (`t_recover`, `t_steady`, backlog/burst,
+  lost-during-outage, latched re-arrival) — host unit test extracting the metrics
+  from a synthetic timeline of transit records (RFC 0003); the **live recovery run
+  is a nightly monitor** + operator review.
+- [ ] **Coarse linear-ramp curves** — **monitor-only**: nightly trend output,
+  reviewed, not gated.
+- [ ] **Nightly benchmark run wired as a monitor** (alerts on budget regression,
+  never blocks) — **operator/harness check**: the public repo defines the genre;
+  the actual runner topology is FZI-private, so the wiring is confirmed manually in
+  the harness, not by a public CI assertion.
+
 ## Open questions
 
 - **Scalar vs frontier reporting.** A few canonical (size, rate) slices, or the

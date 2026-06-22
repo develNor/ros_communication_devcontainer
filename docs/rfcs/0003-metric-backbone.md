@@ -268,6 +268,61 @@ profile work), not hardcoded here.
 - [x] Cover sequence math, offset math, contracts, forensic joining, generated
   configuration, and stage joins with host tests.
 
+## Validation checklist
+
+How each capability above is *proven*, not merely asserted. Host tests run on every
+PR; the e2e row runs in the single-machine smoke matrix (`just test-e2e-smoke`);
+the cross-host rows are the operator OTA gate.
+
+- [x] **Sequence loss / reorder / burst / epoch reset** — host:
+  `test_status_overview.py::test_sequence_loss_reorder_and_transit_records` and
+  `::test_sequence_zero_starts_new_epoch_after_publisher_restart`. Live: the e2e
+  row asserts delivered transit records on a running pipeline.
+- [x] **`expect.loss_pct { max, stage? }` evaluation** — host:
+  `test_status_eval.py::test_loss_pct_uses_first_sequence_aware_stage`,
+  `::test_loss_pct_exceeded_fails`,
+  `::test_loss_pct_without_sequence_metric_fails_honestly`; classifier side
+  `test_status_overview.py::test_loss_expect_classifies_wrapped_stage_bad`.
+- [x] **Echo offset/RTT math (min-RTT, NTP formula)** — host:
+  `test_status_overview.py::test_clock_offset_estimator_uses_minimum_rtt_sample`.
+  Live: the e2e row asserts `status.json.clock_sync` (`method: echo_min_rtt`,
+  `peer_offset_ms`, `rtt_ms`) exists on a real run.
+- [x] **EchoHeartbeat replaces the one-way heartbeat** — packaging:
+  `test_packaged_resources.py` (ships `EchoHeartbeat.msg`); example
+  `1_heartbeat_status` exercises the symmetric echo; live: the e2e `clock_sync`
+  assertion only passes if a real echo round-trip ran.
+- [x] **Corrected/uncorrected OTA hop + offset flow into latency** — host:
+  the transit-record test checks `sections.ota_hop_ms`. Live: the e2e row on
+  `13_link_latency` asserts the wrapped headerless topic's `com_in` carries a
+  non-null `latency_ms` (offset applied) **and** a separate `latency_uncorrected_ms`
+  (no silent fallback).
+- [x] **Forensic `events.jsonl` transit rows** — host:
+  `test_status_overview.py::test_sequence_loss_reorder_and_transit_records`
+  (record shape) and `::test_write_produces_artifacts_and_transition_events`
+  (writer). Live: the e2e row reads transit rows back from `events.jsonl`.
+- [x] **`rosotacom metrics EVENTS…` join + loss/p50/p95/jitter summary** — host:
+  `test_transit.py` (load / join / summarize, `loss_pct`, p95). CLI invocation:
+  the e2e row runs `rosotacom metrics` and asserts a non-empty digest containing
+  the topic.
+- [x] **Opt-in stage-rosbag config + message-index latency reader** — host:
+  `test_status_overview.py::test_metric_stage_bag_is_generated_from_local_pipeline`
+  (generated config) and `test_stage_latency.py` (the index join). *Manual:*
+  recording a real MCAP and reading it with `ros2 run com_py stage_latency BAG
+  TOPIC…` is operator-run — no Docker test records a bag yet.
+- [x] **End-to-end live wiring on `13_link_latency`** — e2e:
+  `test_smoke.py::test_local_link_latency_smoke_exposes_metric_backbone` ties the
+  above together on running nodes (clock-sync estimate → offset-corrected `com_in`
+  latency → transit rows → `metrics` digest). This is the guardrail the unit tests,
+  which run on synthetic rows, cannot give.
+- [ ] **Cross-host offset/RTT/loss are non-trivial (real two-host link)** —
+  *manual:* operator runs `rosotacom ota-smoke` on a two-host deployment and
+  confirms `clock_sync` offset/RTT and per-direction loss are populated. Not
+  reproducible in CI by design (no shared physical clock; see Honest limits).
+- [x] **Wrap-after-shaping loss semantics** — design review plus the wrapped
+  sized-payload smoke, whose inbound bridge topic is `…/ota_stamped` (wrapping at
+  the boundary, `com_in` measured post-wrap). The pipeline-order claim itself is a
+  design invariant, not a runtime assertion.
+
 ## Implementation decisions and reality checks
 
 - **Measurement authority:** sequence and transit accounting lives in

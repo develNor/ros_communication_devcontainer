@@ -63,6 +63,7 @@ class SizedPublisher(Node):
         self.declare_parameter("size_b", -1)
         self.declare_parameter("pattern", "")
         self.declare_parameter("rate", 10.0)
+        self.declare_parameter("streams", 1)
 
         topic = self.get_parameter("topic").value
         default_size = int(self.get_parameter("size").value)
@@ -70,6 +71,7 @@ class SizedPublisher(Node):
         size_b_param = int(self.get_parameter("size_b").value)
         pattern_param = str(self.get_parameter("pattern").value)
         rate = self.get_parameter("rate").value
+        streams = max(1, int(self.get_parameter("streams").value))
 
         self.size_a = size_a_param if size_a_param >= 0 else default_size
         self.size_b = size_b_param
@@ -92,8 +94,11 @@ class SizedPublisher(Node):
         if self.size_b < -1:
             raise ValueError("size_b must be >= 0 when set.")
 
-        self.publisher = self.create_publisher(SizedPayload, topic, 10)
-        self.seq = 0
+        self.streams_state: list[dict] = []
+        for i in range(streams):
+            stream_topic = f"{topic}_{i}" if streams > 1 else topic
+            pub = self.create_publisher(SizedPayload, stream_topic, 10)
+            self.streams_state.append({"publisher": pub, "seq": 0, "topic": stream_topic})
 
         period = 1.0 / rate
         self.timer = self.create_timer(period, self._publish)
@@ -103,19 +108,22 @@ class SizedPublisher(Node):
         bandwidth_bits = avg_size * 8 * rate
         bandwidth_bytes = avg_size * rate
 
+        stream_suffix = f" x{streams} streams" if streams > 1 else ""
+        topics_desc = ", ".join(s["topic"] for s in self.streams_state)
+
         if self.uses_pattern:
             cycle_desc = ", ".join(f"{token}:{self._size_for_token(token)} B" for token in self.pattern)
             self.get_logger().info(
-                f"Publishing topic {topic} with rate {rate} Hz, "
+                f"Publishing [{topics_desc}]{stream_suffix} at {rate} Hz, "
                 f"pattern '{self._pattern_as_string()}' -> [{cycle_desc}]. "
                 f"Average payload {_human_bytes(avg_size)}. "
-                f"Average bandwidth: {_human_bits(bandwidth_bits)}/s, {_human_bytes(bandwidth_bytes)}/s"
+                f"Average bandwidth per stream: {_human_bits(bandwidth_bits)}/s, {_human_bytes(bandwidth_bytes)}/s"
             )
         else:
             self.get_logger().info(
-                f"Publishing topic {topic} with rate {rate} Hz, "
+                f"Publishing [{topics_desc}]{stream_suffix} at {rate} Hz, "
                 f"payload {_human_bytes(self.size_a)}. "
-                f"Bandwidth: {_human_bits(bandwidth_bits)}/s, {_human_bytes(bandwidth_bytes)}/s"
+                f"Bandwidth per stream: {_human_bits(bandwidth_bits)}/s, {_human_bytes(bandwidth_bytes)}/s"
             )
 
     def _size_for_token(self, token: str) -> int:
@@ -142,18 +150,19 @@ class SizedPublisher(Node):
         return ",".join(compressed)
 
     def _publish(self):
-        size = self._size_for_token(self.pattern[self.seq % len(self.pattern)])
-        msg = SizedPayload()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.seq = self.seq
-        msg.size = size
-        msg.payload = list(b"\x42" * size)
+        for stream in self.streams_state:
+            size = self._size_for_token(self.pattern[stream["seq"] % len(self.pattern)])
+            msg = SizedPayload()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.seq = stream["seq"]
+            msg.size = size
+            msg.payload = list(b"\x42" * size)
+            stream["publisher"].publish(msg)
+            stream["seq"] += 1
 
-        self.publisher.publish(msg)
-        self.seq += 1
-
-        if self.seq % 100 == 0:
-            self.get_logger().debug(f"Sent seq={self.seq - 1}, size={size} B")
+        total_seq = sum(s["seq"] for s in self.streams_state)
+        if total_seq % 100 == 0 and total_seq > 0:
+            self.get_logger().debug(f"Published {total_seq} total messages across {len(self.streams_state)} stream(s)")
 
 
 def main(args=None):

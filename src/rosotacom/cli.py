@@ -2182,7 +2182,7 @@ def _resolve_ota_profile(
     from .network_profiles import load_profiles_file
 
     profile = load_profiles_file(runtime.profiles_file)[name]
-    if profile.is_timeline:
+    if profile.is_timeline and not getattr(args, "benchmark_stepping", False):
         raise RuntimeError(
             f"profile {name!r} is a timeline profile; ota-smoke applies a static condition only. "
             "Timeline / recovery runs are driven by the benchmark recovery genre (RFC 0005)."
@@ -6445,6 +6445,7 @@ def main(argv: list[str] | None = None) -> int:
         "examples",
         "config",
         "completion",
+        "benchmark",
     }
     if not argv:
         argv = ["start"]
@@ -6772,6 +6773,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Clear the machine-wide default (the only persisted scope).",
     )
     config_unset_parser.set_defaults(func=config_command)
+
+    from .cli_benchmark import register_benchmark_parser
+
+    register_benchmark_parser(subparsers)
 
     completion_parser = subparsers.add_parser(
         "completion",

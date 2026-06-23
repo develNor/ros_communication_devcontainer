@@ -1,0 +1,110 @@
+"""Smoke tests for rosotacom.plots — verify each function writes a non-empty PNG."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+try:
+    import matplotlib  # noqa: F401
+
+    has_matplotlib = True
+except ImportError:
+    has_matplotlib = False
+
+pytestmark = pytest.mark.skipif(not has_matplotlib, reason="matplotlib is required for benchmark plots")
+
+from rosotacom.plots import (  # noqa: E402, I001
+    _require_matplotlib,
+    plot_capacity_frontier,
+    plot_offered_bw,
+    plot_ramp,
+    plot_recovery_timeline,
+    plot_topic_heatmap,
+)
+
+
+# -- fixtures --------------------------------------------------------------- #
+
+CAPACITY_RESULTS: list[dict] = [
+    {"bandwidth_bps": 1e6, "loss_pct": 0.1, "latency_p95_ms": 50},
+    {"bandwidth_bps": 2e6, "loss_pct": 0.5, "latency_p95_ms": 80},
+    {"bandwidth_bps": 4e6, "loss_pct": 2.0, "latency_p95_ms": 150},
+]
+
+OFFERED_BW_RESULTS: list[dict] = [
+    {"offered_bw_bps": 1e6, "latency_p95_ms": 10, "size": 1000, "rate_hz": 10, "streams": 1},
+    {"offered_bw_bps": 2e6, "latency_p95_ms": 25, "size": 1000, "rate_hz": 20, "streams": 1},
+    {"offered_bw_bps": 4e6, "latency_p95_ms": 80, "size": 2000, "rate_hz": 10, "streams": 2},
+]
+
+RAMP_CURVE: list[dict] = [
+    {"value": 1.0, "metric": 5.0},
+    {"value": 2.0, "metric": 6.0},
+    {"value": 3.0, "metric": 8.0},
+    {"value": 4.0, "metric": 15.0},
+    {"value": 5.0, "metric": 40.0},
+]
+
+RECOVERY_RECORDS: list[dict] = [
+    {"arrival_s": 0.5},
+    {"arrival_s": 1.0},
+    {"arrival_s": 3.5},
+    {"arrival_s": 4.0},
+    {"arrival_s": 4.1},
+    {"arrival_s": 4.2},
+    {"arrival_s": 5.0},
+]
+
+TOPIC_HEATMAP: dict[str, dict[str, float]] = {
+    "/camera": {"wifi_good": 0.1, "wifi_bad": 5.0, "lte": 1.2},
+    "/lidar": {"wifi_good": 0.0, "wifi_bad": 3.5, "lte": 0.8},
+    "/cmd_vel": {"wifi_good": 0.0, "wifi_bad": 0.2, "lte": 0.0},
+}
+
+
+# -- smoke tests ------------------------------------------------------------ #
+
+
+def test_capacity_frontier_writes_figure(tmp_path: Path) -> None:
+    out = tmp_path / "cap.png"
+    result = plot_capacity_frontier(CAPACITY_RESULTS, out=out)
+    assert result == out
+    assert out.stat().st_size > 0
+
+
+def test_offered_bw_writes_figure(tmp_path: Path) -> None:
+    out = tmp_path / "offered.png"
+    result = plot_offered_bw(OFFERED_BW_RESULTS, out=out)
+    assert result == out
+    assert out.stat().st_size > 0
+
+
+def test_ramp_writes_figure(tmp_path: Path) -> None:
+    out = tmp_path / "ramp.png"
+    result = plot_ramp(RAMP_CURVE, out=out)
+    assert result == out
+    assert out.stat().st_size > 0
+
+
+def test_recovery_timeline_writes_figure(tmp_path: Path) -> None:
+    out = tmp_path / "recovery.png"
+    result = plot_recovery_timeline(RECOVERY_RECORDS, outage_start=2.0, outage_end=3.5, out=out)
+    assert result == out
+    assert out.stat().st_size > 0
+
+
+def test_topic_heatmap_writes_figure(tmp_path: Path) -> None:
+    out = tmp_path / "heatmap.png"
+    result = plot_topic_heatmap(TOPIC_HEATMAP, out=out)
+    assert result == out
+    assert out.stat().st_size > 0
+
+
+def test_require_matplotlib_error_message() -> None:
+    """Verify the import guard gives a helpful install hint."""
+    with patch.dict("sys.modules", {"matplotlib": None}):
+        with pytest.raises(ImportError, match=r"pip install rosotacom\[plots\]"):
+            _require_matplotlib()

@@ -1,6 +1,12 @@
 # RFC 0004 — Network profiles & the fidelity ladder
 
-**Status:** Draft — design agreed, not yet implemented · **Scope:** the
+**Status:** Implemented (pure half) — the schema, `tc`/`netem` command generation,
+fail-safe arm/teardown controller, timeline expansion, both outage kinds,
+`--profile` selection and the `expect.per_profile` invariant/conditional split are
+in `rosotacom.network_profiles` / `network_shaper` / `status_eval`, host-tested. The
+**privileged per-direction live arming** (wiring the controller into the ota-smoke
+SSH path) and the **manual bench checks** (crash teardown, post-shaping link bytes,
+real two-shaped-interface application) remain. · **Scope:** the
 environment / fidelity axis (the condition the transport runs *in*) · extends
 [RFC 0002](0002-expectation-concepts.md) (expectations), consumes
 [RFC 0003](0003-metric-backbone.md) (the measured metrics it asserts on), feeds
@@ -190,26 +196,40 @@ RFC 0002's `calibrate` / `--suggest` machinery, **per profile**:
 Roughly in dependency order; the fail-safe teardown (second item) is the highest
 risk — a stuck `qdisc` silently corrupts every later result on the machine.
 
-- [ ] Define the profile schema (static + per-direction `{rate, delay, jitter,
-  distribution, loss, loss_correlation, reorder, duplicate}`) at project scope, and
-  resolve selection via `--profile <name>` / `shared.profile` / `none`.
-- [ ] Arm a named static profile on the OTA-interface egress with fail-safe
-  teardown (revert on stop, on error, and via a safety max-duration); target the
-  data interface only, never the SSH/control interface.
+- [x] Define the profile schema (static + per-direction `{rate, delay, jitter,
+  distribution, loss, loss_correlation, reorder, duplicate}`) at project scope
+  (`network_profiles.parse_profiles` / `load_profiles_file`; project-scoped
+  `profiles.yaml` referenced from `rosotacom.yaml`), and resolve selection via
+  `--profile <name>` / `shared.profile` / `none` (`resolve_profile_selection`,
+  `cli._resolve_active_profile`).
+- [x] Arm a named static profile on the OTA-interface egress with fail-safe
+  teardown (revert on stop, on error, and via a safety max-duration watchdog);
+  target the data interface only, never the SSH/control interface
+  (`network_shaper.ProfileShaper`, `network_profiles.safety_teardown_command`). The
+  controller logic + command generation are host-tested; arming it over the live
+  ota-smoke SSH path is the remaining wiring.
 - [ ] Apply profiles per direction — `uplink` on the sending peer's egress,
   `downlink` on the receiver's — and reject profile selection on a real-deployment
-  run.
-- [ ] Add `expect.per_profile` overrides and the invariant/conditional split to
+  run. *(Per-direction `expand_timeline` and the `allow_shaping` reject rule exist
+  and are host-tested; the live wiring into ota-smoke is pending.)*
+- [x] Add `expect.per_profile` overrides and the invariant/conditional split to
   `status_eval`, so `rosotacom test --profile P` asserts the invariant block plus
-  `P`'s conditional band (default conditional where `P` has no override).
-- [ ] Add timeline profiles (ordered segments + `outage`) — the substrate for the
-  recovery genre in RFC 0005.
-- [ ] Add `rosotacom calibrate --profile P` to emit per-profile conditional bands
-  from a reference replay.
+  `P`'s conditional band (default conditional where `P` has no override)
+  (`status_eval.resolve_expect_for_profile`; threaded through `evaluate_report(s)`).
+- [x] Add timeline profiles (ordered segments + `outage`) — the substrate for the
+  recovery genre in RFC 0005 (`network_profiles.TimelineSegment` / `expand_timeline`;
+  both `outage` kinds — see Open questions).
+- [x] Add per-profile calibration — realized as `rosotacom test --suggest --profile
+  P`, which emits `P`'s conditional band nested under `per_profile`
+  (`status_eval.suggest_profile_band`), reusing the RFC 0002 `--suggest` machinery.
 - [ ] Confirm the `/proc/net/dev` link sampler (RFC 0003 / `link_bytes.py`) reports
-  post-shaping wire bytes so link-overhead stays meaningful under a profile.
-- [ ] Cover schema parsing, arm/teardown (including crash teardown), per-direction
-  application, and `per_profile` evaluation with tests.
+  post-shaping wire bytes so link-overhead stays meaningful under a profile. *(Bench
+  check.)*
+- [x] Cover schema parsing, command generation, the arm/teardown controller
+  (including missing-qdisc/crash teardown and the control-interface guard),
+  selection resolution, and `per_profile` evaluation with host tests
+  (`test_network_profiles.py`, `test_network_shaper.py`, `test_status_eval.py`).
+  Live per-direction application + crash teardown on real hardware stay a bench check.
 
 ## Validation checklist
 
@@ -217,31 +237,36 @@ How each capability will be proven once built (forward-looking — fill in and c
 off during implementation). Notes whether automation is feasible; privileged
 `tc`/`netem` arming is the part that resists pure host testing.
 
-- [ ] **Profile schema parsing** (static + per-direction fields) — host unit test
-  on the parser. Fully automatable.
-- [ ] **Selection resolution** (`--profile` / `shared.profile` / `none`, and the
-  *reject a profile on a real-deployment run* rule) — host unit test. Automatable.
-- [ ] **`tc`/`netem` command generation** — host unit test asserting the argv built
+- [x] **Profile schema parsing** (static + per-direction fields) — host unit test
+  on the parser (`test_network_profiles.py::test_parse_*`). Done.
+- [x] **Selection resolution** (`--profile` / `shared.profile` / `none`, and the
+  *reject a profile on a real-deployment run* rule) — host unit test
+  (`test_resolve_profile_selection`). Done.
+- [x] **`tc`/`netem` command generation** — host unit test asserting the argv built
   for a given profile/direction (rate/delay/jitter/loss/correlation → `tbf`+`netem`
-  string), without touching a real interface. Automatable.
-- [ ] **Fail-safe teardown** (revert on stop, on error, on safety max-duration; the
+  string), without touching a real interface (`test_shaping_commands_*`,
+  `test_netem_arg_ordering_is_valid`). Done.
+- [~] **Fail-safe teardown** (revert on stop, on error, on safety max-duration; the
   idempotent `tc qdisc del … root` always runs; data-interface-only, never the
-  SSH/control interface) — host unit test on the teardown/targeting logic; **plus a
-  manual bench check** that a killed run leaves no `qdisc` behind. Highest-risk
-  item — the manual check is required, not optional.
-- [ ] **Per-direction application** (uplink on the sender's OTA egress, downlink on
-  the receiver's) — host unit test on the peer→direction mapping; live application
-  is an **operator bench check** (privileged, needs two shaped interfaces).
-- [ ] **Invariant/conditional split + `expect.per_profile` evaluation** — host unit
-  test in `status_eval` (invariant asserted under every profile; `P`'s conditional
-  used under `--profile P`, default conditional where `P` has no override).
-  Automatable.
-- [ ] **Timeline profiles** (ordered segments + `outage`) — host unit test on the
-  schedule expansion; live stepping is a **bench check** (and the substrate for the
-  RFC 0005 recovery genre).
-- [ ] **`rosotacom calibrate --profile P`** — host unit test that a reference
-  status/bag fixture yields the expected conditional band (reuses RFC 0002
-  calibrate machinery). Automatable.
+  SSH/control interface) — host unit test on the teardown/targeting logic done
+  (`test_network_shaper.py`: revert on stop/error, missing-qdisc tolerance,
+  control-interface refusal, watchdog command); **the manual bench check** that a
+  killed run leaves no `qdisc` behind is still **required, not optional**.
+- [~] **Per-direction application** (uplink on the sender's OTA egress, downlink on
+  the receiver's) — host unit test on the peer→direction mapping done
+  (`expand_timeline(direction=…)`); live application is the pending **operator bench
+  check** (privileged, needs two shaped interfaces).
+- [x] **Invariant/conditional split + `expect.per_profile` evaluation** — host unit
+  test in `status_eval` (`test_status_eval.py`: invariant asserted under every
+  profile; `P`'s conditional used under `--profile P`, default conditional where
+  `P` has no override; invariant/unknown overrides rejected). Done.
+- [x] **Timeline profiles** (ordered segments + `outage`) — host unit test on the
+  schedule expansion (`test_expand_timeline_*`, both outage kinds); live stepping is
+  a **bench check** (and the substrate for the RFC 0005 recovery genre).
+- [x] **Per-profile calibration** (`rosotacom test --suggest --profile P`) — host
+  unit test that a reference status fixture yields `P`'s conditional band nested
+  under `per_profile` (`test_suggest_profile_band_*`), reusing the RFC 0002
+  `--suggest` machinery. Done.
 - [ ] **Emulated-profile gate (rung 2)** — an example session run under one
   canonical profile in the per-promotion CI smoke, asserting a conditional bound
   that differs from the unshaped run. Automatable in the smoke matrix.
@@ -254,13 +279,15 @@ off during implementation). Notes whether automation is feasible; privileged
 
 ## Open questions
 
-- **Config home.** Project-scoped `profiles.yaml` referenced from `rosotacom.yaml`
-  (reusable across sessions) vs inline `shared.profiles`. Leaning project-scoped —
-  a profile is environment, reused across many sessions, not part of one session's
-  contract.
-- **Outage = `loss 100%` vs link-down.** Which models the real reconnect the
-  baseline describes (multi-second backlog, simultaneous arrival)? Possibly both,
-  as two named outage kinds.
+- **Config home.** *Resolved:* project-scoped `profiles.yaml` referenced from
+  `rosotacom.yaml` (`profiles:` key) — a profile is environment, reused across many
+  sessions, not part of one session's contract.
+- **Outage = `loss 100%` vs link-down.** *Resolved (2026-06):* **both, as two named
+  kinds.** `outage: catchup` is `loss 100%` with the interface up (DDS endpoints
+  survive → recovery is "catch up"); `outage: reconnect` is link-down (forces RMW
+  re-discovery → the harsher reconnect with the multi-second backlog/simultaneous
+  arrival the baseline describes). A bare `outage: true` defaults to the milder
+  `catchup`. Implemented in `network_profiles.outage_commands` / `OUTAGE_KINDS`.
 - **Where the metric backbone reads the link during emulation.** The same
   `/proc/net/dev` link sampler (RFC 0003 / `link_bytes.py`) measures the shaped
   interface — confirm `tbf`/`netem` byte counts reflect post-shaping wire bytes so

@@ -1,0 +1,25 @@
+# Illustrative network profiles (RFC 0004 — the emulated environment axis).
+#
+# A profile is a declarative tc/netem condition applied *below* rosotacom on the
+# OTA interface, per direction (uplink != downlink — the defining feature of
+# cellular). Select one with `rosotacom <cmd> --profile <name>`; `--profile none`
+# (or omission) is the unshaped rung.
+#
+# These NUMBERS ARE ILLUSTRATIVE. Real, calibrated per-link profiles live in the
+# operator's private baseline, not in this public example. Re-measure per link.
+profiles:
+
+  # Static "typical cellular" — the standard reproducible point condition.
+  cellular-typical:
+    uplink:   { rate: 4mbit,  delay: 120ms, jitter: 30ms, distribution: normal, loss: 2%, loss_correlation: 25% }
+    downlink: { rate: 25mbit, delay: 60ms,  jitter: 20ms, loss: 0.5% }
+
+  # Timeline — the substrate for the recovery genre (good -> degrade -> outage ->
+  # restore). `outage: catchup` keeps the interface up (loss 100%; DDS survives,
+  # recovery is "catch up"); use `reconnect` for the harsher link-down recovery.
+  cellular-handover:
+    timeline:
+      - { for: 30s, uplink: { rate: 4mbit,   delay: 60ms,  loss: 0.1% } }
+      - { for: 15s, uplink: { rate: 1mbit,   delay: 180ms, loss: 3%   } }
+      - { for: 5s,  outage: catchup }
+      - { for: 40s, uplink: { rate: 2.5mbit, delay: 90ms,  loss: 1%   } }

@@ -9,3 +9,4 @@ session_configs_dir:
 scenario_configs_dir:
   - scenarios
 session_instances_dir: session-instances
+profiles: profiles.yaml

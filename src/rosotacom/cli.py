@@ -26,7 +26,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -99,6 +99,7 @@ class RuntimeConfig:
     session_instances_dir: Path | None = None
     project_source: str | None = None
     scenario_configs_dir: tuple[Path, ...] = ()
+    profiles_file: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -385,6 +386,7 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         "scenario_configs_dir",
         "session_instances_dir",
         "deployment",
+        "profiles",
     }
     unknown_project_keys = sorted(set(cfg) - allowed_project_keys)
     if unknown_project_keys:
@@ -419,6 +421,11 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         os.environ.get("ROSOTACOM_DEPLOYMENT"),
         cfg.get("deployment"),
     )
+    profiles_raw = _first_value(
+        getattr(args, "profiles_file", None),
+        os.environ.get("ROSOTACOM_PROFILES"),
+        cfg.get("profiles"),
+    )
 
     ros2docker_config = _resolve_path(ros2docker_config_raw, config_base, must_exist=True)
     if ros2docker_config is None:
@@ -449,6 +456,7 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
             "scenario_configs_dir",
             must_exist=True,
         ),
+        profiles_file=_resolve_path(profiles_raw, config_base, must_exist=True),
     )
 
 
@@ -1633,8 +1641,8 @@ def _ota_publish_parts(
     return parts
 
 
-def _ota_test_parts(target: InteractiveSmokeTarget, instance_id: str) -> list[str]:
-    return [
+def _ota_test_parts(target: InteractiveSmokeTarget, instance_id: str, *, profile: str | None = None) -> list[str]:
+    parts = [
         "test",
         _ota_target_session_arg(target),
         "--instance-id",
@@ -1644,6 +1652,9 @@ def _ota_test_parts(target: InteractiveSmokeTarget, instance_id: str) -> list[st
         "--interval",
         "2",
     ]
+    if profile:
+        parts += ["--profile", profile]  # assert P's conditional band (RFC 0004)
+    return parts
 
 
 def _ota_probe_publish_parts(
@@ -2146,6 +2157,137 @@ def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: O
             shutil.rmtree(temporary_bundle, ignore_errors=True)
 
 
+# --- RFC 0004 network-profile arming (bench-only; privileged tc/netem) ------ #
+
+# A watchdog reverts a crashed run's shaping within this bound, so a killed OTA
+# smoke can never leave a qdisc corrupting later results.
+_PROFILE_SAFETY_MAX_S = 3600.0
+
+
+def _resolve_ota_profile(
+    runtime: RuntimeConfig, target: InteractiveSmokeTarget, args: argparse.Namespace
+) -> tuple[str | None, Any]:
+    """Resolve the selected static network profile for an OTA run (RFC 0004).
+
+    Returns ``(name, Profile)``, or ``(None, None)`` when unshaped. ota-smoke is the
+    bench tool, so shaping is allowed; a timeline profile is rejected here — its
+    stepping is the RFC 0005 recovery driver's job, not a one-shot smoke."""
+    name = _resolve_active_profile(runtime, target.cfg, args, allow_shaping=True)
+    if name is None:
+        return None, None
+    if runtime.profiles_file is None:
+        raise RuntimeError(
+            f"--profile {name!r} needs a profiles file: set 'profiles:' in rosotacom.yaml or pass --profiles-file."
+        )
+    from .network_profiles import load_profiles_file
+
+    profile = load_profiles_file(runtime.profiles_file)[name]
+    if profile.is_timeline:
+        raise RuntimeError(
+            f"profile {name!r} is a timeline profile; ota-smoke applies a static condition only. "
+            "Timeline / recovery runs are driven by the benchmark recovery genre (RFC 0005)."
+        )
+    return name, profile
+
+
+def _profile_directions(plan: OtaSmokePlan, cfg: dict[str, Any]) -> dict[str, str]:
+    """Map each peer to the profile direction its egress carries (RFC 0004).
+
+    Default for the a/b convention: the first peer (center / receiver) shapes
+    ``downlink``, the second (vehicle / sender) shapes ``uplink`` — the dominant
+    telemetry direction. Override with ``shared.profile_directions: { a: …, b: … }``."""
+    peers = sorted(plan.peers)
+    directions: dict[str, str] = {peers[0]: "downlink", peers[1]: "uplink"} if len(peers) == 2 else {}
+    shared = cfg.get("shared")
+    override = shared.get("profile_directions") if isinstance(shared, dict) else None
+    if isinstance(override, dict):
+        for peer_name, direction in override.items():
+            directions[str(peer_name)] = str(direction)
+    invalid = {peer: direction for peer, direction in directions.items() if direction not in ("uplink", "downlink")}
+    if invalid:
+        raise RuntimeError(f"shared.profile_directions values must be 'uplink' or 'downlink'; got {invalid}")
+    return directions
+
+
+def _ota_resolve_interfaces(peer: OtaSmokePeer, peer_addr: str, *, dry_run: bool) -> tuple[str, str | None]:
+    """Discover ``(OTA egress, control)`` interfaces on ``peer`` from the kernel, not
+    guesses: the OTA interface is the route to the other peer's data address; the
+    control interface is the route back to the SSH client, so it is never shaped."""
+    from .network_shaper import ota_interface_from_route
+
+    script = (
+        f"ip route get {shlex.quote(peer_addr)}; echo '---CTRL---'; "
+        '{ [ -n "$SSH_CONNECTION" ] && ip route get "${SSH_CONNECTION%% *}"; } || true'
+    )
+    result = _ota_run(peer, script, label=f"{peer.name}: resolve OTA + control interface", dry_run=dry_run)
+    ota_text, _, ctrl_text = (result.stdout or "").partition("---CTRL---")
+    ota_iface = ota_interface_from_route(ota_text)
+    try:
+        control_iface: str | None = ota_interface_from_route(ctrl_text)
+    except ValueError:
+        control_iface = None  # local run / no SSH_CONNECTION
+    return ota_iface, control_iface
+
+
+def _peer_command_runner(peer: OtaSmokePeer, *, dry_run: bool) -> Callable[[Sequence[str]], None]:
+    """A CommandRunner that runs one privileged argv on ``peer`` via the SSH path."""
+
+    def run(argv: Sequence[str]) -> None:
+        _ota_run(peer, "sudo " + shlex.join(list(argv)), label=f"{peer.name}: tc/netem", dry_run=dry_run)
+
+    return run
+
+
+def _peer_watchdog_launcher(peer: OtaSmokePeer, *, dry_run: bool) -> Callable[[Sequence[str]], None]:
+    """Launch the safety-watchdog argv detached on ``peer`` so it survives a crash."""
+
+    def launch(argv: Sequence[str]) -> None:
+        detached = f"nohup sudo {shlex.join(list(argv))} >/dev/null 2>&1 &"
+        _ota_run(peer, detached, label=f"{peer.name}: profile safety watchdog", dry_run=dry_run, check=False)
+
+    return launch
+
+
+def _ota_arm_profile(plan: OtaSmokePlan, profile: Any, directions: dict[str, str], *, dry_run: bool) -> list[Any]:
+    """Arm the static profile per direction on every peer's OTA egress (RFC 0004),
+    returning the ``ProfileShaper`` handles to revert in the run's ``finally``."""
+    from .network_profiles import shaping_commands
+    from .network_shaper import ProfileShaper
+
+    shapers: list[Any] = []
+    peer_names = sorted(plan.peers)
+    for peer_name in peer_names:
+        peer = plan.peers[peer_name]
+        direction = directions.get(peer_name)
+        shaping = profile.uplink if direction == "uplink" else profile.downlink
+        if shaping is None or shaping.is_empty:
+            print(f"OTA profile: {peer_name} ({direction}) — nothing to shape.")
+            continue
+        other_addr = next(plan.peers[name].address for name in peer_names if name != peer_name)
+        if dry_run:
+            ota_iface, control_iface = "<ota-if>", None
+        else:
+            ota_iface, control_iface = _ota_resolve_interfaces(peer, other_addr, dry_run=False)
+        shaper = ProfileShaper(
+            ota_iface,
+            _peer_command_runner(peer, dry_run=dry_run),
+            control_interface=control_iface,
+            safety_max_duration_s=_PROFILE_SAFETY_MAX_S,
+            watchdog_launcher=_peer_watchdog_launcher(peer, dry_run=dry_run),
+        )
+        # Register before arming so a mid-arm failure is still reverted in `finally`.
+        shapers.append(shaper)
+        print(f"OTA profile: arming {profile.name!r} {direction} on {peer_name}:{ota_iface}")
+        shaper.arm(shaping_commands(ota_iface, shaping))
+    return shapers
+
+
+def _ota_teardown_profile(shapers: list[Any]) -> None:
+    """Revert every armed profile (always runs in the run's ``finally``)."""
+    for shaper in shapers:
+        shaper.teardown()
+
+
 def _ota_start_peers(
     target: InteractiveSmokeTarget,
     plan: OtaSmokePlan,
@@ -2204,12 +2346,13 @@ def _ota_verify_delivery(
     instance_id: str,
     *,
     dry_run: bool,
+    profile: str | None = None,
 ) -> list[str]:
     errors: list[str] = []
     print("OTA smoke: running status/expectation checks on every peer.")
     for peer_name in sorted(plan.peers):
         peer = plan.peers[peer_name]
-        command = _ota_rosotacom_command(plan, _ota_test_parts(target, instance_id))
+        command = _ota_rosotacom_command(plan, _ota_test_parts(target, instance_id, profile=profile))
         result = _ota_run(peer, command, label=f"{peer_name}: rosotacom test", dry_run=dry_run, check=False)
         if result.returncode != 0:
             _ota_print_failure_output(f"{peer_name}: rosotacom test", result)
@@ -2749,13 +2892,18 @@ def _start_noninteractive_ota_smoke(args: argparse.Namespace) -> int:
         interactive=False,
         phase="running",
     )
+    profile_name, profile = _resolve_ota_profile(runtime, target, args)
+    directions = _profile_directions(plan, target.cfg) if profile is not None else {}
+    shapers: list[Any] = []
     errors: list[str] = []
     try:
+        if profile is not None:
+            shapers = _ota_arm_profile(plan, profile, directions, dry_run=dry_run)
         _ota_start_peers(target, plan, instance.instance_id, dry_run=dry_run)
         if not dry_run:
             time.sleep(12)
         _ota_start_session_publishers(target, plan, dry_run=dry_run)
-        errors += _ota_verify_delivery(target, plan, instance.instance_id, dry_run=dry_run)
+        errors += _ota_verify_delivery(target, plan, instance.instance_id, dry_run=dry_run, profile=profile_name)
         errors += _ota_verify_isolation(target, plan, dry_run=dry_run)
         errors += _ota_verify_content_integrity(target, plan, target.cfg, dry_run=dry_run)
         if errors:
@@ -2763,6 +2911,8 @@ def _start_noninteractive_ota_smoke(args: argparse.Namespace) -> int:
         print("OTA SMOKE OK")
         return 0
     finally:
+        # Revert shaping first — a stuck qdisc must never outlive the run (RFC 0004).
+        _ota_teardown_profile(shapers)
         _ota_collect_logs(instance, plan, dry_run=dry_run)
         if not getattr(args, "keep_running", False):
             _ota_stop_peers(target, plan, instance.instance_id, dry_run=dry_run)
@@ -2839,6 +2989,12 @@ def ota_smoke(args: argparse.Namespace) -> int:
     if getattr(args, "stop", False):
         return _stop_ota_smoke(args)
     if getattr(args, "interactive", False):
+        requested_profile = getattr(args, "profile", None)
+        if requested_profile and requested_profile != "none":
+            raise RuntimeError(
+                "--profile is not supported in interactive mode (no clean teardown hook for a detached tmux "
+                "session). Run the non-interactive ota-smoke to shape the link, or apply the profile manually."
+            )
         return _start_interactive_ota_smoke(args)
     return _start_noninteractive_ota_smoke(args)
 
@@ -5150,6 +5306,28 @@ def publish_test_topics_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_active_profile(
+    runtime: RuntimeConfig,
+    cfg: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    allow_shaping: bool = True,
+) -> str | None:
+    """Resolve the selected network profile name (RFC 0004): `--profile` > `shared.profile`
+    > unshaped. Validated against the configured profiles file when one is set."""
+    from .network_profiles import load_profiles_file, resolve_profile_selection
+
+    available = set(load_profiles_file(runtime.profiles_file)) if runtime.profiles_file is not None else None
+    shared = cfg.get("shared")
+    shared_default = shared.get("profile") if isinstance(shared, dict) else None
+    return resolve_profile_selection(
+        getattr(args, "profile", None),
+        shared_default=shared_default,
+        available=available,
+        allow_shaping=allow_shaping,
+    )
+
+
 def _load_status_reports(logs_dir: Path) -> dict[str, Any]:
     reports: dict[str, Any] = {}
     for peer_dir in sorted(p for p in logs_dir.iterdir() if p.is_dir()):
@@ -5216,6 +5394,7 @@ def test_command(args: argparse.Namespace) -> int:
     interval = max(0.5, float(getattr(args, "interval", 2.0)))
     expect_by_topic = status_eval.expectations_from_cfg(cfg)
     link_expect = status_eval.link_expect_from_cfg(cfg)
+    profile = _resolve_active_profile(runtime, cfg, args)
     ground_truth: dict[str, Any] | None = None
     bag = getattr(args, "bag", None)
     if bag:
@@ -5231,12 +5410,18 @@ def test_command(args: argparse.Namespace) -> int:
         if not reports:
             print(f"rosotacom test --suggest: no status.json under {logs_dir}.", file=sys.stderr)
             return 1
-        suggestions = status_eval.suggest_expectations(reports)
-        print("# Suggested expect blocks from this run (author/narrow before committing):")
+        if profile:
+            suggestions = status_eval.suggest_profile_band(reports, profile)
+            print(f"# Suggested per-profile '{profile}' conditional band from this run (RFC 0004; author/narrow):")
+        else:
+            suggestions = status_eval.suggest_expectations(reports)
+            print("# Suggested expect blocks from this run (author/narrow before committing):")
         print(yaml.safe_dump(suggestions, sort_keys=True, default_flow_style=False).rstrip())
         return 0
 
     wait_timeout = max(0.0, float(getattr(args, "timeout", 30.0)))
+    if profile:
+        print(f"rosotacom test: asserting the '{profile}' conditional band (RFC 0004 per-profile expect)")
     print(f"rosotacom test: waiting up to {wait_timeout:g}s for status reports under {logs_dir}")
     saw_reports = False
     while True:
@@ -5245,7 +5430,7 @@ def test_command(args: argparse.Namespace) -> int:
             if not saw_reports:
                 print(f"rosotacom test: evaluating {len(reports)} peer status report(s)")
                 saw_reports = True
-            failures = status_eval.evaluate_reports(reports, expect_by_topic, link_expect, ground_truth)
+            failures = status_eval.evaluate_reports(reports, expect_by_topic, link_expect, ground_truth, profile)
             if not failures:
                 topic_count = sum(len(r.get("topics", [])) for r in reports.values())
                 print(f"TEST OK: {len(reports)} peer(s), {topic_count} topic(s) meet status + expectations")
@@ -6084,6 +6269,22 @@ def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-instances-dir", help="Host directory for generated session instances and logs.")
     deployment = parser.add_argument("--deployment", help="Deployment YAML containing named hosts and values.")
     cast(Any, deployment).completer = DirectoriesCompleter()
+    profiles = parser.add_argument(
+        "--profiles-file",
+        dest="profiles_file",
+        help="Path to the project's network-profiles YAML (RFC 0004 emulated conditions).",
+    )
+    cast(Any, profiles).completer = DirectoriesCompleter()
+
+
+def _add_profile_arg(parser: argparse.ArgumentParser) -> None:
+    """Select an emulated network profile (RFC 0004); 'none' / omitted is unshaped."""
+    parser.add_argument(
+        "--profile",
+        dest="profile",
+        metavar="NAME",
+        help="Emulated network profile to run under (a name from the profiles file, or 'none').",
+    )
 
 
 def _add_session_arg(parser: argparse.ArgumentParser, *args: str, **kwargs: Any) -> argparse.Action:
@@ -6274,6 +6475,7 @@ def main(argv: list[str] | None = None) -> int:
 
     smoke_parser = subparsers.add_parser("smoke", help="Run a local smoke test.")
     _add_common_config_args(smoke_parser)
+    _add_profile_arg(smoke_parser)
     smoke_target = smoke_parser.add_argument("session_dir", nargs="?")
     cast(Any, smoke_target).completer = _smoke_target_completer
     smoke_parser.add_argument("--local", action="store_true", default=True)
@@ -6305,6 +6507,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ota_smoke_parser = subparsers.add_parser("ota-smoke", help="Run a generic multi-machine OTA smoke test.")
     _add_common_config_args(ota_smoke_parser)
+    _add_profile_arg(ota_smoke_parser)
     ota_target = ota_smoke_parser.add_argument("target", nargs="?")
     cast(Any, ota_target).completer = _smoke_target_completer
     _add_peer_arg(ota_smoke_parser)
@@ -6374,6 +6577,7 @@ def main(argv: list[str] | None = None) -> int:
         "test", help="Assert a running/recent session meets its status + per-topic expect contract."
     )
     _add_common_config_args(test_parser)
+    _add_profile_arg(test_parser)
     _add_session_arg(test_parser, "session_dir", nargs="?", default=DEFAULT_SMOKE_SESSION)
     test_parser.add_argument("--instance-id", help="Evaluate a specific instance id (default: most recent).")
     test_parser.add_argument("--timeout", type=float, default=30.0, help="Seconds to wait for status to settle.")

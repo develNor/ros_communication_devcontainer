@@ -7,7 +7,14 @@ from unittest.mock import patch
 
 import pytest
 
-pytest.importorskip("matplotlib")
+try:
+    import matplotlib  # noqa: F401
+
+    has_matplotlib = True
+except ImportError:
+    has_matplotlib = False
+
+pytestmark = pytest.mark.skipif(not has_matplotlib, reason="matplotlib is required for benchmark plots")
 
 from rosotacom.plots import (  # noqa: E402, I001
     _require_matplotlib,

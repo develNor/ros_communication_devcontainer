@@ -58,6 +58,52 @@ _DELIVERED_STATES = {"FLOWING", "STALE"}  # a message was observed at least once
 _VALID_MODES = {"stream", "latched", "existence"}
 _VALID_PRESENCE = {"required", "optional"}
 
+# RFC 0004 invariant/conditional split. Invariant (correctness) holds under every
+# profile and stays top-level; conditional (performance) is asserted per profile and
+# may be overridden via expect.per_profile.<name>.
+_INVARIANT_KEYS = frozenset({"presence", "mode"})
+_CONDITIONAL_KEYS = frozenset({"hz", "latency_ms", "loss_pct", "completeness", "min_count"})
+
+
+def resolve_expect_for_profile(expect: dict[str, Any], profile: str | None) -> dict[str, Any]:
+    """Resolve a topic's effective `expect` under a network profile (RFC 0004).
+
+    The invariant block (presence/mode — correctness) holds under every profile and
+    is kept verbatim; the conditional block (hz / latency_ms / loss_pct /
+    completeness / min_count — performance) defaults to the top-level values and is
+    overridden, key by key, by `expect.per_profile[profile]` where present. An
+    unshaped run (`profile is None`) uses the default conditional. The `per_profile`
+    key is stripped from the result, so the evaluator never sees it.
+
+    Raises if a per-profile block tries to override an invariant key (those stay
+    profile-independent) or names an unknown conditional key — an authoring bug worth
+    catching at the gate."""
+    resolved = {key: value for key, value in expect.items() if key != "per_profile"}
+    per_profile = expect.get("per_profile")
+    if per_profile is None or profile is None:
+        return resolved
+    if not isinstance(per_profile, dict):
+        raise ValueError("expect.per_profile must be a mapping of profile name -> conditional overrides")
+    overrides = per_profile.get(profile)
+    if overrides is None:
+        return resolved
+    if not isinstance(overrides, dict):
+        raise ValueError(f"expect.per_profile.{profile} must be a mapping of conditional overrides")
+    invalid = sorted(set(overrides) & _INVARIANT_KEYS)
+    if invalid:
+        raise ValueError(
+            f"expect.per_profile.{profile} may only override conditional (performance) keys; invariant "
+            f"keys {invalid} stay top-level and profile-independent (RFC 0004)"
+        )
+    unknown = sorted(set(overrides) - _CONDITIONAL_KEYS)
+    if unknown:
+        raise ValueError(
+            f"expect.per_profile.{profile} has unsupported keys {unknown}; "
+            f"conditional keys are {sorted(_CONDITIONAL_KEYS)}"
+        )
+    resolved.update(overrides)
+    return resolved
+
 
 def expectations_from_cfg(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Map a topic's base name -> its `expect` block, from a session config."""
@@ -298,8 +344,13 @@ def evaluate_report(
     expect_by_topic: dict[str, dict[str, Any]],
     link_expect: dict[str, Any] | None = None,
     ground_truth: dict[str, Any] | None = None,
+    profile: str | None = None,
 ) -> list[str]:
-    """Failures for one peer's status.json (empty == all good)."""
+    """Failures for one peer's status.json (empty == all good).
+
+    Under `--profile P` the invariant block is asserted as always and each topic's
+    conditional bounds come from `P`'s `per_profile` override (RFC 0004); an unshaped
+    run (`profile is None`) uses the default conditional."""
     peer = report.get("peer", "?")
     topics = report.get("topics", [])
     if not topics:
@@ -307,7 +358,7 @@ def evaluate_report(
     failures: list[str] = _check_link(peer, report.get("link"), link_expect or {})
     for topic in topics:
         base = topic.get("base", "?")
-        expect = expect_by_topic.get(base) or {}
+        expect = resolve_expect_for_profile(expect_by_topic.get(base) or {}, profile)
         mode = _topic_mode(expect)
         optional = _is_optional(expect)
         overall = topic.get("overall")
@@ -354,11 +405,12 @@ def evaluate_reports(
     expect_by_topic: dict[str, dict[str, Any]],
     link_expect: dict[str, Any] | None = None,
     ground_truth: dict[str, Any] | None = None,
+    profile: str | None = None,
 ) -> list[str]:
     """Failures across every peer's status.json (empty == all good)."""
     failures: list[str] = []
     for report in reports.values():
-        failures += evaluate_report(report, expect_by_topic, link_expect, ground_truth)
+        failures += evaluate_report(report, expect_by_topic, link_expect, ground_truth, profile)
     return failures
 
 
@@ -401,4 +453,20 @@ def suggest_expectations(reports: dict[str, dict[str, Any]]) -> dict[str, dict[s
             suggestion = _suggest_one(topic)
             if suggestion is not None:
                 out[str(base)] = suggestion
+    return out
+
+
+def suggest_profile_band(reports: dict[str, dict[str, Any]], profile: str) -> dict[str, dict[str, Any]]:
+    """A per-topic ``per_profile[profile]`` conditional band from a reference replay
+    run under profile `P` (RFC 0004 per-profile calibration).
+
+    Reuses the RFC 0002 `--suggest` machinery but keeps only the conditional
+    (performance) keys, nested under `per_profile[profile]` — the invariant block is
+    authored once and is profile-independent, so it is not re-emitted here. The
+    result merges straight into an existing topic's `expect`. Pure and order-stable."""
+    out: dict[str, dict[str, Any]] = {}
+    for topic, expect in suggest_expectations(reports).items():
+        conditional = {key: value for key, value in expect.items() if key in _CONDITIONAL_KEYS}
+        if conditional:
+            out[topic] = {"per_profile": {profile: conditional}}
     return out

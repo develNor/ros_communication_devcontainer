@@ -21,6 +21,7 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
         "resources/examples/rosotacom.yaml",
         "resources/examples/.gitignore",
         "resources/examples/ros2docker.json",
+        "resources/examples/profiles.yaml",
         "resources/examples/deployment.example.yaml",
         "resources/examples/sessions/1_heartbeat/session-definition.yaml",
         "resources/examples/sessions/1_heartbeat_status/session-definition.yaml",
@@ -43,6 +44,17 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
     assert "builtin_interfaces/Time echo_t1" in echo
     assert "builtin_interfaces/Time echo_t2" in echo
     assert "builtin_interfaces/Time echo_t3" in echo
+
+
+def test_packaged_example_profiles_parse() -> None:
+    # The shipped illustrative profiles must actually load — a malformed example
+    # (bad tc/netem combo, unknown key) would be a packaging regression.
+    from rosotacom.network_profiles import load_profiles_file
+
+    path = resources.files("rosotacom").joinpath("resources/examples/profiles.yaml")
+    profiles = load_profiles_file(Path(str(path)))
+    assert {"cellular-typical", "cellular-handover"} <= set(profiles)
+    assert profiles["cellular-handover"].is_timeline
 
 
 def test_cli_resource_constants_point_inside_package_resources() -> None:

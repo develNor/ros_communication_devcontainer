@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from rosotacom.status_eval import evaluate_report, evaluate_reports, expectations_from_cfg
+from rosotacom.status_eval import (
+    evaluate_report,
+    evaluate_reports,
+    expectations_from_cfg,
+    resolve_expect_for_profile,
+)
 
 
 def _stage(stage: str, hz: float, latency_ms: float | None, state: str = "FLOWING", publishers: int = 1) -> dict:
@@ -416,3 +421,63 @@ def test_loss_pct_without_sequence_metric_fails_honestly() -> None:
     rep = {"peer": "a", "topics": [_wrapped_topic()]}
     failures = evaluate_report(rep, {"/wrapped": {"loss_pct": {"max": 3.0}}})
     assert len(failures) == 1 and "loss None" in failures[0]
+
+
+# --- RFC 0004: per-profile conditional overrides --------------------------- #
+
+
+def test_resolve_keeps_invariant_overrides_conditional_and_strips_per_profile() -> None:
+    expect = {
+        "presence": "required",
+        "mode": "stream",
+        "hz": {"min": 9},
+        "latency_ms": {"max": 200},
+        "per_profile": {"cellular": {"hz": {"min": 6}, "loss_pct": {"max": 5}}},
+    }
+    default = resolve_expect_for_profile(expect, None)
+    assert "per_profile" not in default
+    assert default["hz"] == {"min": 9} and default["latency_ms"] == {"max": 200}
+
+    cellular = resolve_expect_for_profile(expect, "cellular")
+    assert cellular["presence"] == "required"  # invariant kept verbatim
+    assert cellular["hz"] == {"min": 6}  # conditional overridden by the profile
+    assert cellular["latency_ms"] == {"max": 200}  # not overridden -> default conditional
+    assert cellular["loss_pct"] == {"max": 5}  # added by the profile
+    assert "per_profile" not in cellular
+
+    # A profile with no override block falls back entirely to the default conditional.
+    assert resolve_expect_for_profile(expect, "unknown")["hz"] == {"min": 9}
+
+
+def test_resolve_rejects_invariant_and_unknown_overrides() -> None:
+    with pytest.raises(ValueError):
+        resolve_expect_for_profile({"mode": "stream", "per_profile": {"c": {"mode": "latched"}}}, "c")
+    with pytest.raises(ValueError):
+        resolve_expect_for_profile({"per_profile": {"c": {"bogus": 1}}}, "c")
+
+
+def test_per_profile_relaxes_the_conditional_bound_end_to_end() -> None:
+    # /heartbeat_a is delivered inbound at ~6.9 ms; a 5 ms LAN bound fails, but the
+    # cellular profile's laxer bound passes -- the same report, two verdicts.
+    expect = {
+        "/heartbeat_a": {
+            "presence": "required",
+            "latency_ms": {"max": 5},
+            "per_profile": {"cellular": {"latency_ms": {"max": 600}}},
+        }
+    }
+    assert evaluate_report(OK_REPORT, expect) != []  # unshaped: default conditional fails
+    assert evaluate_report(OK_REPORT, expect, profile="cellular") == []  # cellular: relaxed, passes
+    assert evaluate_report(OK_REPORT, expect, profile="other") != []  # no override -> default fails
+
+
+def test_suggest_profile_band_nests_conditional_keys_under_per_profile() -> None:
+    # A reference replay under 'cellular' -> the conditional band for that profile,
+    # nested under per_profile so it merges into an authored invariant block.
+    from rosotacom.status_eval import suggest_profile_band
+
+    band = suggest_profile_band({"b": OK_REPORT}, "cellular")
+    assert "/heartbeat_a" in band
+    entry = band["/heartbeat_a"]["per_profile"]["cellular"]
+    assert "hz" in entry and "latency_ms" in entry  # conditional keys only
+    assert "presence" not in entry and "mode" not in entry  # invariant stays top-level

@@ -37,6 +37,7 @@ def test_packaged_example_setup_paths_are_relative_to_example_root() -> None:
         "session_configs_dir": ["sessions"],
         "scenario_configs_dir": ["scenarios"],
         "session_instances_dir": "session-instances",
+        "profiles": "profiles.yaml",
     }
 
 

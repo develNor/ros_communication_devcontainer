@@ -63,7 +63,7 @@ import rclpy
 from rclpy.context import Context
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.serialization import serialize_message
 from rosidl_runtime_py.utilities import get_message
 
@@ -140,17 +140,47 @@ class StageObserver(Node):
                 msg_class = None
             if msg_class is None:
                 continue
-            qos = QoSProfile(
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-                history=HistoryPolicy.KEEP_LAST,
-                depth=10,
-            )
+            qos = self._observation_qos(topic)
             try:
                 self.create_subscription(msg_class, topic, self._make_cb(topic), qos)
                 obs.subscribed = True
                 obs.type_str = type_str
             except Exception:  # pragma: no cover - defensive
                 continue
+
+    def _observation_qos(self, topic: str) -> QoSProfile:
+        """QoS for the observation subscription, matched to the live publisher.
+
+        A VOLATILE reader only receives samples sent *after* it matches, so it
+        cannot read a TRANSIENT_LOCAL writer's already-published held sample. A
+        genuinely static latched topic publishes exactly once at startup, so a
+        hardcoded best-effort/volatile observer turns stage observation into a
+        startup race -- it intermittently misses that single sample and reports a
+        false STALLED even though the pipeline delivered and durably holds the
+        value. Adopting the publisher's offered durability/reliability (request ==
+        offered) is always compatible and replays the durable history. Falls back
+        to best-effort/volatile when no publisher QoS is available.
+        """
+        durability = DurabilityPolicy.VOLATILE
+        reliability = ReliabilityPolicy.BEST_EFFORT
+        try:
+            infos = self.get_publishers_info_by_topic(topic)
+        except Exception:  # pragma: no cover - defensive
+            infos = []
+        for info in infos:
+            pub_qos = getattr(info, "qos_profile", None)
+            if pub_qos is None:
+                continue
+            if pub_qos.durability == DurabilityPolicy.TRANSIENT_LOCAL:
+                durability = DurabilityPolicy.TRANSIENT_LOCAL
+            if pub_qos.reliability == ReliabilityPolicy.RELIABLE:
+                reliability = ReliabilityPolicy.RELIABLE
+        return QoSProfile(
+            reliability=reliability,
+            durability=durability,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
 
     def _make_cb(self, topic: str):
         def cb(msg):

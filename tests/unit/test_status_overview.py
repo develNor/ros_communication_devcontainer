@@ -127,6 +127,20 @@ def test_ota_observer_is_graph_only() -> None:
     assert 'local_topics.update(by_domain.get("ota"' not in source
 
 
+def test_observation_qos_matches_publisher_durability() -> None:
+    """Regression: the observer must adopt the publisher's QoS so it can read a
+    TRANSIENT_LOCAL writer's held sample. A hardcoded volatile observer races the
+    single startup publish of a static latched topic -> intermittent false STALLED.
+    """
+    source = STATUS_NODE_PY.read_text(encoding="utf-8")
+    # Observation subscription QoS is derived per-topic from the live publisher.
+    assert "def _observation_qos" in source
+    assert "self.get_publishers_info_by_topic(topic)" in source
+    assert "DurabilityPolicy.TRANSIENT_LOCAL" in source
+    # The old unconditional volatile/best-effort observer QoS is gone.
+    assert "qos = self._observation_qos(topic)" in source
+
+
 # ---------------------------------------------------------------------------
 # state classification + rollup
 # ---------------------------------------------------------------------------

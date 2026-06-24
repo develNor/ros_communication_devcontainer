@@ -15,6 +15,7 @@ The glue below is host-tested via a **stubbed** ``run_point`` in
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import shlex
 import shutil
@@ -23,6 +24,63 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+
+
+class TeeStream:
+    def __init__(self, original_stream, file_path: Path):
+        self.original_stream = original_stream
+        self.file_path = file_path
+        self.file = None
+
+    def write(self, data):
+        self.original_stream.write(data)
+        self.original_stream.flush()
+        if self.file is None:
+            try:
+                self.file_path.parent.mkdir(parents=True, exist_ok=True)
+                self.file = open(self.file_path, "a", encoding="utf-8")
+            except Exception:
+                pass
+        if self.file is not None:
+            try:
+                self.file.write(data)
+                self.file.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        self.original_stream.flush()
+        if self.file is not None:
+            try:
+                self.file.flush()
+            except Exception:
+                pass
+
+    def close(self):
+        if self.file is not None:
+            try:
+                self.file.close()
+            except Exception:
+                pass
+            self.file = None
+
+
+@contextlib.contextmanager
+def log_stdout_stderr_to_file(file_path: Path):
+    tee_stdout = TeeStream(sys.stdout, file_path)
+    tee_stderr = TeeStream(sys.stderr, file_path)
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = tee_stdout
+    sys.stderr = tee_stderr
+    try:
+        yield
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        tee_stdout.close()
+        tee_stderr.close()
+
 
 # --------------------------------------------------------------------------- #
 # Transit-record collection
@@ -754,6 +812,8 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
             b_container = start_session(
                 argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=SMOKE_PEER_IPS["b"])
             )
+            if not getattr(args, "dry_run", False):
+                time.sleep(12)
 
             from .network_profiles import load_profiles_file, shaping_commands
 
@@ -780,34 +840,6 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
                 return run
 
-            shapers = []
-            peer_steps = {}
-            if profile_obj is not None:
-                if profile_obj.is_timeline:
-                    # Peer A shapes uplink (egress to B)
-                    shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
-                    shapers.append(shaper_a)
-                    steps_a = expand_timeline(profile_obj, "eth0", direction="uplink")
-                    peer_steps["a"] = (shaper_a, steps_a)
-
-                    # Peer B shapes downlink (egress to A)
-                    shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
-                    shapers.append(shaper_b)
-                    steps_b = expand_timeline(profile_obj, "eth0", direction="downlink")
-                    peer_steps["b"] = (shaper_b, steps_b)
-
-                    for shaper in shapers:
-                        shaper.arm([])
-                else:
-                    if profile_obj.uplink and not profile_obj.uplink.is_empty:
-                        shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
-                        shaper_a.arm(shaping_commands("eth0", profile_obj.uplink))
-                        shapers.append(shaper_a)
-                    if profile_obj.downlink and not profile_obj.downlink.is_empty:
-                        shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
-                        shaper_b.arm(shaping_commands("eth0", profile_obj.downlink))
-                        shapers.append(shaper_b)
-
             ros_setup_a = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "a")
             rate = load.get("rate", 20.0)
             size = load.get("size") or load.get("size_a") or 66000
@@ -824,15 +856,64 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 )
                 pub_cmds.append(cmd)
 
+            shapers = []
+            peer_steps = {}
+
             try:
+                # 1. Start the publishers
                 for cmd in pub_cmds:
                     subprocess.run(
-                        ["docker", "exec", "-d", a_container, "bash", "-lc", cmd],
+                        ["docker", "exec", "-d", a_container, "bash", "-c", cmd],
                         capture_output=True,
                         text=True,
                         check=False,
                     )
 
+                # 2. Wait for discovery to complete on unshaped network
+                if not getattr(args, "dry_run", False):
+                    topic_name = topics_a[0].get("topic") if topics_a else "/bench_capacity"
+                    info_cmd = f"{ros_setup_a} && ros2 topic info {shlex.quote(topic_name)}"
+                    for _ in range(30):
+                        res = subprocess.run(
+                            ["docker", "exec", a_container, "bash", "-c", info_cmd],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        output = res.stdout or ""
+                        if "Subscription count: 0" not in output and "Subscription count:" in output:
+                            break
+                        time.sleep(0.5)
+                    time.sleep(3.0)
+
+                # 3. Arm the network shapers
+                if profile_obj is not None:
+                    if profile_obj.is_timeline:
+                        # Peer A shapes uplink (egress to B)
+                        shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
+                        shapers.append(shaper_a)
+                        steps_a = expand_timeline(profile_obj, "eth0", direction="uplink")
+                        peer_steps["a"] = (shaper_a, steps_a)
+
+                        # Peer B shapes downlink (egress to A)
+                        shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
+                        shapers.append(shaper_b)
+                        steps_b = expand_timeline(profile_obj, "eth0", direction="downlink")
+                        peer_steps["b"] = (shaper_b, steps_b)
+
+                        for shaper in shapers:
+                            shaper.arm([])
+                    else:
+                        if profile_obj.uplink and not profile_obj.uplink.is_empty:
+                            shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
+                            shaper_a.arm(shaping_commands("eth0", profile_obj.uplink))
+                            shapers.append(shaper_a)
+                        if profile_obj.downlink and not profile_obj.downlink.is_empty:
+                            shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
+                            shaper_b.arm(shaping_commands("eth0", profile_obj.downlink))
+                            shapers.append(shaper_b)
+
+                # 4. Measure traffic under shaped conditions
                 if profile_obj is not None and profile_obj.is_timeline:
                     num_steps = len(profile_obj.timeline)
                     for i in range(num_steps):
@@ -882,20 +963,21 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
     # Use stub probe under test, or live probe in production.
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_1_capacity")
 
-    result = drive_capacity(
-        run_point,
-        profile=args.profile,
-        knob=args.knob,
-        low=args.low,
-        high=args.high,
-        max_loss_pct=args.max_loss,
-        max_latency_ms=args.max_latency_ms,
-        rate_hz=getattr(args, "rate_hz", 20.0),
-        topic=getattr(args, "topic", ""),
-        repeats=getattr(args, "repeats", 1),
-        duration_s=getattr(args, "duration", 60.0),
-        out_dir=run_dir,
-    )
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        result = drive_capacity(
+            run_point,
+            profile=args.profile,
+            knob=args.knob,
+            low=args.low,
+            high=args.high,
+            max_loss_pct=args.max_loss,
+            max_latency_ms=args.max_latency_ms,
+            rate_hz=getattr(args, "rate_hz", 20.0),
+            topic=getattr(args, "topic", ""),
+            repeats=getattr(args, "repeats", 1),
+            duration_s=getattr(args, "duration", 60.0),
+            out_dir=run_dir,
+        )
 
     # Resolve aggregated file output path
     out_file_name = getattr(args, "out", "budgets.jsonl")
@@ -927,16 +1009,17 @@ def benchmark_ramp(args: argparse.Namespace) -> int:
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_3_ramp")
 
     values = _parse_values(args.values)
-    drive_ramp(
-        run_point,
-        profile=args.profile,
-        values=values,
-        knob=getattr(args, "knob", "size"),
-        rate_hz=getattr(args, "rate_hz", 20.0),
-        topic=getattr(args, "topic", ""),
-        duration_s=getattr(args, "duration", 60.0),
-        out_dir=run_dir,
-    )
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_ramp(
+            run_point,
+            profile=args.profile,
+            values=values,
+            knob=getattr(args, "knob", "size"),
+            rate_hz=getattr(args, "rate_hz", 20.0),
+            topic=getattr(args, "topic", ""),
+            duration_s=getattr(args, "duration", 60.0),
+            out_dir=run_dir,
+        )
 
     # Resolve aggregated file output path
     out_file_name = getattr(args, "out", "curve.jsonl")
@@ -965,15 +1048,18 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_4_recovery")
 
-    drive_recovery(
-        run_point,
-        profile=args.profile,
-        duration_s=getattr(args, "duration", 90.0),
-        nominal_period_s=getattr(args, "nominal_period", 0.05),
-        latched_topics=getattr(args, "latched_topics", "").split(",") if getattr(args, "latched_topics", "") else (),
-        out_dir=run_dir,
-        profiles_file=runtime.profiles_file,
-    )
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_recovery(
+            run_point,
+            profile=args.profile,
+            duration_s=getattr(args, "duration", 90.0),
+            nominal_period_s=getattr(args, "nominal_period", 0.05),
+            latched_topics=getattr(args, "latched_topics", "").split(",")
+            if getattr(args, "latched_topics", "")
+            else (),
+            out_dir=run_dir,
+            profiles_file=runtime.profiles_file,
+        )
 
     # Resolve aggregated file output path
     out_file_name = getattr(args, "out", "recovery.json")
@@ -1003,17 +1089,18 @@ def benchmark_sweep(args: argparse.Namespace) -> int:
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_2_load_sweep")
 
     profile_grid = [p.strip() for p in args.profile_grid.split(",") if p.strip()]
-    drive_sweep(
-        run_point,
-        profile_grid=profile_grid,
-        max_loss_pct=getattr(args, "max_loss", 5.0),
-        max_latency_ms=getattr(args, "max_latency_ms", 300.0),
-        rate_hz=getattr(args, "rate_hz", 20.0),
-        size=getattr(args, "size", 60000),
-        topic=getattr(args, "topic", ""),
-        duration_s=getattr(args, "duration", 60.0),
-        out_dir=run_dir,
-    )
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_sweep(
+            run_point,
+            profile_grid=profile_grid,
+            max_loss_pct=getattr(args, "max_loss", 5.0),
+            max_latency_ms=getattr(args, "max_latency_ms", 300.0),
+            rate_hz=getattr(args, "rate_hz", 20.0),
+            size=getattr(args, "size", 60000),
+            topic=getattr(args, "topic", ""),
+            duration_s=getattr(args, "duration", 60.0),
+            out_dir=run_dir,
+        )
 
     # Resolve aggregated file output path
     out_file_name = getattr(args, "out", "frontier.jsonl")

@@ -2092,6 +2092,8 @@ def _ota_remote_project_config(runtime: RuntimeConfig, plan: OtaSmokePlan, sourc
     project_root = runtime.rosotacom_config.parent
     if runtime.deployment and _relative_to(runtime.deployment, project_root) is None:
         raw["deployment"] = ".rosotacom/deployment.yaml"
+    if runtime.profiles_file and _relative_to(runtime.profiles_file, project_root) is None:
+        raw["profiles"] = ".rosotacom/profiles.yaml"
     staged_source = f"{plan.workdir}/source"
     for key in ("session_configs_dir", "scenario_configs_dir"):
         if raw.get(key) is not None:
@@ -2159,6 +2161,14 @@ def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: O
                     f"{plan.workdir}/project/.rosotacom/deployment.yaml",
                     dry_run=dry_run,
                     label=f"{peer.name}: stage deployment",
+                )
+            if runtime.profiles_file and _relative_to(runtime.profiles_file, project_root) is None:
+                _ota_stage_text(
+                    peer,
+                    runtime.profiles_file.read_text(encoding="utf-8"),
+                    f"{plan.workdir}/project/.rosotacom/profiles.yaml",
+                    dry_run=dry_run,
+                    label=f"{peer.name}: stage profiles",
                 )
     finally:
         if temporary_bundle is not None:
@@ -4367,7 +4377,7 @@ def _topic_probe_command(ros_setup: str, ros2_command: str) -> str:
 def _run_container_shell(container_name: str, command: str, timeout_s: int = 30) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
-            ["docker", "exec", container_name, "bash", "-lc", command],
+            ["docker", "exec", container_name, "bash", "-c", command],
             text=True,
             capture_output=True,
             timeout=timeout_s,
@@ -4997,7 +5007,7 @@ def _start_smoke_topic_publishers(
             f"{spec.publish_topic} ({spec.publish_type}) in {container}"
         )
         subprocess.run(
-            ["docker", "exec", "-d", container, "bash", "-lc", cmd],
+            ["docker", "exec", "-d", container, "bash", "-c", cmd],
             capture_output=True,
             text=True,
             check=False,
@@ -5046,7 +5056,7 @@ def _publish_isolation_probe(
     detached, for `duration` seconds (self-stops via `timeout`)."""
     cmd = f"{ros_setup} && timeout {duration} ros2 topic pub {shlex.quote(topic)} std_msgs/msg/Empty '{{}}' -r {rate}"
     subprocess.run(
-        ["docker", "exec", "-d", container_name, "bash", "-lc", cmd], capture_output=True, text=True, check=False
+        ["docker", "exec", "-d", container_name, "bash", "-c", cmd], capture_output=True, text=True, check=False
     )
 
 

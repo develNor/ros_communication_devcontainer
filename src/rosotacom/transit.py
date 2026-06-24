@@ -72,11 +72,14 @@ def summarize_transit_records(records: Iterable[dict[str, Any]]) -> dict[str, An
         lost = sum(record.get("status") == "lost" for record in topic_records)
         reordered = sum(record.get("status") == "reordered" for record in topic_records)
         delivered = len(topic_records) - lost
-        ota = [
-            float(record["sections"]["ota_hop_ms"])
-            for record in topic_records
-            if isinstance(record.get("sections"), dict) and record["sections"].get("ota_hop_ms") is not None
-        ]
+        ota = []
+        for record in topic_records:
+            if isinstance(record.get("sections"), dict):
+                val = record["sections"].get("ota_hop_ms")
+                if val is None:
+                    val = record["sections"].get("ota_hop_uncorrected_ms")
+                if val is not None:
+                    ota.append(float(val))
         jitter = [float(record["jitter_ms"]) for record in topic_records if record.get("jitter_ms") is not None]
         topics[topic] = {
             "expected": len(topic_records),

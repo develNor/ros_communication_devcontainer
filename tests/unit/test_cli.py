@@ -719,7 +719,7 @@ def test_run_scenario_application_can_override_network(
     assert isinstance(override, dict)
     assert override["container_name"] == "rosotacom_test_scenario_demo_a_local_app"
     assert override["image_name"] == "app-image-test"
-    assert override["run_args"] == ["-e", "ROS_DOMAIN_ID=46", "--network", "smoke-net"]
+    assert override["run_args"] == ["-e", "ROS_DOMAIN_ID=46", "--network", "smoke-net", "--cap-add", "NET_ADMIN"]
 
 
 def test_active_interactive_smoke_runs_are_listed_from_tmux_metadata(
@@ -1283,8 +1283,12 @@ def test_module_completion_registers_the_public_command(
 
 def test_argcomplete_protocol_returns_session_prefix_matches() -> None:
     line = "rosotacom smoke 1_"
+    src_dir = str((Path(__file__).parent.parent.parent / "src").resolve())
     env = {
         **os.environ,
+        "PYTHONPATH": os.path.pathsep.join([src_dir, os.environ.get("PYTHONPATH", "")]),
+        "ROSOTACOM_PROFILES": str(Path(src_dir) / "rosotacom" / "resources" / "examples" / "profiles.yaml"),
+        "ROSOTACOM_ROS2DOCKER_CONFIG": str(Path(src_dir) / "rosotacom" / "resources" / "examples" / "ros2docker.json"),
         "_ARGCOMPLETE": "1",
         "_ARGCOMPLETE_IFS": "\v",
         "_ARGCOMPLETE_SUPPRESS_SPACE": "1",
@@ -1300,13 +1304,20 @@ def test_argcomplete_protocol_returns_session_prefix_matches() -> None:
         text=True,
     )
 
-    assert result.stdout.split("\v") == ["1_heartbeat", "1_heartbeat_status"]
+    assert result.stdout.split("\v") == [
+        "1_heartbeat",
+        "1_heartbeat_status",
+    ], f"STDOUT: {result.stdout!r}, STDERR: {result.stderr!r}"
 
 
 def test_argcomplete_protocol_returns_identity_matches() -> None:
     line = "rosotacom start 1_heartbeat --identity "
+    src_dir = str((Path(__file__).parent.parent.parent / "src").resolve())
     env = {
         **os.environ,
+        "PYTHONPATH": os.path.pathsep.join([src_dir, os.environ.get("PYTHONPATH", "")]),
+        "ROSOTACOM_PROFILES": str(Path(src_dir) / "rosotacom" / "resources" / "examples" / "profiles.yaml"),
+        "ROSOTACOM_ROS2DOCKER_CONFIG": str(Path(src_dir) / "rosotacom" / "resources" / "examples" / "ros2docker.json"),
         "_ARGCOMPLETE": "1",
         "_ARGCOMPLETE_IFS": "\v",
         "_ARGCOMPLETE_SUPPRESS_SPACE": "1",
@@ -1322,7 +1333,10 @@ def test_argcomplete_protocol_returns_identity_matches() -> None:
         text=True,
     )
 
-    assert result.stdout.split("\v") == ["a", "b"]
+    assert result.stdout.split("\v") == [
+        "a",
+        "b",
+    ], f"STDOUT: {result.stdout!r}, STDERR: {result.stderr!r}"
 
 
 def test_peer_completion_returns_logical_peers_hosts_and_values(
@@ -1880,9 +1894,23 @@ def test_isolated_network_run_args_swaps_host_networking() -> None:
     base = ["-e", "ROS_DOMAIN_ID=48", "--network", "host"]
     swapped = rosotacom._isolated_network_run_args(base, "rosotacom-smoke", "10.137.0.2")
     assert "host" not in swapped
-    assert swapped == ["-e", "ROS_DOMAIN_ID=48", "--network", "rosotacom-smoke", "--ip", "10.137.0.2"]
+    assert swapped == [
+        "-e",
+        "ROS_DOMAIN_ID=48",
+        "--network",
+        "rosotacom-smoke",
+        "--cap-add",
+        "NET_ADMIN",
+        "--ip",
+        "10.137.0.2",
+    ]
     # A config that already pins --network=... form is also replaced.
-    assert rosotacom._isolated_network_run_args(["--network=host"], "net", None) == ["--network", "net"]
+    assert rosotacom._isolated_network_run_args(["--network=host"], "net", None) == [
+        "--network",
+        "net",
+        "--cap-add",
+        "NET_ADMIN",
+    ]
 
 
 def test_smoke_crossed_topics_include_native_chatter_direction() -> None:

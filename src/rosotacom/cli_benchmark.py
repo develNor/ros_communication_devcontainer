@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
+import shutil
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -233,6 +235,7 @@ def drive_recovery(
     nominal_period_s: float = 0.05,
     latched_topics: Sequence[str] = (),
     out_dir: Path,
+    profiles_file: Path | None = None,
 ) -> dict[str, Any]:
     """Drive a recovery test: run under a timeline profile, extract recovery metrics.
 
@@ -243,7 +246,7 @@ def drive_recovery(
     from .network_profiles import load_profiles_file
 
     # Load the timeline profile to find the outage window.
-    profiles = load_profiles_file(_find_profiles_file())
+    profiles = load_profiles_file(_find_profiles_file(profiles_file))
     profile_obj = profiles.get(profile)
     if profile_obj is None:
         raise ValueError(f"Profile {profile!r} not found in profiles file.")
@@ -377,8 +380,75 @@ def _current_sha() -> str:
         return "unknown"
 
 
-def _find_profiles_file() -> Path:
+def _setup_benchmark_run_dir(args: argparse.Namespace, genre: str, profile: str | None) -> Path:
+    """Setup a unique run directory under benchmarks_dir and write command/metadata/configs."""
+    from datetime import datetime
+
+    from . import __version__
+    from .cli import _load_runtime_config, _resolve_project_config_source
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+    if not artifacts_dir:
+        artifacts_dir = Path.cwd() / "artifacts" / "benchmarks"
+
+    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    profile_part = f"_{profile}" if profile else ""
+    run_dir = artifacts_dir / f"{genre}{profile_part}_{now_str}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Write command.txt
+    command_line = " ".join(shlex.quote(arg) for arg in sys.argv)
+    (run_dir / "command.txt").write_text(command_line + "\n", encoding="utf-8")
+
+    # 2. Write metadata.json
+    safe_args = {}
+    for k, v in vars(args).items():
+        if k.startswith("_"):
+            continue
+        try:
+            json.dumps(v)
+            safe_args[k] = v
+        except Exception:
+            safe_args[k] = str(v)
+
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "rosotacom_version": __version__,
+        "genre": genre,
+        "profile": profile,
+        "args": safe_args,
+        "rosotacom_sha": _current_sha(),
+    }
+    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    # 3. Copy config files if present
+    # rosotacom.yaml
+    rosotacom_config_raw, _ = _resolve_project_config_source(args)
+    if rosotacom_config_raw:
+        config_path = Path(rosotacom_config_raw).resolve()
+        if config_path.is_file():
+            shutil.copy2(config_path, run_dir / "rosotacom.yaml")
+
+    # profiles file
+    if runtime.profiles_file:
+        profiles_path = Path(runtime.profiles_file).resolve()
+        if profiles_path.is_file():
+            shutil.copy2(profiles_path, run_dir / "profiles.yaml")
+
+    # ros2docker.json
+    if runtime.ros2docker_config:
+        ros2docker_path = Path(runtime.ros2docker_config).resolve()
+        if ros2docker_path.is_file():
+            shutil.copy2(ros2docker_path, run_dir / "ros2docker.json")
+
+    return run_dir
+
+
+def _find_profiles_file(profiles_file: Path | None = None) -> Path:
     """Locate the profiles file from the project config."""
+    if profiles_file is not None and profiles_file.is_file():
+        return profiles_file
     # Walk up from the package to find profiles.yaml or rosotacom.yaml.
     for candidate in (
         Path.cwd() / "profiles.yaml",
@@ -628,10 +698,32 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                         }
                     }
                 }
+            if not dry_run:
+                probe_parts = ["probe", instance.instance_id]
+                for k, v in sorted(load.items()):
+                    probe_parts.append(f"{k}_{v}")
+                probe_name = "_".join(probe_parts)
+                dest = out_dir / "probes" / probe_name
+                shutil.copytree(instance.host_dir, dest, dirs_exist_ok=True)
             return collect_transit_summary(instance.host_dir)
 
         else:
             # --- Lab (smoke) path ---
+            if getattr(args, "dry_run", False):
+                return {
+                    "topics": {
+                        "/bench_capacity": {
+                            "expected": 100,
+                            "delivered": 100,
+                            "lost": 0,
+                            "loss_pct": 0.0,
+                            "reordered": 0,
+                            "ota_hop_ms": {"p50": 50.0, "p95": 100.0},
+                            "jitter_ms": {"p50": 1.0, "p95": 3.0},
+                        }
+                    }
+                }
+
             runtime = _load_runtime_config(args)
             session = _resolve_session(session_name, runtime)
             instance_id = getattr(args, "instance_id", None) or _new_instance_id()
@@ -663,6 +755,59 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=SMOKE_PEER_IPS["b"])
             )
 
+            from .network_profiles import load_profiles_file, shaping_commands
+
+            profile_name = getattr(args, "profile", None)
+            profile_obj = None
+            if profile_name and runtime.profiles_file:
+                try:
+                    profiles = load_profiles_file(runtime.profiles_file)
+                    profile_obj = profiles.get(profile_name)
+                except Exception as exc:
+                    print(f"Warning: Failed to load profile {profile_name!r}: {exc}", file=sys.stderr)
+
+            def make_container_runner(container_name: str) -> Callable[[Sequence[str]], None]:
+                def run(argv: Sequence[str]) -> None:
+                    # Execute tc command inside container namespace as root.
+                    cmd = ["docker", "exec", "-u", "root", container_name] + list(argv)
+                    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    if res.returncode != 0:
+                        print(
+                            f"Warning: Command failed in {container_name}: "
+                            f"{' '.join(cmd)} -> {res.stderr or res.stdout}",
+                            file=sys.stderr,
+                        )
+
+                return run
+
+            shapers = []
+            peer_steps = {}
+            if profile_obj is not None:
+                if profile_obj.is_timeline:
+                    # Peer A shapes uplink (egress to B)
+                    shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
+                    shapers.append(shaper_a)
+                    steps_a = expand_timeline(profile_obj, "eth0", direction="uplink")
+                    peer_steps["a"] = (shaper_a, steps_a)
+
+                    # Peer B shapes downlink (egress to A)
+                    shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
+                    shapers.append(shaper_b)
+                    steps_b = expand_timeline(profile_obj, "eth0", direction="downlink")
+                    peer_steps["b"] = (shaper_b, steps_b)
+
+                    for shaper in shapers:
+                        shaper.arm([])
+                else:
+                    if profile_obj.uplink and not profile_obj.uplink.is_empty:
+                        shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
+                        shaper_a.arm(shaping_commands("eth0", profile_obj.uplink))
+                        shapers.append(shaper_a)
+                    if profile_obj.downlink and not profile_obj.downlink.is_empty:
+                        shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
+                        shaper_b.arm(shaping_commands("eth0", profile_obj.downlink))
+                        shapers.append(shaper_b)
+
             ros_setup_a = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "a")
             rate = load.get("rate", 20.0)
             size = load.get("size") or load.get("size_a") or 66000
@@ -674,7 +819,8 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 topic_name = topic_spec.get("topic")
                 cmd = (
                     f"{ros_setup_a} && timeout {duration_s} ros2 run com_py sized_publisher --ros-args "
-                    f"-p topic:={shlex.quote(topic_name)} -p size:={size} -p rate:={rate} -p streams:={streams}"
+                    f"-p topic:={shlex.quote(topic_name)} -p size:={size} -p rate:={rate} -p streams:={streams} "
+                    f'> "${{ROSOTACOM_LOGS_DIR}}/a/sized_publisher.log" 2>&1'
                 )
                 pub_cmds.append(cmd)
 
@@ -686,8 +832,21 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                         text=True,
                         check=False,
                     )
-                time.sleep(duration_s)
+
+                if profile_obj is not None and profile_obj.is_timeline:
+                    num_steps = len(profile_obj.timeline)
+                    for i in range(num_steps):
+                        step_duration = profile_obj.timeline[i].for_s
+                        for shaper, steps in peer_steps.values():
+                            step = steps[i]
+                            shaper.apply(step.commands)
+                        time.sleep(step_duration)
+                else:
+                    time.sleep(duration_s)
             finally:
+                for shaper in shapers:
+                    shaper.teardown()
+
                 for container in [a_container, b_container]:
                     if container:
                         subprocess.run(
@@ -699,20 +858,13 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                         _stop_container_name(container, runtime)
                 _remove_smoke_network()
 
-            if getattr(args, "dry_run", False):
-                return {
-                    "topics": {
-                        "/bench_capacity": {
-                            "expected": 100,
-                            "delivered": 100,
-                            "lost": 0,
-                            "loss_pct": 0.0,
-                            "reordered": 0,
-                            "ota_hop_ms": {"p50": 50.0, "p95": 100.0},
-                            "jitter_ms": {"p50": 1.0, "p95": 3.0},
-                        }
-                    }
-                }
+            probe_parts = ["probe", smoke_instance.instance_id]
+            for k, v in sorted(load.items()):
+                probe_parts.append(f"{k}_{v}")
+            probe_name = "_".join(probe_parts)
+            dest = out_dir / "probes" / probe_name
+            shutil.copytree(smoke_instance.host_dir, dest, dirs_exist_ok=True)
+
             return collect_transit_summary(smoke_instance.host_dir)
 
     return run_point
@@ -720,14 +872,12 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
 def benchmark_capacity(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark capacity``."""
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
-    if artifacts_dir:
-        out_dir = artifacts_dir
-        out_path = out_dir / Path(getattr(args, "out", "budgets.jsonl")).name
-    else:
-        out_path = Path(getattr(args, "out", "budgets.jsonl"))
-        out_dir = out_path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+
+    run_dir = _setup_benchmark_run_dir(args, "capacity", args.profile)
 
     # Use stub probe under test, or live probe in production.
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_1_capacity")
@@ -744,20 +894,35 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
         topic=getattr(args, "topic", ""),
         repeats=getattr(args, "repeats", 1),
         duration_s=getattr(args, "duration", 60.0),
-        out_dir=out_dir,
+        out_dir=run_dir,
     )
-    print(f"Capacity: {result['slice']['knob']}={result['capacity']} → {out_path}")
+
+    # Resolve aggregated file output path
+    out_file_name = getattr(args, "out", "budgets.jsonl")
+    if artifacts_dir:
+        out_path = artifacts_dir / Path(out_file_name).name
+    else:
+        out_path = Path(out_file_name)
+
+    run_budgets_file = run_dir / "budgets.jsonl"
+    if run_budgets_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "a", encoding="utf-8") as f_out:
+            f_out.write(run_budgets_file.read_text(encoding="utf-8"))
+        print(f"Aggregated budget result appended to {out_path}")
+
+    print(f"Capacity: {result['slice']['knob']}={result['capacity']} → {run_dir / 'budgets.jsonl'}")
     return 0
 
 
 def benchmark_ramp(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark ramp``."""
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
-    if artifacts_dir:
-        out_dir = artifacts_dir
-    else:
-        out_dir = Path(getattr(args, "out", "curve.jsonl")).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+
+    run_dir = _setup_benchmark_run_dir(args, "ramp", args.profile)
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_3_ramp")
 
@@ -770,19 +935,33 @@ def benchmark_ramp(args: argparse.Namespace) -> int:
         rate_hz=getattr(args, "rate_hz", 20.0),
         topic=getattr(args, "topic", ""),
         duration_s=getattr(args, "duration", 60.0),
-        out_dir=out_dir,
+        out_dir=run_dir,
     )
+
+    # Resolve aggregated file output path
+    out_file_name = getattr(args, "out", "curve.jsonl")
+    if artifacts_dir:
+        out_path = artifacts_dir / Path(out_file_name).name
+    else:
+        out_path = Path(out_file_name)
+
+    run_curve_file = run_dir / "curve.jsonl"
+    if run_curve_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(run_curve_file, out_path)
+        print(f"Ramp curve copied to {out_path}")
+
     return 0
 
 
 def benchmark_recovery(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark recovery``."""
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
-    if artifacts_dir:
-        out_dir = artifacts_dir
-    else:
-        out_dir = Path(getattr(args, "out", "recovery.json")).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+
+    run_dir = _setup_benchmark_run_dir(args, "recovery", args.profile)
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_4_recovery")
 
@@ -792,19 +971,34 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
         duration_s=getattr(args, "duration", 90.0),
         nominal_period_s=getattr(args, "nominal_period", 0.05),
         latched_topics=getattr(args, "latched_topics", "").split(",") if getattr(args, "latched_topics", "") else (),
-        out_dir=out_dir,
+        out_dir=run_dir,
+        profiles_file=runtime.profiles_file,
     )
+
+    # Resolve aggregated file output path
+    out_file_name = getattr(args, "out", "recovery.json")
+    if artifacts_dir:
+        out_path = artifacts_dir / Path(out_file_name).name
+    else:
+        out_path = Path(out_file_name)
+
+    run_rec_file = run_dir / "recovery.json"
+    if run_rec_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(run_rec_file, out_path)
+        print(f"Recovery metrics copied to {out_path}")
+
     return 0
 
 
 def benchmark_sweep(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark sweep``."""
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
-    if artifacts_dir:
-        out_dir = artifacts_dir
-    else:
-        out_dir = Path(getattr(args, "out", "frontier.jsonl")).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+
+    run_dir = _setup_benchmark_run_dir(args, "sweep", None)
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_2_load_sweep")
 
@@ -818,13 +1012,28 @@ def benchmark_sweep(args: argparse.Namespace) -> int:
         size=getattr(args, "size", 60000),
         topic=getattr(args, "topic", ""),
         duration_s=getattr(args, "duration", 60.0),
-        out_dir=out_dir,
+        out_dir=run_dir,
     )
+
+    # Resolve aggregated file output path
+    out_file_name = getattr(args, "out", "frontier.jsonl")
+    if artifacts_dir:
+        out_path = artifacts_dir / Path(out_file_name).name
+    else:
+        out_path = Path(out_file_name)
+
+    run_frontier_file = run_dir / "frontier.jsonl"
+    if run_frontier_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(run_frontier_file, out_path)
+        print(f"Sweep frontier copied to {out_path}")
+
     return 0
 
 
 def benchmark_plot(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark plot``."""
+    from .cli import _load_runtime_config
     from .plots import (
         plot_capacity_frontier,
         plot_offered_bw,
@@ -833,7 +1042,8 @@ def benchmark_plot(args: argparse.Namespace) -> int:
         plot_topic_heatmap,
     )
 
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
     input_path_raw = getattr(args, "input", None)
 
     if not input_path_raw and not artifacts_dir:

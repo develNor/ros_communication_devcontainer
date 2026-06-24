@@ -100,6 +100,7 @@ class RuntimeConfig:
     project_source: str | None = None
     scenario_configs_dir: tuple[Path, ...] = ()
     profiles_file: Path | None = None
+    benchmarks_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -387,6 +388,7 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         "session_instances_dir",
         "deployment",
         "profiles",
+        "benchmarks_dir",
     }
     unknown_project_keys = sorted(set(cfg) - allowed_project_keys)
     if unknown_project_keys:
@@ -426,6 +428,11 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         os.environ.get("ROSOTACOM_PROFILES"),
         cfg.get("profiles"),
     )
+    benchmarks_dir_raw = _first_value(
+        getattr(args, "artifacts_dir", None),
+        os.environ.get("ROSOTACOM_BENCHMARKS_DIR"),
+        cfg.get("benchmarks_dir"),
+    )
 
     ros2docker_config = _resolve_path(ros2docker_config_raw, config_base, must_exist=True)
     if ros2docker_config is None:
@@ -457,6 +464,7 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
             must_exist=True,
         ),
         profiles_file=_resolve_path(profiles_raw, config_base, must_exist=True),
+        benchmarks_dir=_resolve_path(benchmarks_dir_raw, config_base, must_exist=False),
     )
 
 
@@ -4497,7 +4505,7 @@ def _isolated_network_run_args(run_args: list[str], network_name: str, ip: str |
             continue
         out.append(token)
         i += 1
-    out.extend(["--network", network_name])
+    out.extend(["--network", network_name, "--cap-add", "NET_ADMIN"])
     if ip:
         out.extend(["--ip", ip])
     return out

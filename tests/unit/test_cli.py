@@ -1302,7 +1302,10 @@ def test_argcomplete_protocol_returns_session_prefix_matches() -> None:
         text=True,
     )
 
-    assert result.stdout.split("\v") == ["1_heartbeat", "1_heartbeat_status"]
+    assert result.stdout.split("\v") == [
+        "1_heartbeat",
+        "1_heartbeat_status",
+    ], f"STDOUT: {result.stdout!r}, STDERR: {result.stderr!r}"
 
 
 def test_argcomplete_protocol_returns_identity_matches() -> None:
@@ -1326,7 +1329,10 @@ def test_argcomplete_protocol_returns_identity_matches() -> None:
         text=True,
     )
 
-    assert result.stdout.split("\v") == ["a", "b"]
+    assert result.stdout.split("\v") == [
+        "a",
+        "b",
+    ], f"STDOUT: {result.stdout!r}, STDERR: {result.stderr!r}"
 
 
 def test_peer_completion_returns_logical_peers_hosts_and_values(

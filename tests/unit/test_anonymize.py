@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import array
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import yaml
+
+# Mock ROS 2 host-side missing packages for unit tests
+sys.modules["rosbag2_py"] = MagicMock()
+sys.modules["rclpy"] = MagicMock()
+sys.modules["rclpy.serialization"] = MagicMock()
+sys.modules["rosidl_runtime_py"] = MagicMock()
+sys.modules["rosidl_runtime_py.utilities"] = MagicMock()
+
+import pytest  # noqa: E402
+
+import rosotacom.cli as cli  # noqa: E402
+
+# Load anonymize_bag.py dynamically to test its recursive anonymizer on mock structures
+ws_creation_dir = Path(__file__).parents[2] / "src" / "rosotacom" / "resources" / "ws" / "session" / "creation"
+anonymize_bag_path = ws_creation_dir / "anonymize_bag.py"
+spec = importlib.util.spec_from_file_location("anonymize_bag", anonymize_bag_path)
+assert spec is not None and spec.loader is not None
+anonymize_bag = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(anonymize_bag)
+
+
+class Time:
+    __slots__ = ["sec", "nanosec"]
+
+    def __init__(self, sec: int, nanosec: int):
+        self.sec = sec
+        self.nanosec = nanosec
+
+
+Time.__module__ = "builtin_interfaces.msg._time"
+
+
+class MockInner:
+    __slots__ = ["inner_str", "inner_int"]
+
+    def __init__(self, s: str, i: int):
+        self.inner_str = s
+        self.inner_int = i
+
+
+class MockMessage:
+    __slots__ = [
+        "stamp",
+        "payload_str",
+        "payload_bytes",
+        "payload_array",
+        "payload_list",
+        "payload_int",
+        "payload_bool",
+        "nested_msg",
+        "nested_list",
+    ]
+
+    def __init__(self):
+        self.stamp = Time(12345, 67890)
+        self.payload_str = "sensitive_data"
+        self.payload_bytes = b"binary_image_data"
+        self.payload_array = array.array("i", [1, 2, 3])
+        self.payload_list = [4, 5, 6]
+        self.payload_int = 42
+        self.payload_bool = True
+        self.nested_msg = MockInner("secret", 7)
+        self.nested_list = [MockInner("subsecret", 8)]
+
+
+def test_anonymize_msg_recursive_replacement() -> None:
+    msg = MockMessage()
+    anonymize_bag.anonymize_msg(msg)
+
+    # Time fields must not be touched
+    assert msg.stamp.sec == 12345
+    assert msg.stamp.nanosec == 67890
+
+    # Payload values must be zeroed/mocked, but keep identical types and lengths
+    assert msg.payload_str == "x" * 14
+    assert msg.payload_bytes == b"\x00" * 17
+    assert msg.payload_array == array.array("i", [0, 0, 0])
+    assert msg.payload_list == [0, 0, 0]
+    assert msg.payload_int == 0
+    assert msg.payload_bool is False
+    assert msg.nested_msg.inner_str == "xxxxxx"
+    assert msg.nested_msg.inner_int == 0
+    assert msg.nested_list[0].inner_str == "xxxxxxxxx"
+    assert msg.nested_list[0].inner_int == 0
+
+
+def test_anonymize_cli_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. Create a dummy session definition
+    session_dir = tmp_path / "sessions" / "test_session"
+    session_dir.mkdir(parents=True)
+    session_def = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {
+            "a": {"domain_id": 46},
+            "b": {"domain_id": 47},
+        },
+        "topics": {"b_to_a": [{"topic": "/sensitive/topic", "type": "std_msgs/msg/String"}]},
+    }
+    with open(session_dir / "session-definition.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(session_def, f)
+
+    # 2. Create a dummy rosbag metadata.yaml
+    bag_dir = tmp_path / "test_bag"
+    bag_dir.mkdir()
+    metadata = {
+        "rosbag2_bagfile_information": {
+            "storage_identifier": "mcap",
+            "topics_with_message_count": [
+                {
+                    "topic_metadata": {
+                        "name": "/sensitive/topic",
+                        "type": "std_msgs/msg/String",
+                        "serialization_format": "cdr",
+                    }
+                }
+            ],
+        }
+    }
+    with open(bag_dir / "metadata.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(metadata, f)
+
+    # 3. Mock runtime environment config and resolution functions
+    from rosotacom.cli import ResolvedSession, RuntimeConfig
+
+    runtime = RuntimeConfig(
+        rosotacom_config=tmp_path / "rosotacom.yaml",
+        ros2docker_config=tmp_path / "ros2docker.json",
+        session_configs_dir=(tmp_path / "sessions",),
+        deployment=None,
+        install_id="test_install",
+        session_instances_dir=tmp_path / "session-instances",
+        scenario_configs_dir=(),
+        profiles_file=None,
+        benchmarks_dir=tmp_path / "benchmarks",
+    )
+
+    # Write a dummy ros2docker.json
+    with open(tmp_path / "ros2docker.json", "w", encoding="utf-8") as f:
+        json.dump({"image_name": "ros2docker-test-image"}, f)
+
+    # Mock resolved session
+    monkeypatch.setattr(cli, "_load_runtime_config", lambda *args: runtime)
+    monkeypatch.setattr(
+        cli,
+        "_resolve_session",
+        lambda name, rt: ResolvedSession(session_dir, str(session_dir), "session_configs"),
+    )
+
+    # Mock docker running api
+    container_runs = []
+
+    def mock_ros2docker_run(config_file, override, extra_run_args):
+        container_runs.append((override, extra_run_args))
+
+    monkeypatch.setattr(cli, "ros2docker_run", mock_ros2docker_run, raising=False)
+    monkeypatch.setattr(cli, "_stop_container_name", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_require_ros2docker", lambda: None)
+
+    # 4. Run anonymize subcommand
+    output_dir = tmp_path / "anonymized_output"
+    argv = ["anonymize", str(bag_dir), "-s", "test_session", "-o", str(output_dir), "--output-name", "anon_session"]
+
+    exit_code = cli.main(argv)
+    assert exit_code == 0
+
+    # 5. Verify the files generated in output_dir
+    assert (output_dir / "ros2docker.json").exists()
+    assert (output_dir / "rosotacom.yaml").exists()
+
+    # Verify anonymized session definition
+    anon_session_def_path = output_dir / "sessions" / "anon_session" / "session-definition.yaml"
+    assert anon_session_def_path.exists()
+    with open(anon_session_def_path, encoding="utf-8") as f:
+        anon_session = yaml.safe_load(f)
+    assert anon_session["topics"]["b_to_a"][0]["topic"] == "/topic1"
+
+    # Verify anonymized scenario definition
+    anon_scenario_def_path = output_dir / "scenarios" / "anon_session" / "scenario-definition.yaml"
+    assert anon_scenario_def_path.exists()
+    with open(anon_scenario_def_path, encoding="utf-8") as f:
+        anon_scenario = yaml.safe_load(f)
+    assert anon_scenario["session"] == "anon_session"
+    assert "b" in anon_scenario["applications"]
+
+    # Verify play_bag_b.ros2docker.json config
+    play_cfg_path = output_dir / "scenarios" / "anon_session" / "play_bag_b.ros2docker.json"
+    assert play_cfg_path.exists()
+    with open(play_cfg_path, encoding="utf-8") as f:
+        play_cfg = json.load(f)
+    assert play_cfg["command"] == "ros2 bag play --loop /bag/anonymized_bag"
+    assert "ROS_DOMAIN_ID=47" in play_cfg["run_args"]
+
+    # Verify container run arguments
+    assert len(container_runs) == 1
+    override, extra_args = container_runs[0]
+    assert override["container_name"] == "rosotacom_anonymizer"
+    assert "anonymize_bag.py" in override["command"]
+    assert f"/input_parent_dir/{bag_dir.name}" in override["command"]
+
+    # Ensure mapping of topics is passed to the container command
+    assert '"/sensitive/topic": "/topic1"' in override["command"]

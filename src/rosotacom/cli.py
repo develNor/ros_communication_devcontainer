@@ -6431,6 +6431,202 @@ def completion_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def anonymize_command(args: argparse.Namespace) -> int:
+    runtime = _load_runtime_config(args)
+
+    if args.scenario_dir:
+        try:
+            resolved_scenario = _resolve_scenario(args.scenario_dir, runtime)
+            scenario_def = _load_scenario_definition(resolved_scenario)
+            session_name = scenario_def.session
+        except Exception as exc:
+            print(f"Error: failed to resolve scenario: {exc}", file=sys.stderr)
+            return 1
+    elif args.session_dir:
+        session_name = args.session_dir
+    else:
+        print("Error: either --session-dir (-s) or --scenario-dir (-c) must be specified.", file=sys.stderr)
+        return 1
+
+    try:
+        resolved_session = _resolve_session(session_name, runtime)
+    except Exception as exc:
+        print(f"Error: failed to resolve session: {exc}", file=sys.stderr)
+        return 1
+
+    session_cfg = _effective_session_config(resolved_session.host_dir, runtime)
+    original_session_name = resolved_session.host_dir.name
+    output_name = args.output_name or f"anonymized_{original_session_name}"
+
+    transported_topics = {}
+    for direction_key, entries in session_cfg.get("topics", {}).items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or "topic" not in entry:
+                continue
+            topic = entry["topic"]
+            transported_topics[topic] = {
+                "type": entry.get("type"),
+                "direction": direction_key,
+            }
+
+    if not transported_topics:
+        print("Error: session configuration does not define any topics.", file=sys.stderr)
+        return 1
+
+    sorted_topics = sorted(transported_topics.keys())
+    topics_map = {topic: f"/topic{i + 1}" for i, topic in enumerate(sorted_topics)}
+
+    output_base_path = Path(args.output_dir).resolve()
+    output_session_dir = output_base_path / "sessions" / output_name
+    output_session_dir.mkdir(parents=True, exist_ok=True)
+
+    output_scenario_dir = output_base_path / "scenarios" / output_name
+    output_scenario_dir.mkdir(parents=True, exist_ok=True)
+
+    output_bag_dir = output_scenario_dir / "anonymized_bag"
+    if output_bag_dir.exists():
+        shutil.rmtree(output_bag_dir)
+
+    anon_session_cfg = dict(session_cfg)
+    anon_topics = {}
+    for direction, entries in session_cfg.get("topics", {}).items():
+        anon_entries = []
+        for entry in entries:
+            if isinstance(entry, dict) and "topic" in entry:
+                new_entry = dict(entry)
+                new_entry["topic"] = topics_map[entry["topic"]]
+                anon_entries.append(new_entry)
+            else:
+                anon_entries.append(entry)
+        anon_topics[direction] = anon_entries
+    anon_session_cfg["topics"] = anon_topics
+
+    session_def_path = output_session_dir / "session-definition.yaml"
+    with open(session_def_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(anon_session_cfg, f, default_flow_style=False, sort_keys=False)
+
+    input_bag_path = Path(args.bag_path).resolve()
+    metadata_file = (
+        input_bag_path / "metadata.yaml" if input_bag_path.is_dir() else input_bag_path.parent / "metadata.yaml"
+    )
+    if not metadata_file.exists():
+        print(f"Error: metadata.yaml not found for bag at {input_bag_path}", file=sys.stderr)
+        return 1
+
+    with open(metadata_file, encoding="utf-8") as f:
+        meta_doc = yaml.safe_load(f) or {}
+    storage_id = meta_doc.get("rosbag2_bagfile_information", {}).get("storage_identifier", "mcap")
+
+    _require_ros2docker()
+    ros2docker_cfg = load_config(runtime.ros2docker_config)
+    image_name = ros2docker_cfg.get("image_name", "ros2docker")
+
+    input_parent = input_bag_path.parent.resolve()
+    input_name = input_bag_path.name
+
+    extra_run_args = [
+        "-v",
+        f"{input_parent}:/input_parent_dir:ro",
+        "-v",
+        f"{output_scenario_dir.resolve()}:/output_scenario_dir",
+        "-v",
+        f"{WS_DIR.resolve()}:/ws",
+    ]
+
+    container_command = [
+        "python3",
+        "/ws/session/creation/anonymize_bag.py",
+        "--input-bag",
+        f"/input_parent_dir/{input_name}",
+        "--output-bag",
+        "/output_scenario_dir/anonymized_bag",
+        "--topics-map",
+        shlex.quote(json.dumps(topics_map)),
+        "--storage-id",
+        storage_id,
+    ]
+
+    container_name = "rosotacom_anonymizer"
+    _stop_container_name(container_name, runtime, quiet_missing=True)
+
+    print("Running anonymization inside ROS 2 docker container...")
+    try:
+        ros2docker_run(
+            config_file=runtime.ros2docker_config,
+            override={
+                "container_name": container_name,
+                "image_name": image_name,
+                "run_type": "command",
+                "command": " ".join(container_command),
+                "tty": True,
+                "stdin_open": True,
+            },
+            extra_run_args=extra_run_args,
+        )
+    except Exception as exc:
+        print(f"Error: ros2docker run failed: {exc}", file=sys.stderr)
+        return 1
+
+    src_peers = set()
+    for direction in anon_topics.keys():
+        parts = direction.split("_to_")
+        if len(parts) == 2:
+            src_peers.add(parts[0])
+
+    peer_settings = session_cfg.get("peer_settings", {})
+    applications_cfg = {}
+
+    for peer in src_peers:
+        domain_id = peer_settings.get(peer, {}).get("domain_id", 0)
+
+        play_bag_name = f"play_bag_{peer}.ros2docker.json"
+        play_bag_path = output_scenario_dir / play_bag_name
+        play_bag_cfg = {
+            "container_name": f"play_bag_{peer}",
+            "image_name": image_name,
+            "run_type": "command",
+            "command": "ros2 bag play --loop /bag/anonymized_bag",
+            "run_args": [
+                "--network",
+                "host",
+                "-v",
+                "./anonymized_bag:/bag/anonymized_bag",
+                "-e",
+                f"ROS_DOMAIN_ID={domain_id}",
+            ],
+        }
+        with open(play_bag_path, "w", encoding="utf-8") as f:
+            json.dump(play_bag_cfg, f, indent=2)
+
+        applications_cfg[peer] = [{"name": "play_bag", "ros2docker_config": f"./{play_bag_name}"}]
+
+    scenario_cfg = {"schema_version": 1, "session": output_name, "applications": applications_cfg}
+    scenario_def_path = output_scenario_dir / "scenario-definition.yaml"
+    with open(scenario_def_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(scenario_cfg, f, default_flow_style=False, sort_keys=False)
+
+    shutil.copy2(runtime.ros2docker_config, output_base_path / "ros2docker.json")
+
+    rosotacom_yaml_content = (
+        "ros2docker_config: ros2docker.json\n"
+        "session_configs_dir:\n"
+        "  - sessions\n"
+        "scenario_configs_dir:\n"
+        "  - scenarios\n"
+        "session_instances_dir: session-instances\n"
+    )
+    with open(output_base_path / "rosotacom.yaml", "w", encoding="utf-8") as f:
+        f.write(rosotacom_yaml_content)
+
+    print("\nSuccessfully generated anonymized scenario:")
+    print(f"  Session:  {output_session_dir}")
+    print(f"  Scenario: {output_scenario_dir}")
+    print(f"  Bag:      {output_bag_dir}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     commands = {
@@ -6454,6 +6650,7 @@ def main(argv: list[str] | None = None) -> int:
         "config",
         "completion",
         "benchmark",
+        "anonymize",
     }
     if not argv:
         argv = ["start"]
@@ -6785,6 +6982,36 @@ def main(argv: list[str] | None = None) -> int:
     from .cli_benchmark import register_benchmark_parser
 
     register_benchmark_parser(subparsers)
+
+    anonymize_parser = subparsers.add_parser(
+        "anonymize",
+        help="Anonymize a rosbag and create a scenario out of it.",
+    )
+    _add_common_config_args(anonymize_parser)
+    anonymize_parser.add_argument("bag_path", help="Path to native input rosbag.")
+    anonymize_parser.add_argument(
+        "-s",
+        "--session-dir",
+        dest="session_dir",
+        help="Path or name of the base session.",
+    )
+    anonymize_parser.add_argument(
+        "-c",
+        "--scenario-dir",
+        dest="scenario_dir",
+        help="Path or name of the base scenario (resolves session).",
+    )
+    anonymize_parser.add_argument(
+        "-o",
+        "--output-dir",
+        required=True,
+        help="Destination directory for anonymized files.",
+    )
+    anonymize_parser.add_argument(
+        "--output-name",
+        help="Name of the generated session/scenario (default: anonymized_<original_name>).",
+    )
+    anonymize_parser.set_defaults(func=anonymize_command)
 
     completion_parser = subparsers.add_parser(
         "completion",

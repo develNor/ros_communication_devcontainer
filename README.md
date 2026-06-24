@@ -239,6 +239,20 @@ container-side catmux prefix with `Ctrl-b Ctrl-b`. Detaching from the outer
 tmux does not stop the use case. `scenario stop` owns cleanup of the application
 containers, communication container, and outer tmux session.
 
+### Safe Replay Testing with Anonymized Rosbags
+
+To test scenarios involving proprietary data (e.g. remote assistance) completely safely, you can anonymize a recorded native rosbag using `rosotacom anonymize`. This command:
+1. Extracts only the topics actually transported in a given session/scenario.
+2. Renames them to generic names like `/topic1`, `/topic2`, etc.
+3. Replaces all message contents with mock payloads of the exact same size, keeping the messages fully valid and deserializable (preserving timing metadata like headers).
+4. Generates a new self-contained `rosotacom` project directory containing the anonymized bag, session-definition, and scenario configuration to replay the exact communication patterns.
+
+```bash
+rosotacom anonymize /path/to/native_bag \
+  -s 3_comp_occ_grid \
+  -o ./anonymized_project
+```
+
 ## Usage Examples
 
 Create the example project first (cwd discovery wires it automatically once you

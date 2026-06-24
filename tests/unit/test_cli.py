@@ -1287,6 +1287,8 @@ def test_argcomplete_protocol_returns_session_prefix_matches() -> None:
     env = {
         **os.environ,
         "PYTHONPATH": os.path.pathsep.join([src_dir, os.environ.get("PYTHONPATH", "")]),
+        "ROSOTACOM_PROFILES": str(Path(src_dir) / "rosotacom" / "resources" / "examples" / "profiles.yaml"),
+        "ROSOTACOM_ROS2DOCKER_CONFIG": str(Path(src_dir) / "rosotacom" / "resources" / "examples" / "ros2docker.json"),
         "_ARGCOMPLETE": "1",
         "_ARGCOMPLETE_IFS": "\v",
         "_ARGCOMPLETE_SUPPRESS_SPACE": "1",
@@ -1314,6 +1316,8 @@ def test_argcomplete_protocol_returns_identity_matches() -> None:
     env = {
         **os.environ,
         "PYTHONPATH": os.path.pathsep.join([src_dir, os.environ.get("PYTHONPATH", "")]),
+        "ROSOTACOM_PROFILES": str(Path(src_dir) / "rosotacom" / "resources" / "examples" / "profiles.yaml"),
+        "ROSOTACOM_ROS2DOCKER_CONFIG": str(Path(src_dir) / "rosotacom" / "resources" / "examples" / "ros2docker.json"),
         "_ARGCOMPLETE": "1",
         "_ARGCOMPLETE_IFS": "\v",
         "_ARGCOMPLETE_SUPPRESS_SPACE": "1",
@@ -2247,14 +2251,3 @@ def test_content_integrity_skips_transformed_topics() -> None:
         )
     )
     assert rosotacom._content_integrity_specs(cfg, "a") == []
-
-
-def test_debug_ci_environment() -> None:
-    print(f"\nSYS_EXEC: {sys.executable}")
-    print(f"SYS_PATH: {sys.path}")
-    print(f"PATH_ENV: {os.environ.get('PATH')}")
-    print(f"VIRTUAL_ENV: {os.environ.get('VIRTUAL_ENV')}")
-    import sysconfig
-
-    print(f"SYSCONFIG_SCHEMES: {sysconfig.get_paths()}")
-    raise AssertionError("Forced failure to print debug info")

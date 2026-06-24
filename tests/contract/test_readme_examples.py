@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pytest
 import yaml
 
 import rosotacom.cli as cli
@@ -19,7 +20,8 @@ def test_readme_documents_current_entrypoints_and_workflow_files() -> None:
     assert "docs/ci.md" in readme
 
 
-def test_source_checkout_rosotacom_yaml_loads() -> None:
+def test_source_checkout_rosotacom_yaml_loads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ROSOTACOM_PROFILES", str(cli.EXAMPLE_PROJECT_DIR / "profiles.yaml"))
     runtime = cli._load_runtime_config(argparse.Namespace(rosotacom_config=str(PACKAGE_ROOT / "rosotacom.yaml")))
 
     assert runtime.ros2docker_config == cli.EXAMPLE_PROJECT_DIR / "ros2docker.json"

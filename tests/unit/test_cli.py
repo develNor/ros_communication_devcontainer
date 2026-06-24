@@ -719,7 +719,7 @@ def test_run_scenario_application_can_override_network(
     assert isinstance(override, dict)
     assert override["container_name"] == "rosotacom_test_scenario_demo_a_local_app"
     assert override["image_name"] == "app-image-test"
-    assert override["run_args"] == ["-e", "ROS_DOMAIN_ID=46", "--network", "smoke-net"]
+    assert override["run_args"] == ["-e", "ROS_DOMAIN_ID=46", "--network", "smoke-net", "--cap-add", "NET_ADMIN"]
 
 
 def test_active_interactive_smoke_runs_are_listed_from_tmux_metadata(
@@ -1880,9 +1880,23 @@ def test_isolated_network_run_args_swaps_host_networking() -> None:
     base = ["-e", "ROS_DOMAIN_ID=48", "--network", "host"]
     swapped = rosotacom._isolated_network_run_args(base, "rosotacom-smoke", "10.137.0.2")
     assert "host" not in swapped
-    assert swapped == ["-e", "ROS_DOMAIN_ID=48", "--network", "rosotacom-smoke", "--ip", "10.137.0.2"]
+    assert swapped == [
+        "-e",
+        "ROS_DOMAIN_ID=48",
+        "--network",
+        "rosotacom-smoke",
+        "--cap-add",
+        "NET_ADMIN",
+        "--ip",
+        "10.137.0.2",
+    ]
     # A config that already pins --network=... form is also replaced.
-    assert rosotacom._isolated_network_run_args(["--network=host"], "net", None) == ["--network", "net"]
+    assert rosotacom._isolated_network_run_args(["--network=host"], "net", None) == [
+        "--network",
+        "net",
+        "--cap-add",
+        "NET_ADMIN",
+    ]
 
 
 def test_smoke_crossed_topics_include_native_chatter_direction() -> None:

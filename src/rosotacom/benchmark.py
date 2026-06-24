@@ -345,7 +345,10 @@ def _send_time(record: dict[str, Any], *, seq0: int, t0: float, period_s: float,
 
 
 def _arrival_time(send_t: float, record: dict[str, Any]) -> float:
-    ota = (record.get("sections") or {}).get("ota_hop_ms")
+    sections = record.get("sections") or {}
+    ota = sections.get("ota_hop_ms")
+    if ota is None:
+        ota = sections.get("ota_hop_uncorrected_ms")
     return send_t + (float(ota) / 1000.0 if ota is not None else 0.0)
 
 

@@ -635,6 +635,21 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
         else:
             # --- Lab (smoke) path ---
+            if getattr(args, "dry_run", False):
+                return {
+                    "topics": {
+                        "/bench_capacity": {
+                            "expected": 100,
+                            "delivered": 100,
+                            "lost": 0,
+                            "loss_pct": 0.0,
+                            "reordered": 0,
+                            "ota_hop_ms": {"p50": 50.0, "p95": 100.0},
+                            "jitter_ms": {"p50": 1.0, "p95": 3.0},
+                        }
+                    }
+                }
+
             runtime = _load_runtime_config(args)
             session = _resolve_session(session_name, runtime)
             instance_id = getattr(args, "instance_id", None) or _new_instance_id()
@@ -666,6 +681,59 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=SMOKE_PEER_IPS["b"])
             )
 
+            from .network_profiles import load_profiles_file, shaping_commands
+
+            profile_name = getattr(args, "profile", None)
+            profile_obj = None
+            if profile_name and runtime.profiles_file:
+                try:
+                    profiles = load_profiles_file(runtime.profiles_file)
+                    profile_obj = profiles.get(profile_name)
+                except Exception as exc:
+                    print(f"Warning: Failed to load profile {profile_name!r}: {exc}", file=sys.stderr)
+
+            def make_container_runner(container_name: str) -> Callable[[Sequence[str]], None]:
+                def run(argv: Sequence[str]) -> None:
+                    # Execute tc command inside container namespace as root.
+                    cmd = ["docker", "exec", "-u", "root", container_name] + list(argv)
+                    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    if res.returncode != 0:
+                        print(
+                            f"Warning: Command failed in {container_name}: "
+                            f"{' '.join(cmd)} -> {res.stderr or res.stdout}",
+                            file=sys.stderr,
+                        )
+
+                return run
+
+            shapers = []
+            peer_steps = {}
+            if profile_obj is not None:
+                if profile_obj.is_timeline:
+                    # Peer A shapes uplink (egress to B)
+                    shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
+                    shapers.append(shaper_a)
+                    steps_a = expand_timeline(profile_obj, "eth0", direction="uplink")
+                    peer_steps["a"] = (shaper_a, steps_a)
+
+                    # Peer B shapes downlink (egress to A)
+                    shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
+                    shapers.append(shaper_b)
+                    steps_b = expand_timeline(profile_obj, "eth0", direction="downlink")
+                    peer_steps["b"] = (shaper_b, steps_b)
+
+                    for shaper in shapers:
+                        shaper.arm([])
+                else:
+                    if profile_obj.uplink and not profile_obj.uplink.is_empty:
+                        shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
+                        shaper_a.arm(shaping_commands("eth0", profile_obj.uplink))
+                        shapers.append(shaper_a)
+                    if profile_obj.downlink and not profile_obj.downlink.is_empty:
+                        shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
+                        shaper_b.arm(shaping_commands("eth0", profile_obj.downlink))
+                        shapers.append(shaper_b)
+
             ros_setup_a = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "a")
             rate = load.get("rate", 20.0)
             size = load.get("size") or load.get("size_a") or 66000
@@ -677,7 +745,8 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 topic_name = topic_spec.get("topic")
                 cmd = (
                     f"{ros_setup_a} && timeout {duration_s} ros2 run com_py sized_publisher --ros-args "
-                    f"-p topic:={shlex.quote(topic_name)} -p size:={size} -p rate:={rate} -p streams:={streams}"
+                    f"-p topic:={shlex.quote(topic_name)} -p size:={size} -p rate:={rate} -p streams:={streams} "
+                    f'> "${{ROSOTACOM_LOGS_DIR}}/a/sized_publisher.log" 2>&1'
                 )
                 pub_cmds.append(cmd)
 
@@ -689,8 +758,21 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                         text=True,
                         check=False,
                     )
-                time.sleep(duration_s)
+
+                if profile_obj is not None and profile_obj.is_timeline:
+                    num_steps = len(profile_obj.timeline)
+                    for i in range(num_steps):
+                        step_duration = profile_obj.timeline[i].for_s
+                        for shaper, steps in peer_steps.values():
+                            step = steps[i]
+                            shaper.apply(step.commands)
+                        time.sleep(step_duration)
+                else:
+                    time.sleep(duration_s)
             finally:
+                for shaper in shapers:
+                    shaper.teardown()
+
                 for container in [a_container, b_container]:
                     if container:
                         subprocess.run(
@@ -702,20 +784,6 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                         _stop_container_name(container, runtime)
                 _remove_smoke_network()
 
-            if getattr(args, "dry_run", False):
-                return {
-                    "topics": {
-                        "/bench_capacity": {
-                            "expected": 100,
-                            "delivered": 100,
-                            "lost": 0,
-                            "loss_pct": 0.0,
-                            "reordered": 0,
-                            "ota_hop_ms": {"p50": 50.0, "p95": 100.0},
-                            "jitter_ms": {"p50": 1.0, "p95": 3.0},
-                        }
-                    }
-                }
             return collect_transit_summary(smoke_instance.host_dir)
 
     return run_point

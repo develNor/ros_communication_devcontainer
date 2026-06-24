@@ -271,6 +271,7 @@ windows:
     if: use_domain_bridge
     splits:
       - commands:
+        - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
         - ros2 run domain_bridge domain_bridge --wait-for-publisher false ${domain_bridge_config_file}
   - name: IN
     if: in

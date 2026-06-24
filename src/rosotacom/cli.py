@@ -4505,7 +4505,7 @@ def _isolated_network_run_args(run_args: list[str], network_name: str, ip: str |
             continue
         out.append(token)
         i += 1
-    out.extend(["--network", network_name])
+    out.extend(["--network", network_name, "--cap-add", "NET_ADMIN"])
     if ip:
         out.extend(["--ip", ip])
     return out

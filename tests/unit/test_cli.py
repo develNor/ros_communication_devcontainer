@@ -1283,8 +1283,10 @@ def test_module_completion_registers_the_public_command(
 
 def test_argcomplete_protocol_returns_session_prefix_matches() -> None:
     line = "rosotacom smoke 1_"
+    src_dir = str((Path(__file__).parent.parent.parent / "src").resolve())
     env = {
         **os.environ,
+        "PYTHONPATH": os.path.pathsep.join([src_dir, os.environ.get("PYTHONPATH", "")]),
         "_ARGCOMPLETE": "1",
         "_ARGCOMPLETE_IFS": "\v",
         "_ARGCOMPLETE_SUPPRESS_SPACE": "1",
@@ -1305,8 +1307,10 @@ def test_argcomplete_protocol_returns_session_prefix_matches() -> None:
 
 def test_argcomplete_protocol_returns_identity_matches() -> None:
     line = "rosotacom start 1_heartbeat --identity "
+    src_dir = str((Path(__file__).parent.parent.parent / "src").resolve())
     env = {
         **os.environ,
+        "PYTHONPATH": os.path.pathsep.join([src_dir, os.environ.get("PYTHONPATH", "")]),
         "_ARGCOMPLETE": "1",
         "_ARGCOMPLETE_IFS": "\v",
         "_ARGCOMPLETE_SUPPRESS_SPACE": "1",

@@ -8,3 +8,5 @@ session_configs_dir:
 scenario_configs_dir:
   - src/rosotacom/resources/examples/scenarios
 session_instances_dir: session-instances
+profiles: ../profiles/benchmark-profiles.yaml
+benchmarks_dir: ../artifacts/benchmarks

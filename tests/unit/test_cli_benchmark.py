@@ -397,3 +397,43 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     args = parser.parse_args(["benchmark", "plot", "results.jsonl"])
     assert args.benchmark_command == "plot"
     assert args.input == "results.jsonl"
+
+
+def test_runtime_config_parses_benchmarks_dir_and_profiles(tmp_path: Path) -> None:
+    import yaml
+
+    from rosotacom.cli import _load_runtime_config
+
+    config_file = tmp_path / "rosotacom.yaml"
+    ros2docker = tmp_path / "ros2docker.json"
+    ros2docker.write_text("{}", encoding="utf-8")
+
+    config_data = {
+        "ros2docker_config": str(ros2docker),
+        "session_configs_dir": [],
+        "scenario_configs_dir": [],
+        "session_instances_dir": "session-instances",
+        "profiles": "profiles.yaml",
+        "benchmarks_dir": "benchmarks",
+    }
+    config_file.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+
+    # Write a dummy profiles file
+    profiles_file = tmp_path / "profiles.yaml"
+    profiles_file.write_text("profiles: {}", encoding="utf-8")
+
+    import argparse
+
+    args = argparse.Namespace(
+        rosotacom_config=str(config_file),
+        ros2docker_config=None,
+        session_configs_dir=None,
+        scenario_configs_dir=None,
+        session_instances_dir=None,
+        deployment=None,
+        profiles_file=None,
+    )
+    runtime = _load_runtime_config(args)
+
+    assert runtime.profiles_file == profiles_file
+    assert runtime.benchmarks_dir == tmp_path / "benchmarks"

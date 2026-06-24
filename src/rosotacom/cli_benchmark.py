@@ -233,6 +233,7 @@ def drive_recovery(
     nominal_period_s: float = 0.05,
     latched_topics: Sequence[str] = (),
     out_dir: Path,
+    profiles_file: Path | None = None,
 ) -> dict[str, Any]:
     """Drive a recovery test: run under a timeline profile, extract recovery metrics.
 
@@ -243,7 +244,7 @@ def drive_recovery(
     from .network_profiles import load_profiles_file
 
     # Load the timeline profile to find the outage window.
-    profiles = load_profiles_file(_find_profiles_file())
+    profiles = load_profiles_file(_find_profiles_file(profiles_file))
     profile_obj = profiles.get(profile)
     if profile_obj is None:
         raise ValueError(f"Profile {profile!r} not found in profiles file.")
@@ -377,8 +378,10 @@ def _current_sha() -> str:
         return "unknown"
 
 
-def _find_profiles_file() -> Path:
+def _find_profiles_file(profiles_file: Path | None = None) -> Path:
     """Locate the profiles file from the project config."""
+    if profiles_file is not None and profiles_file.is_file():
+        return profiles_file
     # Walk up from the package to find profiles.yaml or rosotacom.yaml.
     for candidate in (
         Path.cwd() / "profiles.yaml",
@@ -720,7 +723,10 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
 def benchmark_capacity(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark capacity``."""
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
     if artifacts_dir:
         out_dir = artifacts_dir
         out_path = out_dir / Path(getattr(args, "out", "budgets.jsonl")).name
@@ -752,7 +758,10 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
 
 def benchmark_ramp(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark ramp``."""
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
     if artifacts_dir:
         out_dir = artifacts_dir
     else:
@@ -777,7 +786,10 @@ def benchmark_ramp(args: argparse.Namespace) -> int:
 
 def benchmark_recovery(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark recovery``."""
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
     if artifacts_dir:
         out_dir = artifacts_dir
     else:
@@ -793,13 +805,17 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
         nominal_period_s=getattr(args, "nominal_period", 0.05),
         latched_topics=getattr(args, "latched_topics", "").split(",") if getattr(args, "latched_topics", "") else (),
         out_dir=out_dir,
+        profiles_file=runtime.profiles_file,
     )
     return 0
 
 
 def benchmark_sweep(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark sweep``."""
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
     if artifacts_dir:
         out_dir = artifacts_dir
     else:
@@ -825,6 +841,7 @@ def benchmark_sweep(args: argparse.Namespace) -> int:
 
 def benchmark_plot(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark plot``."""
+    from .cli import _load_runtime_config
     from .plots import (
         plot_capacity_frontier,
         plot_offered_bw,
@@ -833,7 +850,8 @@ def benchmark_plot(args: argparse.Namespace) -> int:
         plot_topic_heatmap,
     )
 
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else None
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
     input_path_raw = getattr(args, "input", None)
 
     if not input_path_raw and not artifacts_dir:

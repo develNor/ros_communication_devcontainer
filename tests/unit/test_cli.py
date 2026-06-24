@@ -2247,3 +2247,14 @@ def test_content_integrity_skips_transformed_topics() -> None:
         )
     )
     assert rosotacom._content_integrity_specs(cfg, "a") == []
+
+
+def test_debug_ci_environment() -> None:
+    print(f"\nSYS_EXEC: {sys.executable}")
+    print(f"SYS_PATH: {sys.path}")
+    print(f"PATH_ENV: {os.environ.get('PATH')}")
+    print(f"VIRTUAL_ENV: {os.environ.get('VIRTUAL_ENV')}")
+    import sysconfig
+
+    print(f"SYSCONFIG_SCHEMES: {sysconfig.get_paths()}")
+    raise AssertionError("Forced failure to print debug info")

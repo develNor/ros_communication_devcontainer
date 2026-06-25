@@ -198,6 +198,13 @@ class SessionInstance:
 
 
 @dataclass(frozen=True)
+class SmokeNetworkConfig:
+    name: str
+    subnet: str
+    peer_ips: dict[str, str]
+
+
+@dataclass(frozen=True)
 class SmokeTopicSpec:
     source_peer_key: str
     receiver_peer_key: str
@@ -4457,28 +4464,67 @@ SMOKE_NETWORK_SUBNET = "10.137.0.0/24"
 SMOKE_PEER_IPS: dict[str, str] = {"a": "10.137.0.2", "b": "10.137.0.3"}
 
 
+def _bounded_docker_name(name: str, *, max_len: int = 63) -> str:
+    token = _sanitize_docker_name(name)
+    if len(token) <= max_len:
+        return token
+    digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:10]
+    return f"{token[: max_len - 11]}_{digest}"
+
+
+def _smoke_subnet_from_token(token: str) -> str:
+    value = int(hashlib.sha1(token.encode("utf-8")).hexdigest()[:8], 16)
+    third_octet = value % 256
+    fourth_octet = ((value // 256) % 32) * 8
+    return f"10.137.{third_octet}.{fourth_octet}/29"
+
+
 def _interactive_smoke_network_config(runtime: RuntimeConfig, target_type: str, target_name: str) -> tuple[str, str]:
-    token = _sanitize_docker_name(f"rosotacom_smoke_{runtime.install_id}_{target_type}_{target_name}")
-    if len(token) > 63:
-        digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:10]
-        token = f"{token[:52]}_{digest}"
+    token = _bounded_docker_name(f"rosotacom_smoke_{runtime.install_id}_{target_type}_{target_name}")
     subnet_octet = 1 + (int(hashlib.sha1(token.encode("utf-8")).hexdigest()[:8], 16) % 200)
     return token, f"10.137.{subnet_octet}.0/24"
 
 
+def _noninteractive_smoke_network_config(
+    runtime: RuntimeConfig,
+    session: ResolvedSession,
+    instance_id: str,
+) -> SmokeNetworkConfig:
+    session_slug = _session_instance_slug(session, runtime)
+    token = _bounded_docker_name(f"rosotacom_smoke_{runtime.install_id}_{session_slug}_{instance_id}")
+    subnet = _smoke_subnet_from_token(token)
+    return SmokeNetworkConfig(
+        name=token,
+        subnet=subnet,
+        peer_ips=_smoke_peer_ips_for_subnet(["a", "b"], subnet),
+    )
+
+
 def _smoke_peer_ips_for_subnet(peers: list[str], subnet: str) -> dict[str, str]:
-    match = re.match(r"^(\d+\.\d+\.\d+)\.0/24$", subnet)
-    if not match:
-        raise RuntimeError(f"Interactive smoke requires a /24 IPv4 subnet, got: {subnet}")
-    prefix = match.group(1)
     sorted_peers = sorted(peers)
-    if len(sorted_peers) > 250:
-        raise RuntimeError(f"Too many peers for a /24 smoke subnet: {len(sorted_peers)}")
-    return {peer: f"{prefix}.{index + 2}" for index, peer in enumerate(sorted_peers)}
+    match_24 = re.match(r"^(\d+\.\d+\.\d+)\.0/24$", subnet)
+    if match_24:
+        prefix = match_24.group(1)
+        if len(sorted_peers) > 250:
+            raise RuntimeError(f"Too many peers for a /24 smoke subnet: {len(sorted_peers)}")
+        return {peer: f"{prefix}.{index + 2}" for index, peer in enumerate(sorted_peers)}
+
+    match_29 = re.match(r"^(\d+\.\d+\.\d+)\.(\d+)/29$", subnet)
+    if match_29:
+        prefix = match_29.group(1)
+        base = int(match_29.group(2))
+        if base % 8 != 0 or base > 248:
+            raise RuntimeError(f"Smoke /29 subnet must start on an 8-address boundary, got: {subnet}")
+        if len(sorted_peers) > 5:
+            raise RuntimeError(f"Too many peers for a /29 smoke subnet: {len(sorted_peers)}")
+        return {peer: f"{prefix}.{base + index + 2}" for index, peer in enumerate(sorted_peers)}
+
+    raise RuntimeError(f"Smoke requires a /24 or /29 IPv4 subnet, got: {subnet}")
 
 
-def _smoke_peer_address_args() -> list[str]:
-    return [f"{peer}={ip}" for peer, ip in SMOKE_PEER_IPS.items()]
+def _smoke_peer_address_args(peer_ips: dict[str, str] | None = None) -> list[str]:
+    source = peer_ips or SMOKE_PEER_IPS
+    return [f"{peer}={source[peer]}" for peer in sorted(source)]
 
 
 def _ensure_smoke_network(network_name: str = SMOKE_NETWORK_NAME, subnet: str = SMOKE_NETWORK_SUBNET) -> None:
@@ -6109,13 +6155,14 @@ def smoke(args: argparse.Namespace) -> int:
     session = _resolve_session(session_dir, runtime)
     instance_id = getattr(args, "instance_id", None) or _new_instance_id()
     smoke_instance = _resolve_session_instance(runtime, session, instance_id)
+    smoke_network = _noninteractive_smoke_network_config(runtime, session, smoke_instance.instance_id)
     smoke_log = smoke_instance.logs_host_dir / "smoke-verification.log"
 
     def log_line(message: str) -> None:
         print(message)
         _append_log(smoke_log, message)
 
-    peer_address_args = _smoke_peer_address_args()
+    peer_address_args = _smoke_peer_address_args(smoke_network.peer_ips)
     cfg = _effective_session_config(session.host_dir, runtime)
     common = {
         "rosotacom_config": args.rosotacom_config,
@@ -6130,22 +6177,22 @@ def smoke(args: argparse.Namespace) -> int:
         "peer": [],
         "peer_address": peer_address_args,
         "instance_id": smoke_instance.instance_id,
-        "network_name": SMOKE_NETWORK_NAME,
+        "network_name": smoke_network.name,
     }
 
     log_line(f"Starting local smoke test with PEER_ADDRESSES={', '.join(peer_address_args)}")
-    log_line(f"Smoke peers isolated on docker network {SMOKE_NETWORK_NAME} ({SMOKE_NETWORK_SUBNET})")
+    log_line(f"Smoke peers isolated on docker network {smoke_network.name} ({smoke_network.subnet})")
     log_line(f"Smoke artifacts: {smoke_instance.host_dir}")
     a_container = None
     b_container = None
     smoke_publishers: list[SmokeTopicSpec] = []
     try:
-        _ensure_smoke_network()
+        _ensure_smoke_network(smoke_network.name, smoke_network.subnet)
         a_container = start_session(
-            argparse.Namespace(**common, identity="a", auto_identity=True, network_ip=SMOKE_PEER_IPS["a"])
+            argparse.Namespace(**common, identity="a", auto_identity=True, network_ip=smoke_network.peer_ips["a"])
         )
         b_container = start_session(
-            argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=SMOKE_PEER_IPS["b"])
+            argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=smoke_network.peer_ips["b"])
         )
 
         plugin_text = "\n".join(
@@ -6208,10 +6255,10 @@ def smoke(args: argparse.Namespace) -> int:
                 _write_docker_log(started_container, smoke_instance, peer)
         if not args.keep_running:
             runtime = _load_runtime_config(args)
-            for started_container in [a_container, b_container]:
-                if started_container:
-                    _stop_container_name(started_container, runtime)
-            _remove_smoke_network()
+            for cleanup_container in [a_container, b_container]:
+                if cleanup_container:
+                    _stop_container_name(cleanup_container, runtime)
+            _remove_smoke_network(smoke_network.name)
         print(f"Smoke artifacts: {smoke_instance.host_dir}")
     return 0
 

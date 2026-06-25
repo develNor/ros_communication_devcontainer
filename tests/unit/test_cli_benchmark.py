@@ -8,12 +8,16 @@ covered by ``test_benchmark.py``; these verify the CLI-level orchestration.
 
 from __future__ import annotations
 
+import argparse
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import rosotacom.cli as cli
+import rosotacom.cli_benchmark as benchmark_cli
 from rosotacom.cli_benchmark import (
     _parse_values,
     collect_transit_summary,
@@ -344,6 +348,88 @@ def test_collect_transit_summary_from_fixture(tmp_path: Path) -> None:
     assert topics[topic_key]["expected"] == 3
     assert topics[topic_key]["delivered"] == 2
     assert topics[topic_key]["lost"] == 1
+
+
+def test_live_lab_run_point_uses_instance_scoped_smoke_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions_root = tmp_path / "sessions"
+    session_dir = sessions_root / "bench_1_1_capacity"
+    session_dir.mkdir(parents=True)
+    instance = cli.SessionInstance(
+        instance_id="bench",
+        host_dir=tmp_path / "instances" / "2026-01-01" / "bench_1_1_capacity_bench",
+        container_dir="/session/instances/2026-01-01/bench_1_1_capacity_bench",
+        config_host_dir=tmp_path / "instances" / "2026-01-01" / "bench_1_1_capacity_bench" / "config",
+        config_container_dir="/session/instances/2026-01-01/bench_1_1_capacity_bench/config",
+        logs_host_dir=tmp_path / "instances" / "2026-01-01" / "bench_1_1_capacity_bench" / "logs",
+        logs_container_dir="/session/instances/2026-01-01/bench_1_1_capacity_bench/logs",
+        rosbags_host_dir=tmp_path / "instances" / "2026-01-01" / "bench_1_1_capacity_bench" / "rosbags",
+        rosbags_container_dir="/session/instances/2026-01-01/bench_1_1_capacity_bench/rosbags",
+    )
+    status_dir = instance.host_dir / "logs" / "b" / "status"
+    status_dir.mkdir(parents=True)
+    (status_dir / "status.json").write_text(
+        json.dumps({"topics": [{"base": "/bench_capacity", "stages": [{"messages_total": 1}]}]}),
+        encoding="utf-8",
+    )
+    runtime = cli.RuntimeConfig(
+        None,
+        tmp_path / "ros2docker.json",
+        (sessions_root,),
+        None,
+        "id",
+        tmp_path / "instances",
+    )
+    session = cli.ResolvedSession(session_dir, "/session/definitions/bench_1_1_capacity", "session_configs")
+    smoke_network = cli._noninteractive_smoke_network_config(runtime, session, instance.instance_id)
+    started: list[argparse.Namespace] = []
+    networks_created: list[tuple[str, str]] = []
+    networks_removed: list[str] = []
+    stopped: list[str] = []
+
+    monkeypatch.setattr(cli, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(cli, "_resolve_session", lambda session_name, runtime: session)
+    monkeypatch.setattr(cli, "_resolve_session_instance", lambda runtime, session, instance_id=None: instance)
+    monkeypatch.setattr(cli, "_effective_session_config", lambda *args, **kwargs: {"topics": {"a_to_b": []}})
+    monkeypatch.setattr(cli, "_ensure_smoke_network", lambda name, subnet: networks_created.append((name, subnet)))
+    monkeypatch.setattr(cli, "start_session", lambda args: started.append(args) or f"container_{args.identity}")
+    monkeypatch.setattr(cli, "_smoke_ros_setup", lambda *args: "source /ros")
+    monkeypatch.setattr(cli, "_write_docker_log", lambda *args: None)
+    monkeypatch.setattr(cli, "_stop_container_name", lambda name, runtime: stopped.append(name) or True)
+    monkeypatch.setattr(cli, "_remove_smoke_network", lambda name: networks_removed.append(name))
+    monkeypatch.setattr(benchmark_cli, "collect_transit_summary", lambda instance_dir: {"topics": {}})
+    monkeypatch.setattr(benchmark_cli.time, "sleep", lambda seconds: None)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, "Subscription count: 1\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    args = argparse.Namespace(
+        rosotacom_config=None,
+        ros2docker_config=None,
+        session_configs_dir=None,
+        session_instances_dir=None,
+        deployment=None,
+        dry_run=False,
+        instance_id=instance.instance_id,
+        profile=None,
+    )
+
+    run_point = benchmark_cli._make_live_run_point(args, "bench_1_1_capacity")
+
+    assert run_point(profile="p", load={"size": 1}, duration_s=0.1, out_dir=out_dir) == {"topics": {}}
+    assert networks_created == [(smoke_network.name, smoke_network.subnet)]
+    assert [(args.identity, args.network_name, args.network_ip) for args in started] == [
+        ("a", smoke_network.name, smoke_network.peer_ips["a"]),
+        ("b", smoke_network.name, smoke_network.peer_ips["b"]),
+    ]
+    assert all(args.peer_address == cli._smoke_peer_address_args(smoke_network.peer_ips) for args in started)
+    assert stopped == ["container_a", "container_b"]
+    assert networks_removed == [smoke_network.name]
 
 
 # --------------------------------------------------------------------------- #

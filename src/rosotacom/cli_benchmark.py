@@ -619,12 +619,11 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
     from .cli import (
         _PROFILE_SAFETY_MAX_S,
-        SMOKE_NETWORK_NAME,
-        SMOKE_PEER_IPS,
         _effective_session_config,
         _ensure_smoke_network,
         _load_runtime_config,
         _new_instance_id,
+        _noninteractive_smoke_network_config,
         _ota_arm_profile,
         _ota_cleanup_hosts,
         _ota_collect_logs,
@@ -833,8 +832,9 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
             session = _resolve_session(session_name, runtime)
             instance_id = getattr(args, "instance_id", None) or _new_instance_id()
             smoke_instance = _resolve_session_instance(runtime, session, instance_id)
+            smoke_network = _noninteractive_smoke_network_config(runtime, session, smoke_instance.instance_id)
 
-            peer_address_args = _smoke_peer_address_args()
+            peer_address_args = _smoke_peer_address_args(smoke_network.peer_ips)
             cfg = _effective_session_config(session.host_dir, runtime)
             common = {
                 "rosotacom_config": args.rosotacom_config,
@@ -849,7 +849,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 "peer": [],
                 "peer_address": peer_address_args,
                 "instance_id": smoke_instance.instance_id,
-                "network_name": SMOKE_NETWORK_NAME,
+                "network_name": smoke_network.name,
             }
 
             from .network_profiles import load_profiles_file, shaping_commands
@@ -862,16 +862,6 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     profile_obj = profiles.get(profile_name)
                 except Exception as exc:
                     print(f"Warning: Failed to load profile {profile_name!r}: {exc}", file=sys.stderr)
-
-            _ensure_smoke_network()
-            a_container = start_session(
-                argparse.Namespace(**common, identity="a", auto_identity=True, network_ip=SMOKE_PEER_IPS["a"])
-            )
-            b_container = start_session(
-                argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=SMOKE_PEER_IPS["b"])
-            )
-            if not getattr(args, "dry_run", False):
-                time.sleep(12)
 
             def make_container_runner(container_name: str) -> Callable[[Sequence[str]], None]:
                 def run(argv: Sequence[str]) -> None:
@@ -903,10 +893,32 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 )
                 pub_cmds.append(cmd)
 
+            a_container = None
+            b_container = None
             shapers = []
             peer_steps = {}
 
             try:
+                _ensure_smoke_network(smoke_network.name, smoke_network.subnet)
+                a_container = start_session(
+                    argparse.Namespace(
+                        **common,
+                        identity="a",
+                        auto_identity=True,
+                        network_ip=smoke_network.peer_ips["a"],
+                    )
+                )
+                b_container = start_session(
+                    argparse.Namespace(
+                        **common,
+                        identity="b",
+                        auto_identity=True,
+                        network_ip=smoke_network.peer_ips["b"],
+                    )
+                )
+                if not getattr(args, "dry_run", False):
+                    time.sleep(12)
+
                 # 1. Start the publishers
                 for cmd in pub_cmds:
                     subprocess.run(
@@ -1007,16 +1019,20 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 for shaper in shapers:
                     shaper.teardown()
 
-                for container in [a_container, b_container]:
-                    if container:
+                for cleanup_container in [a_container, b_container]:
+                    if cleanup_container:
                         subprocess.run(
-                            ["docker", "exec", container, "pkill", "-f", "sized_publisher"],
+                            ["docker", "exec", cleanup_container, "pkill", "-f", "sized_publisher"],
                             capture_output=True,
                             check=False,
                         )
-                        _write_docker_log(container, smoke_instance, "a" if container == a_container else "b")
-                        _stop_container_name(container, runtime)
-                _remove_smoke_network()
+                        _write_docker_log(
+                            cleanup_container,
+                            smoke_instance,
+                            "a" if cleanup_container == a_container else "b",
+                        )
+                        _stop_container_name(cleanup_container, runtime)
+                _remove_smoke_network(smoke_network.name)
 
             probe_parts = ["probe", smoke_instance.instance_id]
             for k, v in sorted(load.items()):

@@ -15,12 +15,47 @@ Shared workflow:
 
 - Follow `CONTRIBUTING.md`.
 - Check `git status --short --branch` before editing.
+- For every repository-changing task, create or identify a GitHub issue first.
+  Fetch current remote state with `git fetch origin --prune`, create a fresh
+  sibling worktree from `origin/develop` unless the issue explicitly requires a
+  different base, implement there, then push a branch and open a PR.
+- Keep the original checkout untouched. Treat unrelated dirty state in any
+  checkout or worktree as user-owned; do not clean, reset, or reuse it for
+  implementation work.
+- Name branches so the issue and purpose are obvious, for example
+  `issue-65-agent-workflow`.
 - Treat unrelated local changes as user-owned and do not revert them.
 - Update tests and docs when CLI, config, package, Docker, or public runtime behavior changes.
 - Validate what you build: every behaviour you implement should be verified by something that runs, wherever possible and sensible. Prefer automation (unit/contract test > an example exercised in CI smoke > a scripted check); fall back to a documented manual check only when automation is genuinely impossible, and say why. Add the verification in the same change as the behaviour.
 - Keep docs reachable: every doc must be linkable from `README.md` (directly, or via a doc already linked there — e.g. a new RFC goes in `docs/rfcs/README.md`). Link new docs in the same change, and link any orphan you notice.
 - Do not skip, weaken, or delete tests/CI to make a change pass.
-- Default to a draft review PR unless autonomous merge is explicitly requested.
+- Enable GitHub auto-merge after opening the PR whenever repository policy
+  allows it. Use this repository's allowed/default merge method; currently only
+  squash merge is enabled, so use `gh pr merge --auto --squash`. Do not bypass
+  protected-branch rules, required approvals, or failing checks; if auto-merge
+  is unavailable, record why in the PR and final status.
+- Keep the PR description current with the issue link, validation commands,
+  important SHAs, CI status, and any dependency on another PR or harness MR.
+- Before reporting completion, check the remote PR state and CI results with
+  `gh pr view` / `gh pr checks`; report the actual status, not just that a
+  branch was pushed.
+
+Practical notes:
+
+- If a task is requested from the harness but the change is in this repository,
+  create the GitHub issue/PR here and mention it from the harness issue/MR.
+  Update the harness submodule pointer only when the harness branch must pin
+  this exact commit.
+- When testing this repo through a shared virtualenv from another checkout, make
+  the import path explicit, e.g. `PYTHONPATH=/path/to/worktree/src ...`, or run
+  pytest from this worktree so `pyproject.toml` sets `pythonpath = ["src"]`.
+- Docker-backed checks can leave containers or networks behind after hard
+  timeouts. If a smoke or benchmark run fails with `network with name
+  rosotacom-smoke already exists`, inspect and remove attached containers before
+  removing the network.
+- GitHub `fast-e2e` may take tens of minutes because it runs Docker-backed smoke
+  and benchmark lanes. Do not call a PR ready until that check resolves or its
+  failure log has been inspected.
 
 Working with RFCs:
 

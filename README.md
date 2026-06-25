@@ -241,14 +241,24 @@ containers, communication container, and outer tmux session.
 
 ### Safe Replay Testing with Anonymized Rosbags
 
-To test scenarios involving proprietary data (e.g. remote assistance) completely safely, you can anonymize a recorded native rosbag using `rosotacom anonymize`. This command:
-1. Extracts only the topics actually transported in a given session/scenario.
-2. Renames them to generic names like `/topic1`, `/topic2`, etc.
-3. Replaces all message contents with mock payloads of the exact same size, keeping the messages fully valid and deserializable (preserving timing metadata like headers).
-4. Generates a new self-contained `rosotacom` project directory containing the anonymized bag, session-definition, and scenario configuration to replay the exact communication patterns.
+To test scenarios involving proprietary data safely, first record the processed
+outbound handoff topics that the session pipeline actually forwards into the OTA
+path. `rosotacom anonymize` consumes that processed trace bag and the matching
+session/scenario definition. It:
+
+1. Resolves the session pipeline and selects the outbound handoff topics that feed
+   `/com/out/...` and `/ota/...`.
+2. Fails closed if the input bag only contains raw source topics and is missing
+   the processed handoff topics.
+3. Renames the handoff topics to generic names like `/topic1`, `/topic2`, etc.
+4. Replaces message contents with mock payloads while preserving message shape,
+   timestamps, payload lengths, bag QoS metadata, and playback QoS overrides.
+5. Generates a self-contained `rosotacom` project containing the anonymized bag,
+   processed-topic session definition, replay scenario, QoS overrides, and an
+   anonymization manifest.
 
 ```bash
-rosotacom anonymize /path/to/native_bag \
+rosotacom anonymize /path/to/processed_handoff_bag \
   -s 3_comp_occ_grid \
   -o ./anonymized_project
 ```

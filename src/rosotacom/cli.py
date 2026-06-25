@@ -13,6 +13,7 @@ import argparse
 import base64
 import binascii
 import hashlib
+import importlib
 import importlib.resources as importlib_resources
 import importlib.util
 import io
@@ -45,6 +46,8 @@ from .deployment import (
     parse_assignments,
     resolve_peer_bindings,
 )
+
+anonymize_lib = importlib.import_module("rosotacom.anonymize")
 
 ros2docker: ModuleType | None
 _ROS2DOCKER_IMPORT_ERROR: Exception | None
@@ -6468,66 +6471,70 @@ def anonymize_command(args: argparse.Namespace) -> int:
     original_session_name = resolved_session.host_dir.name
     output_name = args.output_name or f"anonymized_{original_session_name}"
 
-    transported_topics = {}
-    for direction_key, entries in session_cfg.get("topics", {}).items():
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
-            if not isinstance(entry, dict) or "topic" not in entry:
-                continue
-            topic = entry["topic"]
-            transported_topics[topic] = {
-                "type": entry.get("type"),
-                "direction": direction_key,
-            }
-
-    if not transported_topics:
-        print("Error: session configuration does not define any topics.", file=sys.stderr)
+    try:
+        handoff_plan = anonymize_lib.plan_handoff_topics(session_cfg, session_gen)
+    except Exception as exc:
+        print(f"Error: failed to resolve processed handoff topics: {exc}", file=sys.stderr)
         return 1
 
-    sorted_topics = sorted(transported_topics.keys())
-    topics_map = {topic: f"/topic{i + 1}" for i, topic in enumerate(sorted_topics)}
+    input_bag_path = Path(args.bag_path).resolve()
+    try:
+        meta_doc = anonymize_lib.load_bag_metadata(input_bag_path)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    bag_info = anonymize_lib.bag_topics_info(meta_doc)
+    missing_topics = anonymize_lib.missing_handoff_topics(handoff_plan, bag_info)
+    if missing_topics:
+        print("Error: input bag is missing processed handoff topic(s):", file=sys.stderr)
+        for item in missing_topics:
+            print(
+                "  "
+                f"{item.direction} {item.source_topic} -> {item.handoff_topic} "
+                f"({item.handoff_type or 'unknown type'})",
+                file=sys.stderr,
+            )
+        print(
+            "The anonymizer expects a processed trace bag recorded from the session pipeline, "
+            "not the raw source bag when processing changes the OTA payload.",
+            file=sys.stderr,
+        )
+        return 1
+
+    storage_id = anonymize_lib.bag_storage_id(meta_doc)
+    topics_map = anonymize_lib.topics_map(handoff_plan)
 
     output_base_path = Path(args.output_dir).resolve()
     output_session_dir = output_base_path / "sessions" / output_name
-    output_session_dir.mkdir(parents=True, exist_ok=True)
-
     output_scenario_dir = output_base_path / "scenarios" / output_name
+    output_session_dir.mkdir(parents=True, exist_ok=True)
     output_scenario_dir.mkdir(parents=True, exist_ok=True)
 
     output_bag_dir = output_scenario_dir / "anonymized_bag"
     if output_bag_dir.exists():
         shutil.rmtree(output_bag_dir)
 
-    anon_session_cfg = dict(session_cfg)
-    anon_topics = {}
-    for direction, entries in session_cfg.get("topics", {}).items():
-        anon_entries = []
-        for entry in entries:
-            if isinstance(entry, dict) and "topic" in entry:
-                new_entry = dict(entry)
-                new_entry["topic"] = topics_map[entry["topic"]]
-                anon_entries.append(new_entry)
-            else:
-                anon_entries.append(entry)
-        anon_topics[direction] = anon_entries
-    anon_session_cfg["topics"] = anon_topics
+    anon_session_cfg = anonymize_lib.build_replay_session_config(session_cfg, handoff_plan)
 
     session_def_path = output_session_dir / "session-definition.yaml"
     with open(session_def_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(anon_session_cfg, f, default_flow_style=False, sort_keys=False)
 
-    input_bag_path = Path(args.bag_path).resolve()
-    metadata_file = (
-        input_bag_path / "metadata.yaml" if input_bag_path.is_dir() else input_bag_path.parent / "metadata.yaml"
-    )
-    if not metadata_file.exists():
-        print(f"Error: metadata.yaml not found for bag at {input_bag_path}", file=sys.stderr)
-        return 1
+    qos_overrides = anonymize_lib.playback_qos_overrides(handoff_plan, bag_info)
+    qos_overrides_path = output_scenario_dir / "qos-overrides.yaml"
+    if qos_overrides:
+        with open(qos_overrides_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(qos_overrides, f, default_flow_style=False, sort_keys=False)
 
-    with open(metadata_file, encoding="utf-8") as f:
-        meta_doc = yaml.safe_load(f) or {}
-    storage_id = meta_doc.get("rosbag2_bagfile_information", {}).get("storage_identifier", "mcap")
+    manifest_path = output_scenario_dir / "anonymization-manifest.yaml"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            anonymize_lib.anonymization_manifest(handoff_plan, bag_info),
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+        )
 
     _require_ros2docker()
     ros2docker_cfg = load_config(runtime.ros2docker_config)
@@ -6579,33 +6586,35 @@ def anonymize_command(args: argparse.Namespace) -> int:
         print(f"Error: ros2docker run failed: {exc}", file=sys.stderr)
         return 1
 
-    src_peers = set()
-    for direction in anon_topics.keys():
-        parts = direction.split("_to_")
-        if len(parts) == 2:
-            src_peers.add(parts[0])
-
     peer_settings = session_cfg.get("peer_settings", {})
     applications_cfg = {}
+    topics_by_peer = anonymize_lib.source_topics_by_peer(handoff_plan)
 
-    for peer in src_peers:
+    for peer, replay_topics in topics_by_peer.items():
         domain_id = peer_settings.get(peer, {}).get("domain_id", 0)
 
         play_bag_name = f"play_bag_{peer}.ros2docker.json"
         play_bag_path = output_scenario_dir / play_bag_name
+        play_command_parts = ["ros2 bag play --loop /bag/anonymized_bag"]
+        if qos_overrides:
+            play_command_parts.append("--qos-profile-overrides-path /scenario/qos-overrides.yaml")
+        play_command_parts.append("--topics " + " ".join(shlex.quote(topic) for topic in replay_topics))
+        play_run_args = [
+            "--network",
+            "host",
+            "-v",
+            "./anonymized_bag:/bag/anonymized_bag",
+            "-e",
+            f"ROS_DOMAIN_ID={domain_id}",
+        ]
+        if qos_overrides:
+            play_run_args.extend(["-v", "./qos-overrides.yaml:/scenario/qos-overrides.yaml:ro"])
         play_bag_cfg = {
             "container_name": f"play_bag_{peer}",
             "image_name": image_name,
             "run_type": "command",
-            "command": "ros2 bag play --loop /bag/anonymized_bag",
-            "run_args": [
-                "--network",
-                "host",
-                "-v",
-                "./anonymized_bag:/bag/anonymized_bag",
-                "-e",
-                f"ROS_DOMAIN_ID={domain_id}",
-            ],
+            "command": " ".join(play_command_parts),
+            "run_args": play_run_args,
         }
         with open(play_bag_path, "w", encoding="utf-8") as f:
             json.dump(play_bag_cfg, f, indent=2)
@@ -6634,6 +6643,7 @@ def anonymize_command(args: argparse.Namespace) -> int:
     print(f"  Session:  {output_session_dir}")
     print(f"  Scenario: {output_scenario_dir}")
     print(f"  Bag:      {output_bag_dir}")
+    print(f"  Manifest: {manifest_path}")
     return 0
 
 
@@ -6998,7 +7008,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Anonymize a rosbag and create a scenario out of it.",
     )
     _add_common_config_args(anonymize_parser)
-    anonymize_parser.add_argument("bag_path", help="Path to native input rosbag.")
+    anonymize_parser.add_argument("bag_path", help="Path to processed handoff trace rosbag.")
     anonymize_parser.add_argument(
         "-s",
         "--session-dir",

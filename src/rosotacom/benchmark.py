@@ -178,7 +178,7 @@ def capacity_binary_search(low: int, high: int, probe: Callable[[int], bool]) ->
     if not probe(low):
         return None
     best = low
-    lo, hi = low, high
+    lo, hi = low + 1, high
     while lo <= hi:
         mid = (lo + hi) // 2
         if probe(mid):

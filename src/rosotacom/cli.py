@@ -13,6 +13,7 @@ import argparse
 import base64
 import binascii
 import hashlib
+import importlib
 import importlib.resources as importlib_resources
 import importlib.util
 import io
@@ -45,6 +46,8 @@ from .deployment import (
     parse_assignments,
     resolve_peer_bindings,
 )
+
+anonymize_lib = importlib.import_module("rosotacom.anonymize")
 
 ros2docker: ModuleType | None
 _ROS2DOCKER_IMPORT_ERROR: Exception | None
@@ -195,6 +198,13 @@ class SessionInstance:
 
 
 @dataclass(frozen=True)
+class SmokeNetworkConfig:
+    name: str
+    subnet: str
+    peer_ips: dict[str, str]
+
+
+@dataclass(frozen=True)
 class SmokeTopicSpec:
     source_peer_key: str
     receiver_peer_key: str
@@ -209,6 +219,7 @@ class SmokeTopicSpec:
     hz_max: float | None = None
     max_delay_s: float | None = None
     expected_size: int | None = None
+    publish_qos: dict[str, Any] | None = None
 
 
 def _load_yaml_file(path: Path | None) -> dict[str, Any]:
@@ -4453,28 +4464,67 @@ SMOKE_NETWORK_SUBNET = "10.137.0.0/24"
 SMOKE_PEER_IPS: dict[str, str] = {"a": "10.137.0.2", "b": "10.137.0.3"}
 
 
+def _bounded_docker_name(name: str, *, max_len: int = 63) -> str:
+    token = _sanitize_docker_name(name)
+    if len(token) <= max_len:
+        return token
+    digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:10]
+    return f"{token[: max_len - 11]}_{digest}"
+
+
+def _smoke_subnet_from_token(token: str) -> str:
+    value = int(hashlib.sha1(token.encode("utf-8")).hexdigest()[:8], 16)
+    third_octet = value % 256
+    fourth_octet = ((value // 256) % 32) * 8
+    return f"10.137.{third_octet}.{fourth_octet}/29"
+
+
 def _interactive_smoke_network_config(runtime: RuntimeConfig, target_type: str, target_name: str) -> tuple[str, str]:
-    token = _sanitize_docker_name(f"rosotacom_smoke_{runtime.install_id}_{target_type}_{target_name}")
-    if len(token) > 63:
-        digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:10]
-        token = f"{token[:52]}_{digest}"
+    token = _bounded_docker_name(f"rosotacom_smoke_{runtime.install_id}_{target_type}_{target_name}")
     subnet_octet = 1 + (int(hashlib.sha1(token.encode("utf-8")).hexdigest()[:8], 16) % 200)
     return token, f"10.137.{subnet_octet}.0/24"
 
 
+def _noninteractive_smoke_network_config(
+    runtime: RuntimeConfig,
+    session: ResolvedSession,
+    instance_id: str,
+) -> SmokeNetworkConfig:
+    session_slug = _session_instance_slug(session, runtime)
+    token = _bounded_docker_name(f"rosotacom_smoke_{runtime.install_id}_{session_slug}_{instance_id}")
+    subnet = _smoke_subnet_from_token(token)
+    return SmokeNetworkConfig(
+        name=token,
+        subnet=subnet,
+        peer_ips=_smoke_peer_ips_for_subnet(["a", "b"], subnet),
+    )
+
+
 def _smoke_peer_ips_for_subnet(peers: list[str], subnet: str) -> dict[str, str]:
-    match = re.match(r"^(\d+\.\d+\.\d+)\.0/24$", subnet)
-    if not match:
-        raise RuntimeError(f"Interactive smoke requires a /24 IPv4 subnet, got: {subnet}")
-    prefix = match.group(1)
     sorted_peers = sorted(peers)
-    if len(sorted_peers) > 250:
-        raise RuntimeError(f"Too many peers for a /24 smoke subnet: {len(sorted_peers)}")
-    return {peer: f"{prefix}.{index + 2}" for index, peer in enumerate(sorted_peers)}
+    match_24 = re.match(r"^(\d+\.\d+\.\d+)\.0/24$", subnet)
+    if match_24:
+        prefix = match_24.group(1)
+        if len(sorted_peers) > 250:
+            raise RuntimeError(f"Too many peers for a /24 smoke subnet: {len(sorted_peers)}")
+        return {peer: f"{prefix}.{index + 2}" for index, peer in enumerate(sorted_peers)}
+
+    match_29 = re.match(r"^(\d+\.\d+\.\d+)\.(\d+)/29$", subnet)
+    if match_29:
+        prefix = match_29.group(1)
+        base = int(match_29.group(2))
+        if base % 8 != 0 or base > 248:
+            raise RuntimeError(f"Smoke /29 subnet must start on an 8-address boundary, got: {subnet}")
+        if len(sorted_peers) > 5:
+            raise RuntimeError(f"Too many peers for a /29 smoke subnet: {len(sorted_peers)}")
+        return {peer: f"{prefix}.{base + index + 2}" for index, peer in enumerate(sorted_peers)}
+
+    raise RuntimeError(f"Smoke requires a /24 or /29 IPv4 subnet, got: {subnet}")
 
 
-def _smoke_peer_address_args() -> list[str]:
-    return [f"{peer}={ip}" for peer, ip in SMOKE_PEER_IPS.items()]
+def _smoke_peer_address_args(peer_ips: dict[str, str] | None = None) -> list[str]:
+    source = peer_ips or SMOKE_PEER_IPS
+    return [f"{peer}={source[peer]}" for peer in sorted(source)]
 
 
 def _ensure_smoke_network(network_name: str = SMOKE_NETWORK_NAME, subnet: str = SMOKE_NETWORK_SUBNET) -> None:
@@ -4533,12 +4583,17 @@ def _smoke_heartbeat_topic(cfg: dict[str, Any], peer_key: str) -> str:
     return f"/heartbeat_{_peer_com_name(peers, peer_key)}"
 
 
-def _smoke_inbound_bridge_topic(cfg: dict[str, Any], source_peer_key: str) -> str:
+def _smoke_inbound_bridge_topic(cfg: dict[str, Any], source_peer_key: str, receiver_peer_key: str) -> str:
     peers = cfg.get("peers", {}) or {}
     if not isinstance(peers, dict):
         raise RuntimeError("Smoke verification requires a session config with peers.")
     source_name = _peer_com_name(peers, source_peer_key)
-    heartbeat_topic = _smoke_heartbeat_topic(cfg, source_peer_key).lstrip("/")
+    heartbeat_topic = _smoke_forward_topic_for_inbound(
+        cfg,
+        source_peer_key,
+        receiver_peer_key,
+        _smoke_heartbeat_topic(cfg, source_peer_key),
+    ).lstrip("/")
     return f"/com/in/{source_name}/{heartbeat_topic}"
 
 
@@ -4648,6 +4703,14 @@ def _smoke_expect_bounds(expect: Any) -> tuple[float | None, float | None, float
         else None
     )
     return hz_min, hz_max, max_delay_s
+
+
+def _smoke_publish_qos(qos: Any) -> dict[str, Any] | None:
+    if not isinstance(qos, dict):
+        return None
+    allowed = {"depth", "reliability", "durability", "history"}
+    clean = {key: value for key, value in qos.items() if key in allowed and value is not None}
+    return clean or None
 
 
 def _smoke_publish_rate(expect: Any) -> float:
@@ -4777,14 +4840,16 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
                 SmokeTopicSpec(
                     source_peer_key=source,
                     receiver_peer_key=receiver_peer_key,
-                    topic=_smoke_inbound_bridge_topic(cfg, source),
+                    topic=_smoke_inbound_bridge_topic(cfg, source, receiver_peer_key),
                     label=f"{source}->{receiver_peer_key} inbound bridge heartbeat",
                     enforce_bounds=False,
                 ),
                 SmokeTopicSpec(
                     source_peer_key=source,
                     receiver_peer_key=receiver_peer_key,
-                    topic=_smoke_heartbeat_topic(cfg, source),
+                    topic=_smoke_receiver_final_topic(
+                        cfg, source, receiver_peer_key, _smoke_heartbeat_topic(cfg, source)
+                    ),
                     label=f"{source}->{receiver_peer_key} final heartbeat",
                     enforce_bounds=True,
                     use_default_bounds=True,
@@ -4801,6 +4866,8 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
         if src != source or dst != receiver_peer_key:
             continue
         for entry in session_gen._topic_entries(cfg, str(direction)):
+            if isinstance(entry.expect, dict) and entry.expect.get("smoke_probe") is False:
+                continue
             pipe = _smoke_topic_pipeline(cfg, entry)
             final_topic = str(pipe["final"])
             if bool(shared.get("use_heartbeat", False)) and final_topic == _smoke_heartbeat_topic(cfg, src):
@@ -4826,13 +4893,14 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
                         enforce_bounds=any(
                             value is not None for value in (expect_hz_min, expect_hz_max, expect_max_delay_s)
                         ),
-                        publish_topic=entry.base,
+                        publish_topic=_smoke_forward_topic_for_inbound(cfg, src, dst, entry.base),
                         publish_type=entry.msg_type,
                         publish_rate=_smoke_native_publish_rate(entry.expect),
                         hz_min=expect_hz_min,
                         hz_max=expect_hz_max,
                         max_delay_s=expect_max_delay_s,
                         expected_size=66000 if entry.msg_type == "com_msgs/msg/SizedPayload" else None,
+                        publish_qos=_smoke_publish_qos(entry.qos),
                     ),
                 ]
             )
@@ -4868,10 +4936,14 @@ def _verify_received_topics(
             continue
         log_line(f"OK: {label} ({topic}) is publishing in {container_name}")
         hz = _parse_topic_hz_rate(output)
-        delay_output = _measure_topic_delay(container_name, ros_setup, topic)
-        if detail_log:
-            detail_log(f"\n--- delay {label} ({topic}) in {container_name} ---\n{delay_output}")
-        delay_s = _parse_topic_delay_seconds(delay_output)
+        needs_delay = spec.use_default_bounds or spec.max_delay_s is not None
+        if needs_delay:
+            delay_output = _measure_topic_delay(container_name, ros_setup, topic)
+            if detail_log:
+                detail_log(f"\n--- delay {label} ({topic}) in {container_name} ---\n{delay_output}")
+            delay_s = _parse_topic_delay_seconds(delay_output)
+        else:
+            delay_s = None
         log_line(_smoke_metric_line(label=label, topic=topic, container_name=container_name, hz=hz, delay_s=delay_s))
         if spec.expected_size is not None:
             received_size = _received_sized_payload_size(container_name, ros_setup, topic)
@@ -4898,11 +4970,40 @@ def _smoke_publish_message(msg_type: str) -> str:
     normalized = msg_type.strip()
     if normalized in {"std_msgs/msg/String", "std_msgs/String"}:
         return "{data: 'rosotacom smoke'}"
+    if normalized in {"std_msgs/msg/Empty", "std_msgs/Empty"}:
+        return "{}"
+    if normalized in {"std_msgs/msg/Float32", "std_msgs/Float32", "std_msgs/msg/Float64", "std_msgs/Float64"}:
+        return "{data: 1.0}"
+    if normalized in {"geometry_msgs/msg/PoseStamped", "geometry_msgs/PoseStamped"}:
+        return "{header: {frame_id: map}, pose: {orientation: {w: 1.0}}}"
+    if normalized in {"geometry_msgs/msg/TwistStamped", "geometry_msgs/TwistStamped"}:
+        return "{header: {frame_id: base_link}, twist: {linear: {x: 1.0}, angular: {z: 0.1}}}"
+    if normalized in {"tf2_msgs/msg/TFMessage", "tf2_msgs/TFMessage"}:
+        return "{transforms: [{header: {frame_id: map}, child_frame_id: base_link, transform: {rotation: {w: 1.0}}}]}"
     if normalized == "nav_msgs/msg/OccupancyGrid":
         return (
             "{header: {frame_id: map}, "
             "info: {resolution: 0.5, width: 4, height: 4, origin: {orientation: {w: 1.0}}}, "
             "data: [0, 0, 0, 0, 0, 25, 50, 0, 0, 50, 100, 0, -1, -1, -1, -1]}"
+        )
+    if normalized in {"sensor_msgs/msg/CameraInfo", "sensor_msgs/CameraInfo"}:
+        return "{header: {frame_id: camera}, height: 1, width: 1}"
+    if normalized in {"sensor_msgs/msg/NavSatFix", "sensor_msgs/NavSatFix"}:
+        return (
+            "{header: {frame_id: gps}, status: {status: 0, service: 1}, "
+            "latitude: 48.0, longitude: 8.0, altitude: 100.0}"
+        )
+    if normalized in {"gps_msgs/msg/GPSFix", "gps_msgs/GPSFix"}:
+        return (
+            "{header: {frame_id: gps}, status: {status: 0, position_source: 1}, "
+            "latitude: 48.0, longitude: 8.0, altitude: 100.0}"
+        )
+    if normalized == "com_msgs/msg/CompressedData":
+        return "{header: {frame_id: map}, msg_type: 'anonymized', data: [0, 1, 2, 3]}"
+    if normalized == "ffmpeg_image_transport_msgs/msg/FFMPEGPacket":
+        return (
+            "{header: {frame_id: camera}, width: 1, height: 1, encoding: h264, "
+            "pts: 0, flags: 0, is_bigendian: false, data: [0, 1, 2, 3]}"
         )
     if normalized in {"geometry_msgs/msg/PointStamped", "geometry_msgs/PointStamped"}:
         # A deliberately STALE header.stamp (epoch+1000s == 1970) so the restamp
@@ -4941,6 +5042,21 @@ def _content_integrity_specs(cfg: dict[str, Any], receiver_peer_key: str) -> lis
     return out
 
 
+def _smoke_topic_pub_qos_args(qos: dict[str, Any] | None) -> str:
+    if not qos:
+        return ""
+    args: list[str] = []
+    if qos.get("reliability") is not None:
+        args.extend(["--qos-reliability", str(qos["reliability"])])
+    if qos.get("durability") is not None:
+        args.extend(["--qos-durability", str(qos["durability"])])
+    if qos.get("history") is not None:
+        args.extend(["--qos-history", str(qos["history"])])
+    if qos.get("depth") is not None:
+        args.extend(["--qos-depth", str(qos["depth"])])
+    return " ".join(shlex.quote(arg) for arg in args) + (" " if args else "")
+
+
 def _smoke_publisher_command(spec: SmokeTopicSpec, ros_setup: str, duration: float) -> str:
     assert spec.publish_topic is not None and spec.publish_type is not None
     if spec.publish_type == "com_msgs/msg/SizedPayload":
@@ -4950,8 +5066,9 @@ def _smoke_publisher_command(spec: SmokeTopicSpec, ros_setup: str, duration: flo
             f"-p topic:={shlex.quote(spec.publish_topic)} -p size:={size} -p rate:={spec.publish_rate}"
         )
     message = _smoke_publish_message(spec.publish_type)
+    qos_args = _smoke_topic_pub_qos_args(spec.publish_qos)
     return (
-        f"{ros_setup} && timeout {duration} ros2 topic pub -r {spec.publish_rate} "
+        f"{ros_setup} && timeout {duration} ros2 topic pub -r {spec.publish_rate} {qos_args}"
         f"{shlex.quote(spec.publish_topic)} {shlex.quote(spec.publish_type)} "
         f"{shlex.quote(message)}"
     )
@@ -6038,13 +6155,14 @@ def smoke(args: argparse.Namespace) -> int:
     session = _resolve_session(session_dir, runtime)
     instance_id = getattr(args, "instance_id", None) or _new_instance_id()
     smoke_instance = _resolve_session_instance(runtime, session, instance_id)
+    smoke_network = _noninteractive_smoke_network_config(runtime, session, smoke_instance.instance_id)
     smoke_log = smoke_instance.logs_host_dir / "smoke-verification.log"
 
     def log_line(message: str) -> None:
         print(message)
         _append_log(smoke_log, message)
 
-    peer_address_args = _smoke_peer_address_args()
+    peer_address_args = _smoke_peer_address_args(smoke_network.peer_ips)
     cfg = _effective_session_config(session.host_dir, runtime)
     common = {
         "rosotacom_config": args.rosotacom_config,
@@ -6059,22 +6177,22 @@ def smoke(args: argparse.Namespace) -> int:
         "peer": [],
         "peer_address": peer_address_args,
         "instance_id": smoke_instance.instance_id,
-        "network_name": SMOKE_NETWORK_NAME,
+        "network_name": smoke_network.name,
     }
 
     log_line(f"Starting local smoke test with PEER_ADDRESSES={', '.join(peer_address_args)}")
-    log_line(f"Smoke peers isolated on docker network {SMOKE_NETWORK_NAME} ({SMOKE_NETWORK_SUBNET})")
+    log_line(f"Smoke peers isolated on docker network {smoke_network.name} ({smoke_network.subnet})")
     log_line(f"Smoke artifacts: {smoke_instance.host_dir}")
     a_container = None
     b_container = None
     smoke_publishers: list[SmokeTopicSpec] = []
     try:
-        _ensure_smoke_network()
+        _ensure_smoke_network(smoke_network.name, smoke_network.subnet)
         a_container = start_session(
-            argparse.Namespace(**common, identity="a", auto_identity=True, network_ip=SMOKE_PEER_IPS["a"])
+            argparse.Namespace(**common, identity="a", auto_identity=True, network_ip=smoke_network.peer_ips["a"])
         )
         b_container = start_session(
-            argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=SMOKE_PEER_IPS["b"])
+            argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=smoke_network.peer_ips["b"])
         )
 
         plugin_text = "\n".join(
@@ -6137,10 +6255,10 @@ def smoke(args: argparse.Namespace) -> int:
                 _write_docker_log(started_container, smoke_instance, peer)
         if not args.keep_running:
             runtime = _load_runtime_config(args)
-            for started_container in [a_container, b_container]:
-                if started_container:
-                    _stop_container_name(started_container, runtime)
-            _remove_smoke_network()
+            for cleanup_container in [a_container, b_container]:
+                if cleanup_container:
+                    _stop_container_name(cleanup_container, runtime)
+            _remove_smoke_network(smoke_network.name)
         print(f"Smoke artifacts: {smoke_instance.host_dir}")
     return 0
 
@@ -6468,66 +6586,70 @@ def anonymize_command(args: argparse.Namespace) -> int:
     original_session_name = resolved_session.host_dir.name
     output_name = args.output_name or f"anonymized_{original_session_name}"
 
-    transported_topics = {}
-    for direction_key, entries in session_cfg.get("topics", {}).items():
-        if not isinstance(entries, list):
-            continue
-        for entry in entries:
-            if not isinstance(entry, dict) or "topic" not in entry:
-                continue
-            topic = entry["topic"]
-            transported_topics[topic] = {
-                "type": entry.get("type"),
-                "direction": direction_key,
-            }
-
-    if not transported_topics:
-        print("Error: session configuration does not define any topics.", file=sys.stderr)
+    try:
+        handoff_plan = anonymize_lib.plan_handoff_topics(session_cfg, session_gen)
+    except Exception as exc:
+        print(f"Error: failed to resolve processed handoff topics: {exc}", file=sys.stderr)
         return 1
 
-    sorted_topics = sorted(transported_topics.keys())
-    topics_map = {topic: f"/topic{i + 1}" for i, topic in enumerate(sorted_topics)}
+    input_bag_path = Path(args.bag_path).resolve()
+    try:
+        meta_doc = anonymize_lib.load_bag_metadata(input_bag_path)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    bag_info = anonymize_lib.bag_topics_info(meta_doc)
+    missing_topics = anonymize_lib.missing_handoff_topics(handoff_plan, bag_info)
+    if missing_topics:
+        print("Error: input bag is missing processed handoff topic(s):", file=sys.stderr)
+        for item in missing_topics:
+            print(
+                "  "
+                f"{item.direction} {item.source_topic} -> {item.handoff_topic} "
+                f"({item.handoff_type or 'unknown type'})",
+                file=sys.stderr,
+            )
+        print(
+            "The anonymizer expects a processed trace bag recorded from the session pipeline, "
+            "not the raw source bag when processing changes the OTA payload.",
+            file=sys.stderr,
+        )
+        return 1
+
+    storage_id = anonymize_lib.bag_storage_id(meta_doc)
+    topics_map = anonymize_lib.topics_map(handoff_plan)
 
     output_base_path = Path(args.output_dir).resolve()
     output_session_dir = output_base_path / "sessions" / output_name
-    output_session_dir.mkdir(parents=True, exist_ok=True)
-
     output_scenario_dir = output_base_path / "scenarios" / output_name
+    output_session_dir.mkdir(parents=True, exist_ok=True)
     output_scenario_dir.mkdir(parents=True, exist_ok=True)
 
     output_bag_dir = output_scenario_dir / "anonymized_bag"
     if output_bag_dir.exists():
         shutil.rmtree(output_bag_dir)
 
-    anon_session_cfg = dict(session_cfg)
-    anon_topics = {}
-    for direction, entries in session_cfg.get("topics", {}).items():
-        anon_entries = []
-        for entry in entries:
-            if isinstance(entry, dict) and "topic" in entry:
-                new_entry = dict(entry)
-                new_entry["topic"] = topics_map[entry["topic"]]
-                anon_entries.append(new_entry)
-            else:
-                anon_entries.append(entry)
-        anon_topics[direction] = anon_entries
-    anon_session_cfg["topics"] = anon_topics
+    anon_session_cfg = anonymize_lib.build_replay_session_config(session_cfg, handoff_plan)
 
     session_def_path = output_session_dir / "session-definition.yaml"
     with open(session_def_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(anon_session_cfg, f, default_flow_style=False, sort_keys=False)
 
-    input_bag_path = Path(args.bag_path).resolve()
-    metadata_file = (
-        input_bag_path / "metadata.yaml" if input_bag_path.is_dir() else input_bag_path.parent / "metadata.yaml"
-    )
-    if not metadata_file.exists():
-        print(f"Error: metadata.yaml not found for bag at {input_bag_path}", file=sys.stderr)
-        return 1
+    qos_overrides = anonymize_lib.playback_qos_overrides(handoff_plan, bag_info)
+    qos_overrides_path = output_scenario_dir / "qos-overrides.yaml"
+    if qos_overrides:
+        with open(qos_overrides_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(qos_overrides, f, default_flow_style=False, sort_keys=False)
 
-    with open(metadata_file, encoding="utf-8") as f:
-        meta_doc = yaml.safe_load(f) or {}
-    storage_id = meta_doc.get("rosbag2_bagfile_information", {}).get("storage_identifier", "mcap")
+    manifest_path = output_scenario_dir / "anonymization-manifest.yaml"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            anonymize_lib.anonymization_manifest(handoff_plan, bag_info),
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+        )
 
     _require_ros2docker()
     ros2docker_cfg = load_config(runtime.ros2docker_config)
@@ -6579,33 +6701,46 @@ def anonymize_command(args: argparse.Namespace) -> int:
         print(f"Error: ros2docker run failed: {exc}", file=sys.stderr)
         return 1
 
-    src_peers = set()
-    for direction in anon_topics.keys():
-        parts = direction.split("_to_")
-        if len(parts) == 2:
-            src_peers.add(parts[0])
-
     peer_settings = session_cfg.get("peer_settings", {})
     applications_cfg = {}
+    try:
+        playback_topics_by_peer = anonymize_lib.playback_topics_by_peer(anon_session_cfg, handoff_plan, session_gen)
+    except Exception as exc:
+        print(f"Error: failed to resolve replay publish topics: {exc}", file=sys.stderr)
+        return 1
 
-    for peer in src_peers:
+    for peer, replay_topics in playback_topics_by_peer.items():
         domain_id = peer_settings.get(peer, {}).get("domain_id", 0)
 
         play_bag_name = f"play_bag_{peer}.ros2docker.json"
         play_bag_path = output_scenario_dir / play_bag_name
+        play_command_parts = ["ros2 bag play --loop /bag/anonymized_bag"]
+        if qos_overrides:
+            play_command_parts.append("--qos-profile-overrides-path /scenario/qos-overrides.yaml")
+        play_command_parts.append("--topics " + " ".join(shlex.quote(topic.bag_topic) for topic in replay_topics))
+        remaps = [
+            f"{topic.bag_topic}:={topic.publish_topic}"
+            for topic in replay_topics
+            if topic.bag_topic != topic.publish_topic
+        ]
+        if remaps:
+            play_command_parts.append("--remap " + " ".join(shlex.quote(remap) for remap in remaps))
+        play_run_args = [
+            "--network",
+            "host",
+            "-v",
+            "./anonymized_bag:/bag/anonymized_bag",
+            "-e",
+            f"ROS_DOMAIN_ID={domain_id}",
+        ]
+        if qos_overrides:
+            play_run_args.extend(["-v", "./qos-overrides.yaml:/scenario/qos-overrides.yaml:ro"])
         play_bag_cfg = {
             "container_name": f"play_bag_{peer}",
             "image_name": image_name,
             "run_type": "command",
-            "command": "ros2 bag play --loop /bag/anonymized_bag",
-            "run_args": [
-                "--network",
-                "host",
-                "-v",
-                "./anonymized_bag:/bag/anonymized_bag",
-                "-e",
-                f"ROS_DOMAIN_ID={domain_id}",
-            ],
+            "command": " ".join(play_command_parts),
+            "run_args": play_run_args,
         }
         with open(play_bag_path, "w", encoding="utf-8") as f:
             json.dump(play_bag_cfg, f, indent=2)
@@ -6634,6 +6769,7 @@ def anonymize_command(args: argparse.Namespace) -> int:
     print(f"  Session:  {output_session_dir}")
     print(f"  Scenario: {output_scenario_dir}")
     print(f"  Bag:      {output_bag_dir}")
+    print(f"  Manifest: {manifest_path}")
     return 0
 
 
@@ -6998,7 +7134,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Anonymize a rosbag and create a scenario out of it.",
     )
     _add_common_config_args(anonymize_parser)
-    anonymize_parser.add_argument("bag_path", help="Path to native input rosbag.")
+    anonymize_parser.add_argument("bag_path", help="Path to processed handoff trace rosbag.")
     anonymize_parser.add_argument(
         "-s",
         "--session-dir",

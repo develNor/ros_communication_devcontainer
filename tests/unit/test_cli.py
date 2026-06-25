@@ -1818,10 +1818,11 @@ def test_stop_list_doctor_and_smoke_host_flows(
         rosbags_host_dir=tmp_path / "session-instances" / "2026-01-01" / "1_heartbeat_smoke" / "rosbags",
         rosbags_container_dir="/session/instances/2026-01-01/1_heartbeat_smoke/rosbags",
     )
+    smoke_network = rosotacom._noninteractive_smoke_network_config(runtime, session, instance.instance_id)
     (instance.config_host_dir / "a").mkdir(parents=True)
     (instance.config_host_dir / "b").mkdir()
-    (instance.config_host_dir / "a" / "plugin.yaml").write_text("10.137.0.2\n", encoding="utf-8")
-    (instance.config_host_dir / "b" / "plugin.yaml").write_text("10.137.0.3\n", encoding="utf-8")
+    (instance.config_host_dir / "a" / "plugin.yaml").write_text(f"{smoke_network.peer_ips['a']}\n", encoding="utf-8")
+    (instance.config_host_dir / "b" / "plugin.yaml").write_text(f"{smoke_network.peer_ips['b']}\n", encoding="utf-8")
     cfg = {"peers": {"a": {}, "b": {}}}
     stopped: list[str] = []
 
@@ -1845,9 +1846,16 @@ def test_stop_list_doctor_and_smoke_host_flows(
     assert rosotacom.doctor(argparse.Namespace()) == 0
     assert "OK: ros2docker validation: config loads" in capsys.readouterr().out
 
-    monkeypatch.setattr(rosotacom, "start_session", lambda args: f"container_{args.identity}")
-    monkeypatch.setattr(rosotacom, "_ensure_smoke_network", lambda: None)
-    monkeypatch.setattr(rosotacom, "_remove_smoke_network", lambda: None)
+    started: list[argparse.Namespace] = []
+    networks_created: list[tuple[str, str]] = []
+    networks_removed: list[str] = []
+    monkeypatch.setattr(rosotacom, "start_session", lambda args: started.append(args) or f"container_{args.identity}")
+    monkeypatch.setattr(
+        rosotacom,
+        "_ensure_smoke_network",
+        lambda name, subnet: networks_created.append((name, subnet)),
+    )
+    monkeypatch.setattr(rosotacom, "_remove_smoke_network", lambda name: networks_removed.append(name))
     # Smoke's per-container delivery + isolation verification is exercised
     # end-to-end in tests/e2e; this unit test only drives the host flow
     # (start/stop/network), so stub the shared verification helpers as passing.
@@ -1880,6 +1888,13 @@ def test_stop_list_doctor_and_smoke_host_flows(
     )
     assert publisher_durations == [rosotacom.SMOKE_PUBLISHER_DURATION_S]
     assert rosotacom.SMOKE_PUBLISHER_DURATION_S == 900.0
+    assert networks_created == [(smoke_network.name, smoke_network.subnet)]
+    assert [(args.identity, args.network_name, args.network_ip) for args in started] == [
+        ("a", smoke_network.name, smoke_network.peer_ips["a"]),
+        ("b", smoke_network.name, smoke_network.peer_ips["b"]),
+    ]
+    assert all(args.peer_address == rosotacom._smoke_peer_address_args(smoke_network.peer_ips) for args in started)
+    assert networks_removed == [smoke_network.name]
     assert stopped[-2:] == ["container_a", "container_b"]
 
 
@@ -1888,6 +1903,38 @@ def test_smoke_peer_addresses_use_isolated_bridge_ips() -> None:
     # docker bridge with distinct IPs, instead of sharing the host loopback.
     assert rosotacom._smoke_peer_address_args() == ["a=10.137.0.2", "b=10.137.0.3"]
     assert rosotacom.SMOKE_PEER_IPS == {"a": "10.137.0.2", "b": "10.137.0.3"}
+
+
+def test_noninteractive_smoke_network_config_is_instance_scoped(tmp_path: Path) -> None:
+    sessions_root = tmp_path / "sessions"
+    session_dir = sessions_root / "1_heartbeat"
+    session_dir.mkdir(parents=True)
+    runtime = rosotacom.RuntimeConfig(
+        None,
+        tmp_path / "ros2docker.json",
+        (sessions_root,),
+        None,
+        "id",
+        tmp_path / "session-instances",
+    )
+    session = rosotacom.ResolvedSession(session_dir, "/session/definitions/1_heartbeat", "session_configs")
+
+    first = rosotacom._noninteractive_smoke_network_config(runtime, session, "first")
+    second = rosotacom._noninteractive_smoke_network_config(runtime, session, "second")
+
+    assert first.name != second.name
+    assert first.subnet != second.subnet
+    assert first.name.startswith("rosotacom_smoke_id_1_heartbeat_first")
+    assert first.subnet.startswith("10.137.")
+    assert first.subnet.endswith("/29")
+    assert first.peer_ips == rosotacom._smoke_peer_ips_for_subnet(["a", "b"], first.subnet)
+
+
+def test_smoke_peer_ips_for_subnet_supports_small_run_subnets() -> None:
+    assert rosotacom._smoke_peer_ips_for_subnet(["b", "a"], "10.137.42.16/29") == {
+        "a": "10.137.42.18",
+        "b": "10.137.42.19",
+    }
 
 
 def test_isolated_network_run_args_swaps_host_networking() -> None:
@@ -1940,6 +1987,60 @@ def test_smoke_crossed_topics_include_native_chatter_direction() -> None:
     assert "export ROS_DOMAIN_ID=47" in rosotacom._smoke_ros_setup("/config", cfg, "b")
 
 
+def test_smoke_publish_specs_use_source_target_prefix_and_qos() -> None:
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {
+            "a": {
+                "domain_id": 46,
+                "inbound": {"keep_source_prefix": True},
+                "outbound": {"target_prefix": {"use_target_prefix": True}},
+            },
+            "b": {"domain_id": 47},
+        },
+        "shared": {"use_heartbeat": True},
+        "topics": {
+            "a_to_b": [
+                {
+                    "topic": "/topic1",
+                    "type": "geometry_msgs/msg/PoseStamped",
+                    "qos": {"reliability": "reliable", "durability": "transient_local", "for_role": {}},
+                }
+            ]
+        },
+    }
+
+    received = rosotacom._received_crossed_topics(cfg, "b")
+    received_a = rosotacom._received_crossed_topics(cfg, "a")
+    specs = [s for s in rosotacom._smoke_publish_specs(cfg) if s.publish_topic]
+
+    assert received[0].topic == "/com/in/a/to_b/heartbeat_a"
+    assert received_a[1].topic == "/b/heartbeat_b"
+    assert len(specs) == 1
+    assert specs[0].publish_topic == "/to_b/topic1"
+    assert specs[0].topic == "/topic1"
+    assert specs[0].publish_qos == {"reliability": "reliable", "durability": "transient_local"}
+    command = rosotacom._smoke_publisher_command(specs[0], "source ros", 180.0)
+    assert "--qos-reliability reliable" in command
+    assert "--qos-durability transient_local" in command
+
+
+def test_smoke_probe_false_keeps_topic_out_of_synthetic_runner() -> None:
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 46}, "b": {"domain_id": 47}},
+        "topics": {
+            "b_to_a": [
+                {"topic": "/active", "type": "std_msgs/msg/String"},
+                {"topic": "/contract_only", "type": "std_msgs/msg/String", "expect": {"smoke_probe": False}},
+            ]
+        },
+    }
+
+    assert [s.publish_topic for s in rosotacom._smoke_publish_specs(cfg)] == ["/active"]
+    assert [s.topic for s in rosotacom._received_crossed_topics(cfg, "a") if s.publish_topic] == ["/active"]
+
+
 def test_smoke_native_publish_rate_override() -> None:
     # A rate-changing feature drives its source from expect.smoke_native_hz, not
     # the (lower) asserted received bounds.
@@ -1974,6 +2075,26 @@ def test_restamp_example_uses_stale_stamped_header_source() -> None:
     # The synthetic message carries a stale (1970) stamp so restamp has an effect.
     msg = rosotacom._smoke_publish_message("geometry_msgs/msg/PointStamped")
     assert "sec: 1000" in msg and "point" in msg
+
+
+@pytest.mark.parametrize(
+    "msg_type",
+    [
+        "std_msgs/msg/Empty",
+        "std_msgs/msg/Float32",
+        "std_msgs/msg/Float64",
+        "geometry_msgs/msg/PoseStamped",
+        "geometry_msgs/msg/TwistStamped",
+        "tf2_msgs/msg/TFMessage",
+        "sensor_msgs/msg/CameraInfo",
+        "sensor_msgs/msg/NavSatFix",
+        "gps_msgs/msg/GPSFix",
+        "com_msgs/msg/CompressedData",
+        "ffmpeg_image_transport_msgs/msg/FFMPEGPacket",
+    ],
+)
+def test_smoke_publish_message_supports_remote_assist_anonymized_types(msg_type: str) -> None:
+    assert rosotacom._smoke_publish_message(msg_type)
 
 
 def test_named_stage_latency_is_left_to_status_oracle() -> None:

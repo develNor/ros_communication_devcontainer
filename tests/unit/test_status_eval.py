@@ -40,6 +40,12 @@ def test_non_ok_overall_fails_with_diagnosis() -> None:
     assert len(failures) == 1 and "STALLED" in failures[0] and "stopped 4s ago" in failures[0]
 
 
+def test_smoke_probe_false_skips_contract_only_topic() -> None:
+    report = {"peer": "a", "topics": [_topic("/contract_only", "inbound", "STALLED", [])]}
+
+    assert evaluate_report(report, {"/contract_only": {"smoke_probe": False, "hz": {"min": 1}}}) == []
+
+
 def test_empty_report_fails() -> None:
     assert evaluate_report({"peer": "a", "topics": []}, {})
 

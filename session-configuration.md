@@ -409,6 +409,8 @@ Each entry is either:
   - `processing` (optional mapping)
   - `qos` (optional mapping)
   - `zen_qos` (optional mapping)
+  - `expect` (optional mapping); `smoke_probe: false` keeps the topic in the
+    generated contract but excludes it from synthetic local-smoke probes
 
 In split-domain mode the generator must emit a standard ROS 2 `domain_bridge` YAML with explicit
 message types for `/com/...` topics. For that reason, user-defined topic entries need `type:`.

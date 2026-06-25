@@ -5,11 +5,11 @@ from __future__ import annotations
 import argparse
 import array
 import json
-from pathlib import Path
 import sys
-import yaml
+from pathlib import Path
 
 import rosbag2_py
+import yaml
 from rclpy.serialization import deserialize_message, serialize_message
 from rosidl_runtime_py.utilities import get_message
 
@@ -69,7 +69,7 @@ def anonymize_msg(msg) -> None:
 def get_topics_info(metadata_path: Path) -> dict[str, dict]:
     if metadata_path.is_dir():
         metadata_path = metadata_path / "metadata.yaml"
-    with open(metadata_path, "r", encoding="utf-8") as f:
+    with open(metadata_path, encoding="utf-8") as f:
         doc = yaml.safe_load(f) or {}
     info = doc.get("rosbag2_bagfile_information", {})
     topics_info = {}
@@ -103,10 +103,13 @@ def main() -> int:
 
     topics_info = get_topics_info(input_path)
 
-    # Filter topics map to only include topics actually present in the bag
-    active_topics_map = {orig: anonymized for orig, anonymized in topics_map.items() if orig in topics_info}
-    if not active_topics_map:
-        print("Warning: no topics from the mapping found in the input bag.", file=sys.stderr)
+    missing_topics = [orig for orig in topics_map if orig not in topics_info]
+    if missing_topics:
+        print("Error: mapped topic(s) missing from the input bag:", file=sys.stderr)
+        for topic in missing_topics:
+            print(f"  {topic}", file=sys.stderr)
+        return 1
+    active_topics_map = dict(topics_map)
 
     # Initialize sequential reader
     reader = rosbag2_py.SequentialReader()
@@ -130,7 +133,7 @@ def main() -> int:
             name=anonymized,
             type=info["type"],
             serialization_format=info["serialization_format"],
-            offered_qos_profiles=[],
+            offered_qos_profiles=info["offered_qos_profiles"],
         )
         writer.create_topic(topic_metadata)
 

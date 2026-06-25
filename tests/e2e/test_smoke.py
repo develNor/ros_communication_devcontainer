@@ -61,6 +61,11 @@ ZEN_SIZED_PAYLOAD_SMOKE_SESSIONS = [
 LINK_LATENCY_SMOKE_SESSIONS = [
     pytest.param(name, id="link-latency") for name in SMOKE_SESSIONS if name == "13_link_latency"
 ]
+REMOTE_ASSIST_ANON_SMOKE_SESSIONS = [
+    pytest.param(name, id="remote-assist-anonymized")
+    for name in SMOKE_SESSIONS
+    if name == "14_remote_assist_anonymized"
+]
 
 EXPECTED_HEARTBEAT_CHECKS = (
     "OK: generated plugin.yaml files use literal CLI addresses",
@@ -107,6 +112,15 @@ EXPECTED_ZEN_SIZED_PAYLOAD_CHECKS = (
     "OK: b->a inbound bridge topic (/com/in/b/size_test_b)",
     "OK: b->a final topic (/size_test_b)",
     "OK: b->a final topic (/size_test_b) preserves SizedPayload size 66000",
+)
+EXPECTED_REMOTE_ASSIST_ANON_CHECKS = (
+    "OK: smoke publisher a->b /to_b/topic1 (geometry_msgs/msg/PoseStamped) is advertising",
+    "OK: smoke publisher a->b /to_b/topic2 (std_msgs/msg/Empty) is advertising",
+    "OK: smoke publisher b->a /topic9 (ffmpeg_image_transport_msgs/msg/FFMPEGPacket) is advertising",
+    "OK: a->b inbound bridge topic (/com/in/a/to_b/topic1)",
+    "OK: a->b final topic (/topic1)",
+    "OK: b->a inbound bridge topic (/com/in/b/topic3)",
+    "OK: b->a final topic (/b/topic3)",
 )
 
 # Heartbeat publishers emit at 10 Hz; received rate should stay close to that.
@@ -535,6 +549,41 @@ def test_local_native_chatter_smoke_from_copied_example_project(
 
     _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
     _assert_metric_present(session_name, result.stdout, topic="/chatter", label="b->a final topic")
+
+
+@pytest.mark.parametrize("session_name", REMOTE_ASSIST_ANON_SMOKE_SESSIONS)
+def test_local_remote_assist_anonymized_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    for expected in EXPECTED_REMOTE_ASSIST_ANON_CHECKS:
+        assert expected in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    config_dir = artifact_dir / "config"
+    assert (config_dir / "a_to_b_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_a",
+        "/topic1",
+        "/topic2",
+    ]
+    assert (config_dir / "b_to_a_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_b",
+        *[f"/topic{i}" for i in range(3, 21)],
+    ]
+    qos = yaml.safe_load((config_dir / "qos.yaml").read_text(encoding="utf-8"))
+    assert qos["topics"]["/topic4"]["durability"] == "transient_local"
+    assert qos["topics"]["/topic12"]["roles"]["ota_pub"]["lifespan"] == 86400
+    pipeline_a = yaml.safe_load((config_dir / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
+    topic1 = next(topic for topic in pipeline_a["topics"] if topic["base"] == "/topic1")
+    assert topic1["stages"][0]["topic"] == "/to_b/topic1"
+    assert topic1["stages"][-1]["topic"] == "/ota/a/to_b/topic1"
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+    _assert_metric_present(session_name, result.stdout, topic="/topic1", label="a->b final topic")
+    _assert_metric_present(session_name, result.stdout, topic="/b/topic3", label="b->a final topic")
 
 
 def test_native_chatter_scenario_starts_apps_and_communication_together(

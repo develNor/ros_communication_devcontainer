@@ -164,6 +164,14 @@ slice and reuses RFC 0003 + 0004.
 - [x] Add the budget store (per `(SHA, profile, genre)`) and the regression compare
   against a recorded baseline ± tolerance (`benchmark.BudgetEntry`/`save_budget`/
   `load_budget`/`find_baseline`, `compare_to_budget`).
+- [x] Make live benchmark sessions RMW-selectable per invocation and default the
+  packaged benchmark sessions to Cyclone DDS, while keeping `--rmw fastdds` and
+  other supported session RMW values available for explicit comparisons
+  (`cli_benchmark --rmw`, artifact-backed session copy).
+- [x] Persist a self-contained per-run `result.json` with selected RMW, local/OTA
+  mode, configured load, offered bandwidth, profile shaping context, thresholds,
+  verdict, and per-topic loss/latency/jitter metrics; keep `budgets.jsonl` as the
+  budget/baseline feed (`cli_benchmark._write_benchmark_result`).
 - [x] Build the recovery driver on timeline profiles (RFC 0004) + the recovery
   metric set (`t_recover`, `t_steady`, backlog/burst, lost-during-outage, latched
   re-arrival) (`benchmark.recovery_metrics`; arming the timeline profile is RFC
@@ -196,6 +204,18 @@ reviewed rather than asserted in a blocking test.
 - [x] **Budget store + regression compare** (per `(SHA, profile, genre)`, ±
   tolerance) — host unit test on the compare against a recorded baseline fixture.
   Automatable. *(`test_budget_compare_*`, `test_budget_store_roundtrip_*`.)*
+- [x] **Benchmark RMW selection** (Cyclone default, explicit per-run override) —
+  host unit test for parser defaults and artifact-backed session override; the
+  Docker-backed capacity E2E pins `--rmw cyclone`. Automatable.
+  *(`test_benchmark_subcommand_arg_parsing`,
+  `test_benchmark_session_copy_pins_requested_rmw`,
+  `test_benchmark_capacity_*`.)*
+- [x] **Self-contained benchmark result artifact** (`result.json` with context,
+  metrics, verdict, and artifact references) — host unit tests assert the capacity,
+  ramp, and sweep result files and the CI-readable metric output. Automatable.
+  *(`test_capacity_driver_finds_breakpoint_with_stubbed_probe`,
+  `test_ramp_driver_builds_curve_with_stubbed_probe`,
+  `test_sweep_driver_runs_grid_with_stubbed_probe`.)*
 - [x] **Recovery driver + metric set** (`t_recover`, `t_steady`, backlog/burst,
   lost-during-outage, latched re-arrival) — host unit test extracting the metrics
   from a synthetic timeline of transit records (RFC 0003); the **live recovery run

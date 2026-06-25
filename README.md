@@ -460,6 +460,13 @@ The `sessions/` directory contains curated built-in session definitions:
 Transport-combination coverage lives under `tests/sessions/rmw_matrix` and is
 generated from `tests/sessions/generate_rmw_matrix.py`.
 
+`rosotacom benchmark` uses the packaged `bench_1_*` sessions for local or OTA
+benchmark probes. Benchmark sessions default to Cyclone DDS; pass `--rmw
+fastdds`, `--rmw cyclone`, or another supported session RMW value to pin a run.
+Each run writes a self-contained `result.json` under its benchmark artifact
+directory with the selected RMW, configured load and offered bandwidth, profile
+shaping context, thresholds, verdict, and per-topic loss/latency/jitter metrics.
+
 ## Development
 
 For contributor setup, local checks, PR workflow, CI, and releases, see

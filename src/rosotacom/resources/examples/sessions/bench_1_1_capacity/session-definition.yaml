@@ -23,7 +23,7 @@ shared:
   use_heartbeat: false
   use_status_overview: true
   ota_domain_id: 52
-  rmw: fastdds
+  rmw: cyclone
 
   qos:
     defaults:

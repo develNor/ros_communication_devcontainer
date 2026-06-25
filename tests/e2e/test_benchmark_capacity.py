@@ -103,6 +103,8 @@ def test_benchmark_capacity_good_case(copied_example_project: Path) -> None:
         "10",
         "--repeats",
         "1",
+        "--rmw",
+        "cyclone",
     ]
     result = _run(cmd, timeout=BENCHMARK_TIMEOUT_S)
     # The output should contain: Capacity: size=1
@@ -135,6 +137,8 @@ def test_benchmark_capacity_bad_case(copied_example_project: Path) -> None:
         "10",
         "--repeats",
         "1",
+        "--rmw",
+        "cyclone",
     ]
     result = _run(cmd, timeout=BENCHMARK_TIMEOUT_S)
     # The output should contain: Capacity: size=None

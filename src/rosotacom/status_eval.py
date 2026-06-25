@@ -359,6 +359,8 @@ def evaluate_report(
     for topic in topics:
         base = topic.get("base", "?")
         expect = resolve_expect_for_profile(expect_by_topic.get(base) or {}, profile)
+        if expect.get("smoke_probe") is False:
+            continue
         mode = _topic_mode(expect)
         optional = _is_optional(expect)
         overall = topic.get("overall")

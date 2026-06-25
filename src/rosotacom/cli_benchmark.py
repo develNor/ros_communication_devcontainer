@@ -22,8 +22,15 @@ import shutil
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+import yaml
+
+DEFAULT_BENCHMARK_RMW = "cyclone"
+BENCHMARK_RESULT_FILE = "result.json"
 
 
 class TeeStream:
@@ -176,6 +183,263 @@ def collect_transit_records(instance_dir: Path) -> list[dict[str, Any]]:
 RunPointFn = Callable[..., dict[str, Any]]
 
 
+def _jsonable(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _jsonable(asdict(value))
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(item) for item in value]
+    try:
+        json.dumps(value)
+    except TypeError:
+        return str(value)
+    return value
+
+
+def _benchmark_rmw(args: argparse.Namespace) -> str:
+    return str(getattr(args, "rmw", None) or DEFAULT_BENCHMARK_RMW)
+
+
+def _rmw_runtime_implementation(rmw: str) -> str:
+    from .cli import session_gen
+
+    return str(session_gen.RMW_ALIASES.get(rmw, rmw))
+
+
+def _prepare_benchmark_session_config(args: argparse.Namespace, session_name: str, run_dir: Path) -> dict[str, Any]:
+    """Copy the benchmark session into the run artifacts and pin ``shared.rmw``."""
+    from .cli import _load_runtime_config, _resolve_session
+
+    rmw = _benchmark_rmw(args)
+    runtime = _load_runtime_config(args)
+    source_session = _resolve_session(session_name, runtime)
+    dest_root = run_dir / "session-configs"
+    dest_session = dest_root / session_name
+    shutil.copytree(source_session.host_dir, dest_session)
+
+    config_path = dest_session / "session-definition.yaml"
+    if not config_path.is_file():
+        config_path = dest_session / "session-parametrization.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Benchmark session {session_name!r} has no session YAML: {source_session.host_dir}")
+
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(cfg, dict):
+        raise RuntimeError(f"Benchmark session config must be a mapping: {config_path}")
+    shared = cfg.setdefault("shared", {})
+    if not isinstance(shared, dict):
+        raise RuntimeError(f"Benchmark session config 'shared' must be a mapping: {config_path}")
+    shared["rmw"] = rmw
+    config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+    existing_raw = getattr(args, "session_configs_dir", None)
+    if existing_raw is None:
+        existing: list[Any] = []
+    elif isinstance(existing_raw, list | tuple):
+        existing = list(existing_raw)
+    else:
+        existing = [existing_raw]
+    args.session_configs_dir = [str(dest_root), *[str(path) for path in existing]]
+    args._benchmark_session_dir = str(dest_session)
+    args._benchmark_session_source = str(source_session.host_dir)
+    args._benchmark_session_config = str(config_path)
+
+    return {
+        "name": session_name,
+        "source_dir": source_session.host_dir,
+        "artifact_dir": dest_session,
+        "config_path": config_path,
+        "rmw": rmw,
+        "runtime_implementation": _rmw_runtime_implementation(rmw),
+    }
+
+
+def _profile_context(profile: str | None, profiles_file: Path | None) -> dict[str, Any]:
+    if not profile:
+        return {"name": None, "kind": "none", "configured": None}
+    context: dict[str, Any] = {"name": profile, "profiles_file": profiles_file}
+    if profiles_file is None:
+        context["configured"] = None
+        return cast(dict[str, Any], _jsonable(context))
+    try:
+        from .network_profiles import load_profiles_file
+
+        configured = load_profiles_file(profiles_file).get(profile)
+    except Exception as exc:
+        context["configured"] = None
+        context["load_error"] = str(exc)
+    else:
+        context["configured"] = configured
+    return cast(dict[str, Any], _jsonable(context))
+
+
+def _benchmark_result_context(
+    args: argparse.Namespace,
+    *,
+    genre: str,
+    profile: str | None,
+    run_dir: Path,
+    session: dict[str, Any] | None,
+) -> dict[str, Any]:
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    rmw = _benchmark_rmw(args)
+    return cast(
+        dict[str, Any],
+        _jsonable(
+            {
+                "command": " ".join(shlex.quote(arg) for arg in sys.argv),
+                "genre": genre,
+                "execution": {
+                    "mode": "ota" if getattr(args, "deployment", None) else "local",
+                    "dry_run": bool(getattr(args, "dry_run", False)),
+                },
+                "rmw": {
+                    "requested": rmw,
+                    "runtime_implementation": _rmw_runtime_implementation(rmw),
+                },
+                "profile": _profile_context(profile, runtime.profiles_file),
+                "session": session,
+                "paths": {
+                    "run_dir": run_dir,
+                    "rosotacom_config": runtime.rosotacom_config,
+                    "ros2docker_config": runtime.ros2docker_config,
+                    "profiles_file": runtime.profiles_file,
+                    "benchmarks_dir": runtime.benchmarks_dir,
+                },
+            }
+        ),
+    )
+
+
+def _mean_payload_bytes(load: dict[str, Any]) -> float | None:
+    size_a_raw = load.get("size_a", load.get("size"))
+    if size_a_raw is None:
+        return None
+    try:
+        size_a = int(size_a_raw)
+        size_b = int(load["size_b"]) if load.get("size_b") is not None else None
+        pattern = str(load.get("pattern") or load.get("size_pattern") or "")
+        if pattern:
+            from .benchmark import pattern_mean_bytes
+
+            return float(pattern_mean_bytes(pattern, size_a, size_b))
+        return float(size_a)
+    except Exception:
+        return None
+
+
+def _load_context(load: dict[str, Any]) -> dict[str, Any]:
+    rate_hz = float(load.get("rate", load.get("rate_hz", 0.0)) or 0.0)
+    streams = int(load.get("streams", 1) or 1)
+    mean_payload_bytes = _mean_payload_bytes(load)
+    offered_bandwidth_bps = None
+    if mean_payload_bytes is not None:
+        offered_bandwidth_bps = mean_payload_bytes * 8.0 * rate_hz * streams
+    return cast(
+        dict[str, Any],
+        _jsonable(
+            {
+                "parameters": dict(load),
+                "rate_hz": rate_hz,
+                "streams": streams,
+                "mean_payload_bytes": mean_payload_bytes,
+                "offered_bandwidth_bps": offered_bandwidth_bps,
+            }
+        ),
+    )
+
+
+def _format_bps(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.3g} Mbit/s"
+    if value >= 1_000:
+        return f"{value / 1_000:.3g} kbit/s"
+    return f"{value:.0f} bit/s"
+
+
+def _topic_rows(summary: dict[str, Any], topic: str = "") -> list[dict[str, Any]]:
+    topics = summary.get("topics", {})
+    if not isinstance(topics, dict):
+        return []
+    selected = [(topic, topics.get(topic, {}))] if topic else list(topics.items())
+    rows: list[dict[str, Any]] = []
+    for topic_name, topic_data in selected:
+        topic_data = topic_data if isinstance(topic_data, dict) else {}
+        ota = topic_data.get("ota_hop_ms") or {}
+        jitter = topic_data.get("jitter_ms") or {}
+        rows.append(
+            {
+                "topic": str(topic_name),
+                "expected": topic_data.get("expected"),
+                "delivered": topic_data.get("delivered"),
+                "lost": topic_data.get("lost"),
+                "loss_pct": topic_data.get("loss_pct"),
+                "reordered": topic_data.get("reordered"),
+                "latency_ms": {
+                    "p50": ota.get("p50") if isinstance(ota, dict) else None,
+                    "p95": ota.get("p95") if isinstance(ota, dict) else None,
+                },
+                "jitter_ms": {
+                    "p50": jitter.get("p50") if isinstance(jitter, dict) else None,
+                    "p95": jitter.get("p95") if isinstance(jitter, dict) else None,
+                },
+            }
+        )
+    return rows
+
+
+def _format_topic_rows(rows: Sequence[dict[str, Any]]) -> str:
+    if not rows:
+        return "no topic metrics"
+    parts = []
+    for row in rows:
+        loss = row.get("loss_pct")
+        latency_p95 = (row.get("latency_ms") or {}).get("p95")
+        jitter_p95 = (row.get("jitter_ms") or {}).get("p95")
+        parts.append(
+            f"{row.get('topic')}: delivered={row.get('delivered')}/{row.get('expected')} "
+            f"lost={row.get('lost')} loss={loss}% p95={latency_p95}ms jitter_p95={jitter_p95}ms"
+        )
+    return "; ".join(parts)
+
+
+def _write_benchmark_result(
+    out_dir: Path,
+    *,
+    genre: str,
+    configuration: dict[str, Any],
+    result: dict[str, Any] | list[dict[str, Any]],
+    measurements: dict[str, Any],
+    verdict: dict[str, Any],
+    context: dict[str, Any] | None = None,
+    artifacts: dict[str, Any] | None = None,
+) -> Path:
+    doc = _jsonable(
+        {
+            "schema_version": 1,
+            "created_at": datetime.now().isoformat(),
+            "genre": genre,
+            "context": context or {},
+            "configuration": configuration,
+            "measurements": measurements,
+            "result": result,
+            "verdict": verdict,
+            "artifacts": artifacts or {},
+        }
+    )
+    path = out_dir / BENCHMARK_RESULT_FILE
+    path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Benchmark result saved to {path}")
+    return path
+
+
 def _default_run_point(
     *,
     profile: str | None,
@@ -213,6 +477,7 @@ def drive_capacity(
     repeats: int = 1,
     duration_s: float = 60.0,
     out_dir: Path,
+    result_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Drive a capacity binary search using real runs.
 
@@ -230,6 +495,7 @@ def drive_capacity(
 
     thresholds = OracleThresholds(max_loss_pct=max_loss_pct, max_latency_ms=max_latency_ms)
     slice_ = CapacitySlice(profile=profile, knob=knob, fixed={"rate": rate_hz})
+    probe_results: list[dict[str, Any]] = []
 
     def probe(value: int) -> bool:
         """Run a live point at the given knob value and check the oracle."""
@@ -247,20 +513,51 @@ def drive_capacity(
         for attempt in range(repeats):
             summary = run_point(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
             topics = summary.get("topics", {})
+            rows = _topic_rows(summary, topic)
             if topic:
                 passes = oracle_passes_topic(topics.get(topic, {}), thresholds)
             else:
                 passes = all(oracle_passes_topic(t, thresholds) for t in topics.values()) if topics else False
             results.append(passes)
-            print(f"  probe({knob}={value}, attempt={attempt + 1}/{repeats}): {'PASS' if passes else 'FAIL'}")
+            load_info = _load_context(load)
+            probe_results.append(
+                {
+                    "knob": knob,
+                    "value": value,
+                    "attempt": attempt + 1,
+                    "passed": passes,
+                    "load": load_info,
+                    "topics": rows,
+                    "summary": summary,
+                }
+            )
+            print(
+                f"  probe({knob}={value}, attempt={attempt + 1}/{repeats}): "
+                f"{'PASS' if passes else 'FAIL'} "
+                f"offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} "
+                f"{_format_topic_rows(rows)}"
+            )
 
         # Median vote: passes if more than half the repeats pass.
         return sum(results) > len(results) // 2
 
     result = find_capacity(slice_, low, high, probe)
-    capacity_result = {
+    capacity_load: dict[str, Any] | None = None
+    if result.capacity is not None:
+        capacity_load_raw: dict[str, Any] = {"rate": rate_hz}
+        if knob == "size":
+            capacity_load_raw["size_a"] = result.capacity
+        elif knob == "rate":
+            capacity_load_raw["rate"] = float(result.capacity)
+        elif knob == "bandwidth":
+            capacity_load_raw["size_a"] = int(result.capacity / (8.0 * rate_hz)) if rate_hz > 0 else result.capacity
+        else:
+            capacity_load_raw[knob] = result.capacity
+        capacity_load = _load_context(capacity_load_raw)
+    capacity_result: dict[str, Any] = {
         "slice": {"profile": result.slice.profile, "knob": result.slice.knob, "fixed": result.slice.fixed},
         "capacity": result.capacity,
+        "capacity_load": capacity_load,
     }
 
     # Save budget entry.
@@ -273,7 +570,34 @@ def drive_capacity(
         metrics=metrics,
     )
     save_budget(budget_path, [budget_entry])
-    print(f"Capacity result: {knob}={result.capacity} (saved to {budget_path})")
+    result_path = _write_benchmark_result(
+        out_dir,
+        genre="capacity",
+        context=result_context,
+        configuration={
+            "profile": profile,
+            "knob": knob,
+            "bounds": {"low": low, "high": high},
+            "load": _load_context({"rate": rate_hz}),
+            "thresholds": {
+                "max_loss_pct": max_loss_pct,
+                "max_latency_ms": max_latency_ms,
+                "latency_quantile": thresholds.latency_quantile,
+            },
+            "topic": topic or None,
+            "repeats": repeats,
+            "duration_s": duration_s,
+        },
+        result=capacity_result,
+        measurements={"probes": probe_results},
+        verdict={
+            "passed": result.capacity is not None,
+            "status": "capacity_found" if result.capacity is not None else "no_passing_probe",
+        },
+        artifacts={"budget": budget_path.name, "stdout": "stdout.txt", "probes_dir": "probes"},
+    )
+    capacity_result["result_file"] = str(result_path)
+    print(f"Capacity result: {knob}={result.capacity} (budget {budget_path}, result {result_path})")
     return capacity_result
 
 
@@ -292,6 +616,7 @@ def drive_ramp(
     topic: str = "",
     duration_s: float = 60.0,
     out_dir: Path,
+    result_context: dict[str, Any] | None = None,
 ) -> list[dict[str, float]]:
     """Drive a linear ramp: measure latency at each load value.
 
@@ -308,20 +633,47 @@ def drive_ramp(
             load[knob] = value
 
         summary = run_point(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
+        rows = _topic_rows(summary, topic)
         topics = summary.get("topics", {})
         # Use the first topic or the specified one.
         target_topic = topic if topic else next(iter(topics), "")
         topic_data = topics.get(target_topic, {})
         latency_p95 = (topic_data.get("ota_hop_ms") or {}).get("p95")
         loss_pct = topic_data.get("loss_pct", 100.0)
-        point = {"value": float(value), "metric": float(latency_p95 or 0.0), "loss_pct": float(loss_pct)}
+        load_info = _load_context(load)
+        point = {
+            "value": float(value),
+            "metric": float(latency_p95 or 0.0),
+            "loss_pct": float(loss_pct),
+            "offered_bw_bps": float(load_info["offered_bandwidth_bps"] or 0.0),
+        }
         curve.append(point)
-        print(f"  ramp({knob}={value}): latency_p95={latency_p95}, loss={loss_pct}%")
+        print(
+            f"  ramp({knob}={value}): offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} "
+            f"{_format_topic_rows(rows)}"
+        )
 
     curve_path = out_dir / "curve.jsonl"
     curve_path.write_text(
         "\n".join(json.dumps(point, sort_keys=True) for point in curve) + "\n",
         encoding="utf-8",
+    )
+    _write_benchmark_result(
+        out_dir,
+        genre="ramp",
+        context=result_context,
+        configuration={
+            "profile": profile,
+            "knob": knob,
+            "values": list(values),
+            "load": _load_context({"rate": rate_hz}),
+            "topic": topic or None,
+            "duration_s": duration_s,
+        },
+        result=curve,
+        measurements={"points": curve},
+        verdict={"passed": True, "status": "completed"},
+        artifacts={"curve": curve_path.name, "stdout": "stdout.txt", "probes_dir": "probes"},
     )
     print(f"Ramp curve saved to {curve_path}")
     return curve
@@ -341,6 +693,7 @@ def drive_recovery(
     latched_topics: Sequence[str] = (),
     out_dir: Path,
     profiles_file: Path | None = None,
+    result_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Drive a recovery test: run under a timeline profile, extract recovery metrics.
 
@@ -371,7 +724,7 @@ def drive_recovery(
         raise ValueError(f"Profile {profile!r} has no outage segment; recovery needs one.")
 
     # Run the point (the live probe handles timeline stepping).
-    run_point(profile=profile, load={}, duration_s=duration_s, out_dir=out_dir)
+    summary = run_point(profile=profile, load={}, duration_s=duration_s, out_dir=out_dir)
 
     # Collect raw records for recovery analysis.
     records = _load_raw_records_from_out(out_dir)
@@ -393,6 +746,22 @@ def drive_recovery(
 
     rec_path = out_dir / "recovery.json"
     rec_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_benchmark_result(
+        out_dir,
+        genre="recovery",
+        context=result_context,
+        configuration={
+            "profile": profile,
+            "duration_s": duration_s,
+            "nominal_period_s": nominal_period_s,
+            "latched_topics": list(latched_topics),
+            "outage": {"start": outage_start, "end": outage_end},
+        },
+        result=result,
+        measurements={"summary": summary, "raw_record_count": len(records)},
+        verdict={"passed": True, "status": "completed"},
+        artifacts={"recovery": rec_path.name, "stdout": "stdout.txt", "probes_dir": "probes"},
+    )
     print(f"Recovery metrics saved to {rec_path}")
     return result
 
@@ -425,6 +794,7 @@ def drive_sweep(
     topic: str = "",
     duration_s: float = 60.0,
     out_dir: Path,
+    result_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Drive a profile-grid sweep (tests 1.1/2.1): run one point per profile,
     report oracle pass/fail for each.
@@ -435,10 +805,12 @@ def drive_sweep(
 
     thresholds = OracleThresholds(max_loss_pct=max_loss_pct, max_latency_ms=max_latency_ms)
     frontier: list[dict[str, Any]] = []
+    point_measurements: list[dict[str, Any]] = []
 
     for profile in profile_grid:
         load = {"size_a": size, "rate": rate_hz}
         summary = run_point(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
+        rows = _topic_rows(summary, topic)
         topics = summary.get("topics", {})
         target_topic = topic if topic else next(iter(topics), "")
         topic_data = topics.get(target_topic, {})
@@ -452,12 +824,48 @@ def drive_sweep(
             "latency_p95_ms": float(latency_p95) if latency_p95 is not None else None,
         }
         frontier.append(result)
-        print(f"  sweep({profile}): {'PASS' if passes else 'FAIL'} loss={loss_pct}% latency_p95={latency_p95}")
+        load_info = _load_context(load)
+        point_measurements.append(
+            {
+                "profile": profile,
+                "passed": passes,
+                "load": load_info,
+                "topics": rows,
+                "summary": summary,
+            }
+        )
+        print(
+            f"  sweep({profile}): {'PASS' if passes else 'FAIL'} "
+            f"offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} {_format_topic_rows(rows)}"
+        )
 
     frontier_path = out_dir / "frontier.jsonl"
     frontier_path.write_text(
         "\n".join(json.dumps(row, sort_keys=True) for row in frontier) + "\n",
         encoding="utf-8",
+    )
+    _write_benchmark_result(
+        out_dir,
+        genre="sweep",
+        context=result_context,
+        configuration={
+            "profile_grid": list(profile_grid),
+            "load": _load_context({"size_a": size, "rate": rate_hz}),
+            "thresholds": {
+                "max_loss_pct": max_loss_pct,
+                "max_latency_ms": max_latency_ms,
+                "latency_quantile": thresholds.latency_quantile,
+            },
+            "topic": topic or None,
+            "duration_s": duration_s,
+        },
+        result=frontier,
+        measurements={"points": point_measurements},
+        verdict={
+            "passed": all(row["passes"] for row in frontier),
+            "status": "all_profiles_passed" if all(row["passes"] for row in frontier) else "profile_failures",
+        },
+        artifacts={"frontier": frontier_path.name, "stdout": "stdout.txt", "probes_dir": "probes"},
     )
     print(f"Sweep frontier saved to {frontier_path}")
     return frontier
@@ -609,6 +1017,11 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--keep-workdir", action="store_true", help="Keep temporary checkout directories.")
     parser.add_argument("--dry-run", action="store_true", help="Show commands but do not run them.")
     parser.add_argument("--artifacts-dir", help="Output directory for all benchmark artifacts.")
+    parser.add_argument(
+        "--rmw",
+        default=DEFAULT_BENCHMARK_RMW,
+        help=f"RMW implementation or rosotacom RMW alias for benchmark sessions (default: {DEFAULT_BENCHMARK_RMW}).",
+    )
 
 
 def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPointFn:
@@ -1038,6 +1451,14 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
     run_dir = _setup_benchmark_run_dir(args, "capacity", args.profile)
+    session_context = _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
+    result_context = _benchmark_result_context(
+        args,
+        genre="capacity",
+        profile=args.profile,
+        run_dir=run_dir,
+        session=session_context,
+    )
 
     # Use stub probe under test, or live probe in production.
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_1_capacity")
@@ -1056,6 +1477,7 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
             repeats=getattr(args, "repeats", 1),
             duration_s=getattr(args, "duration", 60.0),
             out_dir=run_dir,
+            result_context=result_context,
         )
 
     # Resolve aggregated file output path
@@ -1072,7 +1494,7 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
             f_out.write(run_budgets_file.read_text(encoding="utf-8"))
         print(f"Aggregated budget result appended to {out_path}")
 
-    print(f"Capacity: {result['slice']['knob']}={result['capacity']} → {run_dir / 'budgets.jsonl'}")
+    print(f"Capacity: {result['slice']['knob']}={result['capacity']} → {run_dir / BENCHMARK_RESULT_FILE}")
     return 0
 
 
@@ -1084,6 +1506,14 @@ def benchmark_ramp(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
     run_dir = _setup_benchmark_run_dir(args, "ramp", args.profile)
+    session_context = _prepare_benchmark_session_config(args, "bench_1_3_ramp", run_dir)
+    result_context = _benchmark_result_context(
+        args,
+        genre="ramp",
+        profile=args.profile,
+        run_dir=run_dir,
+        session=session_context,
+    )
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_3_ramp")
 
@@ -1098,6 +1528,7 @@ def benchmark_ramp(args: argparse.Namespace) -> int:
             topic=getattr(args, "topic", ""),
             duration_s=getattr(args, "duration", 60.0),
             out_dir=run_dir,
+            result_context=result_context,
         )
 
     # Resolve aggregated file output path
@@ -1124,6 +1555,14 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
     run_dir = _setup_benchmark_run_dir(args, "recovery", args.profile)
+    session_context = _prepare_benchmark_session_config(args, "bench_1_4_recovery", run_dir)
+    result_context = _benchmark_result_context(
+        args,
+        genre="recovery",
+        profile=args.profile,
+        run_dir=run_dir,
+        session=session_context,
+    )
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_4_recovery")
 
@@ -1138,6 +1577,7 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
             else (),
             out_dir=run_dir,
             profiles_file=runtime.profiles_file,
+            result_context=result_context,
         )
 
     # Resolve aggregated file output path
@@ -1164,6 +1604,14 @@ def benchmark_sweep(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
     run_dir = _setup_benchmark_run_dir(args, "sweep", None)
+    session_context = _prepare_benchmark_session_config(args, "bench_1_2_load_sweep", run_dir)
+    result_context = _benchmark_result_context(
+        args,
+        genre="sweep",
+        profile=None,
+        run_dir=run_dir,
+        session=session_context,
+    )
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_2_load_sweep")
 
@@ -1179,6 +1627,7 @@ def benchmark_sweep(args: argparse.Namespace) -> int:
             topic=getattr(args, "topic", ""),
             duration_s=getattr(args, "duration", 60.0),
             out_dir=run_dir,
+            result_context=result_context,
         )
 
     # Resolve aggregated file output path

@@ -15,7 +15,10 @@ from typing import Any
 import pytest
 
 from rosotacom.cli_benchmark import (
+    BENCHMARK_RESULT_FILE,
+    DEFAULT_BENCHMARK_RMW,
     _parse_values,
+    _prepare_benchmark_session_config,
     collect_transit_summary,
     drive_capacity,
     drive_ramp,
@@ -78,7 +81,9 @@ def _make_stub_probe(
 # --------------------------------------------------------------------------- #
 
 
-def test_capacity_driver_finds_breakpoint_with_stubbed_probe(tmp_path: Path) -> None:
+def test_capacity_driver_finds_breakpoint_with_stubbed_probe(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """The capacity driver finds the binary-search breakpoint against a stubbed
     metric source that fails above 8000 B."""
     probe = _make_stub_probe(breakpoint_size=8000)
@@ -98,6 +103,13 @@ def test_capacity_driver_finds_breakpoint_with_stubbed_probe(tmp_path: Path) -> 
     assert result["slice"]["profile"] == "test-profile"
     # Budget file was written.
     assert (tmp_path / "budgets.jsonl").exists()
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["configuration"]["thresholds"]["max_loss_pct"] == 5.0
+    assert result_doc["result"]["capacity"] == 8000
+    assert result_doc["verdict"]["passed"] is True
+    assert result_doc["measurements"]["probes"]
+    assert result_doc["measurements"]["probes"][0]["topics"][0]["loss_pct"] in (0.0, 100.0)
+    assert "offered_bw=" in capsys.readouterr().out
 
 
 def test_capacity_driver_returns_none_when_low_fails(tmp_path: Path) -> None:
@@ -137,6 +149,7 @@ def test_ramp_driver_builds_curve_with_stubbed_probe(tmp_path: Path) -> None:
     assert curve[0]["value"] == 1000.0
     # Curve file was written.
     assert (tmp_path / "curve.jsonl").exists()
+    assert (tmp_path / BENCHMARK_RESULT_FILE).exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +250,7 @@ def test_sweep_driver_runs_grid_with_stubbed_probe(tmp_path: Path) -> None:
     assert all(row["passes"] for row in frontier)
     # Frontier file was written.
     assert (tmp_path / "frontier.jsonl").exists()
+    assert (tmp_path / BENCHMARK_RESULT_FILE).exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -380,6 +394,29 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     )
     assert args.benchmark_command == "capacity"
     assert args.knob == "size"
+    assert args.rmw == DEFAULT_BENCHMARK_RMW
+
+    args = parser.parse_args(
+        [
+            "benchmark",
+            "capacity",
+            "--profile",
+            "p",
+            "--knob",
+            "size",
+            "--low",
+            "1000",
+            "--high",
+            "10000",
+            "--max-loss",
+            "5",
+            "--max-latency-ms",
+            "200",
+            "--rmw",
+            "fastdds",
+        ]
+    )
+    assert args.rmw == "fastdds"
 
     # Ramp.
     args = parser.parse_args(["benchmark", "ramp", "--profile", "p", "--values", "1000,2000"])
@@ -437,6 +474,54 @@ def test_runtime_config_parses_benchmarks_dir_and_profiles(tmp_path: Path) -> No
 
     assert runtime.profiles_file == profiles_file
     assert runtime.benchmarks_dir == tmp_path / "benchmarks"
+
+
+def test_benchmark_session_copy_pins_requested_rmw(tmp_path: Path) -> None:
+    import argparse
+
+    import yaml
+
+    project = tmp_path / "project"
+    session_dir = project / "sessions" / "bench_1_1_capacity"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session-definition.yaml").write_text(
+        "peers:\n  a: {}\n  b: {}\nshared:\n  rmw: fastdds\n",
+        encoding="utf-8",
+    )
+    ros2docker = project / "ros2docker.json"
+    ros2docker.write_text("{}", encoding="utf-8")
+    config_file = project / "rosotacom.yaml"
+    config_file.write_text(
+        yaml.safe_dump(
+            {
+                "ros2docker_config": str(ros2docker),
+                "session_configs_dir": ["sessions"],
+                "session_instances_dir": "session-instances",
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    args = argparse.Namespace(
+        rosotacom_config=str(config_file),
+        ros2docker_config=None,
+        session_configs_dir=None,
+        scenario_configs_dir=None,
+        session_instances_dir=None,
+        deployment=None,
+        profiles_file=None,
+        artifacts_dir=None,
+        rmw="cyclone",
+    )
+
+    context = _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
+
+    copied_config = Path(context["config_path"])
+    copied = yaml.safe_load(copied_config.read_text(encoding="utf-8"))
+    assert copied["shared"]["rmw"] == "cyclone"
+    assert args.session_configs_dir[0] == str(run_dir / "session-configs")
+    assert context["runtime_implementation"] == "rmw_cyclonedds_cpp"
 
 
 def test_tee_stream_and_stdout_redirection(tmp_path: Path) -> None:

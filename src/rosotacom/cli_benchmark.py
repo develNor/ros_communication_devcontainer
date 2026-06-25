@@ -32,6 +32,12 @@ import yaml
 
 DEFAULT_BENCHMARK_RMW = "cyclone"
 BENCHMARK_RESULT_FILE = "result.json"
+BENCHMARK_SESSIONS_BY_GENRE = {
+    "capacity": "bench_1_1_capacity",
+    "sweep": "bench_1_2_load_sweep",
+    "ramp": "bench_1_3_ramp",
+    "recovery": "bench_1_4_recovery",
+}
 
 
 class TeeStream:
@@ -289,6 +295,7 @@ def _benchmark_result_context(
 
     runtime = _load_runtime_config(args)
     rmw = _benchmark_rmw(args)
+    profiles_file = _benchmark_profiles_file(profile, runtime.profiles_file)
     return cast(
         dict[str, Any],
         _jsonable(
@@ -303,13 +310,13 @@ def _benchmark_result_context(
                     "requested": rmw,
                     "runtime_implementation": _rmw_runtime_implementation(rmw),
                 },
-                "profile": _profile_context(profile, runtime.profiles_file),
+                "profile": _profile_context(profile, profiles_file),
                 "session": session,
                 "paths": {
                     "run_dir": run_dir,
                     "rosotacom_config": runtime.rosotacom_config,
                     "ros2docker_config": runtime.ros2docker_config,
-                    "profiles_file": runtime.profiles_file,
+                    "profiles_file": profiles_file,
                     "benchmarks_dir": runtime.benchmarks_dir,
                 },
             }
@@ -365,6 +372,17 @@ def _benchmark_ota_target(args: argparse.Namespace, session_name: str) -> tuple[
     return session_name, "session"
 
 
+def _benchmark_profiles_file(profile: str | None, profiles_file: Path | None) -> Path | None:
+    if profiles_file is not None:
+        return _find_profiles_file(profiles_file)
+    try:
+        return _find_profiles_file(None)
+    except FileNotFoundError:
+        if profile:
+            raise
+        return None
+
+
 def _benchmark_artifacts_root(args: argparse.Namespace) -> Path:
     from .cli import _load_runtime_config
 
@@ -386,6 +404,58 @@ def _strip_interactive_args(argv: Sequence[str]) -> list[str]:
 
 def _benchmark_child_command() -> list[str]:
     return [sys.executable, "-m", "rosotacom", *_strip_interactive_args(sys.argv[1:])]
+
+
+def _peer_catmux_attach_script(identity: str, container_name: str) -> str:
+    inner = (
+        "while true; do "
+        "session=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | head -1); "
+        'if [ -n "$session" ]; then exec tmux attach-session -t "$session"; fi; '
+        "echo '[INFO] waiting for catmux/tmux session inside container'; "
+        "sleep 1; "
+        "done"
+    )
+    return (
+        "while true; do "
+        "clear; date; "
+        f"container={shlex.quote(container_name)}; identity={shlex.quote(identity)}; "
+        'if ! docker inspect -f "{{.State.Running}}" "$container" >/dev/null 2>&1; then '
+        'echo "[INFO] waiting for benchmark peer $identity container: $container"; '
+        "sleep 1; continue; "
+        "fi; "
+        'echo "[INFO] attaching to benchmark peer $identity in $container"; '
+        f'docker exec -it "$container" bash -lc {shlex.quote(inner)}; '
+        "rc=$?; echo; echo '[INFO] catmux attach exited with status' \"$rc\"; "
+        "sleep 1; "
+        "done"
+    )
+
+
+def _benchmark_peer_windows(args: argparse.Namespace, genre: str) -> list[tuple[str, str, str]]:
+    from .cli import (
+        _container_name,
+        _effective_session_config,
+        _load_runtime_config,
+        _remote_peer_name,
+        _resolve_session,
+        _safe_path_token,
+    )
+
+    if getattr(args, "deployment", None):
+        return []
+    session_name = BENCHMARK_SESSIONS_BY_GENRE[genre]
+    runtime = _load_runtime_config(args)
+    session = _resolve_session(session_name, runtime)
+    cfg = _effective_session_config(session.host_dir, runtime)
+    peers = cfg.get("peers")
+    if not isinstance(peers, dict):
+        return []
+    windows: list[tuple[str, str, str]] = []
+    for identity in sorted(str(peer) for peer in peers):
+        container_name = _container_name(_remote_peer_name(cfg, identity), runtime)
+        window_name = _safe_path_token(f"{identity}_catmux")
+        windows.append((window_name, identity, _peer_catmux_attach_script(identity, container_name)))
+    return windows
 
 
 def _latest_result_watch_script(artifacts_root: Path) -> str:
@@ -462,10 +532,13 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
     )
     network_script = _network_watch_script(is_ota=is_ota)
     results_script = _latest_result_watch_script(artifacts_root)
+    peer_windows = _benchmark_peer_windows(args, genre) if not is_ota else []
 
     if getattr(args, "dry_run", False):
         print(f"Would create benchmark tmux session: {session_name}")
         print("Run window: " + shlex.join(command))
+        for window_name, identity, _script in peer_windows:
+            print(f"Peer window {identity}: {window_name} catmux attach")
         print("Network window: qdisc monitor" if not is_ota else "Network window: OTA shaping monitor")
         print(f"Results window: latest result under {artifacts_root}")
         return 0
@@ -510,10 +583,12 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
         check=True,
     )
 
-    for window_name, script, log_name in (
-        ("network", network_script, "network.log"),
-        ("results", results_script, "results.log"),
-    ):
+    window_specs = [
+        *(window for window in peer_windows),
+        ("network", "network", network_script),
+        ("results", "results", results_script),
+    ]
+    for window_name, log_name, script in window_specs:
         created_window = subprocess.run(
             _tmux_command(
                 runtime,
@@ -532,7 +607,8 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
             capture_output=True,
             check=True,
         )
-        _attach_tmux_pipe(runtime, created_window.stdout.strip(), interactive_logs / log_name)
+        pane_id = created_window.stdout.strip()
+        _attach_tmux_pipe(runtime, pane_id, interactive_logs / f"{log_name}.log")
 
     subprocess.run(_tmux_command(runtime, "select-window", "-t", f"{session_name}:run"), check=True)
     print(f"Benchmark tmux session: {session_name}")
@@ -1134,8 +1210,9 @@ def _setup_benchmark_run_dir(args: argparse.Namespace, genre: str, profile: str 
             shutil.copy2(config_path, run_dir / "rosotacom.yaml")
 
     # profiles file
-    if runtime.profiles_file:
-        profiles_path = Path(runtime.profiles_file).resolve()
+    profiles_file = _benchmark_profiles_file(profile, runtime.profiles_file)
+    if profiles_file:
+        profiles_path = Path(profiles_file).resolve()
         if profiles_path.is_file():
             shutil.copy2(profiles_path, run_dir / "profiles.yaml")
 
@@ -1298,6 +1375,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 if candidate.is_file():
                     args.rosotacom_config = str(candidate)
             target_name, target_type = _benchmark_ota_target(args, session_name)
+            profiles_file = _benchmark_profiles_file(profile, _load_runtime_config(args).profiles_file)
 
             smoke_args = argparse.Namespace(
                 rosotacom_config=getattr(args, "rosotacom_config", None),
@@ -1306,7 +1384,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 scenario_configs_dir=getattr(args, "scenario_configs_dir", None),
                 session_instances_dir=getattr(args, "session_instances_dir", None),
                 deployment=getattr(args, "deployment", None),
-                profiles_file=getattr(args, "profiles_file", None),
+                profiles_file=str(profiles_file) if profiles_file else None,
                 target=target_name,
                 target_type=target_type,
                 peer=getattr(args, "peer", None),
@@ -1484,14 +1562,14 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
             from .network_profiles import load_profiles_file, shaping_commands
 
-            profile_name = getattr(args, "profile", None)
+            profile_name = profile
             profile_obj = None
-            if profile_name and runtime.profiles_file:
-                try:
-                    profiles = load_profiles_file(runtime.profiles_file)
-                    profile_obj = profiles.get(profile_name)
-                except Exception as exc:
-                    print(f"Warning: Failed to load profile {profile_name!r}: {exc}", file=sys.stderr)
+            profiles_file = _benchmark_profiles_file(profile_name, runtime.profiles_file)
+            if profile_name and profiles_file:
+                profiles = load_profiles_file(profiles_file)
+                profile_obj = profiles.get(profile_name)
+                if profile_obj is None:
+                    raise ValueError(f"Profile {profile_name!r} not found in profiles file {profiles_file}.")
 
             def make_container_runner(container_name: str) -> Callable[[Sequence[str]], None]:
                 def run(argv: Sequence[str]) -> None:
@@ -1798,6 +1876,7 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
 
     run_dir = _setup_benchmark_run_dir(args, "recovery", args.profile)
     session_context = _prepare_benchmark_session_config(args, "bench_1_4_recovery", run_dir)
+    profiles_file = _benchmark_profiles_file(args.profile, runtime.profiles_file)
     result_context = _benchmark_result_context(
         args,
         genre="recovery",
@@ -1818,7 +1897,7 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
             if getattr(args, "latched_topics", "")
             else (),
             out_dir=run_dir,
-            profiles_file=runtime.profiles_file,
+            profiles_file=profiles_file,
             result_context=result_context,
         )
 

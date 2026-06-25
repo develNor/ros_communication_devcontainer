@@ -18,6 +18,7 @@ sys.modules["rosidl_runtime_py.utilities"] = MagicMock()
 
 import pytest  # noqa: E402
 
+import rosotacom.anonymize as anonymize_lib  # noqa: E402
 import rosotacom.cli as cli  # noqa: E402
 
 # Load anonymize_bag.py dynamically to test its recursive anonymizer on mock structures
@@ -94,6 +95,129 @@ def test_anonymize_msg_recursive_replacement() -> None:
     assert msg.nested_list[0].inner_int == 0
 
 
+def test_anonymize_bag_writer_preserves_offered_qos_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bag_dir = tmp_path / "processed_bag"
+    bag_dir.mkdir()
+    offered_qos = [{"reliability": "reliable", "durability": "transient_local", "depth": 1}]
+    metadata = {
+        "rosbag2_bagfile_information": {
+            "storage_identifier": "mcap",
+            "topics_with_message_count": [
+                {
+                    "message_count": 1,
+                    "topic_metadata": {
+                        "name": "/processed",
+                        "type": "std_msgs/msg/String",
+                        "serialization_format": "cdr",
+                        "offered_qos_profiles": offered_qos,
+                    },
+                }
+            ],
+        }
+    }
+    with open(bag_dir / "metadata.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(metadata, f)
+
+    class FakeReader:
+        def __init__(self) -> None:
+            self.done = False
+
+        def open(self, *args, **kwargs) -> None:
+            pass
+
+        def has_next(self) -> bool:
+            return not self.done
+
+        def read_next(self):
+            self.done = True
+            return "/processed", b"serialized", 123
+
+    created_topics = []
+    writes = []
+
+    class FakeWriter:
+        def open(self, *args, **kwargs) -> None:
+            pass
+
+        def create_topic(self, metadata) -> None:
+            created_topics.append(metadata)
+
+        def write(self, *args) -> None:
+            writes.append(args)
+
+    class FakeTopicMetadata:
+        def __init__(self, id, name, type, serialization_format, offered_qos_profiles):
+            self.id = id
+            self.name = name
+            self.type = type
+            self.serialization_format = serialization_format
+            self.offered_qos_profiles = offered_qos_profiles
+
+    monkeypatch.setattr(anonymize_bag.rosbag2_py, "SequentialReader", FakeReader)
+    monkeypatch.setattr(anonymize_bag.rosbag2_py, "SequentialWriter", FakeWriter)
+    monkeypatch.setattr(anonymize_bag.rosbag2_py, "TopicMetadata", FakeTopicMetadata)
+    monkeypatch.setattr(anonymize_bag.rosbag2_py, "StorageOptions", lambda **kwargs: kwargs)
+    monkeypatch.setattr(anonymize_bag.rosbag2_py, "ConverterOptions", lambda *args: args)
+    monkeypatch.setattr(anonymize_bag, "get_message", lambda msg_type: MockMessage)
+    monkeypatch.setattr(anonymize_bag, "deserialize_message", lambda data, msg_cls: MockMessage())
+    monkeypatch.setattr(anonymize_bag, "serialize_message", lambda msg: b"anonymized")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "anonymize_bag.py",
+            "--input-bag",
+            str(bag_dir),
+            "--output-bag",
+            str(tmp_path / "out_bag"),
+            "--topics-map",
+            json.dumps({"/processed": "/topic1"}),
+        ],
+    )
+
+    assert anonymize_bag.main() == 0
+    assert created_topics[0].name == "/topic1"
+    assert created_topics[0].offered_qos_profiles == offered_qos
+    assert writes == [("/topic1", b"anonymized", 123)]
+
+
+def test_anonymize_bag_fails_when_mapped_topic_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bag_dir = tmp_path / "processed_bag"
+    bag_dir.mkdir()
+    metadata = {
+        "rosbag2_bagfile_information": {
+            "storage_identifier": "mcap",
+            "topics_with_message_count": [
+                {
+                    "message_count": 1,
+                    "topic_metadata": {
+                        "name": "/present",
+                        "type": "std_msgs/msg/String",
+                        "serialization_format": "cdr",
+                    },
+                }
+            ],
+        }
+    }
+    with open(bag_dir / "metadata.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(metadata, f)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "anonymize_bag.py",
+            "--input-bag",
+            str(bag_dir),
+            "--output-bag",
+            str(tmp_path / "out_bag"),
+            "--topics-map",
+            json.dumps({"/present": "/topic1", "/missing": "/topic2"}),
+        ],
+    )
+
+    assert anonymize_bag.main() == 1
+
+
 def test_anonymize_cli_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # 1. Create a dummy session definition
     session_dir = tmp_path / "sessions" / "test_session"
@@ -117,11 +241,15 @@ def test_anonymize_cli_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
             "storage_identifier": "mcap",
             "topics_with_message_count": [
                 {
+                    "message_count": 3,
                     "topic_metadata": {
                         "name": "/sensitive/topic",
                         "type": "std_msgs/msg/String",
                         "serialization_format": "cdr",
-                    }
+                        "offered_qos_profiles": [
+                            {"reliability": "reliable", "durability": "transient_local", "depth": 1}
+                        ],
+                    },
                 }
             ],
         }
@@ -183,6 +311,7 @@ def test_anonymize_cli_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     with open(anon_session_def_path, encoding="utf-8") as f:
         anon_session = yaml.safe_load(f)
     assert anon_session["topics"]["b_to_a"][0]["topic"] == "/topic1"
+    assert "processing" not in anon_session["topics"]["b_to_a"][0]
 
     # Verify anonymized scenario definition
     anon_scenario_def_path = output_dir / "scenarios" / "anon_session" / "scenario-definition.yaml"
@@ -197,8 +326,24 @@ def test_anonymize_cli_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert play_cfg_path.exists()
     with open(play_cfg_path, encoding="utf-8") as f:
         play_cfg = json.load(f)
-    assert play_cfg["command"] == "ros2 bag play --loop /bag/anonymized_bag"
+    assert play_cfg["command"] == (
+        "ros2 bag play --loop /bag/anonymized_bag "
+        "--qos-profile-overrides-path /scenario/qos-overrides.yaml --topics /topic1"
+    )
     assert "ROS_DOMAIN_ID=47" in play_cfg["run_args"]
+    assert "./qos-overrides.yaml:/scenario/qos-overrides.yaml:ro" in play_cfg["run_args"]
+
+    qos_path = output_dir / "scenarios" / "anon_session" / "qos-overrides.yaml"
+    with open(qos_path, encoding="utf-8") as f:
+        qos = yaml.safe_load(f)
+    assert qos["/topic1"]["durability"] == "transient_local"
+    assert qos["/topic1"]["reliability"] == "reliable"
+
+    manifest_path = output_dir / "scenarios" / "anon_session" / "anonymization-manifest.yaml"
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = yaml.safe_load(f)
+    assert manifest["mode"] == "processed_handoff_replay"
+    assert manifest["topics"][0]["handoff_topic"] == "/sensitive/topic"
 
     # Verify container run arguments
     assert len(container_runs) == 1
@@ -209,3 +354,135 @@ def test_anonymize_cli_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
     # Ensure mapping of topics is passed to the container command
     assert '"/sensitive/topic": "/topic1"' in override["command"]
+
+
+def test_handoff_planner_selects_processed_compressed_topic() -> None:
+    session_cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 46}, "b": {"domain_id": 47}},
+        "topics": {
+            "b_to_a": [
+                {
+                    "topic": "/costmap/costmap",
+                    "type": "nav_msgs/msg/OccupancyGrid",
+                    "processing": {"compress": True},
+                    "qos": {"reliability": "reliable"},
+                    "expect": {"hz": {"min": 1, "max": 5}, "latency_ms": {"max": 500}},
+                }
+            ]
+        },
+    }
+
+    plan = anonymize_lib.plan_handoff_topics(session_cfg, cli.session_gen)
+
+    assert len(plan) == 1
+    item = plan[0]
+    assert item.source_peer == "b"
+    assert item.direction == "b_to_a"
+    assert item.source_topic == "/costmap/costmap"
+    assert item.handoff_topic == "/costmap/costmap/bz2"
+    assert item.handoff_type == "com_msgs/msg/CompressedData"
+    assert item.generic_topic == "/topic1"
+
+    replay_cfg = anonymize_lib.build_replay_session_config(session_cfg, plan)
+    replay_entry = replay_cfg["topics"]["b_to_a"][0]
+    assert replay_entry["topic"] == "/topic1"
+    assert replay_entry["type"] == "com_msgs/msg/CompressedData"
+    assert "processing" not in replay_entry
+    assert replay_entry["qos"] == {"reliability": "reliable"}
+    assert replay_entry["expect"] == {"hz": {"min": 1, "max": 5}}
+
+
+def test_playback_topics_remap_target_prefixed_replay_sources() -> None:
+    session_cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {
+            "a": {"domain_id": 46, "outbound": {"target_prefix": {"use_target_prefix": True}}},
+            "b": {"domain_id": 47},
+        },
+        "topics": {
+            "a_to_b": [
+                {
+                    "topic": "/move_base_free/goal",
+                    "type": "geometry_msgs/msg/PoseStamped",
+                    "processing": {"framebridge": "global_to_local"},
+                }
+            ],
+            "b_to_a": [{"topic": "/status", "type": "std_msgs/msg/String"}],
+        },
+    }
+
+    plan = anonymize_lib.plan_handoff_topics(session_cfg, cli.session_gen)
+    replay_cfg = anonymize_lib.build_replay_session_config(session_cfg, plan)
+    topics_by_peer = anonymize_lib.playback_topics_by_peer(replay_cfg, plan, cli.session_gen)
+
+    assert [(topic.bag_topic, topic.publish_topic) for topic in topics_by_peer["a"]] == [("/topic1", "/to_b/topic1")]
+    assert [(topic.bag_topic, topic.publish_topic) for topic in topics_by_peer["b"]] == [("/topic2", "/topic2")]
+
+
+def test_handoff_planner_missing_processed_topic_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session_dir = tmp_path / "sessions" / "compressed"
+    session_dir.mkdir(parents=True)
+    session_def = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 46}, "b": {"domain_id": 47}},
+        "topics": {
+            "b_to_a": [
+                {
+                    "topic": "/costmap/costmap",
+                    "type": "nav_msgs/msg/OccupancyGrid",
+                    "processing": {"compress": True},
+                }
+            ]
+        },
+    }
+    with open(session_dir / "session-definition.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(session_def, f)
+
+    bag_dir = tmp_path / "raw_bag"
+    bag_dir.mkdir()
+    metadata = {
+        "rosbag2_bagfile_information": {
+            "storage_identifier": "mcap",
+            "topics_with_message_count": [
+                {
+                    "message_count": 1,
+                    "topic_metadata": {
+                        "name": "/costmap/costmap",
+                        "type": "nav_msgs/msg/OccupancyGrid",
+                        "serialization_format": "cdr",
+                    },
+                }
+            ],
+        }
+    }
+    with open(bag_dir / "metadata.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(metadata, f)
+
+    from rosotacom.cli import ResolvedSession, RuntimeConfig
+
+    runtime = RuntimeConfig(
+        rosotacom_config=tmp_path / "rosotacom.yaml",
+        ros2docker_config=tmp_path / "ros2docker.json",
+        session_configs_dir=(tmp_path / "sessions",),
+        deployment=None,
+        install_id="test_install",
+        session_instances_dir=tmp_path / "session-instances",
+        scenario_configs_dir=(),
+        profiles_file=None,
+        benchmarks_dir=tmp_path / "benchmarks",
+    )
+    with open(tmp_path / "ros2docker.json", "w", encoding="utf-8") as f:
+        json.dump({"image_name": "ros2docker-test-image"}, f)
+
+    monkeypatch.setattr(cli, "_load_runtime_config", lambda *args: runtime)
+    monkeypatch.setattr(
+        cli,
+        "_resolve_session",
+        lambda name, rt: ResolvedSession(session_dir, str(session_dir), "session_configs"),
+    )
+
+    exit_code = cli.main(["anonymize", str(bag_dir), "-s", "compressed", "-o", str(tmp_path / "out")])
+
+    assert exit_code == 1
+    assert not (tmp_path / "out").exists()

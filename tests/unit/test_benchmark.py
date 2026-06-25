@@ -84,6 +84,17 @@ def test_capacity_binary_search_finds_the_breakpoint() -> None:
     assert capacity_binary_search(100, 70_000, lambda size: False) is None
 
 
+def test_capacity_binary_search_probes_fixed_range_once() -> None:
+    probed: list[int] = []
+
+    def probe(size: int) -> bool:
+        probed.append(size)
+        return True
+
+    assert capacity_binary_search(1, 1, probe) == 1
+    assert probed == [1]
+
+
 def test_find_capacity_states_its_slice() -> None:
     slice_ = CapacitySlice(profile="cellular-emulated", knob="size", fixed={"rate": 10.0})
     result = find_capacity(slice_, 0, 70_000, lambda size: size <= 8000)

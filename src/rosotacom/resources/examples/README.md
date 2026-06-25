@@ -89,6 +89,21 @@ Scenario applications share their peer communication container's isolated
 network namespace. The outer prefix is `Ctrl-b`; use `Ctrl-b Ctrl-b` for the
 inner catmux sessions.
 
+## Anonymized remote-assist replay shape
+
+`14_remote_assist_anonymized` is the public, CI-safe replay shape of the
+private remote-assist scenario. It keeps the two-way OTA contract, command
+target-prefixing, receiver source-prefixing, processed message types, and QoS,
+but uses generic `/topic1` ... `/topic20` names and synthetic smoke payloads:
+
+```bash
+rosotacom smoke 14_remote_assist_anonymized
+```
+
+The full replay scenario with bag-play applications is generated from a
+processed handoff trace by `rosotacom anonymize`; this packaged session is the
+small deterministic smoke target for that generated shape.
+
 ## Two-machine runs
 
 For a real two-machine run, pass both reachable addresses on both hosts:

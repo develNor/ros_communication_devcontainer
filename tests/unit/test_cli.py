@@ -1818,10 +1818,11 @@ def test_stop_list_doctor_and_smoke_host_flows(
         rosbags_host_dir=tmp_path / "session-instances" / "2026-01-01" / "1_heartbeat_smoke" / "rosbags",
         rosbags_container_dir="/session/instances/2026-01-01/1_heartbeat_smoke/rosbags",
     )
+    smoke_network = rosotacom._noninteractive_smoke_network_config(runtime, session, instance.instance_id)
     (instance.config_host_dir / "a").mkdir(parents=True)
     (instance.config_host_dir / "b").mkdir()
-    (instance.config_host_dir / "a" / "plugin.yaml").write_text("10.137.0.2\n", encoding="utf-8")
-    (instance.config_host_dir / "b" / "plugin.yaml").write_text("10.137.0.3\n", encoding="utf-8")
+    (instance.config_host_dir / "a" / "plugin.yaml").write_text(f"{smoke_network.peer_ips['a']}\n", encoding="utf-8")
+    (instance.config_host_dir / "b" / "plugin.yaml").write_text(f"{smoke_network.peer_ips['b']}\n", encoding="utf-8")
     cfg = {"peers": {"a": {}, "b": {}}}
     stopped: list[str] = []
 
@@ -1845,9 +1846,16 @@ def test_stop_list_doctor_and_smoke_host_flows(
     assert rosotacom.doctor(argparse.Namespace()) == 0
     assert "OK: ros2docker validation: config loads" in capsys.readouterr().out
 
-    monkeypatch.setattr(rosotacom, "start_session", lambda args: f"container_{args.identity}")
-    monkeypatch.setattr(rosotacom, "_ensure_smoke_network", lambda: None)
-    monkeypatch.setattr(rosotacom, "_remove_smoke_network", lambda: None)
+    started: list[argparse.Namespace] = []
+    networks_created: list[tuple[str, str]] = []
+    networks_removed: list[str] = []
+    monkeypatch.setattr(rosotacom, "start_session", lambda args: started.append(args) or f"container_{args.identity}")
+    monkeypatch.setattr(
+        rosotacom,
+        "_ensure_smoke_network",
+        lambda name, subnet: networks_created.append((name, subnet)),
+    )
+    monkeypatch.setattr(rosotacom, "_remove_smoke_network", lambda name: networks_removed.append(name))
     # Smoke's per-container delivery + isolation verification is exercised
     # end-to-end in tests/e2e; this unit test only drives the host flow
     # (start/stop/network), so stub the shared verification helpers as passing.
@@ -1880,6 +1888,13 @@ def test_stop_list_doctor_and_smoke_host_flows(
     )
     assert publisher_durations == [rosotacom.SMOKE_PUBLISHER_DURATION_S]
     assert rosotacom.SMOKE_PUBLISHER_DURATION_S == 900.0
+    assert networks_created == [(smoke_network.name, smoke_network.subnet)]
+    assert [(args.identity, args.network_name, args.network_ip) for args in started] == [
+        ("a", smoke_network.name, smoke_network.peer_ips["a"]),
+        ("b", smoke_network.name, smoke_network.peer_ips["b"]),
+    ]
+    assert all(args.peer_address == rosotacom._smoke_peer_address_args(smoke_network.peer_ips) for args in started)
+    assert networks_removed == [smoke_network.name]
     assert stopped[-2:] == ["container_a", "container_b"]
 
 
@@ -1888,6 +1903,38 @@ def test_smoke_peer_addresses_use_isolated_bridge_ips() -> None:
     # docker bridge with distinct IPs, instead of sharing the host loopback.
     assert rosotacom._smoke_peer_address_args() == ["a=10.137.0.2", "b=10.137.0.3"]
     assert rosotacom.SMOKE_PEER_IPS == {"a": "10.137.0.2", "b": "10.137.0.3"}
+
+
+def test_noninteractive_smoke_network_config_is_instance_scoped(tmp_path: Path) -> None:
+    sessions_root = tmp_path / "sessions"
+    session_dir = sessions_root / "1_heartbeat"
+    session_dir.mkdir(parents=True)
+    runtime = rosotacom.RuntimeConfig(
+        None,
+        tmp_path / "ros2docker.json",
+        (sessions_root,),
+        None,
+        "id",
+        tmp_path / "session-instances",
+    )
+    session = rosotacom.ResolvedSession(session_dir, "/session/definitions/1_heartbeat", "session_configs")
+
+    first = rosotacom._noninteractive_smoke_network_config(runtime, session, "first")
+    second = rosotacom._noninteractive_smoke_network_config(runtime, session, "second")
+
+    assert first.name != second.name
+    assert first.subnet != second.subnet
+    assert first.name.startswith("rosotacom_smoke_id_1_heartbeat_first")
+    assert first.subnet.startswith("10.137.")
+    assert first.subnet.endswith("/29")
+    assert first.peer_ips == rosotacom._smoke_peer_ips_for_subnet(["a", "b"], first.subnet)
+
+
+def test_smoke_peer_ips_for_subnet_supports_small_run_subnets() -> None:
+    assert rosotacom._smoke_peer_ips_for_subnet(["b", "a"], "10.137.42.16/29") == {
+        "a": "10.137.42.18",
+        "b": "10.137.42.19",
+    }
 
 
 def test_isolated_network_run_args_swaps_host_networking() -> None:

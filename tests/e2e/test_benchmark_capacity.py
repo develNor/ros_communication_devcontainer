@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -8,6 +9,8 @@ from pathlib import Path
 import pytest
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+BENCHMARK_TIMEOUT_S = 900
+SMOKE_NETWORK_NAME = "rosotacom-smoke"
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.skipif(
@@ -17,15 +20,36 @@ pytestmark = [
 ]
 
 
-def _run(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        command,
-        cwd=PACKAGE_ROOT,
+def _cleanup_smoke_network() -> None:
+    inspect = subprocess.run(
+        ["docker", "network", "inspect", SMOKE_NETWORK_NAME, "--format", "{{json .Containers}}"],
         text=True,
         capture_output=True,
-        timeout=timeout,
         check=False,
     )
+    if inspect.returncode == 0 and inspect.stdout.strip():
+        try:
+            containers = json.loads(inspect.stdout)
+        except json.JSONDecodeError:
+            containers = {}
+        for container_id in containers:
+            subprocess.run(["docker", "rm", "-f", container_id], text=True, capture_output=True, check=False)
+    subprocess.run(["docker", "network", "rm", SMOKE_NETWORK_NAME], text=True, capture_output=True, check=False)
+
+
+def _run(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=PACKAGE_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _cleanup_smoke_network()
+        raise AssertionError(f"Command timed out after {timeout}s: {' '.join(command)}") from exc
     if result.returncode != 0:
         raise AssertionError(
             f"Command failed with {result.returncode}: {' '.join(command)}\n"
@@ -80,7 +104,7 @@ def test_benchmark_capacity_good_case(copied_example_project: Path) -> None:
         "--repeats",
         "1",
     ]
-    result = _run(cmd, timeout=300)
+    result = _run(cmd, timeout=BENCHMARK_TIMEOUT_S)
     # The output should contain: Capacity: size=1
     assert "Capacity: size=1" in result.stdout
 
@@ -112,6 +136,6 @@ def test_benchmark_capacity_bad_case(copied_example_project: Path) -> None:
         "--repeats",
         "1",
     ]
-    result = _run(cmd, timeout=300)
+    result = _run(cmd, timeout=BENCHMARK_TIMEOUT_S)
     # The output should contain: Capacity: size=None
     assert "Capacity: size=None" in result.stdout

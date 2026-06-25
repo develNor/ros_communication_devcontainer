@@ -410,6 +410,20 @@ def _benchmark_child_command() -> list[str]:
     return [sys.executable, "-m", "rosotacom", *_strip_interactive_args(sys.argv[1:])]
 
 
+def _initialize_interactive_log(full_log: Path, command: Sequence[str]) -> None:
+    full_log.parent.mkdir(parents=True, exist_ok=True)
+    full_log.write_text(
+        "\n".join(
+            [
+                f"--- benchmark operator log initialized {datetime.now().isoformat(timespec='seconds')} ---",
+                "command: " + " ".join(command),
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _benchmark_run_script(command: Sequence[str], full_log: Path, session_name: str) -> str:
     pattern = (
         r"probe\(|Benchmark result saved|Capacity result|Capacity:|Ramp curve copied|Recovery metrics copied|"
@@ -522,12 +536,16 @@ def _result_once_script(full_log: Path) -> str:
 import json
 import pathlib
 import re
-import sys
 import time
 
 log_path = pathlib.Path({str(full_log)!r})
 result_re = re.compile(r"Benchmark result saved to (.+)")
 exit_re = re.compile(r"benchmark exited with status (\\d+)")
+
+def hold_open(message):
+    print(message, flush=True)
+    while True:
+        time.sleep(3600)
 
 print("[INFO] waiting for final benchmark result in", log_path, flush=True)
 while True:
@@ -543,13 +561,12 @@ while True:
             else:
                 print("[WARN] result path was reported but is not readable yet:", result_path)
             print()
-            print("[INFO] result printed once; pane remains open for inspection")
-            sys.exit(0)
+            hold_open("[INFO] result printed once; pane stays alive for inspection")
         exit_match = exit_re.search(text)
         if exit_match:
             print("[WARN] benchmark exited with status", exit_match.group(1), "before reporting a result file")
             print("[INFO] inspect the run window or full orchestrator log:", log_path)
-            sys.exit(1)
+            hold_open("[INFO] pane stays alive for inspection")
     time.sleep(1)
 """.strip()
     return shlex.join([sys.executable, "-c", script])
@@ -639,7 +656,7 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
             print(f"Attach with: rosotacom {subcommand} {genre} ... --interactive")
         return 0
 
-    interactive_logs.mkdir(parents=True, exist_ok=True)
+    _initialize_interactive_log(full_log, command)
     created = subprocess.run(
         _tmux_command(
             runtime,
@@ -1412,7 +1429,14 @@ def _parse_values(raw: str) -> list[float]:
 
 
 def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark: bool = False) -> None:
-    from .cli import _add_common_config_args, _add_peer_address_arg, _add_peer_arg, _add_peer_ssh_arg
+    from .cli import (
+        OTA_DEFAULT_SUDO_MODE,
+        OTA_SUDO_MODES,
+        _add_common_config_args,
+        _add_peer_address_arg,
+        _add_peer_arg,
+        _add_peer_ssh_arg,
+    )
 
     _add_common_config_args(parser)
     _add_peer_arg(parser)
@@ -1439,6 +1463,15 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
         "--reuse",
         action="store_true",
         help="Reuse already staged OTA source/project on remote hosts.",
+    )
+    parser.add_argument(
+        "--sudo-mode",
+        choices=OTA_SUDO_MODES,
+        default=OTA_DEFAULT_SUDO_MODE,
+        help=(
+            "How OTA benchmark profile shaping obtains sudo for tc/ip "
+            "(passwordless: require sudo -n; askpass: prompt locally per peer and feed sudo -S)."
+        ),
     )
     parser.add_argument("--interactive", action="store_true", help="Open a tmux operator view for this benchmark run.")
     parser.add_argument(
@@ -1470,6 +1503,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
         _ota_arm_profile,
         _ota_cleanup_hosts,
         _ota_collect_logs,
+        _ota_network_sudo_passwords,
         _ota_preflight,
         _ota_prepare_hosts,
         _ota_resolve_interfaces,
@@ -1537,11 +1571,18 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 instance_id=getattr(args, "instance_id", None),
                 profile=profile,
                 benchmark_stepping=True,
+                sudo_mode=getattr(args, "sudo_mode", "passwordless"),
             )
 
             runtime, plan, target = _resolve_ota_smoke_context(smoke_args)
             dry_run = smoke_args.dry_run
             _profile_name, profile_obj = _resolve_ota_profile(runtime, target, smoke_args)
+            sudo_passwords = _ota_network_sudo_passwords(
+                plan,
+                sudo_mode=smoke_args.sudo_mode,
+                require_network_shaping_sudo=profile_obj is not None,
+                dry_run=dry_run,
+            )
 
             if not smoke_args.skip_preflight:
                 _ota_preflight(
@@ -1550,6 +1591,8 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     check_peer_reachability=False,
                     dry_run=dry_run,
                     require_network_shaping_sudo=profile_obj is not None,
+                    sudo_mode=smoke_args.sudo_mode,
+                    sudo_passwords=sudo_passwords,
                 )
             _ota_prepare_hosts(smoke_args, runtime, plan)
             instance = _resolve_session_instance(
@@ -1588,10 +1631,14 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                                 ota_iface, control_iface = _ota_resolve_interfaces(peer, other_addr, dry_run=False)
                             shaper = ProfileShaper(
                                 ota_iface,
-                                _peer_command_runner(peer, dry_run=dry_run),
+                                _peer_command_runner(
+                                    peer, dry_run=dry_run, sudo_password=sudo_passwords.get(peer_name)
+                                ),
                                 control_interface=control_iface,
                                 safety_max_duration_s=_PROFILE_SAFETY_MAX_S,
-                                watchdog_launcher=_peer_watchdog_launcher(peer, dry_run=dry_run),
+                                watchdog_launcher=_peer_watchdog_launcher(
+                                    peer, dry_run=dry_run, sudo_password=sudo_passwords.get(peer_name)
+                                ),
                             )
                             shapers.append(shaper)
                             steps = expand_timeline(profile_obj, ota_iface, direction=direction)
@@ -1600,7 +1647,9 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                         for shaper in shapers:
                             shaper.arm([])
                     else:
-                        shapers = _ota_arm_profile(plan, profile_obj, directions, dry_run=dry_run)
+                        shapers = _ota_arm_profile(
+                            plan, profile_obj, directions, dry_run=dry_run, sudo_passwords=sudo_passwords
+                        )
 
                 _ota_start_peers(target, plan, instance.instance_id, dry_run=dry_run)
                 if not dry_run:

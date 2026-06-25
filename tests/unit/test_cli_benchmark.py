@@ -24,10 +24,12 @@ from rosotacom.cli_benchmark import (
     _benchmark_child_command,
     _benchmark_ota_target,
     _benchmark_profiles_file,
+    _initialize_interactive_log,
     _is_ota_benchmark,
     _parse_values,
     _peer_catmux_attach_script,
     _prepare_benchmark_session_config,
+    _result_once_script,
     _start_interactive_benchmark,
     collect_transit_summary,
     drive_capacity,
@@ -509,6 +511,7 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.knob == "size"
     assert args.rmw == DEFAULT_BENCHMARK_RMW
     assert args.ota_benchmark is False
+    assert args.sudo_mode == "passwordless"
     assert _is_ota_benchmark(args) is False
 
     args = parser.parse_args(
@@ -609,6 +612,8 @@ def test_benchmark_subcommand_arg_parsing() -> None:
             "a=seat_tks",
             "--peer",
             "b=majestic_tks",
+            "--sudo-mode",
+            "askpass",
         ]
     )
     assert args.command == "ota-benchmark"
@@ -617,6 +622,7 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.target is None
     assert args.target_type is None
     assert args.peer == ["a=seat_tks", "b=majestic_tks"]
+    assert args.sudo_mode == "askpass"
     assert _is_ota_benchmark(args) is True
 
 
@@ -796,15 +802,51 @@ def test_ota_profile_shaping_uses_noninteractive_sudo(monkeypatch: pytest.Monkey
     monkeypatch.setattr(cli, "_ota_run", fake_ota_run)
 
     cli._peer_command_runner(peer, dry_run=False)(["tc", "qdisc", "show", "dev", "tun0"])
-    cli._peer_watchdog_launcher(peer, dry_run=False)(["sh", "-c", "sleep 1; tc qdisc del dev tun0 root"])
+    cli._peer_watchdog_launcher(peer, dry_run=False)(
+        ["sh", "-c", "sleep 1; tc qdisc del dev tun0 root; ip link set dev tun0 up"]
+    )
 
     assert calls[0][0] == "sudo -n tc qdisc show dev tun0"
     assert calls[0][1]["label"] == "a: tc/netem"
-    assert calls[1][0].startswith("nohup sudo -n sh -c ")
+    assert calls[1][0].startswith("nohup sh -c ")
+    assert "sudo -n tc qdisc del dev tun0 root" in calls[1][0]
+    assert "sudo -n ip link set dev tun0 up" in calls[1][0]
     assert calls[1][1]["label"] == "a: profile safety watchdog"
 
 
-def test_ota_preflight_can_require_passwordless_network_shaping(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ota_profile_shaping_askpass_uses_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    action_calls: list[tuple[str, str]] = []
+    secret_calls: list[tuple[str, dict[str, object]]] = []
+    peer = cli.OtaSmokePeer(name="a", ssh="robot-a", address="10.0.0.10")
+
+    def fake_log_action(label: str, detail: str) -> None:
+        action_calls.append((label, detail))
+
+    def fake_ota_run_with_secret_stdin(
+        _peer: cli.OtaSmokePeer, script: str, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        secret_calls.append((script, kwargs))
+        return subprocess.CompletedProcess(["ssh"], 0, "", "")
+
+    monkeypatch.setattr(cli, "_ota_log_action", fake_log_action)
+    monkeypatch.setattr(cli, "_ota_run_with_secret_stdin", fake_ota_run_with_secret_stdin)
+
+    cli._peer_command_runner(peer, dry_run=False, sudo_password="secret")(["tc", "qdisc", "show", "dev", "tun0"])
+    cli._peer_watchdog_launcher(peer, dry_run=False, sudo_password="secret")(
+        ["sh", "-c", "sleep 1; tc qdisc del dev tun0 root; ip link set dev tun0 up"]
+    )
+
+    assert action_calls[0] == ("a: tc/netem", "running remote sudo command via stdin")
+    assert secret_calls[0][0] == "sudo -S -p '' tc qdisc show dev tun0"
+    assert secret_calls[0][1]["secret_stdin"] == "secret\n"
+    assert "secret" not in secret_calls[0][0]
+    assert action_calls[1] == ("a: profile safety watchdog", "arming remote sudo watchdog via stdin")
+    assert secret_calls[1][0].startswith("sudo -S -p '' sh -c ")
+    assert secret_calls[1][1]["secret_stdin"] == "secret\n"
+    assert "secret" not in secret_calls[1][0]
+
+
+def test_ota_preflight_can_require_network_shaping_sudo(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, str]] = []
     plan = cli.OtaSmokePlan(
         state_path=None,
@@ -835,9 +877,132 @@ def test_ota_preflight_can_require_passwordless_network_shaping(monkeypatch: pyt
     )
 
     assert (
-        "a: passwordless sudo for network shaping",
-        "command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 && sudo -n true",
+        "a: required commands for network shaping",
+        "command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1",
     ) in calls
+    assert (
+        "a: passwordless sudo for network shaping",
+        "sudo -n tc qdisc show >/dev/null && sudo -n ip link show >/dev/null",
+    ) in calls
+
+
+def test_ota_preflight_askpass_authenticates_via_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+    action_calls: list[tuple[str, str]] = []
+    secret_calls: list[tuple[str, str, str]] = []
+    plan = cli.OtaSmokePlan(
+        state_path=None,
+        workdir="/tmp/rosotacom_ota",
+        rosotacom="rosotacom",
+        project="project/rosotacom.yaml",
+        peers={"a": cli.OtaSmokePeer(name="a", ssh="robot-a", address="10.0.0.10")},
+    )
+
+    def fake_ota_run(
+        _peer: cli.OtaSmokePeer,
+        script: str,
+        *,
+        label: str,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((label, script))
+        return subprocess.CompletedProcess(["ssh"], 0, "", "")
+
+    def fake_log_action(label: str, detail: str) -> None:
+        action_calls.append((label, detail))
+
+    def fake_ota_run_with_secret_stdin(
+        _peer: cli.OtaSmokePeer,
+        script: str,
+        *,
+        label: str,
+        secret_stdin: str,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        secret_calls.append((label, script, secret_stdin))
+        return subprocess.CompletedProcess(["ssh"], 0, "", "")
+
+    monkeypatch.setattr(cli, "_ota_run", fake_ota_run)
+    monkeypatch.setattr(cli, "_ota_log_action", fake_log_action)
+    monkeypatch.setattr(cli, "_ota_run_with_secret_stdin", fake_ota_run_with_secret_stdin)
+
+    cli._ota_preflight(
+        plan,
+        require_tmux=False,
+        check_peer_reachability=False,
+        dry_run=False,
+        require_network_shaping_sudo=True,
+        sudo_mode="askpass",
+        sudo_passwords={"a": "secret"},
+    )
+
+    assert (
+        "a: sudo authentication for network shaping",
+        "authenticating sudo via stdin",
+    ) in action_calls
+    assert ("a: sudo authentication for network shaping", "sudo -S -p '' true", "secret\n") in secret_calls
+    assert all("secret" not in script for _label, script in calls)
+    assert all("secret" not in detail for _label, detail in action_calls)
+    assert all("secret" not in script for _label, script, _stdin in secret_calls)
+
+
+def test_ota_askpass_prompts_once_per_peer(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts: list[str] = []
+    plan = cli.OtaSmokePlan(
+        state_path=None,
+        workdir="/tmp/rosotacom_ota",
+        rosotacom="rosotacom",
+        project="project/rosotacom.yaml",
+        peers={
+            "a": cli.OtaSmokePeer(name="a", ssh="robot-a", address="10.0.0.10"),
+            "b": cli.OtaSmokePeer(name="b", ssh="robot-b", address="10.0.0.11"),
+        },
+    )
+
+    def fake_getpass(prompt: str) -> str:
+        prompts.append(prompt)
+        return f"pw-{len(prompts)}"
+
+    monkeypatch.setattr(cli.getpass, "getpass", fake_getpass)
+
+    passwords = cli._ota_network_sudo_passwords(
+        plan,
+        sudo_mode="askpass",
+        require_network_shaping_sudo=True,
+        dry_run=False,
+    )
+
+    assert passwords == {"a": "pw-1", "b": "pw-2"}
+    assert prompts == [
+        "sudo password for a (robot-a) [network shaping only]: ",
+        "sudo password for b (robot-b) [network shaping only]: ",
+    ]
+
+    dry_run_passwords = cli._ota_network_sudo_passwords(
+        plan,
+        sudo_mode="askpass",
+        require_network_shaping_sudo=True,
+        dry_run=True,
+    )
+    assert dry_run_passwords == {"a": "", "b": ""}
+    assert len(prompts) == 2
+
+
+def test_interactive_result_log_is_reset_between_runs(tmp_path: Path) -> None:
+    full_log = tmp_path / "interactive" / "benchmark-capacity-p" / "orchestrator.full.log"
+    full_log.parent.mkdir(parents=True)
+    full_log.write_text("Benchmark result saved to /old/result.json\n", encoding="utf-8")
+
+    _initialize_interactive_log(full_log, ["rosotacom", "benchmark", "capacity"])
+
+    text = full_log.read_text(encoding="utf-8")
+    assert "Benchmark result saved" not in text
+    assert "benchmark operator log initialized" in text
+    assert "command: rosotacom benchmark capacity" in text
+
+    script = _result_once_script(full_log)
+    assert "result printed once; pane stays alive" in script
+    assert "sys.exit" not in script
 
 
 def test_interactive_benchmark_dry_run_prints_operator_view(

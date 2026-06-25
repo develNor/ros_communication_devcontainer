@@ -176,10 +176,13 @@ slice and reuses RFC 0003 + 0004.
   instead of a hard-coded project target, while allowing `--target` /
   `--target-type` for project-specific sessions or scenarios
   (`cli_benchmark._benchmark_ota_target`).
+- [x] Add a first-class `rosotacom ota-benchmark` command so OTA runs use the
+  same benchmark grammar as local runs and only need deployment peer bindings
+  such as `--peer a=seat_tks --peer b=majestic_tks` for the common case.
 - [x] Add an interactive benchmark operator view that opens a local tmux session
-  with separate run, per-peer catmux, network-shaping, and result windows for
-  local runs and an OTA shaping monitor note for remote runs
-  (`cli_benchmark --interactive`).
+  with a high-level run window, one catmux attach plus launch-log window per
+  local peer, and a network window split into qdisc status and tc/netem command
+  logs (`cli_benchmark --interactive`).
 - [x] Build the recovery driver on timeline profiles (RFC 0004) + the recovery
   metric set (`t_recover`, `t_steady`, backlog/burst, lost-during-outage, latched
   re-arrival) (`benchmark.recovery_metrics`; arming the timeline profile is RFC
@@ -227,10 +230,14 @@ reviewed rather than asserted in a blocking test.
 - [x] **OTA target selection** (default to benchmark genre session, explicit
   target override for sessions/scenarios) — host unit test for default and
   override resolution. Automatable. *(`test_benchmark_ota_target_defaults_to_benchmark_session`.)*
-- [x] **Interactive operator view** (tmux run/per-peer catmux/network/results
-  windows) — host unit test for the dry-run command plan, peer catmux attach
-  script, and parser flags; live tmux attachment remains an operator workflow.
-  Automatable for command planning, manual for actual attachment.
+- [x] **Simple OTA benchmark command** (`rosotacom ota-benchmark ... --peer
+  a=... --peer b=...`) — host unit test for parser defaults and peer bindings.
+  Automatable. *(`test_benchmark_subcommand_arg_parsing`.)*
+- [x] **Interactive operator view** (tmux high-level run window, per-peer catmux
+  attach plus launch-log windows, network status plus command-log panes) — host
+  unit test for the dry-run command plan, peer catmux attach script, and parser
+  flags; live tmux attachment remains an operator workflow. Automatable for
+  command planning, manual for actual attachment.
   *(`test_interactive_benchmark_dry_run_prints_operator_view`,
   `test_peer_catmux_attach_script_waits_for_container_and_tmux`,
   `test_benchmark_subcommand_arg_parsing`.)*

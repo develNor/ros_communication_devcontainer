@@ -6796,6 +6796,7 @@ def main(argv: list[str] | None = None) -> int:
         "config",
         "completion",
         "benchmark",
+        "ota-benchmark",
         "anonymize",
     }
     if not argv:

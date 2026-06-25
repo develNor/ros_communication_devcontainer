@@ -1948,6 +1948,7 @@ def _ota_preflight(
     require_tmux: bool,
     check_peer_reachability: bool,
     dry_run: bool,
+    require_network_shaping_sudo: bool = False,
 ) -> None:
     for peer in plan.peers.values():
         if peer.ssh:
@@ -1971,6 +1972,14 @@ def _ota_preflight(
             batch=True,
         )
         _ota_run(peer, "docker ps >/dev/null", label=f"{peer.name}: docker access", dry_run=dry_run, batch=True)
+        if require_network_shaping_sudo:
+            _ota_run(
+                peer,
+                "command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 && sudo -n true",
+                label=f"{peer.name}: passwordless sudo for network shaping",
+                dry_run=dry_run,
+                batch=True,
+            )
 
     if check_peer_reachability:
         for src in plan.peers.values():
@@ -2262,7 +2271,7 @@ def _peer_command_runner(peer: OtaSmokePeer, *, dry_run: bool) -> Callable[[Sequ
     """A CommandRunner that runs one privileged argv on ``peer`` via the SSH path."""
 
     def run(argv: Sequence[str]) -> None:
-        _ota_run(peer, "sudo " + shlex.join(list(argv)), label=f"{peer.name}: tc/netem", dry_run=dry_run)
+        _ota_run(peer, "sudo -n " + shlex.join(list(argv)), label=f"{peer.name}: tc/netem", dry_run=dry_run)
 
     return run
 
@@ -2271,7 +2280,7 @@ def _peer_watchdog_launcher(peer: OtaSmokePeer, *, dry_run: bool) -> Callable[[S
     """Launch the safety-watchdog argv detached on ``peer`` so it survives a crash."""
 
     def launch(argv: Sequence[str]) -> None:
-        detached = f"nohup sudo {shlex.join(list(argv))} >/dev/null 2>&1 &"
+        detached = f"nohup sudo -n {shlex.join(list(argv))} >/dev/null 2>&1 &"
         _ota_run(peer, detached, label=f"{peer.name}: profile safety watchdog", dry_run=dry_run, check=False)
 
     return launch

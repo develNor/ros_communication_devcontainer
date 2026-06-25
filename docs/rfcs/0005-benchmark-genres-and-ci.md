@@ -180,9 +180,13 @@ slice and reuses RFC 0003 + 0004.
   same benchmark grammar as local runs and only need deployment peer bindings
   such as `--peer a=seat_tks --peer b=majestic_tks` for the common case.
 - [x] Add an interactive benchmark operator view that opens a local tmux session
-  with a high-level run window, one catmux attach plus launch-log window per
-  local peer, and a network window split into qdisc status and tc/netem command
-  logs (`cli_benchmark --interactive`).
+  with a high-level run window, one fullscreen catmux attach window per local
+  peer, a network window split into qdisc status and tc/netem command logs, and a
+  one-shot final result window (`cli_benchmark --interactive`).
+- [x] Require shaped OTA benchmark runs to prove passwordless non-interactive sudo
+  for `tc`/`ip` during preflight, and run profile commands through `sudo -n` so
+  missing privileges fail early instead of hanging or failing mid-run
+  (`cli._ota_preflight`, `cli._peer_command_runner`).
 - [x] Build the recovery driver on timeline profiles (RFC 0004) + the recovery
   metric set (`t_recover`, `t_steady`, backlog/burst, lost-during-outage, latched
   re-arrival) (`benchmark.recovery_metrics`; arming the timeline profile is RFC
@@ -233,14 +237,19 @@ reviewed rather than asserted in a blocking test.
 - [x] **Simple OTA benchmark command** (`rosotacom ota-benchmark ... --peer
   a=... --peer b=...`) — host unit test for parser defaults and peer bindings.
   Automatable. *(`test_benchmark_subcommand_arg_parsing`.)*
-- [x] **Interactive operator view** (tmux high-level run window, per-peer catmux
-  attach plus launch-log windows, network status plus command-log panes) — host
-  unit test for the dry-run command plan, peer catmux attach script, and parser
-  flags; live tmux attachment remains an operator workflow. Automatable for
-  command planning, manual for actual attachment.
+- [x] **Interactive operator view** (tmux high-level run window, fullscreen
+  per-peer catmux attach windows, network status plus command-log panes, one-shot
+  final result window) — host unit test for the dry-run command plan, peer catmux
+  attach script, and parser flags; live tmux attachment remains an operator
+  workflow. Automatable for command planning, manual for actual attachment.
   *(`test_interactive_benchmark_dry_run_prints_operator_view`,
   `test_peer_catmux_attach_script_waits_for_container_and_tmux`,
   `test_benchmark_subcommand_arg_parsing`.)*
+- [x] **OTA profile shaping privilege check** (passwordless non-interactive sudo
+  for `tc`/`ip`) — host unit tests assert the preflight check and `sudo -n`
+  wrapping for shaping/watchdog commands. Automatable.
+  *(`test_ota_preflight_can_require_passwordless_network_shaping`,
+  `test_ota_profile_shaping_uses_noninteractive_sudo`.)*
 - [x] **Recovery driver + metric set** (`t_recover`, `t_steady`, backlog/burst,
   lost-during-outage, latched re-arrival) — host unit test extracting the metrics
   from a synthetic timeline of transit records (RFC 0003); the **live recovery run

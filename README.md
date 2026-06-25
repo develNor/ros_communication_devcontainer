@@ -466,6 +466,10 @@ fastdds`, `--rmw cyclone`, or another supported session RMW value to pin a run.
 Each run writes a self-contained `result.json` under its benchmark artifact
 directory with the selected RMW, configured load and offered bandwidth, profile
 shaping context, thresholds, verdict, and per-topic loss/latency/jitter metrics.
+For OTA benchmark runs (`--deployment ...`), the default target is the benchmark
+session for the selected genre; pass `--target` and `--target-type` to benchmark a
+project-specific session or scenario instead. Add `--interactive` to open a tmux
+operator view with separate run, network-shaping, and result windows.
 
 ## Development
 

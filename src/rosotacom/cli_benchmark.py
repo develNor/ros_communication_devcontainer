@@ -19,6 +19,7 @@ import contextlib
 import json
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -352,6 +353,195 @@ def _load_context(load: dict[str, Any]) -> dict[str, Any]:
             }
         ),
     )
+
+
+def _benchmark_ota_target(args: argparse.Namespace, session_name: str) -> tuple[str, str]:
+    target = getattr(args, "target", None)
+    target_type = getattr(args, "target_type", None)
+    if target:
+        return str(target), str(target_type or "auto")
+    if target_type not in (None, "session"):
+        raise ValueError("--target-type requires --target unless --target-type=session.")
+    return session_name, "session"
+
+
+def _benchmark_artifacts_root(args: argparse.Namespace) -> Path:
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+    return artifacts_dir or Path.cwd() / "artifacts" / "benchmarks"
+
+
+def _benchmark_tmux_session_name(args: argparse.Namespace, genre: str) -> str:
+    from .cli import _safe_path_token
+
+    profile = getattr(args, "profile", None) or getattr(args, "profile_grid", None) or "run"
+    return _safe_path_token(f"benchmark-{genre}-{profile}")
+
+
+def _strip_interactive_args(argv: Sequence[str]) -> list[str]:
+    return [arg for arg in argv if arg not in {"--interactive", "--no-attach"}]
+
+
+def _benchmark_child_command() -> list[str]:
+    return [sys.executable, "-m", "rosotacom", *_strip_interactive_args(sys.argv[1:])]
+
+
+def _latest_result_watch_script(artifacts_root: Path) -> str:
+    root = shlex.quote(str(artifacts_root))
+    return (
+        "while true; do "
+        "clear; date; "
+        f"root={root}; "
+        "latest=$(find \"$root\" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\\n' 2>/dev/null "
+        "| sort -nr | head -1 | cut -d' ' -f2-); "
+        'if [ -z "$latest" ]; then '
+        "echo '[INFO] waiting for benchmark artifacts under' \"$root\"; "
+        'elif [ -f "$latest/result.json" ]; then '
+        "echo '[INFO] latest result:' \"$latest/result.json\"; "
+        'python3 -m json.tool "$latest/result.json" | tail -120; '
+        'elif [ -f "$latest/stdout.txt" ]; then '
+        'echo \'[INFO] latest stdout:\' "$latest/stdout.txt"; tail -80 "$latest/stdout.txt"; '
+        "else "
+        'echo \'[INFO] latest artifact dir:\' "$latest"; find "$latest" -maxdepth 2 -type f | sort; '
+        "fi; "
+        "sleep 2; "
+        "done"
+    )
+
+
+def _network_watch_script(*, is_ota: bool) -> str:
+    if is_ota:
+        return (
+            "while true; do "
+            "clear; date; "
+            "echo '[INFO] OTA benchmark: network shaping is applied on the remote peers.'; "
+            "echo '[INFO] Watch the run pane for tc/netem commands and qdisc diagnostics.'; "
+            "sleep 5; "
+            "done"
+        )
+    return (
+        "while true; do "
+        "clear; date; "
+        "echo '[INFO] local benchmark containers'; "
+        "docker ps --filter name=rosotacom --format 'table {{.Names}}\\t{{.Status}}' 2>/dev/null || true; "
+        "for c in $(docker ps --filter name=rosotacom --format '{{.Names}}' 2>/dev/null); do "
+        "echo; echo '[INFO]' \"$c\" 'eth0 qdisc'; "
+        'docker exec -u root "$c" tc qdisc show dev eth0 2>/dev/null || true; '
+        "done; "
+        "sleep 2; "
+        "done"
+    )
+
+
+def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
+    from .cli import (
+        _attach_tmux_pipe,
+        _host_shell,
+        _load_runtime_config,
+        _require_tmux,
+        _tmux_command,
+        _tmux_session_exists,
+    )
+
+    runtime = _load_runtime_config(args)
+    session_name = _benchmark_tmux_session_name(args, genre)
+    command = _benchmark_child_command()
+    artifacts_root = _benchmark_artifacts_root(args)
+    interactive_logs = artifacts_root / "interactive" / session_name
+    is_ota = bool(getattr(args, "deployment", None))
+
+    run_script = (
+        f"echo '[INFO] benchmark operator session: {session_name}'; "
+        f"echo '[INFO] running: {shlex.join(command)}'; "
+        f"{shlex.join(command)}; rc=$?; "
+        "echo; echo '[INFO] benchmark exited with status' \"$rc\"; "
+        "echo '[INFO] pane remains open for inspection'; "
+        "exec bash"
+    )
+    network_script = _network_watch_script(is_ota=is_ota)
+    results_script = _latest_result_watch_script(artifacts_root)
+
+    if getattr(args, "dry_run", False):
+        print(f"Would create benchmark tmux session: {session_name}")
+        print("Run window: " + shlex.join(command))
+        print("Network window: qdisc monitor" if not is_ota else "Network window: OTA shaping monitor")
+        print(f"Results window: latest result under {artifacts_root}")
+        return 0
+
+    _require_tmux()
+    if _tmux_session_exists(runtime, session_name):
+        if not getattr(args, "no_attach", False):
+            subprocess.run(_tmux_command(runtime, "attach-session", "-t", session_name), check=True)
+        else:
+            print(f"Attach with: rosotacom benchmark {genre} ... --interactive")
+        return 0
+
+    interactive_logs.mkdir(parents=True, exist_ok=True)
+    created = subprocess.run(
+        _tmux_command(
+            runtime,
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-s",
+            session_name,
+            "-n",
+            "run",
+            _host_shell(run_script),
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    run_pane = created.stdout.strip()
+    _attach_tmux_pipe(runtime, run_pane, interactive_logs / "run.log")
+    subprocess.run(
+        _tmux_command(runtime, "set-window-option", "-g", "-t", session_name, "remain-on-exit", "on"),
+        check=True,
+    )
+    subprocess.run(_tmux_command(runtime, "set-option", "-t", session_name, "prefix", "C-b"), check=True)
+    subprocess.run(_tmux_command(runtime, "bind-key", "-T", "prefix", "C-b", "send-prefix"), check=True)
+    subprocess.run(
+        _tmux_command(runtime, "set-option", "-t", session_name, "status-right", " benchmark | C-b n/p "),
+        check=True,
+    )
+
+    for window_name, script, log_name in (
+        ("network", network_script, "network.log"),
+        ("results", results_script, "results.log"),
+    ):
+        created_window = subprocess.run(
+            _tmux_command(
+                runtime,
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                session_name,
+                "-n",
+                window_name,
+                _host_shell(script),
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        _attach_tmux_pipe(runtime, created_window.stdout.strip(), interactive_logs / log_name)
+
+    subprocess.run(_tmux_command(runtime, "select-window", "-t", f"{session_name}:run"), check=True)
+    print(f"Benchmark tmux session: {session_name}")
+    print("Local control tmux prefix: Ctrl-b.")
+    if not getattr(args, "no_attach", False):
+        subprocess.run(_tmux_command(runtime, "attach-session", "-t", session_name), check=True)
+    else:
+        print("Attach with: " + shlex.join(_tmux_command(runtime, "attach-session", "-t", session_name)))
+    return 0
 
 
 def _format_bps(value: float | None) -> str:
@@ -1018,6 +1208,30 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Show commands but do not run them.")
     parser.add_argument("--artifacts-dir", help="Output directory for all benchmark artifacts.")
     parser.add_argument(
+        "--target",
+        help="OTA target session or scenario (default for OTA: the benchmark genre session).",
+    )
+    parser.add_argument(
+        "--target-type",
+        choices=["auto", "session", "scenario"],
+        help=(
+            "How to resolve --target for OTA benchmark runs "
+            "(default: session when --target is omitted, auto otherwise)."
+        ),
+    )
+    parser.add_argument("--workdir", help="Remote OTA workdir (default: /tmp/rosotacom_ota).")
+    parser.add_argument(
+        "--reuse",
+        action="store_true",
+        help="Reuse already staged OTA source/project on remote hosts.",
+    )
+    parser.add_argument("--interactive", action="store_true", help="Open a tmux operator view for this benchmark run.")
+    parser.add_argument(
+        "--no-attach",
+        action="store_true",
+        help="Create the interactive tmux session without attaching.",
+    )
+    parser.add_argument(
         "--rmw",
         default=DEFAULT_BENCHMARK_RMW,
         help=f"RMW implementation or rosotacom RMW alias for benchmark sessions (default: {DEFAULT_BENCHMARK_RMW}).",
@@ -1077,13 +1291,13 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
     ) -> dict[str, Any]:
         if is_ota:
             # --- Real-near (ota-smoke) path ---
-            target_name = "remote_assist"
             # Default project to fzi_projects/remote_assist/rosotacom.yaml if not set.
             rosotacom_config = getattr(args, "rosotacom_config", None)
             if not rosotacom_config:
                 candidate = Path.cwd() / "fzi_projects" / "remote_assist" / "rosotacom.yaml"
                 if candidate.is_file():
                     args.rosotacom_config = str(candidate)
+            target_name, target_type = _benchmark_ota_target(args, session_name)
 
             smoke_args = argparse.Namespace(
                 rosotacom_config=getattr(args, "rosotacom_config", None),
@@ -1094,9 +1308,12 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 deployment=getattr(args, "deployment", None),
                 profiles_file=getattr(args, "profiles_file", None),
                 target=target_name,
-                target_type="auto",
+                target_type=target_type,
                 peer=getattr(args, "peer", None),
                 peer_address=getattr(args, "peer_address", None),
+                peer_ssh=getattr(args, "peer_ssh", None),
+                workdir=getattr(args, "workdir", None),
+                reuse=getattr(args, "reuse", False),
                 skip_preflight=getattr(args, "skip_preflight", False),
                 keep_workdir=getattr(args, "keep_workdir", False),
                 dry_run=getattr(args, "dry_run", False),
@@ -1463,6 +1680,9 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark capacity``."""
     from .cli import _load_runtime_config
 
+    if getattr(args, "interactive", False):
+        return _start_interactive_benchmark(args, "capacity")
+
     runtime = _load_runtime_config(args)
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
@@ -1518,6 +1738,9 @@ def benchmark_ramp(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark ramp``."""
     from .cli import _load_runtime_config
 
+    if getattr(args, "interactive", False):
+        return _start_interactive_benchmark(args, "ramp")
+
     runtime = _load_runtime_config(args)
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
@@ -1567,6 +1790,9 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark recovery``."""
     from .cli import _load_runtime_config
 
+    if getattr(args, "interactive", False):
+        return _start_interactive_benchmark(args, "recovery")
+
     runtime = _load_runtime_config(args)
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
@@ -1615,6 +1841,9 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
 def benchmark_sweep(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark sweep``."""
     from .cli import _load_runtime_config
+
+    if getattr(args, "interactive", False):
+        return _start_interactive_benchmark(args, "sweep")
 
     runtime = _load_runtime_config(args)
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir

@@ -15,14 +15,119 @@ The glue below is host-tested via a **stubbed** ``run_point`` in
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import shlex
 import shutil
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
+
+
+class TeeStream:
+    def __init__(self, original_stream: Any, file_path: Path):
+        self.original_stream: Any = original_stream
+        self.file_path: Path = file_path
+        self.file: Any = None
+
+    def write(self, data: Any) -> None:
+        self.original_stream.write(data)
+        self.original_stream.flush()
+        if self.file is None:
+            try:
+                self.file_path.parent.mkdir(parents=True, exist_ok=True)
+                self.file = open(self.file_path, "a", encoding="utf-8")
+            except Exception:
+                pass
+        if self.file is not None:
+            try:
+                self.file.write(data)
+                self.file.flush()
+            except Exception:
+                pass
+
+    def flush(self) -> None:
+        self.original_stream.flush()
+        if self.file is not None:
+            try:
+                self.file.flush()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self.file is not None:
+            try:
+                self.file.close()
+            except Exception:
+                pass
+            self.file = None
+
+
+@contextlib.contextmanager
+def log_stdout_stderr_to_file(file_path: Path) -> Iterator[None]:
+    import subprocess
+
+    tee_stdout = TeeStream(sys.stdout, file_path)
+    tee_stderr = TeeStream(sys.stderr, file_path)
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = tee_stdout
+    sys.stderr = tee_stderr
+
+    original_run = subprocess.run
+
+    def hooked_run(*args, **kwargs):
+        capture_stdout = kwargs.get("stdout") is None and not kwargs.get("capture_output")
+        capture_stderr = kwargs.get("stderr") is None and not kwargs.get("capture_output")
+
+        if capture_stdout:
+            kwargs["stdout"] = subprocess.PIPE
+        if capture_stderr:
+            kwargs["stderr"] = subprocess.PIPE
+
+        try:
+            res = original_run(*args, **kwargs)
+            if capture_stdout and res.stdout:
+                val = res.stdout
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8", errors="replace")
+                sys.stdout.write(val)
+                sys.stdout.flush()
+            if capture_stderr and res.stderr:
+                val = res.stderr
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8", errors="replace")
+                sys.stderr.write(val)
+                sys.stderr.flush()
+            return res
+        except subprocess.CalledProcessError as exc:
+            if capture_stdout and exc.stdout:
+                val = exc.stdout
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8", errors="replace")
+                sys.stdout.write(val)
+                sys.stdout.flush()
+            if capture_stderr and exc.stderr:
+                val = exc.stderr
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8", errors="replace")
+                sys.stderr.write(val)
+                sys.stderr.flush()
+            raise
+
+    subprocess.run = hooked_run
+
+    try:
+        yield
+    finally:
+        subprocess.run = original_run
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        tee_stdout.close()
+        tee_stderr.close()
+
 
 # --------------------------------------------------------------------------- #
 # Transit-record collection
@@ -747,14 +852,6 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 "network_name": SMOKE_NETWORK_NAME,
             }
 
-            _ensure_smoke_network()
-            a_container = start_session(
-                argparse.Namespace(**common, identity="a", auto_identity=True, network_ip=SMOKE_PEER_IPS["a"])
-            )
-            b_container = start_session(
-                argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=SMOKE_PEER_IPS["b"])
-            )
-
             from .network_profiles import load_profiles_file, shaping_commands
 
             profile_name = getattr(args, "profile", None)
@@ -765,6 +862,16 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     profile_obj = profiles.get(profile_name)
                 except Exception as exc:
                     print(f"Warning: Failed to load profile {profile_name!r}: {exc}", file=sys.stderr)
+
+            _ensure_smoke_network()
+            a_container = start_session(
+                argparse.Namespace(**common, identity="a", auto_identity=True, network_ip=SMOKE_PEER_IPS["a"])
+            )
+            b_container = start_session(
+                argparse.Namespace(**common, identity="b", auto_identity=True, network_ip=SMOKE_PEER_IPS["b"])
+            )
+            if not getattr(args, "dry_run", False):
+                time.sleep(12)
 
             def make_container_runner(container_name: str) -> Callable[[Sequence[str]], None]:
                 def run(argv: Sequence[str]) -> None:
@@ -780,34 +887,6 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
                 return run
 
-            shapers = []
-            peer_steps = {}
-            if profile_obj is not None:
-                if profile_obj.is_timeline:
-                    # Peer A shapes uplink (egress to B)
-                    shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
-                    shapers.append(shaper_a)
-                    steps_a = expand_timeline(profile_obj, "eth0", direction="uplink")
-                    peer_steps["a"] = (shaper_a, steps_a)
-
-                    # Peer B shapes downlink (egress to A)
-                    shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
-                    shapers.append(shaper_b)
-                    steps_b = expand_timeline(profile_obj, "eth0", direction="downlink")
-                    peer_steps["b"] = (shaper_b, steps_b)
-
-                    for shaper in shapers:
-                        shaper.arm([])
-                else:
-                    if profile_obj.uplink and not profile_obj.uplink.is_empty:
-                        shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
-                        shaper_a.arm(shaping_commands("eth0", profile_obj.uplink))
-                        shapers.append(shaper_a)
-                    if profile_obj.downlink and not profile_obj.downlink.is_empty:
-                        shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
-                        shaper_b.arm(shaping_commands("eth0", profile_obj.downlink))
-                        shapers.append(shaper_b)
-
             ros_setup_a = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "a")
             rate = load.get("rate", 20.0)
             size = load.get("size") or load.get("size_a") or 66000
@@ -818,21 +897,102 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
             for topic_spec in topics_a:
                 topic_name = topic_spec.get("topic")
                 cmd = (
-                    f"{ros_setup_a} && timeout {duration_s} ros2 run com_py sized_publisher --ros-args "
+                    f"{ros_setup_a} && timeout 300 ros2 run com_py sized_publisher --ros-args "
                     f"-p topic:={shlex.quote(topic_name)} -p size:={size} -p rate:={rate} -p streams:={streams} "
                     f'> "${{ROSOTACOM_LOGS_DIR}}/a/sized_publisher.log" 2>&1'
                 )
                 pub_cmds.append(cmd)
 
+            shapers = []
+            peer_steps = {}
+
             try:
+                # 1. Start the publishers
                 for cmd in pub_cmds:
                     subprocess.run(
-                        ["docker", "exec", "-d", a_container, "bash", "-lc", cmd],
+                        ["docker", "exec", "-d", a_container, "bash", "-c", cmd],
                         capture_output=True,
                         text=True,
                         check=False,
                     )
 
+                # 2. Wait for discovery to complete on unshaped network
+                if not getattr(args, "dry_run", False):
+                    topic_name = topics_a[0].get("topic") if topics_a else "/bench_capacity"
+                    # A. Wait for local subscription discovery
+                    info_cmd = f"{ros_setup_a} && ros2 topic info {shlex.quote(topic_name)}"
+                    for _ in range(30):
+                        res = subprocess.run(
+                            ["docker", "exec", a_container, "bash", "-c", info_cmd],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        output = res.stdout or ""
+                        if "Subscription count: 0" not in output and "Subscription count:" in output:
+                            break
+                        time.sleep(0.5)
+
+                    # B. Wait for end-to-end message delivery to Peer B (status.json reports messages_total > 0)
+                    status_json_path = smoke_instance.host_dir / "logs" / "b" / "status" / "status.json"
+                    for _ in range(60):
+                        if status_json_path.is_file():
+                            try:
+                                status_data = json.loads(status_json_path.read_text(encoding="utf-8"))
+                                found_msg = False
+                                for topic_info in status_data.get("topics", []):
+                                    if topic_info.get("base") == topic_name:
+                                        if any(
+                                            stage.get("messages_total", 0) > 0 for stage in topic_info.get("stages", [])
+                                        ):
+                                            found_msg = True
+                                            break
+                                if found_msg:
+                                    break
+                            except Exception:
+                                pass
+                        time.sleep(0.5)
+                    time.sleep(3.0)
+
+                # 3. Arm the network shapers (after discovery is complete)
+                if profile_obj is not None:
+                    if profile_obj.is_timeline:
+                        # Peer A shapes uplink (egress to B)
+                        shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
+                        shapers.append(shaper_a)
+                        steps_a = expand_timeline(profile_obj, "eth0", direction="uplink")
+                        peer_steps["a"] = (shaper_a, steps_a)
+
+                        # Peer B shapes downlink (egress to A)
+                        shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
+                        shapers.append(shaper_b)
+                        steps_b = expand_timeline(profile_obj, "eth0", direction="downlink")
+                        peer_steps["b"] = (shaper_b, steps_b)
+
+                        for shaper in shapers:
+                            shaper.arm([])
+                    else:
+                        if profile_obj.uplink and not profile_obj.uplink.is_empty:
+                            shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
+                            shapers.append(shaper_a)
+                            shaper_a.arm(shaping_commands("eth0", profile_obj.uplink))
+                        if profile_obj.downlink and not profile_obj.downlink.is_empty:
+                            shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
+                            shapers.append(shaper_b)
+                            shaper_b.arm(shaping_commands("eth0", profile_obj.downlink))
+
+                # 4. Verify shaping was applied (diagnostic)
+                if profile_obj is not None and not getattr(args, "dry_run", False):
+                    for label, container in [("A (uplink)", a_container), ("B (downlink)", b_container)]:
+                        res = subprocess.run(
+                            ["docker", "exec", "-u", "root", container, "tc", "qdisc", "show", "dev", "eth0"],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        print(f"  qdisc on {label} ({container}): {(res.stdout or '').strip()}")
+
+                # 5. Measure traffic under shaped conditions
                 if profile_obj is not None and profile_obj.is_timeline:
                     num_steps = len(profile_obj.timeline)
                     for i in range(num_steps):
@@ -882,20 +1042,21 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
     # Use stub probe under test, or live probe in production.
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_1_capacity")
 
-    result = drive_capacity(
-        run_point,
-        profile=args.profile,
-        knob=args.knob,
-        low=args.low,
-        high=args.high,
-        max_loss_pct=args.max_loss,
-        max_latency_ms=args.max_latency_ms,
-        rate_hz=getattr(args, "rate_hz", 20.0),
-        topic=getattr(args, "topic", ""),
-        repeats=getattr(args, "repeats", 1),
-        duration_s=getattr(args, "duration", 60.0),
-        out_dir=run_dir,
-    )
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        result = drive_capacity(
+            run_point,
+            profile=args.profile,
+            knob=args.knob,
+            low=args.low,
+            high=args.high,
+            max_loss_pct=args.max_loss,
+            max_latency_ms=args.max_latency_ms,
+            rate_hz=getattr(args, "rate_hz", 20.0),
+            topic=getattr(args, "topic", ""),
+            repeats=getattr(args, "repeats", 1),
+            duration_s=getattr(args, "duration", 60.0),
+            out_dir=run_dir,
+        )
 
     # Resolve aggregated file output path
     out_file_name = getattr(args, "out", "budgets.jsonl")
@@ -927,16 +1088,17 @@ def benchmark_ramp(args: argparse.Namespace) -> int:
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_3_ramp")
 
     values = _parse_values(args.values)
-    drive_ramp(
-        run_point,
-        profile=args.profile,
-        values=values,
-        knob=getattr(args, "knob", "size"),
-        rate_hz=getattr(args, "rate_hz", 20.0),
-        topic=getattr(args, "topic", ""),
-        duration_s=getattr(args, "duration", 60.0),
-        out_dir=run_dir,
-    )
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_ramp(
+            run_point,
+            profile=args.profile,
+            values=values,
+            knob=getattr(args, "knob", "size"),
+            rate_hz=getattr(args, "rate_hz", 20.0),
+            topic=getattr(args, "topic", ""),
+            duration_s=getattr(args, "duration", 60.0),
+            out_dir=run_dir,
+        )
 
     # Resolve aggregated file output path
     out_file_name = getattr(args, "out", "curve.jsonl")
@@ -965,15 +1127,18 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_4_recovery")
 
-    drive_recovery(
-        run_point,
-        profile=args.profile,
-        duration_s=getattr(args, "duration", 90.0),
-        nominal_period_s=getattr(args, "nominal_period", 0.05),
-        latched_topics=getattr(args, "latched_topics", "").split(",") if getattr(args, "latched_topics", "") else (),
-        out_dir=run_dir,
-        profiles_file=runtime.profiles_file,
-    )
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_recovery(
+            run_point,
+            profile=args.profile,
+            duration_s=getattr(args, "duration", 90.0),
+            nominal_period_s=getattr(args, "nominal_period", 0.05),
+            latched_topics=getattr(args, "latched_topics", "").split(",")
+            if getattr(args, "latched_topics", "")
+            else (),
+            out_dir=run_dir,
+            profiles_file=runtime.profiles_file,
+        )
 
     # Resolve aggregated file output path
     out_file_name = getattr(args, "out", "recovery.json")
@@ -1003,17 +1168,18 @@ def benchmark_sweep(args: argparse.Namespace) -> int:
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_2_load_sweep")
 
     profile_grid = [p.strip() for p in args.profile_grid.split(",") if p.strip()]
-    drive_sweep(
-        run_point,
-        profile_grid=profile_grid,
-        max_loss_pct=getattr(args, "max_loss", 5.0),
-        max_latency_ms=getattr(args, "max_latency_ms", 300.0),
-        rate_hz=getattr(args, "rate_hz", 20.0),
-        size=getattr(args, "size", 60000),
-        topic=getattr(args, "topic", ""),
-        duration_s=getattr(args, "duration", 60.0),
-        out_dir=run_dir,
-    )
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_sweep(
+            run_point,
+            profile_grid=profile_grid,
+            max_loss_pct=getattr(args, "max_loss", 5.0),
+            max_latency_ms=getattr(args, "max_latency_ms", 300.0),
+            rate_hz=getattr(args, "rate_hz", 20.0),
+            size=getattr(args, "size", 60000),
+            topic=getattr(args, "topic", ""),
+            duration_s=getattr(args, "duration", 60.0),
+            out_dir=run_dir,
+        )
 
     # Resolve aggregated file output path
     out_file_name = getattr(args, "out", "frontier.jsonl")

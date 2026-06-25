@@ -437,3 +437,33 @@ def test_runtime_config_parses_benchmarks_dir_and_profiles(tmp_path: Path) -> No
 
     assert runtime.profiles_file == profiles_file
     assert runtime.benchmarks_dir == tmp_path / "benchmarks"
+
+
+def test_tee_stream_and_stdout_redirection(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    from rosotacom.cli_benchmark import log_stdout_stderr_to_file
+
+    log_file = tmp_path / "test_log.txt"
+
+    with log_stdout_stderr_to_file(log_file):
+        print("Hello from test stdout")
+        print("Hello from test stderr", file=sys.stderr)
+
+        # Test hooked subprocess.run
+        res = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write('sub stdout\\n'); sys.stderr.write('sub stderr\\n')",
+            ],
+            capture_output=False,
+        )
+        assert res.returncode == 0
+
+    log_content = log_file.read_text(encoding="utf-8")
+    assert "Hello from test stdout" in log_content
+    assert "Hello from test stderr" in log_content
+    assert "sub stdout" in log_content
+    assert "sub stderr" in log_content

@@ -453,6 +453,9 @@ The `sessions/` directory contains curated built-in session definitions:
 - `4_comp_occ_grid_zen`: compressed occupancy grid through Zenoh
 - `5_sized_payload`: sized payload test over DDS
 - `6_sized_payload_zen`: sized payload test through Zenoh
+- `14_remote_assist_anonymized`: generic processed replay shape for the
+  remote-assist OTA contract; run it with
+  `rosotacom smoke 14_remote_assist_anonymized`
 
 Transport-combination coverage lives under `tests/sessions/rmw_matrix` and is
 generated from `tests/sessions/generate_rmw_matrix.py`.

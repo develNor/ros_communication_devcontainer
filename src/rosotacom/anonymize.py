@@ -24,6 +24,13 @@ class HandoffTopic:
     zen_qos: dict[str, Any] | None
 
 
+@dataclass(frozen=True)
+class PlaybackTopic:
+    source_peer: str
+    bag_topic: str
+    publish_topic: str
+
+
 def metadata_path_for_bag(path: Path) -> Path:
     return path / "metadata.yaml" if path.is_dir() else path.parent / "metadata.yaml"
 
@@ -210,8 +217,42 @@ def source_topics_by_peer(plan: list[HandoffTopic]) -> dict[str, list[str]]:
     return by_peer
 
 
+def playback_topics_by_peer(
+    replay_session_cfg: dict[str, Any],
+    plan: list[HandoffTopic],
+    session_gen: Any,
+) -> dict[str, list[PlaybackTopic]]:
+    replay_plan = plan_handoff_topics(replay_session_cfg, session_gen)
+    replay_publish_topics = {(item.source_peer, item.source_topic): item.handoff_topic for item in replay_plan}
+
+    by_peer: dict[str, list[PlaybackTopic]] = {}
+    for item in plan:
+        publish_topic = replay_publish_topics.get((item.source_peer, item.generic_topic))
+        if publish_topic is None:
+            raise RuntimeError(
+                "generated replay session has no outbound handoff topic for "
+                f"{item.source_peer} bag topic {item.generic_topic!r}"
+            )
+        by_peer.setdefault(item.source_peer, []).append(
+            PlaybackTopic(
+                source_peer=item.source_peer,
+                bag_topic=item.generic_topic,
+                publish_topic=publish_topic,
+            )
+        )
+    return by_peer
+
+
 def missing_handoff_topics(plan: list[HandoffTopic], info_by_topic: dict[str, dict[str, Any]]) -> list[HandoffTopic]:
     return [item for item in plan if item.handoff_topic not in info_by_topic]
+
+
+def _replay_expect(expect: Any) -> dict[str, Any] | None:
+    if not isinstance(expect, dict):
+        return None
+    replay = copy.deepcopy(expect)
+    replay.pop("latency_ms", None)
+    return replay or None
 
 
 def build_replay_session_config(session_cfg: dict[str, Any], plan: list[HandoffTopic]) -> dict[str, Any]:
@@ -239,6 +280,11 @@ def build_replay_session_config(session_cfg: dict[str, Any], plan: list[HandoffT
             if item.handoff_type:
                 new_entry["type"] = item.handoff_type
             new_entry.pop("processing", None)
+            replay_expect = _replay_expect(new_entry.get("expect"))
+            if replay_expect is None:
+                new_entry.pop("expect", None)
+            else:
+                new_entry["expect"] = replay_expect
             rewritten.append(new_entry)
         replay_topics[direction] = rewritten
 

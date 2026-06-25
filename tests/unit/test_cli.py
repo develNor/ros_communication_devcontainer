@@ -1940,6 +1940,60 @@ def test_smoke_crossed_topics_include_native_chatter_direction() -> None:
     assert "export ROS_DOMAIN_ID=47" in rosotacom._smoke_ros_setup("/config", cfg, "b")
 
 
+def test_smoke_publish_specs_use_source_target_prefix_and_qos() -> None:
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {
+            "a": {
+                "domain_id": 46,
+                "inbound": {"keep_source_prefix": True},
+                "outbound": {"target_prefix": {"use_target_prefix": True}},
+            },
+            "b": {"domain_id": 47},
+        },
+        "shared": {"use_heartbeat": True},
+        "topics": {
+            "a_to_b": [
+                {
+                    "topic": "/topic1",
+                    "type": "geometry_msgs/msg/PoseStamped",
+                    "qos": {"reliability": "reliable", "durability": "transient_local", "for_role": {}},
+                }
+            ]
+        },
+    }
+
+    received = rosotacom._received_crossed_topics(cfg, "b")
+    received_a = rosotacom._received_crossed_topics(cfg, "a")
+    specs = [s for s in rosotacom._smoke_publish_specs(cfg) if s.publish_topic]
+
+    assert received[0].topic == "/com/in/a/to_b/heartbeat_a"
+    assert received_a[1].topic == "/b/heartbeat_b"
+    assert len(specs) == 1
+    assert specs[0].publish_topic == "/to_b/topic1"
+    assert specs[0].topic == "/topic1"
+    assert specs[0].publish_qos == {"reliability": "reliable", "durability": "transient_local"}
+    command = rosotacom._smoke_publisher_command(specs[0], "source ros", 180.0)
+    assert "--qos-reliability reliable" in command
+    assert "--qos-durability transient_local" in command
+
+
+def test_smoke_probe_false_keeps_topic_out_of_synthetic_runner() -> None:
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 46}, "b": {"domain_id": 47}},
+        "topics": {
+            "b_to_a": [
+                {"topic": "/active", "type": "std_msgs/msg/String"},
+                {"topic": "/contract_only", "type": "std_msgs/msg/String", "expect": {"smoke_probe": False}},
+            ]
+        },
+    }
+
+    assert [s.publish_topic for s in rosotacom._smoke_publish_specs(cfg)] == ["/active"]
+    assert [s.topic for s in rosotacom._received_crossed_topics(cfg, "a") if s.publish_topic] == ["/active"]
+
+
 def test_smoke_native_publish_rate_override() -> None:
     # A rate-changing feature drives its source from expect.smoke_native_hz, not
     # the (lower) asserted received bounds.
@@ -1974,6 +2028,26 @@ def test_restamp_example_uses_stale_stamped_header_source() -> None:
     # The synthetic message carries a stale (1970) stamp so restamp has an effect.
     msg = rosotacom._smoke_publish_message("geometry_msgs/msg/PointStamped")
     assert "sec: 1000" in msg and "point" in msg
+
+
+@pytest.mark.parametrize(
+    "msg_type",
+    [
+        "std_msgs/msg/Empty",
+        "std_msgs/msg/Float32",
+        "std_msgs/msg/Float64",
+        "geometry_msgs/msg/PoseStamped",
+        "geometry_msgs/msg/TwistStamped",
+        "tf2_msgs/msg/TFMessage",
+        "sensor_msgs/msg/CameraInfo",
+        "sensor_msgs/msg/NavSatFix",
+        "gps_msgs/msg/GPSFix",
+        "com_msgs/msg/CompressedData",
+        "ffmpeg_image_transport_msgs/msg/FFMPEGPacket",
+    ],
+)
+def test_smoke_publish_message_supports_remote_assist_anonymized_types(msg_type: str) -> None:
+    assert rosotacom._smoke_publish_message(msg_type)
 
 
 def test_named_stage_latency_is_left_to_status_oracle() -> None:

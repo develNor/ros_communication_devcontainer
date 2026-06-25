@@ -367,7 +367,7 @@ def test_handoff_planner_selects_processed_compressed_topic() -> None:
                     "type": "nav_msgs/msg/OccupancyGrid",
                     "processing": {"compress": True},
                     "qos": {"reliability": "reliable"},
-                    "expect": {"hz": {"min": 1, "max": 5}},
+                    "expect": {"hz": {"min": 1, "max": 5}, "latency_ms": {"max": 500}},
                 }
             ]
         },
@@ -391,6 +391,33 @@ def test_handoff_planner_selects_processed_compressed_topic() -> None:
     assert "processing" not in replay_entry
     assert replay_entry["qos"] == {"reliability": "reliable"}
     assert replay_entry["expect"] == {"hz": {"min": 1, "max": 5}}
+
+
+def test_playback_topics_remap_target_prefixed_replay_sources() -> None:
+    session_cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {
+            "a": {"domain_id": 46, "outbound": {"target_prefix": {"use_target_prefix": True}}},
+            "b": {"domain_id": 47},
+        },
+        "topics": {
+            "a_to_b": [
+                {
+                    "topic": "/move_base_free/goal",
+                    "type": "geometry_msgs/msg/PoseStamped",
+                    "processing": {"framebridge": "global_to_local"},
+                }
+            ],
+            "b_to_a": [{"topic": "/status", "type": "std_msgs/msg/String"}],
+        },
+    }
+
+    plan = anonymize_lib.plan_handoff_topics(session_cfg, cli.session_gen)
+    replay_cfg = anonymize_lib.build_replay_session_config(session_cfg, plan)
+    topics_by_peer = anonymize_lib.playback_topics_by_peer(replay_cfg, plan, cli.session_gen)
+
+    assert [(topic.bag_topic, topic.publish_topic) for topic in topics_by_peer["a"]] == [("/topic1", "/to_b/topic1")]
+    assert [(topic.bag_topic, topic.publish_topic) for topic in topics_by_peer["b"]] == [("/topic2", "/topic2")]
 
 
 def test_handoff_planner_missing_processed_topic_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

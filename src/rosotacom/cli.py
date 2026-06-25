@@ -212,6 +212,7 @@ class SmokeTopicSpec:
     hz_max: float | None = None
     max_delay_s: float | None = None
     expected_size: int | None = None
+    publish_qos: dict[str, Any] | None = None
 
 
 def _load_yaml_file(path: Path | None) -> dict[str, Any]:
@@ -4536,12 +4537,17 @@ def _smoke_heartbeat_topic(cfg: dict[str, Any], peer_key: str) -> str:
     return f"/heartbeat_{_peer_com_name(peers, peer_key)}"
 
 
-def _smoke_inbound_bridge_topic(cfg: dict[str, Any], source_peer_key: str) -> str:
+def _smoke_inbound_bridge_topic(cfg: dict[str, Any], source_peer_key: str, receiver_peer_key: str) -> str:
     peers = cfg.get("peers", {}) or {}
     if not isinstance(peers, dict):
         raise RuntimeError("Smoke verification requires a session config with peers.")
     source_name = _peer_com_name(peers, source_peer_key)
-    heartbeat_topic = _smoke_heartbeat_topic(cfg, source_peer_key).lstrip("/")
+    heartbeat_topic = _smoke_forward_topic_for_inbound(
+        cfg,
+        source_peer_key,
+        receiver_peer_key,
+        _smoke_heartbeat_topic(cfg, source_peer_key),
+    ).lstrip("/")
     return f"/com/in/{source_name}/{heartbeat_topic}"
 
 
@@ -4651,6 +4657,14 @@ def _smoke_expect_bounds(expect: Any) -> tuple[float | None, float | None, float
         else None
     )
     return hz_min, hz_max, max_delay_s
+
+
+def _smoke_publish_qos(qos: Any) -> dict[str, Any] | None:
+    if not isinstance(qos, dict):
+        return None
+    allowed = {"depth", "reliability", "durability", "history"}
+    clean = {key: value for key, value in qos.items() if key in allowed and value is not None}
+    return clean or None
 
 
 def _smoke_publish_rate(expect: Any) -> float:
@@ -4780,14 +4794,16 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
                 SmokeTopicSpec(
                     source_peer_key=source,
                     receiver_peer_key=receiver_peer_key,
-                    topic=_smoke_inbound_bridge_topic(cfg, source),
+                    topic=_smoke_inbound_bridge_topic(cfg, source, receiver_peer_key),
                     label=f"{source}->{receiver_peer_key} inbound bridge heartbeat",
                     enforce_bounds=False,
                 ),
                 SmokeTopicSpec(
                     source_peer_key=source,
                     receiver_peer_key=receiver_peer_key,
-                    topic=_smoke_heartbeat_topic(cfg, source),
+                    topic=_smoke_receiver_final_topic(
+                        cfg, source, receiver_peer_key, _smoke_heartbeat_topic(cfg, source)
+                    ),
                     label=f"{source}->{receiver_peer_key} final heartbeat",
                     enforce_bounds=True,
                     use_default_bounds=True,
@@ -4804,6 +4820,8 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
         if src != source or dst != receiver_peer_key:
             continue
         for entry in session_gen._topic_entries(cfg, str(direction)):
+            if isinstance(entry.expect, dict) and entry.expect.get("smoke_probe") is False:
+                continue
             pipe = _smoke_topic_pipeline(cfg, entry)
             final_topic = str(pipe["final"])
             if bool(shared.get("use_heartbeat", False)) and final_topic == _smoke_heartbeat_topic(cfg, src):
@@ -4829,13 +4847,14 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
                         enforce_bounds=any(
                             value is not None for value in (expect_hz_min, expect_hz_max, expect_max_delay_s)
                         ),
-                        publish_topic=entry.base,
+                        publish_topic=_smoke_forward_topic_for_inbound(cfg, src, dst, entry.base),
                         publish_type=entry.msg_type,
                         publish_rate=_smoke_native_publish_rate(entry.expect),
                         hz_min=expect_hz_min,
                         hz_max=expect_hz_max,
                         max_delay_s=expect_max_delay_s,
                         expected_size=66000 if entry.msg_type == "com_msgs/msg/SizedPayload" else None,
+                        publish_qos=_smoke_publish_qos(entry.qos),
                     ),
                 ]
             )
@@ -4871,10 +4890,14 @@ def _verify_received_topics(
             continue
         log_line(f"OK: {label} ({topic}) is publishing in {container_name}")
         hz = _parse_topic_hz_rate(output)
-        delay_output = _measure_topic_delay(container_name, ros_setup, topic)
-        if detail_log:
-            detail_log(f"\n--- delay {label} ({topic}) in {container_name} ---\n{delay_output}")
-        delay_s = _parse_topic_delay_seconds(delay_output)
+        needs_delay = spec.use_default_bounds or spec.max_delay_s is not None
+        if needs_delay:
+            delay_output = _measure_topic_delay(container_name, ros_setup, topic)
+            if detail_log:
+                detail_log(f"\n--- delay {label} ({topic}) in {container_name} ---\n{delay_output}")
+            delay_s = _parse_topic_delay_seconds(delay_output)
+        else:
+            delay_s = None
         log_line(_smoke_metric_line(label=label, topic=topic, container_name=container_name, hz=hz, delay_s=delay_s))
         if spec.expected_size is not None:
             received_size = _received_sized_payload_size(container_name, ros_setup, topic)
@@ -4901,11 +4924,40 @@ def _smoke_publish_message(msg_type: str) -> str:
     normalized = msg_type.strip()
     if normalized in {"std_msgs/msg/String", "std_msgs/String"}:
         return "{data: 'rosotacom smoke'}"
+    if normalized in {"std_msgs/msg/Empty", "std_msgs/Empty"}:
+        return "{}"
+    if normalized in {"std_msgs/msg/Float32", "std_msgs/Float32", "std_msgs/msg/Float64", "std_msgs/Float64"}:
+        return "{data: 1.0}"
+    if normalized in {"geometry_msgs/msg/PoseStamped", "geometry_msgs/PoseStamped"}:
+        return "{header: {frame_id: map}, pose: {orientation: {w: 1.0}}}"
+    if normalized in {"geometry_msgs/msg/TwistStamped", "geometry_msgs/TwistStamped"}:
+        return "{header: {frame_id: base_link}, twist: {linear: {x: 1.0}, angular: {z: 0.1}}}"
+    if normalized in {"tf2_msgs/msg/TFMessage", "tf2_msgs/TFMessage"}:
+        return "{transforms: [{header: {frame_id: map}, child_frame_id: base_link, transform: {rotation: {w: 1.0}}}]}"
     if normalized == "nav_msgs/msg/OccupancyGrid":
         return (
             "{header: {frame_id: map}, "
             "info: {resolution: 0.5, width: 4, height: 4, origin: {orientation: {w: 1.0}}}, "
             "data: [0, 0, 0, 0, 0, 25, 50, 0, 0, 50, 100, 0, -1, -1, -1, -1]}"
+        )
+    if normalized in {"sensor_msgs/msg/CameraInfo", "sensor_msgs/CameraInfo"}:
+        return "{header: {frame_id: camera}, height: 1, width: 1}"
+    if normalized in {"sensor_msgs/msg/NavSatFix", "sensor_msgs/NavSatFix"}:
+        return (
+            "{header: {frame_id: gps}, status: {status: 0, service: 1}, "
+            "latitude: 48.0, longitude: 8.0, altitude: 100.0}"
+        )
+    if normalized in {"gps_msgs/msg/GPSFix", "gps_msgs/GPSFix"}:
+        return (
+            "{header: {frame_id: gps}, status: {status: 0, position_source: 1}, "
+            "latitude: 48.0, longitude: 8.0, altitude: 100.0}"
+        )
+    if normalized == "com_msgs/msg/CompressedData":
+        return "{header: {frame_id: map}, msg_type: 'anonymized', data: [0, 1, 2, 3]}"
+    if normalized == "ffmpeg_image_transport_msgs/msg/FFMPEGPacket":
+        return (
+            "{header: {frame_id: camera}, width: 1, height: 1, encoding: h264, "
+            "pts: 0, flags: 0, is_bigendian: false, data: [0, 1, 2, 3]}"
         )
     if normalized in {"geometry_msgs/msg/PointStamped", "geometry_msgs/PointStamped"}:
         # A deliberately STALE header.stamp (epoch+1000s == 1970) so the restamp
@@ -4944,6 +4996,21 @@ def _content_integrity_specs(cfg: dict[str, Any], receiver_peer_key: str) -> lis
     return out
 
 
+def _smoke_topic_pub_qos_args(qos: dict[str, Any] | None) -> str:
+    if not qos:
+        return ""
+    args: list[str] = []
+    if qos.get("reliability") is not None:
+        args.extend(["--qos-reliability", str(qos["reliability"])])
+    if qos.get("durability") is not None:
+        args.extend(["--qos-durability", str(qos["durability"])])
+    if qos.get("history") is not None:
+        args.extend(["--qos-history", str(qos["history"])])
+    if qos.get("depth") is not None:
+        args.extend(["--qos-depth", str(qos["depth"])])
+    return " ".join(shlex.quote(arg) for arg in args) + (" " if args else "")
+
+
 def _smoke_publisher_command(spec: SmokeTopicSpec, ros_setup: str, duration: float) -> str:
     assert spec.publish_topic is not None and spec.publish_type is not None
     if spec.publish_type == "com_msgs/msg/SizedPayload":
@@ -4953,8 +5020,9 @@ def _smoke_publisher_command(spec: SmokeTopicSpec, ros_setup: str, duration: flo
             f"-p topic:={shlex.quote(spec.publish_topic)} -p size:={size} -p rate:={spec.publish_rate}"
         )
     message = _smoke_publish_message(spec.publish_type)
+    qos_args = _smoke_topic_pub_qos_args(spec.publish_qos)
     return (
-        f"{ros_setup} && timeout {duration} ros2 topic pub -r {spec.publish_rate} "
+        f"{ros_setup} && timeout {duration} ros2 topic pub -r {spec.publish_rate} {qos_args}"
         f"{shlex.quote(spec.publish_topic)} {shlex.quote(spec.publish_type)} "
         f"{shlex.quote(message)}"
     )
@@ -6588,9 +6656,13 @@ def anonymize_command(args: argparse.Namespace) -> int:
 
     peer_settings = session_cfg.get("peer_settings", {})
     applications_cfg = {}
-    topics_by_peer = anonymize_lib.source_topics_by_peer(handoff_plan)
+    try:
+        playback_topics_by_peer = anonymize_lib.playback_topics_by_peer(anon_session_cfg, handoff_plan, session_gen)
+    except Exception as exc:
+        print(f"Error: failed to resolve replay publish topics: {exc}", file=sys.stderr)
+        return 1
 
-    for peer, replay_topics in topics_by_peer.items():
+    for peer, replay_topics in playback_topics_by_peer.items():
         domain_id = peer_settings.get(peer, {}).get("domain_id", 0)
 
         play_bag_name = f"play_bag_{peer}.ros2docker.json"
@@ -6598,7 +6670,14 @@ def anonymize_command(args: argparse.Namespace) -> int:
         play_command_parts = ["ros2 bag play --loop /bag/anonymized_bag"]
         if qos_overrides:
             play_command_parts.append("--qos-profile-overrides-path /scenario/qos-overrides.yaml")
-        play_command_parts.append("--topics " + " ".join(shlex.quote(topic) for topic in replay_topics))
+        play_command_parts.append("--topics " + " ".join(shlex.quote(topic.bag_topic) for topic in replay_topics))
+        remaps = [
+            f"{topic.bag_topic}:={topic.publish_topic}"
+            for topic in replay_topics
+            if topic.bag_topic != topic.publish_topic
+        ]
+        if remaps:
+            play_command_parts.append("--remap " + " ".join(shlex.quote(remap) for remap in remaps))
         play_run_args = [
             "--network",
             "host",

@@ -21,18 +21,18 @@ import shlex
 import shutil
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
 
 class TeeStream:
-    def __init__(self, original_stream, file_path: Path):
-        self.original_stream = original_stream
-        self.file_path = file_path
-        self.file = None
+    def __init__(self, original_stream: Any, file_path: Path):
+        self.original_stream: Any = original_stream
+        self.file_path: Path = file_path
+        self.file: Any = None
 
-    def write(self, data):
+    def write(self, data: Any) -> None:
         self.original_stream.write(data)
         self.original_stream.flush()
         if self.file is None:
@@ -48,7 +48,7 @@ class TeeStream:
             except Exception:
                 pass
 
-    def flush(self):
+    def flush(self) -> None:
         self.original_stream.flush()
         if self.file is not None:
             try:
@@ -56,7 +56,7 @@ class TeeStream:
             except Exception:
                 pass
 
-    def close(self):
+    def close(self) -> None:
         if self.file is not None:
             try:
                 self.file.close()
@@ -66,7 +66,7 @@ class TeeStream:
 
 
 @contextlib.contextmanager
-def log_stdout_stderr_to_file(file_path: Path):
+def log_stdout_stderr_to_file(file_path: Path) -> Iterator[None]:
     import subprocess
 
     tee_stdout = TeeStream(sys.stdout, file_path)

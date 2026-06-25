@@ -303,7 +303,7 @@ def _benchmark_result_context(
                 "command": " ".join(shlex.quote(arg) for arg in sys.argv),
                 "genre": genre,
                 "execution": {
-                    "mode": "ota" if getattr(args, "deployment", None) else "local",
+                    "mode": "ota" if _is_ota_benchmark(args) else "local",
                     "dry_run": bool(getattr(args, "dry_run", False)),
                 },
                 "rmw": {
@@ -372,6 +372,10 @@ def _benchmark_ota_target(args: argparse.Namespace, session_name: str) -> tuple[
     return session_name, "session"
 
 
+def _is_ota_benchmark(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "ota_benchmark", False) or getattr(args, "deployment", None))
+
+
 def _benchmark_profiles_file(profile: str | None, profiles_file: Path | None) -> Path | None:
     if profiles_file is not None:
         return _find_profiles_file(profiles_file)
@@ -406,32 +410,103 @@ def _benchmark_child_command() -> list[str]:
     return [sys.executable, "-m", "rosotacom", *_strip_interactive_args(sys.argv[1:])]
 
 
-def _peer_catmux_attach_script(identity: str, container_name: str) -> str:
-    inner = (
-        "while true; do "
-        "session=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | head -1); "
-        'if [ -n "$session" ]; then exec tmux attach-session -t "$session"; fi; '
-        "echo '[INFO] waiting for catmux/tmux session inside container'; "
-        "sleep 1; "
-        "done"
+def _benchmark_run_script(command: Sequence[str], full_log: Path, session_name: str) -> str:
+    pattern = (
+        r"probe\(|Benchmark result saved|Capacity result|Capacity:|Ramp curve copied|Recovery metrics copied|"
+        r"Sweep frontier copied|ERROR|Error|Warning|benchmark exited"
     )
+    script = f"""
+import pathlib
+import re
+import subprocess
+import sys
+
+cmd = {json.dumps(list(command))}
+log_path = pathlib.Path({str(full_log)!r})
+log_path.parent.mkdir(parents=True, exist_ok=True)
+selected = re.compile({pattern!r})
+
+print("[INFO] benchmark operator session: {session_name}")
+print("[INFO] full orchestrator log:", log_path)
+print("[INFO] running:", " ".join(cmd), flush=True)
+with log_path.open("a", encoding="utf-8") as log:
+    log.write("\\n--- benchmark run started ---\\n")
+    log.write("command: " + " ".join(cmd) + "\\n")
+    log.flush()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        log.write(line)
+        log.flush()
+        if selected.search(line):
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    rc = proc.wait()
+    log.write(f"--- benchmark exited with status {{rc}} ---\\n")
+print()
+print("[INFO] benchmark exited with status", rc)
+sys.exit(rc)
+""".strip()
+    return shlex.join([sys.executable, "-c", script])
+
+
+def _grep_log_fragment(log_path: Path, pattern: str, *, lines: int = 40) -> str:
+    return (
+        f"log={shlex.quote(str(log_path))}; "
+        'if [ -f "$log" ]; then '
+        f'grep -E {shlex.quote(pattern)} "$log" 2>/dev/null | tail -{lines} || true; '
+        "else "
+        "echo '[INFO] waiting for orchestrator log:' \"$log\"; "
+        "fi"
+    )
+
+
+def _peer_catmux_attach_script(identity: str, container_name: str, full_log: Path) -> str:
+    launch_pattern = f"{container_name}|--identity {identity}|identity {identity}|rosotacom session started"
     return (
         "while true; do "
         "clear; date; "
         f"container={shlex.quote(container_name)}; identity={shlex.quote(identity)}; "
         'if ! docker inspect -f "{{.State.Running}}" "$container" >/dev/null 2>&1; then '
         'echo "[INFO] waiting for benchmark peer $identity container: $container"; '
+        + _grep_log_fragment(full_log, launch_pattern)
+        + "; "
         "sleep 1; continue; "
         "fi; "
-        'echo "[INFO] attaching to benchmark peer $identity in $container"; '
-        f'docker exec -it "$container" bash -lc {shlex.quote(inner)}; '
+        'session=$(docker exec "$container" tmux -L catmux list-sessions -F "#{session_name}" 2>/dev/null '
+        "| head -1 || true); "
+        'if [ -z "$session" ]; then '
+        'echo "[INFO] container is running; waiting for catmux session on tmux socket catmux"; '
+        'docker logs --tail 25 "$container" 2>&1 || true; '
+        + _grep_log_fragment(full_log, launch_pattern, lines=25)
+        + "; "
+        "sleep 1; continue; "
+        "fi; "
+        'echo "[INFO] attaching to benchmark peer $identity catmux session: $session"; '
+        'docker exec -it "$container" tmux -L catmux attach-session -t "$session"; '
         "rc=$?; echo; echo '[INFO] catmux attach exited with status' \"$rc\"; "
         "sleep 1; "
         "done"
     )
 
 
-def _benchmark_peer_windows(args: argparse.Namespace, genre: str) -> list[tuple[str, str, str]]:
+def _peer_launch_watch_script(identity: str, container_name: str, full_log: Path) -> str:
+    launch_pattern = f"{container_name}|--identity {identity}|identity {identity}|rosotacom session started"
+    return (
+        "while true; do "
+        "clear; date; "
+        f"container={shlex.quote(container_name)}; identity={shlex.quote(identity)}; "
+        'echo "[INFO] benchmark peer $identity launch/container log"; '
+        "docker ps --filter name=\"$container\" --format 'table {{.Names}}\\t{{.Status}}' 2>/dev/null || true; "
+        "echo; echo '[INFO] orchestrator lines'; " + _grep_log_fragment(full_log, launch_pattern, lines=60) + "; "
+        "echo; echo '[INFO] docker logs tail'; "
+        'docker logs --tail 40 "$container" 2>&1 || true; '
+        "sleep 2; "
+        "done"
+    )
+
+
+def _benchmark_peer_windows(args: argparse.Namespace, genre: str, full_log: Path) -> list[tuple[str, str, str, str]]:
     from .cli import (
         _container_name,
         _effective_session_config,
@@ -450,32 +525,28 @@ def _benchmark_peer_windows(args: argparse.Namespace, genre: str) -> list[tuple[
     peers = cfg.get("peers")
     if not isinstance(peers, dict):
         return []
-    windows: list[tuple[str, str, str]] = []
+    windows: list[tuple[str, str, str, str]] = []
     for identity in sorted(str(peer) for peer in peers):
         container_name = _container_name(_remote_peer_name(cfg, identity), runtime)
         window_name = _safe_path_token(f"{identity}_catmux")
-        windows.append((window_name, identity, _peer_catmux_attach_script(identity, container_name)))
+        windows.append(
+            (
+                window_name,
+                identity,
+                _peer_catmux_attach_script(identity, container_name, full_log),
+                _peer_launch_watch_script(identity, container_name, full_log),
+            )
+        )
     return windows
 
 
-def _latest_result_watch_script(artifacts_root: Path) -> str:
-    root = shlex.quote(str(artifacts_root))
+def _network_command_watch_script(full_log: Path, *, is_ota: bool) -> str:
+    pattern = r"tc qdisc|netem|qdisc on|Timeline step|profile safety watchdog|OTA benchmark|tc/netem"
+    label = "remote tc/netem commands" if is_ota else "local tc/netem commands"
     return (
         "while true; do "
         "clear; date; "
-        f"root={root}; "
-        "latest=$(find \"$root\" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\\n' 2>/dev/null "
-        "| sort -nr | head -1 | cut -d' ' -f2-); "
-        'if [ -z "$latest" ]; then '
-        "echo '[INFO] waiting for benchmark artifacts under' \"$root\"; "
-        'elif [ -f "$latest/result.json" ]; then '
-        "echo '[INFO] latest result:' \"$latest/result.json\"; "
-        'python3 -m json.tool "$latest/result.json" | tail -120; '
-        'elif [ -f "$latest/stdout.txt" ]; then '
-        'echo \'[INFO] latest stdout:\' "$latest/stdout.txt"; tail -80 "$latest/stdout.txt"; '
-        "else "
-        'echo \'[INFO] latest artifact dir:\' "$latest"; find "$latest" -maxdepth 2 -type f | sort; '
-        "fi; "
+        f"echo '[INFO] {label} from orchestrator log'; " + _grep_log_fragment(full_log, pattern, lines=100) + "; "
         "sleep 2; "
         "done"
     )
@@ -487,7 +558,7 @@ def _network_watch_script(*, is_ota: bool) -> str:
             "while true; do "
             "clear; date; "
             "echo '[INFO] OTA benchmark: network shaping is applied on the remote peers.'; "
-            "echo '[INFO] Watch the run pane for tc/netem commands and qdisc diagnostics.'; "
+            "echo '[INFO] Watch the network:commands pane for tc/netem commands and qdisc diagnostics.'; "
             "sleep 5; "
             "done"
         )
@@ -508,6 +579,7 @@ def _network_watch_script(*, is_ota: bool) -> str:
 def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
     from .cli import (
         _attach_tmux_pipe,
+        _create_tmux_split_below,
         _host_shell,
         _load_runtime_config,
         _require_tmux,
@@ -520,27 +592,25 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
     command = _benchmark_child_command()
     artifacts_root = _benchmark_artifacts_root(args)
     interactive_logs = artifacts_root / "interactive" / session_name
-    is_ota = bool(getattr(args, "deployment", None))
+    full_log = interactive_logs / "orchestrator.full.log"
+    is_ota = _is_ota_benchmark(args)
 
-    run_script = (
-        f"echo '[INFO] benchmark operator session: {session_name}'; "
-        f"echo '[INFO] running: {shlex.join(command)}'; "
-        f"{shlex.join(command)}; rc=$?; "
-        "echo; echo '[INFO] benchmark exited with status' \"$rc\"; "
-        "echo '[INFO] pane remains open for inspection'; "
-        "exec bash"
-    )
+    run_script = _benchmark_run_script(command, full_log, session_name)
     network_script = _network_watch_script(is_ota=is_ota)
-    results_script = _latest_result_watch_script(artifacts_root)
-    peer_windows = _benchmark_peer_windows(args, genre) if not is_ota else []
+    network_command_script = _network_command_watch_script(full_log, is_ota=is_ota)
+    peer_windows = _benchmark_peer_windows(args, genre, full_log) if not is_ota else []
 
     if getattr(args, "dry_run", False):
         print(f"Would create benchmark tmux session: {session_name}")
-        print("Run window: " + shlex.join(command))
-        for window_name, identity, _script in peer_windows:
-            print(f"Peer window {identity}: {window_name} catmux attach")
-        print("Network window: qdisc monitor" if not is_ota else "Network window: OTA shaping monitor")
-        print(f"Results window: latest result under {artifacts_root}")
+        print(f"Run window: high-level orchestrator (full log {full_log})")
+        print("Child command: " + shlex.join(command))
+        for window_name, identity, _attach_script, _launch_script in peer_windows:
+            print(f"Peer window {identity}: {window_name} catmux attach + launch log")
+        print(
+            "Network window: qdisc monitor + tc command log"
+            if not is_ota
+            else "Network window: OTA shaping monitor + remote tc command log"
+        )
         return 0
 
     _require_tmux()
@@ -548,7 +618,8 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
         if not getattr(args, "no_attach", False):
             subprocess.run(_tmux_command(runtime, "attach-session", "-t", session_name), check=True)
         else:
-            print(f"Attach with: rosotacom benchmark {genre} ... --interactive")
+            subcommand = sys.argv[1] if len(sys.argv) > 1 else ("ota-benchmark" if is_ota else "benchmark")
+            print(f"Attach with: rosotacom {subcommand} {genre} ... --interactive")
         return 0
 
     interactive_logs.mkdir(parents=True, exist_ok=True)
@@ -583,12 +654,7 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
         check=True,
     )
 
-    window_specs = [
-        *(window for window in peer_windows),
-        ("network", "network", network_script),
-        ("results", "results", results_script),
-    ]
-    for window_name, log_name, script in window_specs:
+    for window_name, identity, attach_script, launch_script in peer_windows:
         created_window = subprocess.run(
             _tmux_command(
                 runtime,
@@ -601,14 +667,57 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
                 session_name,
                 "-n",
                 window_name,
-                _host_shell(script),
+                _host_shell(attach_script),
             ),
             text=True,
             capture_output=True,
             check=True,
         )
         pane_id = created_window.stdout.strip()
-        _attach_tmux_pipe(runtime, pane_id, interactive_logs / f"{log_name}.log")
+        subprocess.run(_tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"{identity}:catmux"), check=True)
+        _attach_tmux_pipe(runtime, pane_id, interactive_logs / f"{identity}_catmux.log")
+        _create_tmux_split_below(
+            runtime,
+            pane_id,
+            f"{identity}:launch",
+            _host_shell(launch_script),
+            log_path=interactive_logs / f"{identity}_launch.log",
+        )
+        subprocess.run(
+            _tmux_command(runtime, "select-layout", "-t", f"{session_name}:{window_name}", "even-vertical"), check=True
+        )
+
+    created_network = subprocess.run(
+        _tmux_command(
+            runtime,
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            session_name,
+            "-n",
+            "network",
+            _host_shell(network_script),
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    network_pane = created_network.stdout.strip()
+    subprocess.run(_tmux_command(runtime, "select-pane", "-t", network_pane, "-T", "network:status"), check=True)
+    _attach_tmux_pipe(runtime, network_pane, interactive_logs / "network.log")
+    _create_tmux_split_below(
+        runtime,
+        network_pane,
+        "network:commands",
+        _host_shell(network_command_script),
+        log_path=interactive_logs / "network_commands.log",
+    )
+    subprocess.run(
+        _tmux_command(runtime, "select-layout", "-t", f"{session_name}:network", "even-vertical"), check=True
+    )
 
     subprocess.run(_tmux_command(runtime, "select-window", "-t", f"{session_name}:run"), check=True)
     print(f"Benchmark tmux session: {session_name}")
@@ -1273,7 +1382,7 @@ def _parse_values(raw: str) -> list[float]:
 # --------------------------------------------------------------------------- #
 
 
-def _add_benchmark_common_args(parser: argparse.ArgumentParser) -> None:
+def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark: bool = False) -> None:
     from .cli import _add_common_config_args, _add_peer_address_arg, _add_peer_arg, _add_peer_ssh_arg
 
     _add_common_config_args(parser)
@@ -1313,6 +1422,7 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_BENCHMARK_RMW,
         help=f"RMW implementation or rosotacom RMW alias for benchmark sessions (default: {DEFAULT_BENCHMARK_RMW}).",
     )
+    parser.set_defaults(ota_benchmark=ota_benchmark)
 
 
 def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPointFn:
@@ -1357,7 +1467,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
     from .network_profiles import expand_timeline
     from .network_shaper import ProfileShaper
 
-    is_ota = bool(getattr(args, "deployment", None))
+    is_ota = _is_ota_benchmark(args)
 
     def run_point(
         *,
@@ -2088,20 +2198,13 @@ def _infer_plot_type(data: list[dict[str, Any]], filename: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def register_benchmark_parser(subparsers: Any) -> None:
-    """Register the ``benchmark`` subcommand and its sub-subcommands."""
-    benchmark_parser = subparsers.add_parser(
-        "benchmark",
-        help="Run benchmark tests (capacity, ramp, recovery, sweep) and render plots.",
-    )
-    benchmark_subparsers = benchmark_parser.add_subparsers(dest="benchmark_command", required=True)
-
+def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchmark: bool) -> None:
     # --- capacity ---
     cap_parser = benchmark_subparsers.add_parser(
         "capacity",
         help="Binary-search for the capacity breakpoint under a profile.",
     )
-    _add_benchmark_common_args(cap_parser)
+    _add_benchmark_common_args(cap_parser, ota_benchmark=ota_benchmark)
     cap_parser.add_argument("--profile", required=True, help="Network profile name.")
     cap_parser.add_argument("--knob", required=True, choices=["size", "rate", "bandwidth"], help="Parameter to sweep.")
     cap_parser.add_argument("--low", type=int, required=True, help="Lower bound for the sweep.")
@@ -2122,7 +2225,7 @@ def register_benchmark_parser(subparsers: Any) -> None:
         "ramp",
         help="Measure latency over a linear load ramp (monitor-only trend).",
     )
-    _add_benchmark_common_args(ramp_parser)
+    _add_benchmark_common_args(ramp_parser, ota_benchmark=ota_benchmark)
     ramp_parser.add_argument("--profile", required=True, help="Network profile name.")
     ramp_parser.add_argument(
         "--values", required=True, help="Comma-separated values, start:stop:step, or start..stop/count."
@@ -2139,7 +2242,7 @@ def register_benchmark_parser(subparsers: Any) -> None:
         "recovery",
         help="Run a recovery test under a timeline profile.",
     )
-    _add_benchmark_common_args(rec_parser)
+    _add_benchmark_common_args(rec_parser, ota_benchmark=ota_benchmark)
     rec_parser.add_argument("--profile", required=True, help="Timeline profile name (must have an outage segment).")
     rec_parser.add_argument("--duration", type=float, default=90.0, help="Total run duration (s).")
     rec_parser.add_argument("--nominal-period", type=float, default=0.05, help="Nominal publish period (s).")
@@ -2152,7 +2255,7 @@ def register_benchmark_parser(subparsers: Any) -> None:
         "sweep",
         help="Grid sweep over profiles; oracle pass/fail for each (frontier).",
     )
-    _add_benchmark_common_args(sweep_parser)
+    _add_benchmark_common_args(sweep_parser, ota_benchmark=ota_benchmark)
     sweep_parser.add_argument("--profile-grid", required=True, help="Comma-separated list of profile names to sweep.")
     sweep_parser.add_argument("--max-loss", type=float, default=5.0, help="Oracle: max loss %%.")
     sweep_parser.add_argument("--max-latency-ms", type=float, default=300.0, help="Oracle: max p95 latency (ms).")
@@ -2163,6 +2266,8 @@ def register_benchmark_parser(subparsers: Any) -> None:
     sweep_parser.add_argument("--out", default="frontier.jsonl", help="Output frontier JSONL file.")
     sweep_parser.set_defaults(func=benchmark_sweep)
 
+
+def _register_benchmark_plot_parser(benchmark_subparsers: Any) -> None:
     # --- plot ---
     plot_parser = benchmark_subparsers.add_parser(
         "plot",
@@ -2178,3 +2283,21 @@ def register_benchmark_parser(subparsers: Any) -> None:
         help="Plot type (default: auto-detect from data).",
     )
     plot_parser.set_defaults(func=benchmark_plot)
+
+
+def register_benchmark_parser(subparsers: Any) -> None:
+    """Register the ``benchmark`` and ``ota-benchmark`` commands."""
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="Run local benchmark tests (capacity, ramp, recovery, sweep) and render plots.",
+    )
+    benchmark_subparsers = benchmark_parser.add_subparsers(dest="benchmark_command", required=True)
+    _register_benchmark_driver_parsers(benchmark_subparsers, ota_benchmark=False)
+    _register_benchmark_plot_parser(benchmark_subparsers)
+
+    ota_parser = subparsers.add_parser(
+        "ota-benchmark",
+        help="Run OTA benchmark tests against deployment peers.",
+    )
+    ota_subparsers = ota_parser.add_subparsers(dest="benchmark_command", required=True)
+    _register_benchmark_driver_parsers(ota_subparsers, ota_benchmark=True)

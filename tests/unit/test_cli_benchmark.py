@@ -24,6 +24,7 @@ from rosotacom.cli_benchmark import (
     _benchmark_child_command,
     _benchmark_ota_target,
     _benchmark_profiles_file,
+    _is_ota_benchmark,
     _parse_values,
     _peer_catmux_attach_script,
     _prepare_benchmark_session_config,
@@ -507,6 +508,8 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.benchmark_command == "capacity"
     assert args.knob == "size"
     assert args.rmw == DEFAULT_BENCHMARK_RMW
+    assert args.ota_benchmark is False
+    assert _is_ota_benchmark(args) is False
 
     args = parser.parse_args(
         [
@@ -563,6 +566,7 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.reuse is True
     assert args.interactive is True
     assert args.no_attach is True
+    assert args.ota_benchmark is False
 
     # Ramp.
     args = parser.parse_args(["benchmark", "ramp", "--profile", "p", "--values", "1000,2000"])
@@ -580,6 +584,83 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     args = parser.parse_args(["benchmark", "plot", "results.jsonl"])
     assert args.benchmark_command == "plot"
     assert args.input == "results.jsonl"
+
+    args = parser.parse_args(
+        [
+            "ota-benchmark",
+            "capacity",
+            "--profile",
+            "cellular-4g-degraded",
+            "--knob",
+            "size",
+            "--low",
+            "1",
+            "--high",
+            "1",
+            "--max-loss",
+            "30",
+            "--max-latency-ms",
+            "1000",
+            "--duration",
+            "10",
+            "--repeats",
+            "1",
+            "--peer",
+            "a=seat_tks",
+            "--peer",
+            "b=majestic_tks",
+        ]
+    )
+    assert args.command == "ota-benchmark"
+    assert args.benchmark_command == "capacity"
+    assert args.ota_benchmark is True
+    assert args.target is None
+    assert args.target_type is None
+    assert args.peer == ["a=seat_tks", "b=majestic_tks"]
+    assert _is_ota_benchmark(args) is True
+
+
+def test_main_routes_ota_benchmark_as_top_level_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, argparse.Namespace] = {}
+
+    def fake_capacity(args: argparse.Namespace) -> int:
+        seen["args"] = args
+        return 0
+
+    monkeypatch.setattr(benchmark_cli, "benchmark_capacity", fake_capacity)
+
+    rc = cli.main(
+        [
+            "ota-benchmark",
+            "capacity",
+            "--profile",
+            "cellular-4g-degraded",
+            "--knob",
+            "size",
+            "--low",
+            "1",
+            "--high",
+            "1",
+            "--max-loss",
+            "30",
+            "--max-latency-ms",
+            "1000",
+            "--duration",
+            "10",
+            "--repeats",
+            "1",
+            "--peer",
+            "a=seat_tks",
+            "--peer",
+            "b=majestic_tks",
+        ]
+    )
+
+    assert rc == 0
+    assert seen["args"].command == "ota-benchmark"
+    assert seen["args"].benchmark_command == "capacity"
+    assert seen["args"].ota_benchmark is True
+    assert seen["args"].peer == ["a=seat_tks", "b=majestic_tks"]
 
 
 def test_runtime_config_parses_benchmarks_dir_and_profiles(tmp_path: Path) -> None:
@@ -695,12 +776,12 @@ def test_benchmark_ota_target_defaults_to_benchmark_session() -> None:
 
 
 def test_peer_catmux_attach_script_waits_for_container_and_tmux() -> None:
-    script = _peer_catmux_attach_script("a", "rosotacom_id_com_to_b")
+    script = _peer_catmux_attach_script("a", "rosotacom_id_com_to_b", Path("/tmp/orchestrator.full.log"))
 
     assert "waiting for benchmark peer $identity container" in script
-    assert 'docker exec -it "$container" bash -lc' in script
-    assert "tmux list-sessions" in script
-    assert 'tmux attach-session -t "$session"' in script
+    assert "orchestrator.full.log" in script
+    assert 'docker exec "$container" tmux -L catmux list-sessions' in script
+    assert 'docker exec -it "$container" tmux -L catmux attach-session -t "$session"' in script
 
 
 def test_interactive_benchmark_dry_run_prints_operator_view(
@@ -768,10 +849,11 @@ def test_interactive_benchmark_dry_run_prints_operator_view(
 
     output = capsys.readouterr().out
     assert "Would create benchmark tmux session: benchmark-capacity-p" in output
-    assert "Peer window a: a_catmux catmux attach" in output
-    assert "Peer window b: b_catmux catmux attach" in output
-    assert "Network window: qdisc monitor" in output
-    assert "Results window: latest result under" in output
+    assert "Run window: high-level orchestrator" in output
+    assert "Peer window a: a_catmux catmux attach + launch log" in output
+    assert "Peer window b: b_catmux catmux attach + launch log" in output
+    assert "Network window: qdisc monitor + tc command log" in output
+    assert "Results window" not in output
     child = " ".join(_benchmark_child_command())
     assert "--interactive" not in child
     assert "--no-attach" not in child

@@ -172,6 +172,13 @@ slice and reuses RFC 0003 + 0004.
   mode, configured load, offered bandwidth, profile shaping context, thresholds,
   verdict, and per-topic loss/latency/jitter metrics; keep `budgets.jsonl` as the
   budget/baseline feed (`cli_benchmark._write_benchmark_result`).
+- [x] Make OTA benchmark runs default to the selected genre's benchmark session
+  instead of a hard-coded project target, while allowing `--target` /
+  `--target-type` for project-specific sessions or scenarios
+  (`cli_benchmark._benchmark_ota_target`).
+- [x] Add an interactive benchmark operator view that opens a local tmux session
+  with separate run, network-shaping, and result windows for local runs and an OTA
+  shaping monitor note for remote runs (`cli_benchmark --interactive`).
 - [x] Build the recovery driver on timeline profiles (RFC 0004) + the recovery
   metric set (`t_recover`, `t_steady`, backlog/burst, lost-during-outage, latched
   re-arrival) (`benchmark.recovery_metrics`; arming the timeline profile is RFC
@@ -216,6 +223,14 @@ reviewed rather than asserted in a blocking test.
   *(`test_capacity_driver_finds_breakpoint_with_stubbed_probe`,
   `test_ramp_driver_builds_curve_with_stubbed_probe`,
   `test_sweep_driver_runs_grid_with_stubbed_probe`.)*
+- [x] **OTA target selection** (default to benchmark genre session, explicit
+  target override for sessions/scenarios) — host unit test for default and
+  override resolution. Automatable. *(`test_benchmark_ota_target_defaults_to_benchmark_session`.)*
+- [x] **Interactive operator view** (tmux run/network/results windows) — host unit
+  test for the dry-run command plan and parser flags; live tmux attachment remains
+  an operator workflow. Automatable for command planning, manual for actual
+  attachment. *(`test_interactive_benchmark_dry_run_prints_operator_view`,
+  `test_benchmark_subcommand_arg_parsing`.)*
 - [x] **Recovery driver + metric set** (`t_recover`, `t_steady`, backlog/burst,
   lost-during-outage, latched re-arrival) — host unit test extracting the metrics
   from a synthetic timeline of transit records (RFC 0003); the **live recovery run

@@ -21,8 +21,11 @@ import rosotacom.cli_benchmark as benchmark_cli
 from rosotacom.cli_benchmark import (
     BENCHMARK_RESULT_FILE,
     DEFAULT_BENCHMARK_RMW,
+    _benchmark_child_command,
+    _benchmark_ota_target,
     _parse_values,
     _prepare_benchmark_session_config,
+    _start_interactive_benchmark,
     collect_transit_summary,
     drive_capacity,
     drive_ramp,
@@ -504,6 +507,40 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     )
     assert args.rmw == "fastdds"
 
+    args = parser.parse_args(
+        [
+            "benchmark",
+            "capacity",
+            "--profile",
+            "p",
+            "--knob",
+            "size",
+            "--low",
+            "1000",
+            "--high",
+            "10000",
+            "--max-loss",
+            "5",
+            "--max-latency-ms",
+            "200",
+            "--target",
+            "remote_assist",
+            "--target-type",
+            "scenario",
+            "--workdir",
+            "/tmp/bench",
+            "--reuse",
+            "--interactive",
+            "--no-attach",
+        ]
+    )
+    assert args.target == "remote_assist"
+    assert args.target_type == "scenario"
+    assert args.workdir == "/tmp/bench"
+    assert args.reuse is True
+    assert args.interactive is True
+    assert args.no_attach is True
+
     # Ramp.
     args = parser.parse_args(["benchmark", "ramp", "--profile", "p", "--values", "1000,2000"])
     assert args.benchmark_command == "ramp"
@@ -608,6 +645,91 @@ def test_benchmark_session_copy_pins_requested_rmw(tmp_path: Path) -> None:
     assert copied["shared"]["rmw"] == "cyclone"
     assert args.session_configs_dir[0] == str(run_dir / "session-configs")
     assert context["runtime_implementation"] == "rmw_cyclonedds_cpp"
+
+
+def test_benchmark_ota_target_defaults_to_benchmark_session() -> None:
+    args = argparse.Namespace(target=None, target_type=None)
+    assert _benchmark_ota_target(args, "bench_1_1_capacity") == ("bench_1_1_capacity", "session")
+
+    args = argparse.Namespace(target="remote_assist", target_type=None)
+    assert _benchmark_ota_target(args, "bench_1_1_capacity") == ("remote_assist", "auto")
+
+    args = argparse.Namespace(target="remote_assist", target_type="scenario")
+    assert _benchmark_ota_target(args, "bench_1_1_capacity") == ("remote_assist", "scenario")
+
+    args = argparse.Namespace(target=None, target_type="scenario")
+    with pytest.raises(ValueError, match="--target-type requires --target"):
+        _benchmark_ota_target(args, "bench_1_1_capacity")
+
+
+def test_interactive_benchmark_dry_run_prints_operator_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import yaml
+
+    ros2docker = tmp_path / "ros2docker.json"
+    ros2docker.write_text("{}", encoding="utf-8")
+    config_file = tmp_path / "rosotacom.yaml"
+    config_file.write_text(
+        yaml.safe_dump(
+            {
+                "ros2docker_config": str(ros2docker),
+                "session_configs_dir": [],
+                "scenario_configs_dir": [],
+                "session_instances_dir": "session-instances",
+                "benchmarks_dir": "benchmarks",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        benchmark_cli.sys,
+        "argv",
+        [
+            "rosotacom",
+            "benchmark",
+            "capacity",
+            "--profile",
+            "p",
+            "--knob",
+            "size",
+            "--low",
+            "1",
+            "--high",
+            "10",
+            "--max-loss",
+            "5",
+            "--max-latency-ms",
+            "200",
+            "--interactive",
+            "--no-attach",
+        ],
+    )
+    args = argparse.Namespace(
+        rosotacom_config=str(config_file),
+        ros2docker_config=None,
+        session_configs_dir=None,
+        scenario_configs_dir=None,
+        session_instances_dir=None,
+        deployment=None,
+        profiles_file=None,
+        artifacts_dir=None,
+        dry_run=True,
+        no_attach=True,
+        profile="p",
+    )
+
+    assert _start_interactive_benchmark(args, "capacity") == 0
+
+    output = capsys.readouterr().out
+    assert "Would create benchmark tmux session: benchmark-capacity-p" in output
+    assert "Network window: qdisc monitor" in output
+    assert "Results window: latest result under" in output
+    child = " ".join(_benchmark_child_command())
+    assert "--interactive" not in child
+    assert "--no-attach" not in child
 
 
 def test_tee_stream_and_stdout_redirection(tmp_path: Path) -> None:

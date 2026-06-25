@@ -23,7 +23,9 @@ from rosotacom.cli_benchmark import (
     DEFAULT_BENCHMARK_RMW,
     _benchmark_child_command,
     _benchmark_ota_target,
+    _benchmark_profiles_file,
     _parse_values,
+    _peer_catmux_attach_script,
     _prepare_benchmark_session_config,
     _start_interactive_benchmark,
     collect_transit_summary,
@@ -371,6 +373,17 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    profiles_file = tmp_path / "profiles" / "benchmark-profiles.yaml"
+    profiles_file.parent.mkdir()
+    profiles_file.write_text(
+        "profiles:\n"
+        "  cellular-4g-degraded:\n"
+        "    uplink: { rate: 1mbit, delay: 180ms, jitter: 50ms, loss: 3% }\n"
+        "    downlink: { rate: 10mbit, delay: 100ms, jitter: 30ms, loss: 1% }\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
     sessions_root = tmp_path / "sessions"
     session_dir = sessions_root / "bench_1_1_capacity"
     session_dir.mkdir(parents=True)
@@ -418,8 +431,10 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
     monkeypatch.setattr(cli, "_remove_smoke_network", lambda name: networks_removed.append(name))
     monkeypatch.setattr(benchmark_cli, "collect_transit_summary", lambda instance_dir: {"topics": {}})
     monkeypatch.setattr(benchmark_cli.time, "sleep", lambda seconds: None)
+    commands: list[list[str]] = []
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
         return subprocess.CompletedProcess(command, 0, "Subscription count: 1\n", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -438,7 +453,9 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
 
     run_point = benchmark_cli._make_live_run_point(args, "bench_1_1_capacity")
 
-    assert run_point(profile="p", load={"size": 1}, duration_s=0.1, out_dir=out_dir) == {"topics": {}}
+    assert run_point(profile="cellular-4g-degraded", load={"size": 1}, duration_s=0.1, out_dir=out_dir) == {
+        "topics": {}
+    }
     assert networks_created == [(smoke_network.name, smoke_network.subnet)]
     assert [(args.identity, args.network_name, args.network_ip) for args in started] == [
         ("a", smoke_network.name, smoke_network.peer_ips["a"]),
@@ -447,6 +464,12 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
     assert all(args.peer_address == cli._smoke_peer_address_args(smoke_network.peer_ips) for args in started)
     assert stopped == ["container_a", "container_b"]
     assert networks_removed == [smoke_network.name]
+    assert any(
+        command[:6] == ["docker", "exec", "-u", "root", "container_a", "tc"] and "3%" in command for command in commands
+    )
+    assert any(
+        command[:6] == ["docker", "exec", "-u", "root", "container_b", "tc"] and "1%" in command for command in commands
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -599,6 +622,15 @@ def test_runtime_config_parses_benchmarks_dir_and_profiles(tmp_path: Path) -> No
     assert runtime.benchmarks_dir == tmp_path / "benchmarks"
 
 
+def test_benchmark_profiles_file_falls_back_to_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    profiles_file = tmp_path / "profiles" / "benchmark-profiles.yaml"
+    profiles_file.parent.mkdir()
+    profiles_file.write_text("profiles: {}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    assert _benchmark_profiles_file("cellular-4g-degraded", None) == profiles_file
+
+
 def test_benchmark_session_copy_pins_requested_rmw(tmp_path: Path) -> None:
     import argparse
 
@@ -662,6 +694,15 @@ def test_benchmark_ota_target_defaults_to_benchmark_session() -> None:
         _benchmark_ota_target(args, "bench_1_1_capacity")
 
 
+def test_peer_catmux_attach_script_waits_for_container_and_tmux() -> None:
+    script = _peer_catmux_attach_script("a", "rosotacom_id_com_to_b")
+
+    assert "waiting for benchmark peer $identity container" in script
+    assert 'docker exec -it "$container" bash -lc' in script
+    assert "tmux list-sessions" in script
+    assert 'tmux attach-session -t "$session"' in script
+
+
 def test_interactive_benchmark_dry_run_prints_operator_view(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -676,7 +717,9 @@ def test_interactive_benchmark_dry_run_prints_operator_view(
         yaml.safe_dump(
             {
                 "ros2docker_config": str(ros2docker),
-                "session_configs_dir": [],
+                "session_configs_dir": [
+                    str(Path(benchmark_cli.__file__).resolve().parent / "resources" / "examples" / "sessions")
+                ],
                 "scenario_configs_dir": [],
                 "session_instances_dir": "session-instances",
                 "benchmarks_dir": "benchmarks",
@@ -725,6 +768,8 @@ def test_interactive_benchmark_dry_run_prints_operator_view(
 
     output = capsys.readouterr().out
     assert "Would create benchmark tmux session: benchmark-capacity-p" in output
+    assert "Peer window a: a_catmux catmux attach" in output
+    assert "Peer window b: b_catmux catmux attach" in output
     assert "Network window: qdisc monitor" in output
     assert "Results window: latest result under" in output
     child = " ".join(_benchmark_child_command())

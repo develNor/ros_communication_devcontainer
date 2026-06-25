@@ -469,7 +469,8 @@ shaping context, thresholds, verdict, and per-topic loss/latency/jitter metrics.
 For OTA benchmark runs (`--deployment ...`), the default target is the benchmark
 session for the selected genre; pass `--target` and `--target-type` to benchmark a
 project-specific session or scenario instead. Add `--interactive` to open a tmux
-operator view with separate run, network-shaping, and result windows.
+operator view with separate run, per-peer catmux, network-shaping, and result
+windows.
 
 ## Development
 

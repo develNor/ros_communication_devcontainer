@@ -65,6 +65,23 @@ def test_expect_only_checked_on_inbound_side() -> None:
     assert evaluate_report(OK_REPORT, {"/heartbeat_b": {"hz": {"min": 50}}}) == []
 
 
+def test_bad_outbound_quality_does_not_fail_receiver_side_contract() -> None:
+    # 11_trickle is the concrete regression: the sender publishes the base topic
+    # at 1 Hz, while the receiver-side trickle output is contracted at 2..8 Hz.
+    # The sender report may therefore classify the outbound base topic as BAD,
+    # but the contract is asserted on the receiver's inbound final stage.
+    bad_outbound_stage = {
+        "stage": "ota_sent",
+        "hz": 1.0,
+        "latency_ms": None,
+        "state": "FLOWING",
+        "quality": "BAD",
+        "quality_reason": "hz",
+    }
+    report = {"peer": "b", "topics": [_topic("/trickle_demo", "outbound", "OK", [bad_outbound_stage])]}
+    assert evaluate_report(report, {"/trickle_demo": {"hz": {"min": 2, "max": 8}}}) == []
+
+
 def test_expectations_from_cfg_collects_only_expect_blocks() -> None:
     cfg = {"topics": {"b_to_a": [{"topic": "/c", "expect": {"hz": {"min": 1}}}, {"topic": "/d"}, "/e"]}}
     assert expectations_from_cfg(cfg) == {"/c": {"hz": {"min": 1}}}

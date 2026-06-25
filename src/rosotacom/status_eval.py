@@ -370,10 +370,11 @@ def evaluate_report(
             # only need to have reached OK, which they have.
             if mode == "stream":
                 if stage and stage.get("quality") == "BAD":
-                    reason = stage.get("quality_reason")
-                    detail = f": {reason}" if reason else ""
-                    failures.append(f"[{peer}] {base}: contract violated (quality BAD{detail})")
-                    continue
+                    if topic.get("direction") == "inbound":
+                        reason = stage.get("quality_reason")
+                        detail = f": {reason}" if reason else ""
+                        failures.append(f"[{peer}] {base}: contract violated (quality BAD{detail})")
+                        continue
                 if expect and topic.get("direction") == "inbound" and stage is not None:
                     failures += _check_expect(peer, base, topic, stage, expect)
                     failures += _check_completeness(peer, base, topic, expect)

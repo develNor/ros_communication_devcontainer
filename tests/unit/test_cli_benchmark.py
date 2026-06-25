@@ -782,6 +782,62 @@ def test_peer_catmux_attach_script_waits_for_container_and_tmux() -> None:
     assert "orchestrator.full.log" in script
     assert 'docker exec "$container" tmux -L catmux list-sessions' in script
     assert 'docker exec -it "$container" tmux -L catmux attach-session -t "$session"' in script
+    assert "split-window" not in script
+
+
+def test_ota_profile_shaping_uses_noninteractive_sudo(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    peer = cli.OtaSmokePeer(name="a", ssh="robot-a", address="10.0.0.10")
+
+    def fake_ota_run(_peer: cli.OtaSmokePeer, script: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((script, kwargs))
+        return subprocess.CompletedProcess(["ssh"], 0, "", "")
+
+    monkeypatch.setattr(cli, "_ota_run", fake_ota_run)
+
+    cli._peer_command_runner(peer, dry_run=False)(["tc", "qdisc", "show", "dev", "tun0"])
+    cli._peer_watchdog_launcher(peer, dry_run=False)(["sh", "-c", "sleep 1; tc qdisc del dev tun0 root"])
+
+    assert calls[0][0] == "sudo -n tc qdisc show dev tun0"
+    assert calls[0][1]["label"] == "a: tc/netem"
+    assert calls[1][0].startswith("nohup sudo -n sh -c ")
+    assert calls[1][1]["label"] == "a: profile safety watchdog"
+
+
+def test_ota_preflight_can_require_passwordless_network_shaping(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+    plan = cli.OtaSmokePlan(
+        state_path=None,
+        workdir="/tmp/rosotacom_ota",
+        rosotacom="rosotacom",
+        project="project/rosotacom.yaml",
+        peers={"a": cli.OtaSmokePeer(name="a", ssh="robot-a", address="10.0.0.10")},
+    )
+
+    def fake_ota_run(
+        _peer: cli.OtaSmokePeer,
+        script: str,
+        *,
+        label: str,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((label, script))
+        return subprocess.CompletedProcess(["ssh"], 0, "", "")
+
+    monkeypatch.setattr(cli, "_ota_run", fake_ota_run)
+
+    cli._ota_preflight(
+        plan,
+        require_tmux=False,
+        check_peer_reachability=False,
+        dry_run=False,
+        require_network_shaping_sudo=True,
+    )
+
+    assert (
+        "a: passwordless sudo for network shaping",
+        "command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 && sudo -n true",
+    ) in calls
 
 
 def test_interactive_benchmark_dry_run_prints_operator_view(
@@ -850,10 +906,11 @@ def test_interactive_benchmark_dry_run_prints_operator_view(
     output = capsys.readouterr().out
     assert "Would create benchmark tmux session: benchmark-capacity-p" in output
     assert "Run window: high-level orchestrator" in output
-    assert "Peer window a: a_catmux catmux attach + launch log" in output
-    assert "Peer window b: b_catmux catmux attach + launch log" in output
+    assert "Peer window a: a_catmux fullscreen catmux attach" in output
+    assert "Peer window b: b_catmux fullscreen catmux attach" in output
     assert "Network window: qdisc monitor + tc command log" in output
-    assert "Results window" not in output
+    assert "Results window: final result printed once" in output
+    assert "launch log" not in output
     child = " ".join(_benchmark_child_command())
     assert "--interactive" not in child
     assert "--no-attach" not in child

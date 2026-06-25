@@ -490,23 +490,7 @@ def _peer_catmux_attach_script(identity: str, container_name: str, full_log: Pat
     )
 
 
-def _peer_launch_watch_script(identity: str, container_name: str, full_log: Path) -> str:
-    launch_pattern = f"{container_name}|--identity {identity}|identity {identity}|rosotacom session started"
-    return (
-        "while true; do "
-        "clear; date; "
-        f"container={shlex.quote(container_name)}; identity={shlex.quote(identity)}; "
-        'echo "[INFO] benchmark peer $identity launch/container log"; '
-        "docker ps --filter name=\"$container\" --format 'table {{.Names}}\\t{{.Status}}' 2>/dev/null || true; "
-        "echo; echo '[INFO] orchestrator lines'; " + _grep_log_fragment(full_log, launch_pattern, lines=60) + "; "
-        "echo; echo '[INFO] docker logs tail'; "
-        'docker logs --tail 40 "$container" 2>&1 || true; '
-        "sleep 2; "
-        "done"
-    )
-
-
-def _benchmark_peer_windows(args: argparse.Namespace, genre: str, full_log: Path) -> list[tuple[str, str, str, str]]:
+def _benchmark_peer_windows(args: argparse.Namespace, genre: str, full_log: Path) -> list[tuple[str, str, str]]:
     from .cli import (
         _container_name,
         _effective_session_config,
@@ -525,19 +509,50 @@ def _benchmark_peer_windows(args: argparse.Namespace, genre: str, full_log: Path
     peers = cfg.get("peers")
     if not isinstance(peers, dict):
         return []
-    windows: list[tuple[str, str, str, str]] = []
+    windows: list[tuple[str, str, str]] = []
     for identity in sorted(str(peer) for peer in peers):
         container_name = _container_name(_remote_peer_name(cfg, identity), runtime)
         window_name = _safe_path_token(f"{identity}_catmux")
-        windows.append(
-            (
-                window_name,
-                identity,
-                _peer_catmux_attach_script(identity, container_name, full_log),
-                _peer_launch_watch_script(identity, container_name, full_log),
-            )
-        )
+        windows.append((window_name, identity, _peer_catmux_attach_script(identity, container_name, full_log)))
     return windows
+
+
+def _result_once_script(full_log: Path) -> str:
+    script = f"""
+import json
+import pathlib
+import re
+import sys
+import time
+
+log_path = pathlib.Path({str(full_log)!r})
+result_re = re.compile(r"Benchmark result saved to (.+)")
+exit_re = re.compile(r"benchmark exited with status (\\d+)")
+
+print("[INFO] waiting for final benchmark result in", log_path, flush=True)
+while True:
+    if log_path.is_file():
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        matches = result_re.findall(text)
+        if matches:
+            result_path = pathlib.Path(matches[-1].strip())
+            print("[INFO] final benchmark result:", result_path)
+            if result_path.is_file():
+                with result_path.open(encoding="utf-8") as handle:
+                    print(json.dumps(json.load(handle), indent=2, sort_keys=True))
+            else:
+                print("[WARN] result path was reported but is not readable yet:", result_path)
+            print()
+            print("[INFO] result printed once; pane remains open for inspection")
+            sys.exit(0)
+        exit_match = exit_re.search(text)
+        if exit_match:
+            print("[WARN] benchmark exited with status", exit_match.group(1), "before reporting a result file")
+            print("[INFO] inspect the run window or full orchestrator log:", log_path)
+            sys.exit(1)
+    time.sleep(1)
+""".strip()
+    return shlex.join([sys.executable, "-c", script])
 
 
 def _network_command_watch_script(full_log: Path, *, is_ota: bool) -> str:
@@ -598,19 +613,21 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
     run_script = _benchmark_run_script(command, full_log, session_name)
     network_script = _network_watch_script(is_ota=is_ota)
     network_command_script = _network_command_watch_script(full_log, is_ota=is_ota)
+    result_script = _result_once_script(full_log)
     peer_windows = _benchmark_peer_windows(args, genre, full_log) if not is_ota else []
 
     if getattr(args, "dry_run", False):
         print(f"Would create benchmark tmux session: {session_name}")
         print(f"Run window: high-level orchestrator (full log {full_log})")
         print("Child command: " + shlex.join(command))
-        for window_name, identity, _attach_script, _launch_script in peer_windows:
-            print(f"Peer window {identity}: {window_name} catmux attach + launch log")
+        for window_name, identity, _attach_script in peer_windows:
+            print(f"Peer window {identity}: {window_name} fullscreen catmux attach")
         print(
             "Network window: qdisc monitor + tc command log"
             if not is_ota
             else "Network window: OTA shaping monitor + remote tc command log"
         )
+        print("Results window: final result printed once")
         return 0
 
     _require_tmux()
@@ -654,7 +671,7 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
         check=True,
     )
 
-    for window_name, identity, attach_script, launch_script in peer_windows:
+    for window_name, identity, attach_script in peer_windows:
         created_window = subprocess.run(
             _tmux_command(
                 runtime,
@@ -676,16 +693,6 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
         pane_id = created_window.stdout.strip()
         subprocess.run(_tmux_command(runtime, "select-pane", "-t", pane_id, "-T", f"{identity}:catmux"), check=True)
         _attach_tmux_pipe(runtime, pane_id, interactive_logs / f"{identity}_catmux.log")
-        _create_tmux_split_below(
-            runtime,
-            pane_id,
-            f"{identity}:launch",
-            _host_shell(launch_script),
-            log_path=interactive_logs / f"{identity}_launch.log",
-        )
-        subprocess.run(
-            _tmux_command(runtime, "select-layout", "-t", f"{session_name}:{window_name}", "even-vertical"), check=True
-        )
 
     created_network = subprocess.run(
         _tmux_command(
@@ -718,6 +725,28 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
     subprocess.run(
         _tmux_command(runtime, "select-layout", "-t", f"{session_name}:network", "even-vertical"), check=True
     )
+
+    created_results = subprocess.run(
+        _tmux_command(
+            runtime,
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            session_name,
+            "-n",
+            "results",
+            _host_shell(result_script),
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    results_pane = created_results.stdout.strip()
+    subprocess.run(_tmux_command(runtime, "select-pane", "-t", results_pane, "-T", "results:final"), check=True)
+    _attach_tmux_pipe(runtime, results_pane, interactive_logs / "results.log")
 
     subprocess.run(_tmux_command(runtime, "select-window", "-t", f"{session_name}:run"), check=True)
     print(f"Benchmark tmux session: {session_name}")
@@ -1512,6 +1541,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
             runtime, plan, target = _resolve_ota_smoke_context(smoke_args)
             dry_run = smoke_args.dry_run
+            _profile_name, profile_obj = _resolve_ota_profile(runtime, target, smoke_args)
 
             if not smoke_args.skip_preflight:
                 _ota_preflight(
@@ -1519,6 +1549,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     require_tmux=target.target_type == "scenario",
                     check_peer_reachability=False,
                     dry_run=dry_run,
+                    require_network_shaping_sudo=profile_obj is not None,
                 )
             _ota_prepare_hosts(smoke_args, runtime, plan)
             instance = _resolve_session_instance(
@@ -1539,7 +1570,6 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 interactive=False,
                 phase="running",
             )
-            profile_name, profile_obj = _resolve_ota_profile(runtime, target, smoke_args)
             directions = _profile_directions(plan, target.cfg) if profile_obj is not None else {}
             shapers = []
             try:

@@ -476,9 +476,11 @@ rosotacom ota-benchmark capacity --profile cellular-4g-degraded --knob size --lo
 OTA benchmarks default to the benchmark session for the selected genre. Pass
 `--target` and `--target-type` only when you deliberately want to benchmark a
 project-specific session or scenario instead. Add `--interactive` to open a tmux
-operator view with a high-level run window, one attachable catmux plus launch-log
-window per local peer, and a network window split into qdisc status and tc/netem
-command logs.
+operator view with a high-level run window, one fullscreen attachable catmux
+window per local peer, a network window split into qdisc status and tc/netem
+command logs, and a results window that prints the final result once. Shaped OTA
+benchmark profiles require passwordless non-interactive sudo for `tc`/`ip` on the
+remote peers; preflight checks this before arming the profile.
 
 ## Development
 

@@ -468,10 +468,13 @@ directory with the selected RMW, configured load and offered bandwidth, profile
 shaping context, thresholds, verdict, and per-topic loss/latency/jitter metrics.
 Use `benchmark requirements` when you want rosotacom to search for a tight
 network profile for a stream and quality target. The driver starts from ideal
-conditions, worsens bandwidth, latency, jitter, and loss with a coordinate
-boundary search, then writes the chosen profile, all probes, and the nearby
-failing neighbors to `result.json`, `requirements.jsonl`, and
-`generated-profiles.yaml`:
+conditions, uses a geometric boundary search for bandwidth, linear boundary
+searches for latency-like axes, and finishes with an extra refinement pass around
+the final candidate. By default jitter and loss are searched as a coupled
+practical tradeoff curve; pass `--loss-coupling independent` if you want network
+loss treated as its own axis. The chosen profile, target slack, all probes, and
+the nearby failing neighbors are written to `result.json`, `requirements.jsonl`,
+and `generated-profiles.yaml`:
 
 ```bash
 rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 5 --max-latency-ms 250

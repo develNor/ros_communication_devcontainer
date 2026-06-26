@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 import rosotacom.cli as cli
 import rosotacom.cli_benchmark as benchmark_cli
@@ -24,6 +25,7 @@ from rosotacom.cli_benchmark import (
     _benchmark_child_command,
     _benchmark_ota_target,
     _benchmark_profiles_file,
+    _build_sensitivity_profiles,
     _initialize_interactive_log,
     _is_ota_benchmark,
     _parse_values,
@@ -34,6 +36,7 @@ from rosotacom.cli_benchmark import (
     collect_transit_summary,
     drive_capacity,
     drive_ramp,
+    drive_sensitivity,
     drive_sweep,
     register_benchmark_parser,
 )
@@ -263,6 +266,101 @@ def test_sweep_driver_runs_grid_with_stubbed_probe(tmp_path: Path) -> None:
     # Frontier file was written.
     assert (tmp_path / "frontier.jsonl").exists()
     assert (tmp_path / BENCHMARK_RESULT_FILE).exists()
+
+
+def test_sweep_driver_supports_unshaped_profile(tmp_path: Path) -> None:
+    seen_profiles: list[str | None] = []
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        seen_profiles.append(profile)
+        return _make_stub_probe(loss_pct=0.0, latency_p95=10.0)(
+            profile=profile,
+            load=load,
+            duration_s=duration_s,
+            out_dir=out_dir,
+        )
+
+    frontier = drive_sweep(
+        probe,
+        profile_grid=["none", "profile-a"],
+        max_loss_pct=5.0,
+        max_latency_ms=200.0,
+        duration_s=1.0,
+        out_dir=tmp_path,
+    )
+
+    assert seen_profiles == [None, "profile-a"]
+    assert [row["profile"] for row in frontier] == ["none", "profile-a"]
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["configuration"]["profile_grid"] == ["none", "profile-a"]
+
+
+# --------------------------------------------------------------------------- #
+# Sensitivity driver
+# --------------------------------------------------------------------------- #
+
+
+def test_sensitivity_profile_generation_and_driver(tmp_path: Path) -> None:
+    profiles_file = tmp_path / "profiles.yaml"
+    profiles_file.write_text(
+        "profiles:\n"
+        "  cellular-4g-degraded:\n"
+        "    uplink:\n"
+        "      { rate: 1mbit, delay: 180ms, jitter: 50ms, distribution: normal, loss: 3%, loss_correlation: 25% }\n"
+        "    downlink: { rate: 10mbit, delay: 100ms, jitter: 30ms, loss: 1% }\n",
+        encoding="utf-8",
+    )
+    generated, cases = _build_sensitivity_profiles(
+        base_profile="cellular-4g-degraded",
+        profiles_file=profiles_file,
+        ideal_rate="1gbit",
+        loss_values=[0.0, 3.0],
+        delay_values=[0.0, 180.0],
+        jitter_values=[0.0, 50.0],
+        rate_values=["1gbit", "1mbit"],
+        correlation_values=[0.0, 25.0],
+        axes=["jitter"],
+    )
+    generated_file = tmp_path / "generated-profiles.yaml"
+    generated_file.write_text(yaml.safe_dump(generated, sort_keys=False), encoding="utf-8")
+
+    seen_profiles: list[str | None] = []
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        seen_profiles.append(profile)
+        latency = 10.0 if profile is None or profile == "lab_ideal_rate_only" else 25.0
+        return _make_stub_probe(loss_pct=0.0, latency_p95=latency)(
+            profile=profile,
+            load=load,
+            duration_s=duration_s,
+            out_dir=out_dir,
+        )
+
+    rows = drive_sensitivity(
+        probe,
+        cases=cases,
+        max_loss_pct=5.0,
+        max_latency_ms=200.0,
+        rate_hz=20.0,
+        size=1,
+        topic="",
+        duration_s=1.0,
+        out_dir=tmp_path,
+        generated_profiles_file=generated_file,
+    )
+
+    assert seen_profiles[0] is None
+    assert any(row["axis"] == "jitter" and row["value"] == "50ms" for row in rows)
+    assert not any(row["axis"] == "loss" for row in rows)
+    assert generated["metadata"]["axes"] == ["jitter"]
+    assert all(row["expected"] == 100 for row in rows)
+    assert all(row["delivered"] == 100 for row in rows)
+    assert all(row["lost"] == 0 for row in rows)
+    assert (tmp_path / "sensitivity.jsonl").is_file()
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["genre"] == "sensitivity"
+    assert result_doc["artifacts"]["generated_profiles"] == "generated-profiles.yaml"
+    assert result_doc["result"]["analysis"]["axes"]["jitter"]["points"] == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -582,6 +680,13 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     # Sweep.
     args = parser.parse_args(["benchmark", "sweep", "--profile-grid", "p1,p2"])
     assert args.benchmark_command == "sweep"
+
+    # Sensitivity.
+    args = parser.parse_args(["benchmark", "sensitivity", "--profile", "cellular-4g-degraded"])
+    assert args.benchmark_command == "sensitivity"
+    assert args.size == 1
+    assert args.loss_values == "0,0.5,1,3,5"
+    assert args.axes == "all"
 
     # Plot.
     args = parser.parse_args(["benchmark", "plot", "results.jsonl"])

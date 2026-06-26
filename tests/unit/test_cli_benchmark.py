@@ -29,15 +29,18 @@ from rosotacom.cli_benchmark import (
     _build_sensitivity_profiles,
     _initialize_interactive_log,
     _is_ota_benchmark,
+    _parse_requirements_axes,
     _parse_values,
     _peer_catmux_attach_script,
     _prepare_benchmark_session_config,
+    _requirements_jitter_loss_pct,
     _result_once_script,
     _start_interactive_benchmark,
     collect_transit_summary,
     drive_capacity,
     drive_matrix,
     drive_ramp,
+    drive_requirements,
     drive_sensitivity,
     drive_sweep,
     register_benchmark_parser,
@@ -445,6 +448,219 @@ def test_matrix_profile_generation_and_driver(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Requirements driver
+# --------------------------------------------------------------------------- #
+
+
+def test_requirements_driver_finds_tight_profile_with_stubbed_probe(tmp_path: Path) -> None:
+    from rosotacom.network_profiles import parse_ms, parse_pct, parse_rate_bps
+
+    generated_file = tmp_path / "generated-profiles.yaml"
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        assert profile is not None
+        generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
+        spec = generated["profiles"][profile]["uplink"]
+        bandwidth = parse_rate_bps(spec["rate"])
+        latency = parse_ms(spec.get("delay", 0), "delay")
+        jitter = parse_ms(spec.get("jitter", 0), "jitter")
+        loss = parse_pct(spec.get("loss", 0), "loss")
+
+        # Deterministic synthetic quality model:
+        # - bandwidth below 4 Mbit/s causes loss,
+        # - jitter above 20 ms causes loss,
+        # - network loss maps 1:1.5 into ROS-level loss,
+        # - latency and jitter combine into p95 latency.
+        ros_loss = max(0.0, (4_000_000.0 - bandwidth) / 1_000_000.0 * 3.0) + max(0.0, jitter - 20.0) * 0.4
+        ros_loss += loss * 1.5
+        latency_p95 = 40.0 + latency + jitter * 2.0
+        return {
+            "topics": {
+                "/test": {
+                    "expected": 100,
+                    "delivered": max(0, 100 - int(round(ros_loss))),
+                    "lost": int(round(ros_loss)),
+                    "loss_pct": ros_loss,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": latency_p95 * 0.6, "p95": latency_p95},
+                    "jitter_ms": {"p50": jitter * 0.5, "p95": jitter},
+                }
+            }
+        }
+
+    result = drive_requirements(
+        probe,
+        max_loss_pct=5.0,
+        max_latency_ms=250.0,
+        rate_hz=20.0,
+        size=18_000,
+        streams=1,
+        qos_reliability="best_effort",
+        qos_depth=1,
+        topic="/test",
+        out_dir=tmp_path,
+        bandwidth_high_bps=10_000_000.0,
+        bandwidth_low_bps=1_000_000.0,
+        latency_high_ms=300.0,
+        jitter_high_ms=60.0,
+        loss_high_pct=10.0,
+        axes=_parse_requirements_axes("bandwidth,latency,jitter,loss"),
+        min_duration_s=20.0,
+        min_messages=100,
+        search_iterations=6,
+        search_rounds=1,
+        distribution="normal",
+        final_refine_iterations=0,
+        loss_coupling="independent",
+        result_context={"test": True},
+        generated_profiles_file=generated_file,
+    )
+
+    profile = result["profile"]["candidate"]
+    assert result["analysis"]["final_passes"] is True
+    assert result["analysis"]["tight"] is True
+    assert 2_200_000.0 <= profile["bandwidth_bps"] <= 2_500_000.0
+    assert 200.0 <= profile["uplink_latency_ms"] <= 210.0
+    assert profile["jitter_ms"] <= 2.0
+    assert profile["loss_pct"] == 0.0
+    assert all(result["bounds"][axis]["last_fail"] for axis in ("bandwidth", "latency", "jitter", "loss"))
+    assert (tmp_path / "requirements.jsonl").is_file()
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["genre"] == "requirements"
+    assert result_doc["result"]["stream"]["load"]["mean_payload_bytes"] == 18_000.0
+    assert result_doc["artifacts"]["generated_profiles"] == "generated-profiles.yaml"
+    assert "requirements_final" in yaml.safe_load(generated_file.read_text(encoding="utf-8"))["profiles"]
+
+
+def test_requirements_driver_can_search_coupled_jitter_loss(tmp_path: Path) -> None:
+    from rosotacom.network_profiles import parse_ms, parse_pct
+
+    generated_file = tmp_path / "generated-profiles.yaml"
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        assert profile is not None
+        generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
+        spec = generated["profiles"][profile]["uplink"]
+        jitter = parse_ms(spec.get("jitter", 0), "jitter")
+        loss = parse_pct(spec.get("loss", 0), "loss")
+        latency_p95 = 40.0 + jitter * 2.0
+        ros_loss = loss + max(0.0, jitter - 20.0) * 0.5
+        return {
+            "topics": {
+                "/test": {
+                    "expected": 100,
+                    "delivered": max(0, 100 - int(round(ros_loss))),
+                    "lost": int(round(ros_loss)),
+                    "loss_pct": ros_loss,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": latency_p95 * 0.6, "p95": latency_p95},
+                    "jitter_ms": {"p50": jitter * 0.5, "p95": jitter},
+                }
+            }
+        }
+
+    result = drive_requirements(
+        probe,
+        max_loss_pct=5.0,
+        max_latency_ms=100.0,
+        rate_hz=20.0,
+        size=18_000,
+        streams=1,
+        qos_reliability="best_effort",
+        qos_depth=1,
+        topic="/test",
+        out_dir=tmp_path,
+        bandwidth_high_bps=100_000_000.0,
+        bandwidth_low_bps=10_000_000.0,
+        latency_high_ms=0.0,
+        jitter_high_ms=50.0,
+        loss_high_pct=10.0,
+        axes=_parse_requirements_axes("jitter,loss"),
+        min_duration_s=20.0,
+        min_messages=100,
+        search_iterations=5,
+        search_rounds=1,
+        distribution="normal",
+        final_refine_iterations=2,
+        loss_coupling="jitter",
+        result_context={"test": True},
+        generated_profiles_file=generated_file,
+    )
+
+    profile = result["profile"]["candidate"]
+    assert "jitter_loss" in result["bounds"]
+    assert "loss" not in result["bounds"]
+    assert profile["jitter_ms"] == pytest.approx(28.125)
+    assert profile["loss_pct"] == pytest.approx(_requirements_jitter_loss_pct(profile["jitter_ms"]))
+    assert result["analysis"]["loss_coupling"] == "jitter"
+    assert result["analysis"]["final_target_quality"]["limiting_metric"] == "loss"
+    assert result["analysis"]["final_target_quality"]["utilization"] == pytest.approx(0.99375)
+
+
+def test_requirements_bandwidth_refine_recovers_when_previous_fail_becomes_pass(tmp_path: Path) -> None:
+    from rosotacom.network_profiles import parse_rate_bps
+
+    generated_file = tmp_path / "generated-profiles.yaml"
+    four_mbit_seen = 0
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        nonlocal four_mbit_seen
+        assert profile is not None
+        generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
+        rate_bps = parse_rate_bps(generated["profiles"][profile]["uplink"]["rate"])
+        if 3_900_000.0 <= rate_bps <= 4_100_000.0:
+            four_mbit_seen += 1
+            passes = four_mbit_seen >= 2
+        else:
+            passes = rate_bps > 4_100_000.0
+        return {
+            "topics": {
+                "/test": {
+                    "expected": 100,
+                    "delivered": 100 if passes else 0,
+                    "lost": 0 if passes else 100,
+                    "loss_pct": 0.0 if passes else 100.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": 5.0, "p95": 5.0},
+                    "jitter_ms": {"p50": 1.0, "p95": 1.0},
+                }
+            }
+        }
+
+    result = drive_requirements(
+        probe,
+        max_loss_pct=5.0,
+        max_latency_ms=250.0,
+        rate_hz=20.0,
+        size=18_000,
+        streams=1,
+        qos_reliability="best_effort",
+        qos_depth=1,
+        topic="/test",
+        out_dir=tmp_path,
+        bandwidth_high_bps=16_000_000.0,
+        bandwidth_low_bps=1_000_000.0,
+        latency_high_ms=0.0,
+        jitter_high_ms=0.0,
+        loss_high_pct=0.0,
+        axes=_parse_requirements_axes("bandwidth"),
+        min_duration_s=20.0,
+        min_messages=100,
+        search_iterations=1,
+        search_rounds=1,
+        distribution="normal",
+        final_refine_iterations=1,
+        loss_coupling="jitter",
+        result_context={"test": True},
+        generated_profiles_file=generated_file,
+    )
+
+    assert result["bounds"]["bandwidth"]["status"] == "bounded_after_floor_reset"
+    assert result["bounds"]["bandwidth"]["tight"] is True
+    assert result["bounds"]["bandwidth"]["last_fail"]
+
+
+# --------------------------------------------------------------------------- #
 # Budget save/load/compare roundtrip (CLI-level)
 # --------------------------------------------------------------------------- #
 
@@ -778,6 +994,20 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.qos_cases == "best_effort:1,reliable:1,best_effort:10,reliable:10"
     assert args.min_duration == 20.0
     assert args.min_messages == 100
+
+    # Requirements.
+    args = parser.parse_args(["benchmark", "requirements"])
+    assert args.benchmark_command == "requirements"
+    assert args.rate_hz == 20.0
+    assert args.size == 18_000
+    assert args.max_loss == 5.0
+    assert args.max_latency_ms == 250.0
+    assert args.axes == "all"
+    assert args.bandwidth_high == "1gbit"
+    assert args.search_iterations == 6
+    assert args.search_rounds == 1
+    assert args.final_refine_iterations == 3
+    assert args.loss_coupling == "jitter"
 
     # Plot.
     args = parser.parse_args(["benchmark", "plot", "results.jsonl"])

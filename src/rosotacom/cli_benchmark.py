@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -40,6 +40,7 @@ BENCHMARK_SESSIONS_BY_GENRE = {
     "recovery": "bench_1_4_recovery",
     "sensitivity": "bench_1_1_capacity",
     "matrix": "bench_1_1_capacity",
+    "requirements": "bench_1_1_capacity",
 }
 
 
@@ -892,10 +893,14 @@ def _start_interactive_benchmark(args: argparse.Namespace, genre: str) -> int:
 def _format_bps(value: float | None) -> str:
     if value is None:
         return "unknown"
+
+    def decimal(scaled: float) -> str:
+        return f"{scaled:.3f}".rstrip("0").rstrip(".")
+
     if value >= 1_000_000:
-        return f"{value / 1_000_000:.3g} Mbit/s"
+        return f"{decimal(value / 1_000_000)} Mbit/s"
     if value >= 1_000:
-        return f"{value / 1_000:.3g} kbit/s"
+        return f"{decimal(value / 1_000)} kbit/s"
     return f"{value:.0f} bit/s"
 
 
@@ -1444,13 +1449,17 @@ def _format_yaml_rate(value: float | str | None) -> str | None:
         return None
     if isinstance(value, str):
         return value
-    if value >= 1_000_000_000 and value % 1_000_000_000 == 0:
-        return f"{value / 1_000_000_000:g}gbit"
-    if value >= 1_000_000 and value % 1_000_000 == 0:
-        return f"{value / 1_000_000:g}mbit"
-    if value >= 1_000 and value % 1_000 == 0:
-        return f"{value / 1_000:g}kbit"
-    return f"{value:g}bit"
+
+    def decimal(scaled: float) -> str:
+        return f"{scaled:.6f}".rstrip("0").rstrip(".")
+
+    if value >= 1_000_000_000:
+        return f"{decimal(value / 1_000_000_000)}gbit"
+    if value >= 1_000_000:
+        return f"{decimal(value / 1_000_000)}mbit"
+    if value >= 1_000:
+        return f"{decimal(value / 1_000)}kbit"
+    return f"{decimal(value)}bit"
 
 
 def _parse_rate_values(raw: str) -> list[str]:
@@ -2136,6 +2145,653 @@ def drive_matrix(
     )
     print(f"Matrix rows saved to {matrix_path}")
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# Benchmark driver: requirements
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class _RequirementCandidate:
+    bandwidth_bps: float
+    latency_ms: float = 0.0
+    jitter_ms: float = 0.0
+    loss_pct: float = 0.0
+
+
+def _parse_requirements_axes(raw: str) -> list[str]:
+    available = ("bandwidth", "latency", "jitter", "loss")
+    aliases = {"rate": "bandwidth", "bw": "bandwidth", "delay": "latency"}
+    axes = [aliases.get(value.strip().lower(), value.strip().lower()) for value in raw.split(",") if value.strip()]
+    if not axes or "all" in axes:
+        return list(available)
+    unknown = sorted(set(axes) - set(available))
+    if unknown:
+        raise ValueError(f"Unknown requirements axes: {', '.join(unknown)}")
+    return [axis for axis in available if axis in axes]
+
+
+def _requirements_axis_value(candidate: _RequirementCandidate, axis: str) -> float:
+    return {
+        "bandwidth": candidate.bandwidth_bps,
+        "latency": candidate.latency_ms,
+        "jitter": candidate.jitter_ms,
+        "jitter_loss": candidate.jitter_ms,
+        "loss": candidate.loss_pct,
+    }[axis]
+
+
+def _requirements_with_axis(candidate: _RequirementCandidate, axis: str, value: float) -> _RequirementCandidate:
+    updates = {
+        "bandwidth_bps": candidate.bandwidth_bps,
+        "latency_ms": candidate.latency_ms,
+        "jitter_ms": candidate.jitter_ms,
+        "loss_pct": candidate.loss_pct,
+    }
+    if axis == "bandwidth":
+        updates["bandwidth_bps"] = value
+    elif axis == "latency":
+        updates["latency_ms"] = value
+    elif axis == "jitter":
+        updates["jitter_ms"] = value
+    elif axis == "loss":
+        updates["loss_pct"] = value
+    else:
+        raise ValueError(f"Unknown requirements axis {axis!r}.")
+    return _RequirementCandidate(**updates)
+
+
+def _requirements_candidate_context(candidate: _RequirementCandidate, *, downlink_ratio: float = 1.0) -> dict[str, Any]:
+    return {
+        "bandwidth_bps": candidate.bandwidth_bps,
+        "bandwidth": _format_yaml_rate(candidate.bandwidth_bps),
+        "uplink_latency_ms": candidate.latency_ms,
+        "downlink_latency_ms": candidate.latency_ms * downlink_ratio,
+        "jitter_ms": candidate.jitter_ms,
+        "loss_pct": candidate.loss_pct,
+    }
+
+
+def _requirements_profile_spec(
+    candidate: _RequirementCandidate,
+    *,
+    distribution: str,
+    downlink_ratio: float,
+) -> dict[str, Any]:
+    latency_downlink_ms = candidate.latency_ms * downlink_ratio
+    delay_uplink = candidate.latency_ms if candidate.latency_ms > 0.0 or candidate.jitter_ms > 0.0 else None
+    delay_downlink = latency_downlink_ms if latency_downlink_ms > 0.0 or candidate.jitter_ms > 0.0 else None
+    loss = candidate.loss_pct if candidate.loss_pct > 0.0 else None
+    return {
+        "uplink": _direction_to_yaml(
+            rate=_format_yaml_rate(candidate.bandwidth_bps),
+            delay_ms=delay_uplink,
+            jitter_ms=candidate.jitter_ms if candidate.jitter_ms > 0.0 else None,
+            distribution=distribution,
+            loss_pct=loss,
+        ),
+        "downlink": _direction_to_yaml(
+            rate=_format_yaml_rate(candidate.bandwidth_bps),
+            delay_ms=delay_downlink,
+            jitter_ms=candidate.jitter_ms if candidate.jitter_ms > 0.0 else None,
+            distribution=distribution,
+            loss_pct=loss,
+        ),
+    }
+
+
+def _requirements_profile_name(prefix: str, index: int, axis: str, candidate: _RequirementCandidate) -> str:
+    parts = [
+        prefix,
+        f"{index:03d}",
+        axis,
+        _safe_case_token(_format_yaml_rate(candidate.bandwidth_bps) or str(candidate.bandwidth_bps)),
+        f"lat{candidate.latency_ms:g}ms",
+        f"jit{candidate.jitter_ms:g}ms",
+        f"loss{candidate.loss_pct:g}pct",
+    ]
+    return _safe_case_token("_".join(parts))
+
+
+def _requirements_row_summary(row: dict[str, Any]) -> str:
+    return (
+        f"{row['axis']}[{row['phase']}] "
+        f"bw={_format_bps(row['candidate']['bandwidth_bps'])} "
+        f"lat={row['candidate']['uplink_latency_ms']:g}ms "
+        f"jitter={row['candidate']['jitter_ms']:g}ms "
+        f"loss={row['candidate']['loss_pct']:g}%"
+    )
+
+
+def _requirements_jitter_loss_pct(jitter_ms: float) -> float:
+    """Practical jitter/loss coupling curve for mobile-ish shaped links."""
+    points = (
+        (0.0, 0.0),
+        (10.0, 0.1),
+        (15.0, 0.2),
+        (20.0, 0.5),
+        (30.0, 1.0),
+        (50.0, 3.0),
+    )
+    if jitter_ms <= points[0][0]:
+        return points[0][1]
+    for (left_jitter, left_loss), (right_jitter, right_loss) in zip(points, points[1:], strict=False):
+        if jitter_ms <= right_jitter:
+            span = right_jitter - left_jitter
+            fraction = (jitter_ms - left_jitter) / span if span else 0.0
+            return left_loss + (right_loss - left_loss) * fraction
+    last_jitter, last_loss = points[-1]
+    prev_jitter, prev_loss = points[-2]
+    slope = (last_loss - prev_loss) / (last_jitter - prev_jitter)
+    return last_loss + (jitter_ms - last_jitter) * slope
+
+
+def _requirements_target_quality(row: dict[str, Any], *, max_loss_pct: float, max_latency_ms: float) -> dict[str, Any]:
+    loss_pct = row.get("loss_pct")
+    latency_p95_ms = row.get("latency_p95_ms")
+    loss_ratio = float(loss_pct) / max_loss_pct if loss_pct is not None and max_loss_pct > 0 else None
+    latency_ratio = (
+        float(latency_p95_ms) / max_latency_ms if latency_p95_ms is not None and max_latency_ms > 0 else None
+    )
+    known_ratios: dict[str, float] = {}
+    if loss_ratio is not None:
+        known_ratios["loss"] = loss_ratio
+    if latency_ratio is not None:
+        known_ratios["latency"] = latency_ratio
+    limiting_metric = max(known_ratios, key=lambda key: known_ratios[key]) if known_ratios else None
+    utilization = known_ratios[limiting_metric] if limiting_metric else None
+    return {
+        "loss_margin_pct": max_loss_pct - float(loss_pct) if loss_pct is not None else None,
+        "latency_margin_ms": max_latency_ms - float(latency_p95_ms) if latency_p95_ms is not None else None,
+        "loss_ratio": loss_ratio,
+        "latency_ratio": latency_ratio,
+        "utilization": utilization,
+        "limiting_metric": limiting_metric,
+    }
+
+
+def _format_requirements_target_quality(quality: dict[str, Any]) -> str:
+    utilization = quality.get("utilization")
+    limiting = quality.get("limiting_metric") or "unknown"
+    if utilization is None:
+        return "target=unknown"
+    return f"target={utilization * 100:.1f}%({limiting})"
+
+
+def drive_requirements(
+    run_point: RunPointFn,
+    *,
+    max_loss_pct: float,
+    max_latency_ms: float,
+    rate_hz: float,
+    size: int,
+    streams: int,
+    qos_reliability: str,
+    qos_depth: int,
+    topic: str,
+    out_dir: Path,
+    bandwidth_high_bps: float,
+    bandwidth_low_bps: float,
+    latency_high_ms: float,
+    jitter_high_ms: float,
+    loss_high_pct: float,
+    axes: Sequence[str],
+    min_duration_s: float,
+    min_messages: int,
+    search_iterations: int,
+    search_rounds: int,
+    distribution: str,
+    final_refine_iterations: int = 2,
+    loss_coupling: str = "jitter",
+    downlink_ratio: float = 1.0,
+    result_context: dict[str, Any] | None = None,
+    generated_profiles_file: Path | None = None,
+    profile_prefix: str = "requirements",
+) -> dict[str, Any]:
+    from .benchmark import OracleThresholds, oracle_passes_topic
+
+    if bandwidth_low_bps <= 0.0 or bandwidth_high_bps <= 0.0:
+        raise ValueError("Bandwidth bounds must be > 0.")
+    if bandwidth_low_bps >= bandwidth_high_bps:
+        raise ValueError("bandwidth-low must be smaller than bandwidth-high.")
+    if search_iterations < 1:
+        raise ValueError("search_iterations must be >= 1.")
+    if search_rounds < 1:
+        raise ValueError("search_rounds must be >= 1.")
+    if final_refine_iterations < 0:
+        raise ValueError("final_refine_iterations must be >= 0.")
+    if loss_coupling not in {"independent", "jitter"}:
+        raise ValueError("loss_coupling must be 'independent' or 'jitter'.")
+
+    thresholds = OracleThresholds(max_loss_pct=max_loss_pct, max_latency_ms=max_latency_ms)
+    selected_axes = list(axes)
+    if loss_coupling == "jitter" and "jitter" in selected_axes and "loss" in selected_axes:
+        selected_axes = ["jitter_loss" if axis == "jitter" else axis for axis in selected_axes if axis != "loss"]
+    load = {"size_a": size, "rate": rate_hz, "streams": streams}
+    load_info = _load_context(load)
+    duration_s = _duration_for_min_messages(rate_hz, min_duration_s=min_duration_s, min_messages=min_messages)
+    ideal = _RequirementCandidate(bandwidth_bps=bandwidth_high_bps)
+    candidate = ideal
+    rows: list[dict[str, Any]] = []
+    measurements: list[dict[str, Any]] = []
+    bounds: dict[str, Any] = {}
+    generated_doc: dict[str, Any] = {
+        "profiles": {},
+        "metadata": {
+            "kind": "benchmark-requirements-generated",
+            "stream": {
+                "rate_hz": rate_hz,
+                "size_bytes": size,
+                "qos": {"reliability": qos_reliability, "depth": qos_depth},
+                "offered_bandwidth_bps": load_info.get("offered_bandwidth_bps"),
+            },
+            "thresholds": {
+                "max_loss_pct": max_loss_pct,
+                "max_latency_ms": max_latency_ms,
+                "latency_quantile": thresholds.latency_quantile,
+            },
+            "search": {
+                "axes": selected_axes,
+                "bandwidth_low_bps": bandwidth_low_bps,
+                "bandwidth_high_bps": bandwidth_high_bps,
+                "latency_high_ms": latency_high_ms,
+                "jitter_high_ms": jitter_high_ms,
+                "loss_high_pct": loss_high_pct,
+                "iterations": search_iterations,
+                "rounds": search_rounds,
+                "final_refine_iterations": final_refine_iterations,
+                "distribution": distribution,
+                "loss_coupling": loss_coupling,
+                "downlink_ratio": downlink_ratio,
+            },
+        },
+    }
+    profile_counter = 0
+
+    def write_profiles() -> None:
+        if generated_profiles_file is not None:
+            generated_profiles_file.write_text(yaml.safe_dump(generated_doc, sort_keys=False), encoding="utf-8")
+
+    def probe(candidate_to_probe: _RequirementCandidate, *, axis: str, phase: str) -> dict[str, Any]:
+        nonlocal profile_counter
+        profile_counter += 1
+        profile_name = _requirements_profile_name(profile_prefix, profile_counter, axis, candidate_to_probe)
+        generated_doc["profiles"][profile_name] = _requirements_profile_spec(
+            candidate_to_probe,
+            distribution=distribution,
+            downlink_ratio=downlink_ratio,
+        )
+        write_profiles()
+        summary = run_point(profile=profile_name, load=load, duration_s=duration_s, out_dir=out_dir)
+        selected_topic, topic_data = _selected_topic(summary, topic)
+        rows_for_print = _topic_rows(summary, topic)
+        passes = oracle_passes_topic(topic_data, thresholds) if topic_data else False
+        loss_pct = float(topic_data.get("loss_pct", 100.0)) if topic_data else 100.0
+        latency_p95 = (topic_data.get("ota_hop_ms") or {}).get("p95") if topic_data else None
+        jitter_p95 = (topic_data.get("jitter_ms") or {}).get("p95") if topic_data else None
+        row = {
+            "profile": profile_name,
+            "axis": axis,
+            "phase": phase,
+            "candidate": _requirements_candidate_context(candidate_to_probe, downlink_ratio=downlink_ratio),
+            "passes": passes,
+            "topic": selected_topic,
+            "expected": topic_data.get("expected") if topic_data else None,
+            "delivered": topic_data.get("delivered") if topic_data else None,
+            "lost": topic_data.get("lost") if topic_data else None,
+            "reordered": topic_data.get("reordered") if topic_data else None,
+            "loss_pct": loss_pct,
+            "latency_p95_ms": float(latency_p95) if latency_p95 is not None else None,
+            "jitter_p95_ms": float(jitter_p95) if jitter_p95 is not None else None,
+            "load": load_info,
+            "duration_s": duration_s,
+            "qos": {"reliability": qos_reliability, "depth": qos_depth},
+        }
+        target_quality = _requirements_target_quality(
+            row,
+            max_loss_pct=max_loss_pct,
+            max_latency_ms=max_latency_ms,
+        )
+        row["target_quality"] = target_quality
+        rows.append(row)
+        measurements.append({"row": row, "topics": rows_for_print, "summary": summary})
+        print(
+            f"  requirements({_requirements_row_summary(row)}): {'PASS' if passes else 'FAIL'} "
+            f"offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} "
+            f"{_format_requirements_target_quality(target_quality)} {_format_topic_rows(rows_for_print)}"
+        )
+        return row
+
+    def last_row_ref(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "profile": row.get("profile"),
+            "candidate": row.get("candidate"),
+            "passes": row.get("passes"),
+            "loss_pct": row.get("loss_pct"),
+            "latency_p95_ms": row.get("latency_p95_ms"),
+        }
+
+    def candidate_at_axis(base: _RequirementCandidate, axis: str, value: float) -> _RequirementCandidate:
+        effective_axis = "jitter" if axis == "jitter_loss" else axis
+        candidate_at_value = _requirements_with_axis(base, effective_axis, value)
+        if loss_coupling == "jitter" and axis in {"jitter", "jitter_loss"}:
+            modeled_loss = min(loss_high_pct, max(0.0, _requirements_jitter_loss_pct(value)))
+            candidate_at_value = _requirements_with_axis(candidate_at_value, "loss", modeled_loss)
+        return candidate_at_value
+
+    def axis_ceiling(axis: str) -> float:
+        return {
+            "latency": latency_high_ms,
+            "jitter": jitter_high_ms,
+            "jitter_loss": jitter_high_ms,
+            "loss": loss_high_pct,
+        }[axis]
+
+    def bound_axis_value(axis: str, bound: dict[str, Any] | None, ref_name: str, default: float) -> float:
+        if not bound:
+            return default
+        ref = bound.get(ref_name)
+        if not isinstance(ref, dict):
+            return default
+        candidate_ref = ref.get("candidate")
+        if not isinstance(candidate_ref, dict):
+            return default
+        key = {
+            "bandwidth": "bandwidth_bps",
+            "latency": "uplink_latency_ms",
+            "jitter": "jitter_ms",
+            "jitter_loss": "jitter_ms",
+            "loss": "loss_pct",
+        }[axis]
+        value = candidate_ref.get(key)
+        return float(value) if value is not None else default
+
+    def search_axis(
+        axis: str,
+        current: _RequirementCandidate,
+        *,
+        phase_label: str,
+        iterations: int,
+        low_value: float | None = None,
+        high_value: float | None = None,
+    ) -> tuple[_RequirementCandidate, dict[str, Any]]:
+        if axis == "bandwidth":
+            floor_value = low_value if low_value is not None else bandwidth_low_bps
+            low_row = probe(
+                candidate_at_axis(current, axis, floor_value),
+                axis=axis,
+                phase=f"{phase_label}:floor",
+            )
+            if low_row["passes"]:
+                selected = candidate_at_axis(current, axis, floor_value)
+                if floor_value > bandwidth_low_bps:
+                    reset_row = probe(
+                        candidate_at_axis(current, axis, bandwidth_low_bps),
+                        axis=axis,
+                        phase=f"{phase_label}:floor-reset",
+                    )
+                    if not reset_row["passes"]:
+                        pass_candidate = selected
+                        fail_candidate = candidate_at_axis(current, axis, bandwidth_low_bps)
+                        rebound_pass_row: dict[str, Any] | None = low_row
+                        rebound_fail_row: dict[str, Any] | None = reset_row
+                        for iteration in range(iterations):
+                            mid = math.sqrt(pass_candidate.bandwidth_bps * fail_candidate.bandwidth_bps)
+                            mid_candidate = candidate_at_axis(current, axis, mid)
+                            mid_row = probe(mid_candidate, axis=axis, phase=f"{phase_label}:rebound{iteration + 1}")
+                            if mid_row["passes"]:
+                                pass_candidate = mid_candidate
+                                rebound_pass_row = mid_row
+                            else:
+                                fail_candidate = mid_candidate
+                                rebound_fail_row = mid_row
+                        return pass_candidate, {
+                            "axis": axis,
+                            "selected": _requirements_candidate_context(pass_candidate, downlink_ratio=downlink_ratio),
+                            "tight": True,
+                            "status": "bounded_after_floor_reset",
+                            "search": "geometric",
+                            "last_pass": last_row_ref(rebound_pass_row),
+                            "last_fail": last_row_ref(rebound_fail_row),
+                        }
+                    selected = candidate_at_axis(current, axis, bandwidth_low_bps)
+                    low_row = reset_row
+                return selected, {
+                    "axis": axis,
+                    "selected": _requirements_candidate_context(selected, downlink_ratio=downlink_ratio),
+                    "tight": False,
+                    "status": "floor_still_passes",
+                    "search": "geometric",
+                    "last_pass": last_row_ref(low_row),
+                    "last_fail": None,
+                }
+            pass_candidate = current
+            fail_candidate = candidate_at_axis(current, axis, floor_value)
+            pass_row: dict[str, Any] | None = None
+            fail_row: dict[str, Any] | None = low_row
+            for iteration in range(iterations):
+                mid = math.sqrt(pass_candidate.bandwidth_bps * fail_candidate.bandwidth_bps)
+                mid_candidate = candidate_at_axis(current, axis, mid)
+                mid_row = probe(mid_candidate, axis=axis, phase=f"{phase_label}:bisect{iteration + 1}")
+                if mid_row["passes"]:
+                    pass_candidate = mid_candidate
+                    pass_row = mid_row
+                else:
+                    fail_candidate = mid_candidate
+                    fail_row = mid_row
+            return pass_candidate, {
+                "axis": axis,
+                "selected": _requirements_candidate_context(pass_candidate, downlink_ratio=downlink_ratio),
+                "tight": True,
+                "status": "bounded",
+                "search": "geometric",
+                "last_pass": last_row_ref(pass_row),
+                "last_fail": last_row_ref(fail_row),
+            }
+
+        ceiling_value = high_value if high_value is not None else axis_ceiling(axis)
+        high_candidate = candidate_at_axis(current, axis, ceiling_value)
+        high_row = probe(high_candidate, axis=axis, phase=f"{phase_label}:ceiling")
+        if high_row["passes"]:
+            return high_candidate, {
+                "axis": axis,
+                "selected": _requirements_candidate_context(high_candidate, downlink_ratio=downlink_ratio),
+                "tight": False,
+                "status": "ceiling_still_passes",
+                "search": "linear",
+                "last_pass": last_row_ref(high_row),
+                "last_fail": None,
+            }
+        pass_candidate = current
+        fail_candidate = high_candidate
+        pass_row = None
+        fail_row = high_row
+        for iteration in range(iterations):
+            mid = (
+                _requirements_axis_value(pass_candidate, axis) + _requirements_axis_value(fail_candidate, axis)
+            ) / 2.0
+            mid_candidate = candidate_at_axis(current, axis, mid)
+            mid_row = probe(mid_candidate, axis=axis, phase=f"{phase_label}:bisect{iteration + 1}")
+            if mid_row["passes"]:
+                pass_candidate = mid_candidate
+                pass_row = mid_row
+            else:
+                fail_candidate = mid_candidate
+                fail_row = mid_row
+        return pass_candidate, {
+            "axis": axis,
+            "selected": _requirements_candidate_context(pass_candidate, downlink_ratio=downlink_ratio),
+            "tight": True,
+            "status": "bounded",
+            "search": "linear",
+            "last_pass": last_row_ref(pass_row),
+            "last_fail": last_row_ref(fail_row),
+        }
+
+    baseline = probe(candidate, axis="baseline", phase="ideal")
+    if not baseline["passes"]:
+        requirements_path = out_dir / "requirements.jsonl"
+        requirements_path.write_text(
+            "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+        _write_benchmark_result(
+            out_dir,
+            genre="requirements",
+            context=result_context,
+            configuration={
+                "load": load_info,
+                "duration_s": duration_s,
+                "thresholds": {
+                    "max_loss_pct": max_loss_pct,
+                    "max_latency_ms": max_latency_ms,
+                    "latency_quantile": thresholds.latency_quantile,
+                },
+                "topic": topic or None,
+                "generated_profiles_file": generated_profiles_file.name if generated_profiles_file else None,
+            },
+            result={
+                "stream": {"load": load_info, "qos": {"reliability": qos_reliability, "depth": qos_depth}},
+                "profile": None,
+                "bounds": {},
+                "rows": rows,
+                "analysis": {"status": "ideal_failed", "tight": False},
+            },
+            measurements={"points": measurements},
+            verdict={"passed": False, "status": "ideal_failed"},
+            artifacts={
+                "requirements": requirements_path.name,
+                "generated_profiles": generated_profiles_file.name if generated_profiles_file else None,
+                "stdout": "stdout.txt",
+                "probes_dir": "probes",
+            },
+        )
+        return {"profile": None, "bounds": {}, "rows": rows, "analysis": {"status": "ideal_failed", "tight": False}}
+
+    for round_index in range(1, search_rounds + 1):
+        for axis in selected_axes:
+            candidate, bounds[axis] = search_axis(
+                axis,
+                candidate,
+                phase_label=f"round{round_index}",
+                iterations=search_iterations,
+            )
+
+    if final_refine_iterations:
+        for axis in selected_axes:
+            previous_bound = bounds.get(axis)
+            candidate, bounds[axis] = search_axis(
+                axis,
+                candidate,
+                phase_label="refine",
+                iterations=final_refine_iterations,
+                low_value=bound_axis_value(axis, previous_bound, "last_fail", bandwidth_low_bps)
+                if axis == "bandwidth"
+                else None,
+                high_value=bound_axis_value(axis, previous_bound, "last_fail", axis_ceiling(axis))
+                if axis != "bandwidth"
+                else None,
+            )
+
+    final_profile_name = _safe_case_token(f"{profile_prefix}_final")
+    generated_doc["profiles"][final_profile_name] = _requirements_profile_spec(
+        candidate,
+        distribution=distribution,
+        downlink_ratio=downlink_ratio,
+    )
+    write_profiles()
+    final_row = probe(candidate, axis="combined", phase="final")
+    tight = bool(final_row["passes"]) and all(bounds.get(axis, {}).get("tight") for axis in selected_axes)
+    unresolved = [axis for axis in selected_axes if not bounds.get(axis, {}).get("tight")]
+    offered_bandwidth_bps = load_info.get("offered_bandwidth_bps")
+    bandwidth_overhead_ratio = candidate.bandwidth_bps / float(offered_bandwidth_bps) if offered_bandwidth_bps else None
+    final_profile = {
+        "name": final_profile_name,
+        "candidate": _requirements_candidate_context(candidate, downlink_ratio=downlink_ratio),
+        "yaml": generated_doc["profiles"][final_profile_name],
+    }
+    analysis: dict[str, Any] = {
+        "status": "tight" if tight else "not_tight",
+        "tight": tight,
+        "unresolved_axes": unresolved,
+        "final_passes": final_row["passes"],
+        "final_target_quality": final_row["target_quality"],
+        "bandwidth_overhead_ratio": bandwidth_overhead_ratio,
+        "search_rounds": search_rounds,
+        "search_iterations": search_iterations,
+        "final_refine_iterations": final_refine_iterations,
+        "loss_coupling": loss_coupling,
+        "searched_axes": selected_axes,
+    }
+    result: dict[str, Any] = {
+        "stream": {
+            "load": load_info,
+            "qos": {"reliability": qos_reliability, "depth": qos_depth},
+        },
+        "target": {
+            "max_loss_pct": max_loss_pct,
+            "max_latency_ms": max_latency_ms,
+            "latency_quantile": thresholds.latency_quantile,
+        },
+        "profile": final_profile,
+        "bounds": bounds,
+        "rows": rows,
+        "analysis": analysis,
+    }
+    requirements_path = out_dir / "requirements.jsonl"
+    requirements_path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    _write_benchmark_result(
+        out_dir,
+        genre="requirements",
+        context=result_context,
+        configuration={
+            "load": load_info,
+            "duration_s": duration_s,
+            "thresholds": {
+                "max_loss_pct": max_loss_pct,
+                "max_latency_ms": max_latency_ms,
+                "latency_quantile": thresholds.latency_quantile,
+            },
+            "topic": topic or None,
+            "axes": selected_axes,
+            "bounds": {
+                "bandwidth_low_bps": bandwidth_low_bps,
+                "bandwidth_high_bps": bandwidth_high_bps,
+                "latency_high_ms": latency_high_ms,
+                "jitter_high_ms": jitter_high_ms,
+                "loss_high_pct": loss_high_pct,
+            },
+            "final_refine_iterations": final_refine_iterations,
+            "loss_coupling": loss_coupling,
+            "generated_profiles_file": generated_profiles_file.name if generated_profiles_file else None,
+        },
+        result=result,
+        measurements={"points": measurements},
+        verdict={"passed": bool(final_row["passes"]), "status": str(analysis["status"])},
+        artifacts={
+            "requirements": requirements_path.name,
+            "generated_profiles": generated_profiles_file.name if generated_profiles_file else None,
+            "stdout": "stdout.txt",
+            "probes_dir": "probes",
+        },
+    )
+    print(f"Requirements rows saved to {requirements_path}")
+    print(
+        "Required profile: "
+        f"bw={_format_bps(candidate.bandwidth_bps)}, "
+        f"latency={candidate.latency_ms:g}ms, "
+        f"jitter={candidate.jitter_ms:g}ms, "
+        f"loss={candidate.loss_pct:g}% "
+        f"{_format_requirements_target_quality(final_row['target_quality'])} "
+        f"({'tight' if tight else 'not tight within configured bounds'})"
+    )
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -3185,6 +3841,106 @@ def benchmark_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def benchmark_requirements(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark requirements``."""
+    from .cli import _load_runtime_config
+    from .network_profiles import parse_rate_bps
+
+    if getattr(args, "interactive", False):
+        return _start_interactive_benchmark(args, "requirements")
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+    run_dir = _setup_benchmark_run_dir(args, "requirements", None)
+    generated_profiles_file = run_dir / "generated-profiles.yaml"
+    generated_profiles_file.write_text(
+        yaml.safe_dump(
+            {
+                "profiles": {},
+                "metadata": {
+                    "kind": "benchmark-requirements-generated",
+                    "status": "initializing",
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    args.profiles_file = str(generated_profiles_file)
+    args.qos_reliability = getattr(args, "qos_reliability", None) or "best_effort"
+    args.qos_depth = int(getattr(args, "qos_depth", None) or 1)
+
+    session_name = BENCHMARK_SESSIONS_BY_GENRE["requirements"]
+    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    result_context = _benchmark_result_context(
+        args,
+        genre="requirements",
+        profile=None,
+        run_dir=run_dir,
+        session=session_context,
+    )
+    result_context["requirements"] = {
+        "generated_profiles_file": str(generated_profiles_file),
+    }
+
+    rate_hz = float(getattr(args, "rate_hz", 20.0))
+    size = int(getattr(args, "size", 18_000))
+    streams = int(getattr(args, "streams", 1))
+    bandwidth_high_bps = parse_rate_bps(getattr(args, "bandwidth_high", "1gbit"))
+    bandwidth_low_raw = getattr(args, "bandwidth_low", None)
+    if bandwidth_low_raw:
+        bandwidth_low_bps = parse_rate_bps(bandwidth_low_raw)
+    else:
+        offered_bw = (size * 8.0 * rate_hz * streams) if size > 0 and rate_hz > 0 else 1.0
+        bandwidth_low_bps = max(1.0, offered_bw * float(getattr(args, "bandwidth_low_factor", 0.25)))
+
+    run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, session_name)
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_requirements(
+            run_point,
+            max_loss_pct=float(getattr(args, "max_loss", 5.0)),
+            max_latency_ms=float(getattr(args, "max_latency_ms", 250.0)),
+            rate_hz=rate_hz,
+            size=size,
+            streams=streams,
+            qos_reliability=str(args.qos_reliability),
+            qos_depth=int(args.qos_depth),
+            topic=getattr(args, "topic", ""),
+            out_dir=run_dir,
+            bandwidth_high_bps=bandwidth_high_bps,
+            bandwidth_low_bps=bandwidth_low_bps,
+            latency_high_ms=float(getattr(args, "latency_high_ms", 500.0)),
+            jitter_high_ms=float(getattr(args, "jitter_high_ms", 120.0)),
+            loss_high_pct=float(getattr(args, "loss_high", 20.0)),
+            axes=_parse_requirements_axes(getattr(args, "axes", "all")),
+            min_duration_s=float(getattr(args, "min_duration", 20.0)),
+            min_messages=int(getattr(args, "min_messages", 100)),
+            search_iterations=int(getattr(args, "search_iterations", 6)),
+            search_rounds=int(getattr(args, "search_rounds", 1)),
+            distribution=str(getattr(args, "distribution", "normal")),
+            final_refine_iterations=int(getattr(args, "final_refine_iterations", 3)),
+            loss_coupling=str(getattr(args, "loss_coupling", "jitter")),
+            downlink_ratio=float(getattr(args, "downlink_ratio", 1.0)),
+            result_context=result_context,
+            generated_profiles_file=generated_profiles_file,
+            profile_prefix=str(getattr(args, "profile_prefix", "requirements")),
+        )
+
+    out_file_name = getattr(args, "out", "requirements.jsonl")
+    if artifacts_dir:
+        out_path = artifacts_dir / Path(out_file_name).name
+    else:
+        out_path = Path(out_file_name)
+
+    run_requirements_file = run_dir / "requirements.jsonl"
+    if run_requirements_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(run_requirements_file, out_path)
+        print(f"Requirements rows copied to {out_path}")
+
+    return 0
+
+
 def benchmark_plot(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark plot``."""
     from .cli import _load_runtime_config
@@ -3467,6 +4223,110 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
     matrix_parser.add_argument("--out", default="matrix.jsonl", help="Output matrix JSONL file.")
     matrix_parser.set_defaults(func=benchmark_matrix)
 
+    # --- requirements ---
+    requirements_parser = benchmark_subparsers.add_parser(
+        "requirements",
+        help="Search for a tight network profile that satisfies a ROS 2 stream quality target.",
+    )
+    _add_benchmark_common_args(requirements_parser, ota_benchmark=ota_benchmark)
+    requirements_parser.add_argument("--max-loss", type=float, default=5.0, help="Oracle: max ROS 2 loss %%.")
+    requirements_parser.add_argument(
+        "--max-latency-ms", type=float, default=250.0, help="Oracle: max acceptable p95 latency (ms)."
+    )
+    requirements_parser.add_argument("--rate-hz", type=float, default=20.0, help="ROS 2 publish rate (Hz).")
+    requirements_parser.add_argument("--size", type=int, default=18_000, help="Payload size (bytes).")
+    requirements_parser.add_argument("--streams", type=int, default=1, help="Parallel stream count.")
+    requirements_parser.add_argument("--topic", default="", help="Topic to evaluate.")
+    requirements_parser.add_argument("--bandwidth-high", default="1gbit", help="Known-good search bandwidth ceiling.")
+    requirements_parser.add_argument(
+        "--bandwidth-low",
+        help="Search bandwidth floor; default is offered bandwidth times --bandwidth-low-factor.",
+    )
+    requirements_parser.add_argument(
+        "--bandwidth-low-factor",
+        type=float,
+        default=0.25,
+        help="Default bandwidth floor as a factor of offered stream bandwidth.",
+    )
+    requirements_parser.add_argument(
+        "--latency-high-ms",
+        type=float,
+        default=500.0,
+        help="Worst latency ceiling to try while searching.",
+    )
+    requirements_parser.add_argument(
+        "--jitter-high-ms",
+        type=float,
+        default=120.0,
+        help="Worst jitter ceiling to try while searching.",
+    )
+    requirements_parser.add_argument(
+        "--loss-high",
+        type=float,
+        default=20.0,
+        help="Worst network loss percentage to try while searching.",
+    )
+    requirements_parser.add_argument(
+        "--axes",
+        default="all",
+        help="Comma list of network axes to tighten: all, bandwidth, latency, jitter, loss.",
+    )
+    requirements_parser.add_argument(
+        "--search-iterations",
+        type=int,
+        default=6,
+        help="Binary-search probes per axis and round.",
+    )
+    requirements_parser.add_argument(
+        "--search-rounds",
+        type=int,
+        default=1,
+        help="Coordinate-search rounds; more rounds account for knob interactions better.",
+    )
+    requirements_parser.add_argument(
+        "--final-refine-iterations",
+        type=int,
+        default=3,
+        help="Extra bounded refinement probes per axis after the coordinate search.",
+    )
+    requirements_parser.add_argument(
+        "--loss-coupling",
+        choices=["jitter", "independent"],
+        default="jitter",
+        help="Use a practical jitter/loss tradeoff curve or search network loss as its own independent axis.",
+    )
+    requirements_parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=20.0,
+        help="Minimum seconds per probe.",
+    )
+    requirements_parser.add_argument(
+        "--min-messages",
+        type=int,
+        default=100,
+        help="Minimum intended published messages per probe.",
+    )
+    requirements_parser.add_argument(
+        "--distribution",
+        default="normal",
+        choices=["normal", "pareto", "paretonormal"],
+        help="netem jitter distribution.",
+    )
+    requirements_parser.add_argument(
+        "--downlink-ratio",
+        type=float,
+        default=1.0,
+        help="Downlink latency as a ratio of uplink latency in generated profiles.",
+    )
+    requirements_parser.add_argument(
+        "--profile-prefix",
+        default="requirements",
+        help="Prefix for generated profile names.",
+    )
+    requirements_parser.add_argument("--out", default="requirements.jsonl", help="Output requirements JSONL file.")
+    requirements_parser.set_defaults(func=benchmark_requirements)
+
 
 def _register_benchmark_plot_parser(benchmark_subparsers: Any) -> None:
     # --- plot ---
@@ -3490,7 +4350,7 @@ def register_benchmark_parser(subparsers: Any) -> None:
     """Register the ``benchmark`` and ``ota-benchmark`` commands."""
     benchmark_parser = subparsers.add_parser(
         "benchmark",
-        help="Run local benchmark tests (capacity, ramp, recovery, sweep) and render plots.",
+        help="Run local benchmark tests and render plots.",
     )
     benchmark_subparsers = benchmark_parser.add_subparsers(dest="benchmark_command", required=True)
     _register_benchmark_driver_parsers(benchmark_subparsers, ota_benchmark=False)

@@ -2290,7 +2290,15 @@ def _requirements_jitter_loss_pct(jitter_ms: float) -> float:
 def _requirements_target_quality(row: dict[str, Any], *, max_loss_pct: float, max_latency_ms: float) -> dict[str, Any]:
     loss_pct = row.get("loss_pct")
     latency_p95_ms = row.get("latency_p95_ms")
-    loss_ratio = float(loss_pct) / max_loss_pct if loss_pct is not None and max_loss_pct > 0 else None
+    loss_ratio: float | None
+    if loss_pct is None:
+        loss_ratio = None
+    elif max_loss_pct > 0:
+        loss_ratio = float(loss_pct) / max_loss_pct
+    elif float(loss_pct) <= 0.0:
+        loss_ratio = 0.0
+    else:
+        loss_ratio = math.inf
     latency_ratio = (
         float(latency_p95_ms) / max_latency_ms if latency_p95_ms is not None and max_latency_ms > 0 else None
     )
@@ -2316,7 +2324,19 @@ def _format_requirements_target_quality(quality: dict[str, Any]) -> str:
     limiting = quality.get("limiting_metric") or "unknown"
     if utilization is None:
         return "target=unknown"
+    if math.isinf(float(utilization)):
+        return f"target=over-limit({limiting})"
     return f"target={utilization * 100:.1f}%({limiting})"
+
+
+def _format_requirements_profile(candidate: _RequirementCandidate, *, downlink_ratio: float) -> str:
+    downlink_latency_ms = candidate.latency_ms * downlink_ratio
+    return (
+        f"uplink(rate={_format_bps(candidate.bandwidth_bps)}, delay={candidate.latency_ms:g}ms, "
+        f"jitter={candidate.jitter_ms:g}ms, loss={candidate.loss_pct:g}%), "
+        f"downlink(rate={_format_bps(candidate.bandwidth_bps)}, delay={downlink_latency_ms:g}ms, "
+        f"jitter={candidate.jitter_ms:g}ms, loss={candidate.loss_pct:g}%)"
+    )
 
 
 def drive_requirements(
@@ -2365,8 +2385,15 @@ def drive_requirements(
         raise ValueError("loss_coupling must be 'independent' or 'jitter'.")
 
     thresholds = OracleThresholds(max_loss_pct=max_loss_pct, max_latency_ms=max_latency_ms)
-    selected_axes = list(axes)
-    if loss_coupling == "jitter" and "jitter" in selected_axes and "loss" in selected_axes:
+    requested_axes = list(axes)
+    selected_axes = list(requested_axes)
+    strict_zero_loss_target = max_loss_pct <= 0.0
+    effective_loss_coupling = "zero_loss" if strict_zero_loss_target else loss_coupling
+    skipped_axes: list[str] = []
+    if strict_zero_loss_target:
+        skipped_axes = [axis for axis in selected_axes if axis == "loss"]
+        selected_axes = [axis for axis in selected_axes if axis != "loss"]
+    elif loss_coupling == "jitter" and "jitter" in selected_axes and "loss" in selected_axes:
         selected_axes = ["jitter_loss" if axis == "jitter" else axis for axis in selected_axes if axis != "loss"]
     load = {"size_a": size, "rate": rate_hz, "streams": streams}
     load_info = _load_context(load)
@@ -2392,7 +2419,9 @@ def drive_requirements(
                 "latency_quantile": thresholds.latency_quantile,
             },
             "search": {
+                "requested_axes": requested_axes,
                 "axes": selected_axes,
+                "skipped_axes": skipped_axes,
                 "bandwidth_low_bps": bandwidth_low_bps,
                 "bandwidth_high_bps": bandwidth_high_bps,
                 "latency_high_ms": latency_high_ms,
@@ -2403,6 +2432,8 @@ def drive_requirements(
                 "final_refine_iterations": final_refine_iterations,
                 "distribution": distribution,
                 "loss_coupling": loss_coupling,
+                "effective_loss_coupling": effective_loss_coupling,
+                "strict_zero_loss_target": strict_zero_loss_target,
                 "downlink_ratio": downlink_ratio,
             },
         },
@@ -2477,7 +2508,7 @@ def drive_requirements(
     def candidate_at_axis(base: _RequirementCandidate, axis: str, value: float) -> _RequirementCandidate:
         effective_axis = "jitter" if axis == "jitter_loss" else axis
         candidate_at_value = _requirements_with_axis(base, effective_axis, value)
-        if loss_coupling == "jitter" and axis in {"jitter", "jitter_loss"}:
+        if effective_loss_coupling == "jitter" and axis in {"jitter", "jitter_loss"}:
             modeled_loss = min(loss_high_pct, max(0.0, _requirements_jitter_loss_pct(value)))
             candidate_at_value = _requirements_with_axis(candidate_at_value, "loss", modeled_loss)
         return candidate_at_value
@@ -2638,6 +2669,16 @@ def drive_requirements(
             "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
             encoding="utf-8",
         )
+        analysis = {
+            "status": "ideal_failed",
+            "tight": False,
+            "loss_coupling": loss_coupling,
+            "effective_loss_coupling": effective_loss_coupling,
+            "strict_zero_loss_target": strict_zero_loss_target,
+            "requested_axes": requested_axes,
+            "searched_axes": selected_axes,
+            "skipped_axes": skipped_axes,
+        }
         _write_benchmark_result(
             out_dir,
             genre="requirements",
@@ -2651,6 +2692,20 @@ def drive_requirements(
                     "latency_quantile": thresholds.latency_quantile,
                 },
                 "topic": topic or None,
+                "requested_axes": requested_axes,
+                "axes": selected_axes,
+                "skipped_axes": skipped_axes,
+                "bounds": {
+                    "bandwidth_low_bps": bandwidth_low_bps,
+                    "bandwidth_high_bps": bandwidth_high_bps,
+                    "latency_high_ms": latency_high_ms,
+                    "jitter_high_ms": jitter_high_ms,
+                    "loss_high_pct": loss_high_pct,
+                },
+                "final_refine_iterations": final_refine_iterations,
+                "loss_coupling": loss_coupling,
+                "effective_loss_coupling": effective_loss_coupling,
+                "strict_zero_loss_target": strict_zero_loss_target,
                 "generated_profiles_file": generated_profiles_file.name if generated_profiles_file else None,
             },
             result={
@@ -2658,7 +2713,7 @@ def drive_requirements(
                 "profile": None,
                 "bounds": {},
                 "rows": rows,
-                "analysis": {"status": "ideal_failed", "tight": False},
+                "analysis": analysis,
             },
             measurements={"points": measurements},
             verdict={"passed": False, "status": "ideal_failed"},
@@ -2669,7 +2724,7 @@ def drive_requirements(
                 "probes_dir": "probes",
             },
         )
-        return {"profile": None, "bounds": {}, "rows": rows, "analysis": {"status": "ideal_failed", "tight": False}}
+        return {"profile": None, "bounds": {}, "rows": rows, "analysis": analysis}
 
     for round_index in range(1, search_rounds + 1):
         for axis in selected_axes:
@@ -2724,7 +2779,11 @@ def drive_requirements(
         "search_iterations": search_iterations,
         "final_refine_iterations": final_refine_iterations,
         "loss_coupling": loss_coupling,
+        "effective_loss_coupling": effective_loss_coupling,
+        "strict_zero_loss_target": strict_zero_loss_target,
+        "requested_axes": requested_axes,
         "searched_axes": selected_axes,
+        "skipped_axes": skipped_axes,
     }
     result: dict[str, Any] = {
         "stream": {
@@ -2759,7 +2818,9 @@ def drive_requirements(
                 "latency_quantile": thresholds.latency_quantile,
             },
             "topic": topic or None,
+            "requested_axes": requested_axes,
             "axes": selected_axes,
+            "skipped_axes": skipped_axes,
             "bounds": {
                 "bandwidth_low_bps": bandwidth_low_bps,
                 "bandwidth_high_bps": bandwidth_high_bps,
@@ -2769,6 +2830,8 @@ def drive_requirements(
             },
             "final_refine_iterations": final_refine_iterations,
             "loss_coupling": loss_coupling,
+            "effective_loss_coupling": effective_loss_coupling,
+            "strict_zero_loss_target": strict_zero_loss_target,
             "generated_profiles_file": generated_profiles_file.name if generated_profiles_file else None,
         },
         result=result,
@@ -2783,11 +2846,8 @@ def drive_requirements(
     )
     print(f"Requirements rows saved to {requirements_path}")
     print(
-        "Required profile: "
-        f"bw={_format_bps(candidate.bandwidth_bps)}, "
-        f"latency={candidate.latency_ms:g}ms, "
-        f"jitter={candidate.jitter_ms:g}ms, "
-        f"loss={candidate.loss_pct:g}% "
+        "Required network profile: "
+        f"{_format_requirements_profile(candidate, downlink_ratio=downlink_ratio)} "
         f"{_format_requirements_target_quality(final_row['target_quality'])} "
         f"({'tight' if tight else 'not tight within configured bounds'})"
     )
@@ -4293,7 +4353,10 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
         "--loss-coupling",
         choices=["jitter", "independent"],
         default="jitter",
-        help="Use a practical jitter/loss tradeoff curve or search network loss as its own independent axis.",
+        help=(
+            "Use a practical jitter/loss tradeoff curve or search network loss as its own independent axis. "
+            "For --max-loss 0, generated network loss is clamped to 0 and jitter is searched separately."
+        ),
     )
     requirements_parser.add_argument(
         "--min-duration",

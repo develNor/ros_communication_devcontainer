@@ -472,12 +472,16 @@ conditions, uses a geometric boundary search for bandwidth, linear boundary
 searches for latency-like axes, and finishes with an extra refinement pass around
 the final candidate. By default jitter and loss are searched as a coupled
 practical tradeoff curve; pass `--loss-coupling independent` if you want network
-loss treated as its own axis. The chosen profile, target slack, all probes, and
-the nearby failing neighbors are written to `result.json`, `requirements.jsonl`,
-and `generated-profiles.yaml`:
+loss treated as its own axis. For an exact `--max-loss 0` target, rosotacom
+automatically keeps shaped network loss at `0%` and searches jitter separately,
+so the reproducible command encodes the same policy used for the measurement.
+The chosen profile, target slack, all probes, and the nearby failing neighbors
+are written to `result.json`, `requirements.jsonl`, and
+`generated-profiles.yaml`:
 
 ```bash
 rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 5 --max-latency-ms 250
+rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 0 --max-latency-ms 250
 ```
 
 Use `rosotacom ota-benchmark` for the same probes over deployment peers, without

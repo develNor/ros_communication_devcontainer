@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from rosotacom.cli_benchmark import (
     _peer_catmux_attach_script,
     _prepare_benchmark_session_config,
     _requirements_jitter_loss_pct,
+    _requirements_target_quality,
     _result_once_script,
     _start_interactive_benchmark,
     collect_transit_summary,
@@ -597,6 +599,75 @@ def test_requirements_driver_can_search_coupled_jitter_loss(tmp_path: Path) -> N
     assert result["analysis"]["final_target_quality"]["utilization"] == pytest.approx(0.99375)
 
 
+def test_requirements_zero_loss_target_clamps_network_loss(tmp_path: Path) -> None:
+    from rosotacom.network_profiles import parse_ms, parse_pct
+
+    generated_file = tmp_path / "generated-profiles.yaml"
+    seen_losses: list[float] = []
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        assert profile is not None
+        generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
+        spec = generated["profiles"][profile]["uplink"]
+        jitter = parse_ms(spec.get("jitter", 0), "jitter")
+        loss = parse_pct(spec.get("loss", 0), "loss")
+        seen_losses.append(loss)
+        latency_p95 = 40.0 + jitter * 3.0
+        return {
+            "topics": {
+                "/test": {
+                    "expected": 100,
+                    "delivered": 100,
+                    "lost": 0,
+                    "loss_pct": 0.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": latency_p95 * 0.6, "p95": latency_p95},
+                    "jitter_ms": {"p50": jitter * 0.5, "p95": jitter},
+                }
+            }
+        }
+
+    result = drive_requirements(
+        probe,
+        max_loss_pct=0.0,
+        max_latency_ms=100.0,
+        rate_hz=20.0,
+        size=18_000,
+        streams=1,
+        qos_reliability="best_effort",
+        qos_depth=1,
+        topic="/test",
+        out_dir=tmp_path,
+        bandwidth_high_bps=100_000_000.0,
+        bandwidth_low_bps=10_000_000.0,
+        latency_high_ms=0.0,
+        jitter_high_ms=40.0,
+        loss_high_pct=10.0,
+        axes=_parse_requirements_axes("jitter,loss"),
+        min_duration_s=20.0,
+        min_messages=100,
+        search_iterations=3,
+        search_rounds=1,
+        distribution="normal",
+        final_refine_iterations=0,
+        loss_coupling="jitter",
+        result_context={"test": True},
+        generated_profiles_file=generated_file,
+    )
+
+    assert set(seen_losses) == {0.0}
+    assert result["profile"]["candidate"]["loss_pct"] == 0.0
+    assert "jitter" in result["bounds"]
+    assert "jitter_loss" not in result["bounds"]
+    assert "loss" not in result["bounds"]
+    assert result["analysis"]["loss_coupling"] == "jitter"
+    assert result["analysis"]["effective_loss_coupling"] == "zero_loss"
+    assert result["analysis"]["strict_zero_loss_target"] is True
+    assert result["analysis"]["skipped_axes"] == ["loss"]
+    generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
+    assert generated["metadata"]["search"]["effective_loss_coupling"] == "zero_loss"
+
+
 def test_requirements_bandwidth_refine_recovers_when_previous_fail_becomes_pass(tmp_path: Path) -> None:
     from rosotacom.network_profiles import parse_rate_bps
 
@@ -658,6 +729,17 @@ def test_requirements_bandwidth_refine_recovers_when_previous_fail_becomes_pass(
     assert result["bounds"]["bandwidth"]["status"] == "bounded_after_floor_reset"
     assert result["bounds"]["bandwidth"]["tight"] is True
     assert result["bounds"]["bandwidth"]["last_fail"]
+
+
+def test_requirements_zero_loss_target_reports_loss_as_limiter() -> None:
+    quality = _requirements_target_quality(
+        {"loss_pct": 0.25, "latency_p95_ms": 10.0},
+        max_loss_pct=0.0,
+        max_latency_ms=250.0,
+    )
+
+    assert quality["limiting_metric"] == "loss"
+    assert quality["utilization"] == math.inf
 
 
 # --------------------------------------------------------------------------- #

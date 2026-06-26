@@ -2669,7 +2669,7 @@ def drive_requirements(
             "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
             encoding="utf-8",
         )
-        analysis = {
+        failure_analysis = {
             "status": "ideal_failed",
             "tight": False,
             "loss_coupling": loss_coupling,
@@ -2713,7 +2713,7 @@ def drive_requirements(
                 "profile": None,
                 "bounds": {},
                 "rows": rows,
-                "analysis": analysis,
+                "analysis": failure_analysis,
             },
             measurements={"points": measurements},
             verdict={"passed": False, "status": "ideal_failed"},
@@ -2724,7 +2724,7 @@ def drive_requirements(
                 "probes_dir": "probes",
             },
         )
-        return {"profile": None, "bounds": {}, "rows": rows, "analysis": analysis}
+        return {"profile": None, "bounds": {}, "rows": rows, "analysis": failure_analysis}
 
     for round_index in range(1, search_rounds + 1):
         for axis in selected_axes:

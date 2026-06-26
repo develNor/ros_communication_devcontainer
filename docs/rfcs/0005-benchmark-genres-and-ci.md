@@ -183,10 +183,10 @@ slice and reuses RFC 0003 + 0004.
   with a high-level run window, one fullscreen catmux attach window per local
   peer, a network window split into qdisc status and tc/netem command logs, and a
   one-shot final result window (`cli_benchmark --interactive`).
-- [x] Require shaped OTA benchmark runs to prove passwordless non-interactive sudo
-  for `tc`/`ip` during preflight, and run profile commands through `sudo -n` so
-  missing privileges fail early instead of hanging or failing mid-run
-  (`cli._ota_preflight`, `cli._peer_command_runner`).
+- [x] Let shaped OTA benchmark runs choose explicit sudo handling:
+  passwordless non-interactive sudo for unattended runs, or a local per-peer
+  askpass prompt that feeds `sudo -S` over SSH stdin for attended operator runs
+  (`--sudo-mode`, `cli._ota_preflight`, `cli._peer_command_runner`).
 - [x] Build the recovery driver on timeline profiles (RFC 0004) + the recovery
   metric set (`t_recover`, `t_steady`, backlog/burst, lost-during-outage, latched
   re-arrival) (`benchmark.recovery_metrics`; arming the timeline profile is RFC
@@ -245,11 +245,15 @@ reviewed rather than asserted in a blocking test.
   *(`test_interactive_benchmark_dry_run_prints_operator_view`,
   `test_peer_catmux_attach_script_waits_for_container_and_tmux`,
   `test_benchmark_subcommand_arg_parsing`.)*
-- [x] **OTA profile shaping privilege check** (passwordless non-interactive sudo
-  for `tc`/`ip`) — host unit tests assert the preflight check and `sudo -n`
-  wrapping for shaping/watchdog commands. Automatable.
-  *(`test_ota_preflight_can_require_passwordless_network_shaping`,
-  `test_ota_profile_shaping_uses_noninteractive_sudo`.)*
+- [x] **OTA profile shaping privilege handling** (passwordless non-interactive
+  sudo or local askpass prompt for `tc`/`ip`) — host unit tests assert the
+  preflight checks, `sudo -n` wrapping, `sudo -S` stdin handling, and per-peer
+  prompt flow. Automatable.
+  *(`test_ota_preflight_can_require_network_shaping_sudo`,
+  `test_ota_preflight_askpass_authenticates_via_stdin`,
+  `test_ota_profile_shaping_uses_noninteractive_sudo`,
+  `test_ota_profile_shaping_askpass_uses_stdin`,
+  `test_ota_askpass_prompts_once_per_peer`.)*
 - [x] **Recovery driver + metric set** (`t_recover`, `t_steady`, backlog/burst,
   lost-during-outage, latched re-arrival) — host unit test extracting the metrics
   from a synthetic timeline of transit records (RFC 0003); the **live recovery run

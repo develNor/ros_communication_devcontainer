@@ -479,8 +479,11 @@ project-specific session or scenario instead. Add `--interactive` to open a tmux
 operator view with a high-level run window, one fullscreen attachable catmux
 window per local peer, a network window split into qdisc status and tc/netem
 command logs, and a results window that prints the final result once. Shaped OTA
-benchmark profiles require passwordless non-interactive sudo for `tc`/`ip` on the
-remote peers; preflight checks this before arming the profile.
+benchmark profiles need sudo on the remote peers for the generated `tc`/`ip`
+commands. The default `--sudo-mode passwordless` checks `sudo -n` and is the right
+mode for unattended runs. For attended operator runs, pass `--sudo-mode askpass`
+to prompt locally once per peer and feed the password to remote `sudo -S` over SSH
+stdin without printing or storing it.
 
 ## Development
 

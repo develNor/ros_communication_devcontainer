@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import getpass
 import hashlib
 import importlib
 import importlib.resources as importlib_resources
@@ -27,7 +28,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -79,6 +80,8 @@ SESSION_INSTANCE_CONTAINER_DIR = "/session/instances"
 EXTERNAL_SESSION_CONTAINER_DIR = "/session/current"
 RUN_SESSION_CONTAINER_PATH = "/ws/session/creation/run_session.py"
 DEFAULT_SMOKE_SESSION = "1_heartbeat"
+OTA_SUDO_MODES = ("passwordless", "askpass")
+OTA_DEFAULT_SUDO_MODE = "passwordless"
 
 ws_creation_dir = WS_DIR / "session" / "creation"
 session_gen_path = ws_creation_dir / "generate_session_files.py"
@@ -1461,7 +1464,7 @@ def _ota_run(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     argv = _ota_remote_argv(peer, script, tty=tty, batch=batch)
-    print(f"+ {label}: {_ota_quote_cmd(argv)}")
+    print(f"+ {label}: running remote command")
     if dry_run:
         return subprocess.CompletedProcess(argv, 0, "", "")
     result = subprocess.run(argv, text=True, capture_output=not tty, check=False, timeout=timeout)
@@ -1469,6 +1472,31 @@ def _ota_run(
         detail = ((result.stdout or "") + (result.stderr or "")).strip()
         raise RuntimeError(f"{label} failed with exit code {result.returncode}:\n{detail}")
     return result
+
+
+def _ota_run_with_secret_stdin(
+    peer: OtaSmokePeer,
+    script: str,
+    *,
+    label: str,
+    secret_stdin: str,
+    dry_run: bool = False,
+    check: bool = True,
+    batch: bool = False,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    argv = _ota_remote_argv(peer, script, batch=batch)
+    if dry_run:
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    result = subprocess.run(argv, input=secret_stdin, text=True, capture_output=True, check=False, timeout=timeout)
+    if check and result.returncode != 0:
+        detail = ((result.stdout or "") + (result.stderr or "")).strip()
+        raise RuntimeError(f"{label} failed with exit code {result.returncode}:\n{detail}")
+    return result
+
+
+def _ota_log_action(label: str, detail: str) -> None:
+    print(f"+ {label}: {detail}")
 
 
 def _ota_print_failure_output(label: str, result: subprocess.CompletedProcess[str]) -> None:
@@ -1942,6 +1970,53 @@ def _resolve_ota_smoke_context(
     return runtime, plan, target
 
 
+def _validate_ota_sudo_mode(sudo_mode: str) -> str:
+    if sudo_mode not in OTA_SUDO_MODES:
+        raise RuntimeError(f"Unsupported OTA sudo mode {sudo_mode!r}; expected one of {', '.join(OTA_SUDO_MODES)}.")
+    return sudo_mode
+
+
+def _ota_network_sudo_passwords(
+    plan: OtaSmokePlan,
+    *,
+    sudo_mode: str,
+    require_network_shaping_sudo: bool,
+    dry_run: bool,
+) -> dict[str, str]:
+    sudo_mode = _validate_ota_sudo_mode(sudo_mode)
+    if not require_network_shaping_sudo or sudo_mode != "askpass":
+        return {}
+    if dry_run:
+        return {peer.name: "" for peer in plan.peers.values()}
+    passwords: dict[str, str] = {}
+    for peer in plan.peers.values():
+        target = peer.ssh or "local shell"
+        passwords[peer.name] = getpass.getpass(f"sudo password for {peer.name} ({target}) [network shaping only]: ")
+    return passwords
+
+
+def _sudo_stdin(sudo_password: str | None) -> str | None:
+    return None if sudo_password is None else sudo_password + "\n"
+
+
+def _sudo_command(argv: Sequence[str], *, askpass: bool = False) -> str:
+    mode = "sudo -S -p ''" if askpass else "sudo -n"
+    return f"{mode} {shlex.join(list(argv))}"
+
+
+def _passwordless_watchdog_command(argv: Sequence[str]) -> str:
+    argv = list(argv)
+    if len(argv) >= 3 and argv[0] == "sh" and argv[1] == "-c":
+        script = str(argv[2])
+        script = script.replace("; tc ", "; sudo -n tc ").replace("; ip ", "; sudo -n ip ")
+        if script.startswith("tc "):
+            script = "sudo -n " + script
+        if script.startswith("ip "):
+            script = "sudo -n " + script
+        return f"nohup sh -c {shlex.quote(script)} >/dev/null 2>&1 &"
+    return f"nohup sudo -n {shlex.join(argv)} >/dev/null 2>&1 &"
+
+
 def _ota_preflight(
     plan: OtaSmokePlan,
     *,
@@ -1949,7 +2024,11 @@ def _ota_preflight(
     check_peer_reachability: bool,
     dry_run: bool,
     require_network_shaping_sudo: bool = False,
+    sudo_mode: str = OTA_DEFAULT_SUDO_MODE,
+    sudo_passwords: Mapping[str, str] | None = None,
 ) -> None:
+    sudo_mode = _validate_ota_sudo_mode(sudo_mode)
+    sudo_passwords = sudo_passwords or {}
     for peer in plan.peers.values():
         if peer.ssh:
             _ota_run(peer, "true", label=f"{peer.name}: SSH reachable", dry_run=dry_run, batch=True)
@@ -1975,11 +2054,31 @@ def _ota_preflight(
         if require_network_shaping_sudo:
             _ota_run(
                 peer,
-                "command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 && sudo -n true",
-                label=f"{peer.name}: passwordless sudo for network shaping",
+                "command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1",
+                label=f"{peer.name}: required commands for network shaping",
                 dry_run=dry_run,
                 batch=True,
             )
+            if sudo_mode == "askpass":
+                script = "sudo -S -p '' true"
+                label = f"{peer.name}: sudo authentication for network shaping"
+                _ota_log_action(label, "authenticating sudo via stdin")
+                _ota_run_with_secret_stdin(
+                    peer,
+                    script,
+                    label=label,
+                    dry_run=dry_run,
+                    batch=True,
+                    secret_stdin=_sudo_stdin(sudo_passwords.get(peer.name)) or "",
+                )
+            else:
+                _ota_run(
+                    peer,
+                    "sudo -n tc qdisc show >/dev/null && sudo -n ip link show >/dev/null",
+                    label=f"{peer.name}: passwordless sudo for network shaping",
+                    dry_run=dry_run,
+                    batch=True,
+                )
 
     if check_peer_reachability:
         for src in plan.peers.values():
@@ -2267,26 +2366,64 @@ def _ota_resolve_interfaces(peer: OtaSmokePeer, peer_addr: str, *, dry_run: bool
     return ota_iface, control_iface
 
 
-def _peer_command_runner(peer: OtaSmokePeer, *, dry_run: bool) -> Callable[[Sequence[str]], None]:
+def _peer_command_runner(
+    peer: OtaSmokePeer, *, dry_run: bool, sudo_password: str | None = None
+) -> Callable[[Sequence[str]], None]:
     """A CommandRunner that runs one privileged argv on ``peer`` via the SSH path."""
 
     def run(argv: Sequence[str]) -> None:
-        _ota_run(peer, "sudo -n " + shlex.join(list(argv)), label=f"{peer.name}: tc/netem", dry_run=dry_run)
+        label = f"{peer.name}: tc/netem"
+        if sudo_password is None:
+            script = _sudo_command(argv)
+            _ota_run(peer, script, label=label, dry_run=dry_run)
+        else:
+            script = _sudo_command(argv, askpass=True)
+            _ota_log_action(label, "running remote sudo command via stdin")
+            _ota_run_with_secret_stdin(
+                peer,
+                script,
+                label=label,
+                dry_run=dry_run,
+                secret_stdin=_sudo_stdin(sudo_password) or "",
+            )
 
     return run
 
 
-def _peer_watchdog_launcher(peer: OtaSmokePeer, *, dry_run: bool) -> Callable[[Sequence[str]], None]:
+def _peer_watchdog_launcher(
+    peer: OtaSmokePeer, *, dry_run: bool, sudo_password: str | None = None
+) -> Callable[[Sequence[str]], None]:
     """Launch the safety-watchdog argv detached on ``peer`` so it survives a crash."""
 
     def launch(argv: Sequence[str]) -> None:
-        detached = f"nohup sudo -n {shlex.join(list(argv))} >/dev/null 2>&1 &"
-        _ota_run(peer, detached, label=f"{peer.name}: profile safety watchdog", dry_run=dry_run, check=False)
+        if sudo_password is None:
+            detached = _passwordless_watchdog_command(argv)
+            _ota_run(peer, detached, label=f"{peer.name}: profile safety watchdog", dry_run=dry_run, check=False)
+        else:
+            inner = f"nohup {shlex.join(list(argv))} >/dev/null 2>&1 &"
+            detached = f"sudo -S -p '' sh -c {shlex.quote(inner)}"
+            label = f"{peer.name}: profile safety watchdog"
+            _ota_log_action(label, "arming remote sudo watchdog via stdin")
+            _ota_run_with_secret_stdin(
+                peer,
+                detached,
+                label=label,
+                dry_run=dry_run,
+                check=False,
+                secret_stdin=_sudo_stdin(sudo_password) or "",
+            )
 
     return launch
 
 
-def _ota_arm_profile(plan: OtaSmokePlan, profile: Any, directions: dict[str, str], *, dry_run: bool) -> list[Any]:
+def _ota_arm_profile(
+    plan: OtaSmokePlan,
+    profile: Any,
+    directions: dict[str, str],
+    *,
+    dry_run: bool,
+    sudo_passwords: Mapping[str, str] | None = None,
+) -> list[Any]:
     """Arm the static profile per direction on every peer's OTA egress (RFC 0004),
     returning the ``ProfileShaper`` handles to revert in the run's ``finally``."""
     from .network_profiles import shaping_commands
@@ -2306,12 +2443,13 @@ def _ota_arm_profile(plan: OtaSmokePlan, profile: Any, directions: dict[str, str
             ota_iface, control_iface = "<ota-if>", None
         else:
             ota_iface, control_iface = _ota_resolve_interfaces(peer, other_addr, dry_run=False)
+        sudo_password = (sudo_passwords or {}).get(peer_name)
         shaper = ProfileShaper(
             ota_iface,
-            _peer_command_runner(peer, dry_run=dry_run),
+            _peer_command_runner(peer, dry_run=dry_run, sudo_password=sudo_password),
             control_interface=control_iface,
             safety_max_duration_s=_PROFILE_SAFETY_MAX_S,
-            watchdog_launcher=_peer_watchdog_launcher(peer, dry_run=dry_run),
+            watchdog_launcher=_peer_watchdog_launcher(peer, dry_run=dry_run, sudo_password=sudo_password),
         )
         # Register before arming so a mid-arm failure is still reverted in `finally`.
         shapers.append(shaper)

@@ -1139,15 +1139,15 @@ def test_ota_smoke_dry_run_exercises_generic_remote_flow(
     assert "install rosotacom" in out
     assert "required command tmux" in out
     assert "Python venv support" in out
-    assert 'grep -Eq "[1-9][0-9]* received"' in out
-    assert "ssh -o BatchMode=yes robot-b true" in out
-    assert "scenario start demo --identity a --mode detached --instance-id ota-dry" in out
-    assert "scenario start demo --identity b --mode detached --instance-id ota-dry" in out
-    assert "test demo --instance-id ota-dry" in out
-    assert "probe-publish demo --identity a --topic /local_only" in out
-    assert "probe-check demo --identity b --topic /local_only --expect absent" in out
-    assert "scenario stop demo --identity a --instance-id ota-dry" in out
-    assert "*_ota-dry" in out
+    assert "reach peer b (10.0.0.11): running remote command" in out
+    assert "b: SSH reachable: running remote command" in out
+    assert "a: start demo: running remote command" in out
+    assert "b: start demo: running remote command" in out
+    assert "a: rosotacom test: running remote command" in out
+    assert "a: publish isolation probe: running remote command" in out
+    assert "b: check isolation probe absent: running remote command" in out
+    assert "a: stop demo: running remote command" in out
+    assert "a: collect session-instances: running remote command" in out
     assert "OTA SMOKE OK" in out
 
 

@@ -466,11 +466,23 @@ fastdds`, `--rmw cyclone`, or another supported session RMW value to pin a run.
 Each run writes a self-contained `result.json` under its benchmark artifact
 directory with the selected RMW, configured load and offered bandwidth, profile
 shaping context, thresholds, verdict, and per-topic loss/latency/jitter metrics.
+Use `benchmark requirements` when you want rosotacom to search for a tight
+network profile for a stream and quality target. The driver starts from ideal
+conditions, worsens bandwidth, latency, jitter, and loss with a coordinate
+boundary search, then writes the chosen profile, all probes, and the nearby
+failing neighbors to `result.json`, `requirements.jsonl`, and
+`generated-profiles.yaml`:
+
+```bash
+rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 5 --max-latency-ms 250
+```
+
 Use `rosotacom ota-benchmark` for the same probes over deployment peers, without
 having to name a target:
 
 ```bash
 rosotacom ota-benchmark capacity --profile cellular-4g-degraded --knob size --low 1 --high 1 --max-loss 30 --max-latency-ms 1000 --duration 10 --repeats 1 --peer a=seat_tks --peer b=majestic_tks
+rosotacom ota-benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 5 --max-latency-ms 250 --peer a=seat_tks --peer b=majestic_tks
 ```
 
 OTA benchmarks default to the benchmark session for the selected genre. Pass

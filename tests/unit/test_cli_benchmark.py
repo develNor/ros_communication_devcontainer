@@ -651,6 +651,7 @@ def test_requirements_zero_loss_target_clamps_network_loss(tmp_path: Path) -> No
         distribution="normal",
         final_refine_iterations=0,
         loss_coupling="jitter",
+        downlink_mode="lan",
         result_context={"test": True},
         generated_profiles_file=generated_file,
     )
@@ -664,8 +665,78 @@ def test_requirements_zero_loss_target_clamps_network_loss(tmp_path: Path) -> No
     assert result["analysis"]["effective_loss_coupling"] == "zero_loss"
     assert result["analysis"]["strict_zero_loss_target"] is True
     assert result["analysis"]["skipped_axes"] == ["loss"]
+    assert result["profile"]["candidate"]["downlink_mode"] == "lan"
     generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
     assert generated["metadata"]["search"]["effective_loss_coupling"] == "zero_loss"
+    assert generated["profiles"]["requirements_final"]["downlink"] == {}
+
+
+def test_requirements_repeat_policy_finds_good_and_bad_zero_loss_cases(tmp_path: Path) -> None:
+    from rosotacom.network_profiles import parse_ms
+
+    generated_file = tmp_path / "generated-profiles.yaml"
+    profile_counts: dict[str, int] = {}
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        assert profile is not None
+        generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
+        jitter = parse_ms(generated["profiles"][profile]["uplink"].get("jitter", 0), "jitter")
+        repeat_index = profile_counts.get(profile, 0) + 1
+        profile_counts[profile] = repeat_index
+        lossy = jitter >= 10.0 or repeat_index == 10
+        return {
+            "topics": {
+                "/test": {
+                    "expected": 100,
+                    "delivered": 99 if lossy else 100,
+                    "lost": 1 if lossy else 0,
+                    "loss_pct": 1.0 if lossy else 0.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": 20.0, "p95": 40.0 + jitter},
+                    "jitter_ms": {"p50": jitter * 0.5, "p95": jitter},
+                }
+            }
+        }
+
+    result = drive_requirements(
+        probe,
+        max_loss_pct=0.0,
+        max_latency_ms=100.0,
+        rate_hz=20.0,
+        size=18_000,
+        streams=1,
+        qos_reliability="best_effort",
+        qos_depth=1,
+        topic="/test",
+        out_dir=tmp_path,
+        bandwidth_high_bps=100_000_000.0,
+        bandwidth_low_bps=10_000_000.0,
+        latency_high_ms=0.0,
+        jitter_high_ms=20.0,
+        loss_high_pct=0.0,
+        axes=_parse_requirements_axes("jitter"),
+        min_duration_s=20.0,
+        min_messages=100,
+        search_iterations=1,
+        search_rounds=1,
+        distribution="normal",
+        final_refine_iterations=0,
+        loss_coupling="jitter",
+        probe_repeats=10,
+        probe_min_passes=9,
+        bad_lossy_count=10,
+        result_context={"test": True},
+        generated_profiles_file=generated_file,
+    )
+
+    assert result["analysis"]["final_passes"] is True
+    assert result["analysis"]["probe_repeats"] == 10
+    assert result["analysis"]["probe_min_passes"] == 9
+    assert result["rows"][0]["repeat"]["pass_count"] == 9
+    assert result["rows"][0]["repeat"]["loss_free_count"] == 9
+    assert result["bounds"]["jitter"]["last_bad"]["repeat"]["lossy_count"] == 10
+    assert result["analysis"]["bad_cases_observed"]["jitter"]["repeat"]["bad_case"] is True
+    assert result["analysis"]["final_target_quality"]["repeat_pass_count"] == 9
 
 
 def test_requirements_bandwidth_refine_recovers_when_previous_fail_becomes_pass(tmp_path: Path) -> None:
@@ -1085,11 +1156,19 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.max_loss == 5.0
     assert args.max_latency_ms == 250.0
     assert args.axes == "all"
-    assert args.bandwidth_high == "1gbit"
+    assert args.bandwidth_high == "auto"
+    assert args.bandwidth_high_factor == 8.0
+    assert args.bandwidth_low_factor == 1.0
+    assert args.latency_high_ms is None
     assert args.search_iterations == 6
     assert args.search_rounds == 1
     assert args.final_refine_iterations == 3
     assert args.loss_coupling == "jitter"
+    assert args.downlink_mode == "mirror"
+    assert args.probe_repeats == 1
+    assert args.probe_min_passes is None
+    assert args.bad_lossy_count is None
+    assert args.search_order == "auto"
 
     # Plot.
     args = parser.parse_args(["benchmark", "plot", "results.jsonl"])

@@ -105,6 +105,17 @@ def test_base_plugin_catmux_commands_are_strings() -> None:
     assert not offenders
 
 
+def test_domain_bridge_generates_ota_dds_config_before_launch() -> None:
+    plugin = yaml.safe_load(
+        (cli.WS_DIR / "session" / "content" / "base" / "session_plugin_base.yaml").read_text(encoding="utf-8")
+    )
+    com_window = next(window for window in plugin["windows"] if window["name"] == "COM")
+    commands = com_window["splits"][0]["commands"]
+
+    assert "/ws/ota_configs/get_ota_xml.py" in commands[0]
+    assert commands[1].startswith("ros2 run domain_bridge domain_bridge")
+
+
 def test_native_chatter_waiter_reads_topic_info_without_broken_pipe(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

@@ -37,6 +37,7 @@ BENCHMARK_SESSIONS_BY_GENRE = {
     "sweep": "bench_1_2_load_sweep",
     "ramp": "bench_1_3_ramp",
     "recovery": "bench_1_4_recovery",
+    "sensitivity": "bench_1_1_capacity",
 }
 
 
@@ -210,6 +211,19 @@ def _benchmark_rmw(args: argparse.Namespace) -> str:
     return str(getattr(args, "rmw", None) or DEFAULT_BENCHMARK_RMW)
 
 
+def _normalize_benchmark_profile(profile: str | None) -> str | None:
+    if profile is None:
+        return None
+    normalized = profile.strip()
+    if not normalized or normalized.lower() in {"none", "unshaped"}:
+        return None
+    return normalized
+
+
+def _benchmark_profile_label(profile: str | None) -> str:
+    return _normalize_benchmark_profile(profile) or "none"
+
+
 def _rmw_runtime_implementation(rmw: str) -> str:
     from .cli import session_gen
 
@@ -295,6 +309,7 @@ def _benchmark_result_context(
 
     runtime = _load_runtime_config(args)
     rmw = _benchmark_rmw(args)
+    profile = _normalize_benchmark_profile(profile)
     profiles_file = _benchmark_profiles_file(profile, runtime.profiles_file)
     return cast(
         dict[str, Any],
@@ -377,6 +392,7 @@ def _is_ota_benchmark(args: argparse.Namespace) -> bool:
 
 
 def _benchmark_profiles_file(profile: str | None, profiles_file: Path | None) -> Path | None:
+    profile = _normalize_benchmark_profile(profile)
     if profiles_file is not None:
         return _find_profiles_file(profiles_file)
     try:
@@ -887,7 +903,7 @@ def _default_run_point(
 def drive_capacity(
     run_point: RunPointFn,
     *,
-    profile: str,
+    profile: str | None,
     knob: str,
     low: int,
     high: int,
@@ -915,7 +931,9 @@ def drive_capacity(
     )
 
     thresholds = OracleThresholds(max_loss_pct=max_loss_pct, max_latency_ms=max_latency_ms)
-    slice_ = CapacitySlice(profile=profile, knob=knob, fixed={"rate": rate_hz})
+    profile = _normalize_benchmark_profile(profile)
+    profile_label = _benchmark_profile_label(profile)
+    slice_ = CapacitySlice(profile=profile_label, knob=knob, fixed={"rate": rate_hz})
     probe_results: list[dict[str, Any]] = []
 
     def probe(value: int) -> bool:
@@ -987,7 +1005,7 @@ def drive_capacity(
     if result.capacity is not None:
         metrics[f"capacity_{knob}"] = float(result.capacity)
     budget_entry = BudgetEntry(
-        key=BudgetKey(sha=_current_sha(), profile=profile, genre="capacity"),
+        key=BudgetKey(sha=_current_sha(), profile=profile_label, genre="capacity"),
         metrics=metrics,
     )
     save_budget(budget_path, [budget_entry])
@@ -996,7 +1014,7 @@ def drive_capacity(
         genre="capacity",
         context=result_context,
         configuration={
-            "profile": profile,
+            "profile": profile_label,
             "knob": knob,
             "bounds": {"low": low, "high": high},
             "load": _load_context({"rate": rate_hz}),
@@ -1030,7 +1048,7 @@ def drive_capacity(
 def drive_ramp(
     run_point: RunPointFn,
     *,
-    profile: str,
+    profile: str | None,
     values: Sequence[float],
     knob: str = "size",
     rate_hz: float = 20.0,
@@ -1043,6 +1061,8 @@ def drive_ramp(
 
     Returns the response curve as a list of ``{value, metric}`` dicts.
     """
+    profile = _normalize_benchmark_profile(profile)
+    profile_label = _benchmark_profile_label(profile)
     curve: list[dict[str, float]] = []
     for value in values:
         load: dict[str, Any] = {"rate": rate_hz}
@@ -1084,7 +1104,7 @@ def drive_ramp(
         genre="ramp",
         context=result_context,
         configuration={
-            "profile": profile,
+            "profile": profile_label,
             "knob": knob,
             "values": list(values),
             "load": _load_context({"rate": rate_hz}),
@@ -1228,7 +1248,9 @@ def drive_sweep(
     frontier: list[dict[str, Any]] = []
     point_measurements: list[dict[str, Any]] = []
 
-    for profile in profile_grid:
+    for raw_profile in profile_grid:
+        profile = _normalize_benchmark_profile(raw_profile)
+        profile_label = _benchmark_profile_label(profile)
         load = {"size_a": size, "rate": rate_hz}
         summary = run_point(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
         rows = _topic_rows(summary, topic)
@@ -1239,7 +1261,7 @@ def drive_sweep(
         loss_pct = topic_data.get("loss_pct", 100.0)
         latency_p95 = (topic_data.get("ota_hop_ms") or {}).get("p95")
         result = {
-            "profile": profile,
+            "profile": profile_label,
             "passes": passes,
             "loss_pct": float(loss_pct),
             "latency_p95_ms": float(latency_p95) if latency_p95 is not None else None,
@@ -1249,6 +1271,7 @@ def drive_sweep(
         point_measurements.append(
             {
                 "profile": profile,
+                "profile_label": profile_label,
                 "passed": passes,
                 "load": load_info,
                 "topics": rows,
@@ -1256,7 +1279,7 @@ def drive_sweep(
             }
         )
         print(
-            f"  sweep({profile}): {'PASS' if passes else 'FAIL'} "
+            f"  sweep({profile_label}): {'PASS' if passes else 'FAIL'} "
             f"offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} {_format_topic_rows(rows)}"
         )
 
@@ -1270,7 +1293,7 @@ def drive_sweep(
         genre="sweep",
         context=result_context,
         configuration={
-            "profile_grid": list(profile_grid),
+            "profile_grid": [_benchmark_profile_label(profile) for profile in profile_grid],
             "load": _load_context({"size_a": size, "rate": rate_hz}),
             "thresholds": {
                 "max_loss_pct": max_loss_pct,
@@ -1290,6 +1313,416 @@ def drive_sweep(
     )
     print(f"Sweep frontier saved to {frontier_path}")
     return frontier
+
+
+# --------------------------------------------------------------------------- #
+# Benchmark driver: sensitivity
+# --------------------------------------------------------------------------- #
+
+
+def _safe_case_token(value: str) -> str:
+    from .cli import _safe_path_token
+
+    return _safe_path_token(
+        value.replace("%", "pct")
+        .replace("/", "_")
+        .replace(" ", "")
+        .replace(".", "p")
+        .replace("-", "m")
+        .replace("+", "p")
+    )
+
+
+def _format_yaml_ms(value: float | None) -> str | None:
+    return None if value is None else f"{value:g}ms"
+
+
+def _format_yaml_pct(value: float | None) -> str | None:
+    return None if value is None else f"{value:g}%"
+
+
+def _format_yaml_rate(value: float | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if value >= 1_000_000_000 and value % 1_000_000_000 == 0:
+        return f"{value / 1_000_000_000:g}gbit"
+    if value >= 1_000_000 and value % 1_000_000 == 0:
+        return f"{value / 1_000_000:g}mbit"
+    if value >= 1_000 and value % 1_000 == 0:
+        return f"{value / 1_000:g}kbit"
+    return f"{value:g}bit"
+
+
+def _parse_rate_values(raw: str) -> list[str]:
+    return [value.strip() for value in raw.split(",") if value.strip()]
+
+
+def _parse_sensitivity_axes(raw: str) -> set[str]:
+    available = {"loss", "delay", "jitter", "rate", "loss_correlation"}
+    aliases = {"loss-correlation": "loss_correlation"}
+    axes = {aliases.get(value.strip(), value.strip()) for value in raw.split(",") if value.strip()}
+    if not axes or "all" in axes:
+        return available
+    unknown = axes - available
+    if unknown:
+        raise ValueError(f"Unknown sensitivity axes: {', '.join(sorted(unknown))}")
+    return axes
+
+
+def _direction_to_yaml(
+    *,
+    rate: str | None = None,
+    delay_ms: float | None = None,
+    jitter_ms: float | None = None,
+    distribution: str | None = None,
+    loss_pct: float | None = None,
+    loss_correlation_pct: float | None = None,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {}
+    if rate is not None:
+        spec["rate"] = rate
+    if delay_ms is not None:
+        spec["delay"] = _format_yaml_ms(delay_ms)
+    if jitter_ms is not None:
+        spec["jitter"] = _format_yaml_ms(jitter_ms)
+        if distribution and jitter_ms > 0.0:
+            spec["distribution"] = distribution
+    if loss_pct is not None:
+        spec["loss"] = _format_yaml_pct(loss_pct)
+        if loss_correlation_pct is not None and loss_pct > 0.0:
+            spec["loss_correlation"] = _format_yaml_pct(loss_correlation_pct)
+    return spec
+
+
+def _profile_to_yaml(profile: Any) -> dict[str, Any]:
+    if getattr(profile, "is_timeline", False):
+        raise ValueError("sensitivity requires a static base profile, not a timeline profile")
+
+    def direction(direction_obj: Any) -> dict[str, Any]:
+        if direction_obj is None:
+            return {}
+        return _direction_to_yaml(
+            rate=_format_yaml_rate(direction_obj.rate_bps),
+            delay_ms=direction_obj.delay_ms,
+            jitter_ms=direction_obj.jitter_ms,
+            distribution=direction_obj.distribution,
+            loss_pct=direction_obj.loss_pct,
+            loss_correlation_pct=direction_obj.loss_correlation_pct,
+        )
+
+    return {"uplink": direction(profile.uplink), "downlink": direction(profile.downlink)}
+
+
+def _first_direction_attr(profile: Any, direction_name: str, attr: str, default: Any = None) -> Any:
+    direction = getattr(profile, direction_name, None)
+    return getattr(direction, attr, default) if direction is not None else default
+
+
+def _build_sensitivity_profiles(
+    *,
+    base_profile: str,
+    profiles_file: Path,
+    ideal_rate: str,
+    loss_values: Sequence[float],
+    delay_values: Sequence[float],
+    jitter_values: Sequence[float],
+    rate_values: Sequence[str],
+    correlation_values: Sequence[float],
+    axes: Sequence[str] | set[str] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    from .network_profiles import load_profiles_file, parse_rate_bps
+
+    profiles = load_profiles_file(profiles_file)
+    base_obj = profiles.get(base_profile)
+    if base_obj is None:
+        raise ValueError(f"Base profile {base_profile!r} not found in {profiles_file}.")
+    if getattr(base_obj, "is_timeline", False):
+        raise ValueError(f"Base profile {base_profile!r} is a timeline; sensitivity needs a static profile.")
+
+    # Validate rate tokens early; keep the original strings in YAML for readability.
+    parse_rate_bps(ideal_rate)
+    for rate in rate_values:
+        parse_rate_bps(rate)
+
+    base_distribution = (
+        _first_direction_attr(base_obj, "uplink", "distribution")
+        or _first_direction_attr(base_obj, "downlink", "distribution")
+        or "normal"
+    )
+    base_uplink_delay = float(_first_direction_attr(base_obj, "uplink", "delay_ms", 0.0) or 0.0)
+    base_downlink_delay = float(_first_direction_attr(base_obj, "downlink", "delay_ms", base_uplink_delay) or 0.0)
+    base_uplink_loss = float(_first_direction_attr(base_obj, "uplink", "loss_pct", 0.0) or 0.0)
+    base_downlink_loss = float(_first_direction_attr(base_obj, "downlink", "loss_pct", base_uplink_loss) or 0.0)
+
+    selected_axes = set(axes) if axes is not None else _parse_sensitivity_axes("all")
+    generated: dict[str, Any] = {}
+    cases: list[dict[str, Any]] = [{"axis": "baseline", "profile": None, "value": "unshaped"}]
+    generated[base_profile] = _profile_to_yaml(base_obj)
+
+    def add_case(name: str, axis: str, value: str, profile_spec: dict[str, Any], description: str) -> None:
+        generated[name] = profile_spec
+        cases.append({"axis": axis, "profile": name, "value": value, "description": description})
+
+    def static_profile(
+        *,
+        rate: str = ideal_rate,
+        delay_uplink_ms: float | None = None,
+        delay_downlink_ms: float | None = None,
+        jitter_uplink_ms: float | None = None,
+        jitter_downlink_ms: float | None = None,
+        loss_uplink_pct: float | None = None,
+        loss_downlink_pct: float | None = None,
+        loss_correlation_pct: float | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "uplink": _direction_to_yaml(
+                rate=rate,
+                delay_ms=delay_uplink_ms,
+                jitter_ms=jitter_uplink_ms,
+                distribution=base_distribution,
+                loss_pct=loss_uplink_pct,
+                loss_correlation_pct=loss_correlation_pct,
+            ),
+            "downlink": _direction_to_yaml(
+                rate=rate,
+                delay_ms=delay_downlink_ms,
+                jitter_ms=jitter_downlink_ms,
+                distribution=base_distribution,
+                loss_pct=loss_downlink_pct,
+                loss_correlation_pct=loss_correlation_pct,
+            ),
+        }
+
+    add_case(
+        "lab_ideal_rate_only",
+        "ideal",
+        ideal_rate,
+        static_profile(rate=ideal_rate),
+        "High-rate tbf only; no netem delay/jitter/loss.",
+    )
+    add_case(
+        f"lab_base_{_safe_case_token(base_profile)}",
+        "base",
+        base_profile,
+        _profile_to_yaml(base_obj),
+        "Original base profile copied into the generated lab file.",
+    )
+
+    if "loss" in selected_axes:
+        for loss in loss_values:
+            add_case(
+                f"lab_loss_{_safe_case_token(_format_yaml_pct(loss) or str(loss))}",
+                "loss",
+                _format_yaml_pct(loss) or str(loss),
+                static_profile(rate=ideal_rate, loss_uplink_pct=loss, loss_downlink_pct=loss),
+                "Only random packet loss is varied; rate is high and delay/jitter are absent.",
+            )
+
+    if "delay" in selected_axes:
+        for delay in delay_values:
+            add_case(
+                f"lab_delay_{_safe_case_token(_format_yaml_ms(delay) or str(delay))}",
+                "delay",
+                _format_yaml_ms(delay) or str(delay),
+                static_profile(rate=ideal_rate, delay_uplink_ms=delay, delay_downlink_ms=delay),
+                "Only fixed delay is varied; rate is high and loss/jitter are absent.",
+            )
+
+    if "jitter" in selected_axes:
+        for jitter in jitter_values:
+            add_case(
+                f"lab_jitter_{_safe_case_token(_format_yaml_ms(jitter) or str(jitter))}",
+                "jitter",
+                _format_yaml_ms(jitter) or str(jitter),
+                static_profile(
+                    rate=ideal_rate,
+                    delay_uplink_ms=base_uplink_delay,
+                    delay_downlink_ms=base_downlink_delay,
+                    jitter_uplink_ms=jitter,
+                    jitter_downlink_ms=jitter,
+                ),
+                "Jitter is varied around the base profile's mean delay; rate is high and loss is absent.",
+            )
+
+    if "rate" in selected_axes:
+        for rate in rate_values:
+            add_case(
+                f"lab_rate_{_safe_case_token(rate)}",
+                "rate",
+                rate,
+                static_profile(rate=rate),
+                "Only rate limiting is varied; delay/jitter/loss are absent.",
+            )
+
+    if "loss_correlation" in selected_axes:
+        for correlation in correlation_values:
+            add_case(
+                f"lab_loss_correlation_{_safe_case_token(_format_yaml_pct(correlation) or str(correlation))}",
+                "loss_correlation",
+                _format_yaml_pct(correlation) or str(correlation),
+                static_profile(
+                    rate=ideal_rate,
+                    loss_uplink_pct=base_uplink_loss,
+                    loss_downlink_pct=base_downlink_loss,
+                    loss_correlation_pct=correlation,
+                ),
+                "Loss correlation is varied at the base profile's loss rate; rate is high and delay/jitter are absent.",
+            )
+
+    doc = {
+        "profiles": generated,
+        "metadata": {
+            "kind": "benchmark-sensitivity-generated",
+            "source_profiles_file": str(profiles_file),
+            "base_profile": base_profile,
+            "ideal_rate": ideal_rate,
+            "axes": sorted(selected_axes),
+        },
+    }
+    return doc, cases
+
+
+def _selected_topic(summary: dict[str, Any], topic: str = "") -> tuple[str, dict[str, Any]]:
+    topics = summary.get("topics", {})
+    if not isinstance(topics, dict) or not topics:
+        return "", {}
+    if topic:
+        return topic, topics.get(topic, {}) if isinstance(topics.get(topic), dict) else {}
+    first_topic = next(iter(topics))
+    topic_data = topics.get(first_topic)
+    return first_topic, topic_data if isinstance(topic_data, dict) else {}
+
+
+def _sensitivity_analysis(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    baseline = next((row for row in rows if row.get("axis") == "baseline"), None)
+    ideal = next((row for row in rows if row.get("axis") == "ideal"), None)
+    reference = baseline or ideal
+    reference_loss = float(reference.get("loss_pct") or 0.0) if reference else 0.0
+    reference_latency = float(reference.get("latency_p95_ms") or 0.0) if reference else 0.0
+
+    axes: dict[str, Any] = {}
+    for axis in sorted({str(row.get("axis")) for row in rows} - {"baseline"}):
+        axis_rows = [row for row in rows if row.get("axis") == axis]
+        if not axis_rows:
+            continue
+        worst_loss = max(axis_rows, key=lambda row: float(row.get("loss_pct") or 0.0))
+        worst_latency = max(axis_rows, key=lambda row: float(row.get("latency_p95_ms") or 0.0))
+        axes[axis] = {
+            "points": len(axis_rows),
+            "worst_loss": {
+                "profile": worst_loss.get("profile"),
+                "value": worst_loss.get("value"),
+                "loss_pct": worst_loss.get("loss_pct"),
+                "delta_vs_reference_pct": round(float(worst_loss.get("loss_pct") or 0.0) - reference_loss, 3),
+            },
+            "worst_latency": {
+                "profile": worst_latency.get("profile"),
+                "value": worst_latency.get("value"),
+                "latency_p95_ms": worst_latency.get("latency_p95_ms"),
+                "delta_vs_reference_ms": round(
+                    float(worst_latency.get("latency_p95_ms") or 0.0) - reference_latency,
+                    3,
+                ),
+            },
+        }
+    return {"reference_profile": reference.get("profile") if reference else None, "axes": axes}
+
+
+def drive_sensitivity(
+    run_point: RunPointFn,
+    *,
+    cases: Sequence[dict[str, Any]],
+    max_loss_pct: float,
+    max_latency_ms: float,
+    rate_hz: float,
+    size: int,
+    topic: str,
+    duration_s: float,
+    out_dir: Path,
+    result_context: dict[str, Any] | None = None,
+    generated_profiles_file: Path | None = None,
+) -> list[dict[str, Any]]:
+    from .benchmark import OracleThresholds, oracle_passes_topic
+
+    thresholds = OracleThresholds(max_loss_pct=max_loss_pct, max_latency_ms=max_latency_ms)
+    rows: list[dict[str, Any]] = []
+    measurements: list[dict[str, Any]] = []
+    load = {"size_a": size, "rate": rate_hz}
+    load_info = _load_context(load)
+
+    for case in cases:
+        profile = _normalize_benchmark_profile(cast(str | None, case.get("profile")))
+        profile_label = _benchmark_profile_label(profile)
+        summary = run_point(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
+        selected_topic, topic_data = _selected_topic(summary, topic)
+        rows_for_print = _topic_rows(summary, topic)
+        passes = oracle_passes_topic(topic_data, thresholds) if topic_data else False
+        loss_pct = float(topic_data.get("loss_pct", 100.0)) if topic_data else 100.0
+        latency_p95 = (topic_data.get("ota_hop_ms") or {}).get("p95") if topic_data else None
+        jitter_p95 = (topic_data.get("jitter_ms") or {}).get("p95") if topic_data else None
+        row = {
+            "profile": profile_label,
+            "axis": case.get("axis"),
+            "value": case.get("value"),
+            "description": case.get("description"),
+            "passes": passes,
+            "topic": selected_topic,
+            "expected": topic_data.get("expected") if topic_data else None,
+            "delivered": topic_data.get("delivered") if topic_data else None,
+            "lost": topic_data.get("lost") if topic_data else None,
+            "reordered": topic_data.get("reordered") if topic_data else None,
+            "loss_pct": loss_pct,
+            "latency_p95_ms": float(latency_p95) if latency_p95 is not None else None,
+            "jitter_p95_ms": float(jitter_p95) if jitter_p95 is not None else None,
+            "offered_bw_bps": float(load_info["offered_bandwidth_bps"] or 0.0),
+        }
+        rows.append(row)
+        measurements.append({"case": case, "load": load_info, "topics": rows_for_print, "summary": summary})
+        print(
+            f"  sensitivity({profile_label}, axis={case.get('axis')}, value={case.get('value')}): "
+            f"{'PASS' if passes else 'FAIL'} offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} "
+            f"{_format_topic_rows(rows_for_print)}"
+        )
+
+    sensitivity_path = out_dir / "sensitivity.jsonl"
+    sensitivity_path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    analysis = _sensitivity_analysis(rows)
+    _write_benchmark_result(
+        out_dir,
+        genre="sensitivity",
+        context=result_context,
+        configuration={
+            "cases": list(cases),
+            "load": load_info,
+            "thresholds": {
+                "max_loss_pct": max_loss_pct,
+                "max_latency_ms": max_latency_ms,
+                "latency_quantile": thresholds.latency_quantile,
+            },
+            "topic": topic or None,
+            "duration_s": duration_s,
+            "generated_profiles_file": generated_profiles_file.name if generated_profiles_file else None,
+        },
+        result={"rows": rows, "analysis": analysis},
+        measurements={"points": measurements},
+        verdict={
+            "passed": all(row["passes"] for row in rows),
+            "status": "all_cases_passed" if all(row["passes"] for row in rows) else "case_failures",
+        },
+        artifacts={
+            "sensitivity": sensitivity_path.name,
+            "generated_profiles": generated_profiles_file.name if generated_profiles_file else None,
+            "stdout": "stdout.txt",
+            "probes_dir": "probes",
+        },
+    )
+    print(f"Sensitivity rows saved to {sensitivity_path}")
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -2159,6 +2592,83 @@ def benchmark_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def benchmark_sensitivity(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark sensitivity``."""
+    from .cli import _load_runtime_config
+
+    if getattr(args, "interactive", False):
+        return _start_interactive_benchmark(args, "sensitivity")
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+    base_profile = str(args.profile)
+
+    run_dir = _setup_benchmark_run_dir(args, "sensitivity", base_profile)
+    source_profiles_file = _benchmark_profiles_file(base_profile, runtime.profiles_file)
+    if source_profiles_file is None:
+        raise FileNotFoundError("sensitivity requires a profiles file containing the base profile.")
+
+    generated_doc, cases = _build_sensitivity_profiles(
+        base_profile=base_profile,
+        profiles_file=source_profiles_file,
+        ideal_rate=getattr(args, "ideal_rate", "1gbit"),
+        loss_values=_parse_values(getattr(args, "loss_values", "0,0.5,1,3,5")),
+        delay_values=_parse_values(getattr(args, "delay_values", "0,60,120,180")),
+        jitter_values=_parse_values(getattr(args, "jitter_values", "0,10,30,50,80")),
+        rate_values=_parse_rate_values(getattr(args, "rate_values", "1gbit,100mbit,10mbit,1mbit")),
+        correlation_values=_parse_values(getattr(args, "correlation_values", "0,25,50,75")),
+        axes=_parse_sensitivity_axes(getattr(args, "axes", "all")),
+    )
+    generated_profiles_file = run_dir / "generated-profiles.yaml"
+    generated_profiles_file.write_text(yaml.safe_dump(generated_doc, sort_keys=False), encoding="utf-8")
+    args.profiles_file = str(generated_profiles_file)
+
+    session_name = BENCHMARK_SESSIONS_BY_GENRE["sensitivity"]
+    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    result_context = _benchmark_result_context(
+        args,
+        genre="sensitivity",
+        profile=base_profile,
+        run_dir=run_dir,
+        session=session_context,
+    )
+    result_context["sensitivity"] = {
+        "source_profiles_file": str(source_profiles_file),
+        "generated_profiles_file": str(generated_profiles_file),
+        "base_profile": base_profile,
+    }
+
+    run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, session_name)
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_sensitivity(
+            run_point,
+            cases=cases,
+            max_loss_pct=getattr(args, "max_loss", 5.0),
+            max_latency_ms=getattr(args, "max_latency_ms", 300.0),
+            rate_hz=getattr(args, "rate_hz", 20.0),
+            size=getattr(args, "size", 1),
+            topic=getattr(args, "topic", ""),
+            duration_s=getattr(args, "duration", 60.0),
+            out_dir=run_dir,
+            result_context=result_context,
+            generated_profiles_file=generated_profiles_file,
+        )
+
+    out_file_name = getattr(args, "out", "sensitivity.jsonl")
+    if artifacts_dir:
+        out_path = artifacts_dir / Path(out_file_name).name
+    else:
+        out_path = Path(out_file_name)
+
+    run_sensitivity_file = run_dir / "sensitivity.jsonl"
+    if run_sensitivity_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(run_sensitivity_file, out_path)
+        print(f"Sensitivity rows copied to {out_path}")
+
+    return 0
+
+
 def benchmark_plot(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark plot``."""
     from .cli import _load_runtime_config
@@ -2344,6 +2854,53 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
     sweep_parser.add_argument("--duration", type=float, default=60.0, help="Seconds per sweep point.")
     sweep_parser.add_argument("--out", default="frontier.jsonl", help="Output frontier JSONL file.")
     sweep_parser.set_defaults(func=benchmark_sweep)
+
+    # --- sensitivity ---
+    sensitivity_parser = benchmark_subparsers.add_parser(
+        "sensitivity",
+        help="Run a generated profile lab to isolate loss, delay, jitter, rate, and loss-correlation effects.",
+    )
+    _add_benchmark_common_args(sensitivity_parser, ota_benchmark=ota_benchmark)
+    sensitivity_parser.add_argument("--profile", required=True, help="Static base profile to investigate.")
+    sensitivity_parser.add_argument("--max-loss", type=float, default=5.0, help="Oracle: max loss %%.")
+    sensitivity_parser.add_argument("--max-latency-ms", type=float, default=300.0, help="Oracle: max p95 latency (ms).")
+    sensitivity_parser.add_argument("--rate-hz", type=float, default=20.0, help="Publish rate (Hz).")
+    sensitivity_parser.add_argument("--size", type=int, default=1, help="Payload size (bytes).")
+    sensitivity_parser.add_argument("--topic", default="", help="Topic to evaluate.")
+    sensitivity_parser.add_argument("--duration", type=float, default=60.0, help="Seconds per sensitivity point.")
+    sensitivity_parser.add_argument("--ideal-rate", default="1gbit", help="High-quality shaped-link rate.")
+    sensitivity_parser.add_argument(
+        "--loss-values",
+        default="0,0.5,1,3,5",
+        help="Comma/range list of loss percentages for the loss-only axis.",
+    )
+    sensitivity_parser.add_argument(
+        "--delay-values",
+        default="0,60,120,180",
+        help="Comma/range list of fixed delays in milliseconds for the delay-only axis.",
+    )
+    sensitivity_parser.add_argument(
+        "--jitter-values",
+        default="0,10,30,50,80",
+        help="Comma/range list of jitter values in milliseconds around the base mean delay.",
+    )
+    sensitivity_parser.add_argument(
+        "--rate-values",
+        default="1gbit,100mbit,10mbit,1mbit",
+        help="Comma list of rate tokens for the rate-only axis.",
+    )
+    sensitivity_parser.add_argument(
+        "--correlation-values",
+        default="0,25,50,75",
+        help="Comma/range list of loss-correlation percentages at the base loss rate.",
+    )
+    sensitivity_parser.add_argument(
+        "--axes",
+        default="all",
+        help="Comma list of sensitivity axes to run: all, loss, delay, jitter, rate, loss-correlation.",
+    )
+    sensitivity_parser.add_argument("--out", default="sensitivity.jsonl", help="Output sensitivity JSONL file.")
+    sensitivity_parser.set_defaults(func=benchmark_sensitivity)
 
 
 def _register_benchmark_plot_parser(benchmark_subparsers: Any) -> None:

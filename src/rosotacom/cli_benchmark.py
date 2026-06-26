@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import shlex
 import shutil
 import subprocess
@@ -38,6 +39,7 @@ BENCHMARK_SESSIONS_BY_GENRE = {
     "ramp": "bench_1_3_ramp",
     "recovery": "bench_1_4_recovery",
     "sensitivity": "bench_1_1_capacity",
+    "matrix": "bench_1_1_capacity",
 }
 
 
@@ -224,6 +226,41 @@ def _benchmark_profile_label(profile: str | None) -> str:
     return _normalize_benchmark_profile(profile) or "none"
 
 
+def _apply_benchmark_qos_options(
+    cfg: dict[str, Any],
+    *,
+    reliability: str | None = None,
+    depth: int | None = None,
+) -> dict[str, Any] | None:
+    if reliability is None and depth is None:
+        return None
+    shared = cfg.setdefault("shared", {})
+    if not isinstance(shared, dict):
+        raise RuntimeError("Benchmark session config 'shared' must be a mapping.")
+    qos = shared.setdefault("qos", {})
+    if not isinstance(qos, dict):
+        raise RuntimeError("Benchmark session config 'shared.qos' must be a mapping.")
+    if depth is not None:
+        if depth < 1:
+            raise ValueError("QoS depth must be >= 1.")
+        defaults = qos.setdefault("defaults", {})
+        if not isinstance(defaults, dict):
+            raise RuntimeError("Benchmark session config 'shared.qos.defaults' must be a mapping.")
+        defaults["depth"] = depth
+    if reliability is not None:
+        if reliability not in {"best_effort", "reliable"}:
+            raise ValueError("QoS reliability must be 'best_effort' or 'reliable'.")
+        role_defaults = qos.setdefault("for_role", {})
+        if not isinstance(role_defaults, dict):
+            raise RuntimeError("Benchmark session config 'shared.qos.for_role' must be a mapping.")
+        for role in ("ota_sub", "ota_pub"):
+            role_cfg = role_defaults.setdefault(role, {})
+            if not isinstance(role_cfg, dict):
+                raise RuntimeError(f"Benchmark session config QoS role {role!r} must be a mapping.")
+            role_cfg["reliability"] = reliability
+    return {"reliability": reliability, "depth": depth}
+
+
 def _rmw_runtime_implementation(rmw: str) -> str:
     from .cli import session_gen
 
@@ -254,6 +291,11 @@ def _prepare_benchmark_session_config(args: argparse.Namespace, session_name: st
     if not isinstance(shared, dict):
         raise RuntimeError(f"Benchmark session config 'shared' must be a mapping: {config_path}")
     shared["rmw"] = rmw
+    qos_options = _apply_benchmark_qos_options(
+        cfg,
+        reliability=getattr(args, "qos_reliability", None),
+        depth=getattr(args, "qos_depth", None),
+    )
     config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
     existing_raw = getattr(args, "session_configs_dir", None)
@@ -275,7 +317,63 @@ def _prepare_benchmark_session_config(args: argparse.Namespace, session_name: st
         "config_path": config_path,
         "rmw": rmw,
         "runtime_implementation": _rmw_runtime_implementation(rmw),
+        "qos": qos_options,
     }
+
+
+def _activate_benchmark_session_options(
+    args: argparse.Namespace,
+    session_name: str,
+    out_dir: Path,
+    options: dict[str, Any] | None,
+) -> Any:
+    if not options:
+        return None
+
+    source_session = Path(getattr(args, "_benchmark_session_dir", ""))
+    if not source_session.is_dir():
+        raise FileNotFoundError("Row-specific benchmark session options require a prepared session copy.")
+
+    case_token = _safe_case_token(str(options.get("case_token") or "case"))
+    dest_root = out_dir / "case-session-configs" / case_token
+    dest_session = dest_root / session_name
+    if dest_session.exists():
+        shutil.rmtree(dest_session)
+    shutil.copytree(source_session, dest_session)
+
+    config_path = dest_session / "session-definition.yaml"
+    if not config_path.is_file():
+        config_path = dest_session / "session-parametrization.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Benchmark session {session_name!r} has no session YAML: {dest_session}")
+
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(cfg, dict):
+        raise RuntimeError(f"Benchmark session config must be a mapping: {config_path}")
+    _apply_benchmark_qos_options(
+        cfg,
+        reliability=options.get("qos_reliability"),
+        depth=options.get("qos_depth"),
+    )
+    config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+    previous = getattr(args, "session_configs_dir", None)
+    if previous is None:
+        existing: list[Any] = []
+    elif isinstance(previous, list | tuple):
+        existing = list(previous)
+    else:
+        existing = [previous]
+    args.session_configs_dir = [str(dest_root), *[str(path) for path in existing]]
+    return previous
+
+
+def _restore_benchmark_session_options(args: argparse.Namespace, previous: Any) -> None:
+    if previous is None:
+        if hasattr(args, "session_configs_dir"):
+            args.session_configs_dir = None
+    else:
+        args.session_configs_dir = previous
 
 
 def _profile_context(profile: str | None, profiles_file: Path | None) -> dict[str, Any]:
@@ -1371,6 +1469,46 @@ def _parse_sensitivity_axes(raw: str) -> set[str]:
     return axes
 
 
+def _parse_matrix_axes(raw: str) -> set[str]:
+    available = {"latency", "hz", "qos"}
+    axes = {value.strip().lower() for value in raw.split(",") if value.strip()}
+    if not axes or "all" in axes:
+        return available
+    unknown = axes - available
+    if unknown:
+        raise ValueError(f"Unknown matrix axes: {', '.join(sorted(unknown))}")
+    return axes
+
+
+def _parse_qos_cases(raw: str) -> list[dict[str, Any]]:
+    cases: list[dict[str, Any]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            reliability, depth = item.split(":", 1)
+        else:
+            reliability, depth = item, "1"
+        reliability = reliability.strip()
+        if reliability not in {"best_effort", "reliable"}:
+            raise ValueError(f"Unknown QoS reliability in case {item!r}.")
+        try:
+            depth_int = int(depth.strip())
+        except ValueError as exc:
+            raise ValueError(f"QoS depth must be an integer in case {item!r}.") from exc
+        if depth_int < 1:
+            raise ValueError(f"QoS depth must be >= 1 in case {item!r}.")
+        cases.append({"reliability": reliability, "depth": depth_int})
+    return cases
+
+
+def _duration_for_min_messages(rate_hz: float, *, min_duration_s: float, min_messages: int) -> float:
+    if rate_hz <= 0:
+        raise ValueError("rate_hz must be > 0.")
+    return max(float(min_duration_s), math.ceil(float(min_messages) / rate_hz))
+
+
 def _direction_to_yaml(
     *,
     rate: str | None = None,
@@ -1584,6 +1722,180 @@ def _build_sensitivity_profiles(
     return doc, cases
 
 
+def _build_matrix_profiles(
+    *,
+    base_profile: str,
+    profiles_file: Path,
+    ideal_rate: str,
+    jitter_ms: float,
+    latency_values: Sequence[float],
+    rate_hz_values: Sequence[float],
+    qos_cases: Sequence[dict[str, Any]],
+    axes: Sequence[str] | set[str] | None,
+    size: int,
+    fixed_rate_hz: float,
+    min_duration_s: float,
+    min_messages: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    from .network_profiles import load_profiles_file, parse_rate_bps
+
+    profiles = load_profiles_file(profiles_file)
+    base_obj = profiles.get(base_profile)
+    if base_obj is None:
+        raise ValueError(f"Base profile {base_profile!r} not found in {profiles_file}.")
+    if getattr(base_obj, "is_timeline", False):
+        raise ValueError(f"Base profile {base_profile!r} is a timeline; matrix needs a static profile.")
+
+    parse_rate_bps(ideal_rate)
+    selected_axes = set(axes) if axes is not None else _parse_matrix_axes("all")
+    base_distribution = (
+        _first_direction_attr(base_obj, "uplink", "distribution")
+        or _first_direction_attr(base_obj, "downlink", "distribution")
+        or "normal"
+    )
+    base_uplink_delay = float(_first_direction_attr(base_obj, "uplink", "delay_ms", 0.0) or 0.0)
+    base_downlink_delay = float(_first_direction_attr(base_obj, "downlink", "delay_ms", base_uplink_delay) or 0.0)
+    downlink_ratio = base_downlink_delay / base_uplink_delay if base_uplink_delay > 0.0 else 1.0
+
+    generated: dict[str, Any] = {}
+    cases: list[dict[str, Any]] = []
+
+    def jitter_profile(name: str, uplink_delay_ms: float) -> str:
+        downlink_delay_ms = round(uplink_delay_ms * downlink_ratio, 6)
+        generated[name] = {
+            "uplink": _direction_to_yaml(
+                rate=ideal_rate,
+                delay_ms=uplink_delay_ms,
+                jitter_ms=jitter_ms,
+                distribution=base_distribution,
+            ),
+            "downlink": _direction_to_yaml(
+                rate=ideal_rate,
+                delay_ms=downlink_delay_ms,
+                jitter_ms=jitter_ms,
+                distribution=base_distribution,
+            ),
+        }
+        return name
+
+    fixed_latency_label = _format_yaml_ms(base_uplink_delay) or str(base_uplink_delay)
+    fixed_profile = jitter_profile(
+        f"matrix_jitter_{_safe_case_token(_format_yaml_ms(jitter_ms) or str(jitter_ms))}"
+        f"_latency_{_safe_case_token(fixed_latency_label)}",
+        base_uplink_delay,
+    )
+
+    def add_case(
+        *,
+        axis: str,
+        value: str,
+        profile: str,
+        rate_hz: float,
+        qos_reliability: str = "best_effort",
+        qos_depth: int = 1,
+        description: str,
+    ) -> None:
+        duration_s = _duration_for_min_messages(
+            rate_hz,
+            min_duration_s=min_duration_s,
+            min_messages=min_messages,
+        )
+        case_token = _safe_case_token(f"{axis}_{value}_{qos_reliability}_{qos_depth}_{rate_hz:g}")
+        load = {"size_a": size, "rate": rate_hz}
+        cases.append(
+            {
+                "axis": axis,
+                "value": value,
+                "profile": profile,
+                "description": description,
+                "load": load,
+                "duration_s": duration_s,
+                "qos": {"reliability": qos_reliability, "depth": qos_depth},
+                "session_options": {
+                    "case_token": case_token,
+                    "qos_reliability": qos_reliability,
+                    "qos_depth": qos_depth,
+                },
+            }
+        )
+
+    add_case(
+        axis="reference",
+        value=f"jitter={_format_yaml_ms(jitter_ms)},latency={fixed_latency_label},hz={fixed_rate_hz:g}",
+        profile=fixed_profile,
+        rate_hz=fixed_rate_hz,
+        description="Fixed 30ms-jitter reference using base-profile latency ratio and benchmark default QoS.",
+    )
+
+    if "latency" in selected_axes:
+        for latency in latency_values:
+            latency_label = _format_yaml_ms(latency) or str(latency)
+            profile = jitter_profile(
+                f"matrix_latency_{_safe_case_token(latency_label)}"
+                f"_jitter_{_safe_case_token(_format_yaml_ms(jitter_ms) or str(jitter_ms))}",
+                latency,
+            )
+            add_case(
+                axis="latency",
+                value=latency_label,
+                profile=profile,
+                rate_hz=fixed_rate_hz,
+                description=(
+                    "Vary mean uplink delay while preserving the base profile's uplink/downlink latency ratio; "
+                    "jitter is fixed and random loss is absent."
+                ),
+            )
+
+    if "hz" in selected_axes:
+        for rate_hz in rate_hz_values:
+            add_case(
+                axis="hz",
+                value=f"{rate_hz:g}hz",
+                profile=fixed_profile,
+                rate_hz=rate_hz,
+                description=(
+                    "Vary publisher frequency under the fixed 30ms-jitter profile; duration is extended to keep "
+                    "at least the configured minimum message count."
+                ),
+            )
+
+    if "qos" in selected_axes:
+        for qos in qos_cases:
+            reliability = str(qos["reliability"])
+            depth = int(qos["depth"])
+            add_case(
+                axis="qos",
+                value=f"{reliability}:depth{depth}",
+                profile=fixed_profile,
+                rate_hz=fixed_rate_hz,
+                qos_reliability=reliability,
+                qos_depth=depth,
+                description="Vary OTA QoS role defaults under the fixed 30ms-jitter profile.",
+            )
+
+    doc = {
+        "profiles": generated,
+        "metadata": {
+            "kind": "benchmark-matrix-generated",
+            "source_profiles_file": str(profiles_file),
+            "base_profile": base_profile,
+            "ideal_rate": ideal_rate,
+            "jitter_ms": jitter_ms,
+            "fixed_rate_hz": fixed_rate_hz,
+            "min_duration_s": min_duration_s,
+            "min_messages": min_messages,
+            "axes": sorted(selected_axes),
+            "latency_model": {
+                "mode": "base-ratio",
+                "base_uplink_delay_ms": base_uplink_delay,
+                "base_downlink_delay_ms": base_downlink_delay,
+                "downlink_ratio": downlink_ratio,
+            },
+        },
+    }
+    return doc, cases
+
+
 def _selected_topic(summary: dict[str, Any], topic: str = "") -> tuple[str, dict[str, Any]]:
     topics = summary.get("topics", {})
     if not isinstance(topics, dict) or not topics:
@@ -1597,13 +1909,14 @@ def _selected_topic(summary: dict[str, Any], topic: str = "") -> tuple[str, dict
 
 def _sensitivity_analysis(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     baseline = next((row for row in rows if row.get("axis") == "baseline"), None)
+    explicit_reference = next((row for row in rows if row.get("axis") == "reference"), None)
     ideal = next((row for row in rows if row.get("axis") == "ideal"), None)
-    reference = baseline or ideal
+    reference = baseline or explicit_reference or ideal
     reference_loss = float(reference.get("loss_pct") or 0.0) if reference else 0.0
     reference_latency = float(reference.get("latency_p95_ms") or 0.0) if reference else 0.0
 
     axes: dict[str, Any] = {}
-    for axis in sorted({str(row.get("axis")) for row in rows} - {"baseline"}):
+    for axis in sorted({str(row.get("axis")) for row in rows} - {"baseline", "reference"}):
         axis_rows = [row for row in rows if row.get("axis") == axis]
         if not axis_rows:
             continue
@@ -1722,6 +2035,106 @@ def drive_sensitivity(
         },
     )
     print(f"Sensitivity rows saved to {sensitivity_path}")
+    return rows
+
+
+def drive_matrix(
+    run_point: RunPointFn,
+    *,
+    cases: Sequence[dict[str, Any]],
+    max_loss_pct: float,
+    max_latency_ms: float,
+    topic: str,
+    out_dir: Path,
+    result_context: dict[str, Any] | None = None,
+    generated_profiles_file: Path | None = None,
+) -> list[dict[str, Any]]:
+    from .benchmark import OracleThresholds, oracle_passes_topic
+
+    thresholds = OracleThresholds(max_loss_pct=max_loss_pct, max_latency_ms=max_latency_ms)
+    rows: list[dict[str, Any]] = []
+    measurements: list[dict[str, Any]] = []
+
+    for case in cases:
+        profile = _normalize_benchmark_profile(cast(str | None, case.get("profile")))
+        profile_label = _benchmark_profile_label(profile)
+        load = dict(cast(dict[str, Any], case.get("load", {})))
+        load_info = _load_context(load)
+        duration_s = float(case.get("duration_s", 0.0) or 0.0)
+        summary = run_point(
+            profile=profile,
+            load=load,
+            duration_s=duration_s,
+            out_dir=out_dir,
+            session_options=case.get("session_options"),
+        )
+        selected_topic, topic_data = _selected_topic(summary, topic)
+        rows_for_print = _topic_rows(summary, topic)
+        passes = oracle_passes_topic(topic_data, thresholds) if topic_data else False
+        loss_pct = float(topic_data.get("loss_pct", 100.0)) if topic_data else 100.0
+        latency_p95 = (topic_data.get("ota_hop_ms") or {}).get("p95") if topic_data else None
+        jitter_p95 = (topic_data.get("jitter_ms") or {}).get("p95") if topic_data else None
+        row = {
+            "profile": profile_label,
+            "axis": case.get("axis"),
+            "value": case.get("value"),
+            "description": case.get("description"),
+            "qos": case.get("qos"),
+            "duration_s": duration_s,
+            "load": load_info,
+            "passes": passes,
+            "topic": selected_topic,
+            "expected": topic_data.get("expected") if topic_data else None,
+            "delivered": topic_data.get("delivered") if topic_data else None,
+            "lost": topic_data.get("lost") if topic_data else None,
+            "reordered": topic_data.get("reordered") if topic_data else None,
+            "loss_pct": loss_pct,
+            "latency_p95_ms": float(latency_p95) if latency_p95 is not None else None,
+            "jitter_p95_ms": float(jitter_p95) if jitter_p95 is not None else None,
+            "offered_bw_bps": float(load_info["offered_bandwidth_bps"] or 0.0),
+        }
+        rows.append(row)
+        measurements.append({"case": case, "load": load_info, "topics": rows_for_print, "summary": summary})
+        print(
+            f"  matrix({case.get('axis')}={case.get('value')}, qos={case.get('qos')}, "
+            f"duration={duration_s:g}s): {'PASS' if passes else 'FAIL'} "
+            f"offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} {_format_topic_rows(rows_for_print)}"
+        )
+
+    matrix_path = out_dir / "matrix.jsonl"
+    matrix_path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    analysis = _sensitivity_analysis(rows)
+    _write_benchmark_result(
+        out_dir,
+        genre="matrix",
+        context=result_context,
+        configuration={
+            "cases": list(cases),
+            "thresholds": {
+                "max_loss_pct": max_loss_pct,
+                "max_latency_ms": max_latency_ms,
+                "latency_quantile": thresholds.latency_quantile,
+            },
+            "topic": topic or None,
+            "generated_profiles_file": generated_profiles_file.name if generated_profiles_file else None,
+        },
+        result={"rows": rows, "analysis": analysis},
+        measurements={"points": measurements},
+        verdict={
+            "passed": all(row["passes"] for row in rows),
+            "status": "all_cases_passed" if all(row["passes"] for row in rows) else "case_failures",
+        },
+        artifacts={
+            "matrix": matrix_path.name,
+            "generated_profiles": generated_profiles_file.name if generated_profiles_file else None,
+            "stdout": "stdout.txt",
+            "probes_dir": "probes",
+        },
+    )
+    print(f"Matrix rows saved to {matrix_path}")
     return rows
 
 
@@ -1916,6 +2329,16 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
         "--rmw",
         default=DEFAULT_BENCHMARK_RMW,
         help=f"RMW implementation or rosotacom RMW alias for benchmark sessions (default: {DEFAULT_BENCHMARK_RMW}).",
+    )
+    parser.add_argument(
+        "--qos-reliability",
+        choices=["best_effort", "reliable"],
+        help="Override benchmark session OTA pub/sub reliability for the whole run.",
+    )
+    parser.add_argument(
+        "--qos-depth",
+        type=int,
+        help="Override benchmark session QoS depth for the whole run.",
     )
     parser.set_defaults(ota_benchmark=ota_benchmark)
 
@@ -2669,6 +3092,99 @@ def benchmark_sensitivity(args: argparse.Namespace) -> int:
     return 0
 
 
+def benchmark_matrix(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark matrix``."""
+    from .cli import _load_runtime_config
+
+    if getattr(args, "interactive", False):
+        return _start_interactive_benchmark(args, "matrix")
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+    base_profile = str(args.profile)
+
+    run_dir = _setup_benchmark_run_dir(args, "matrix", base_profile)
+    source_profiles_file = _benchmark_profiles_file(base_profile, runtime.profiles_file)
+    if source_profiles_file is None:
+        raise FileNotFoundError("matrix requires a profiles file containing the base profile.")
+
+    generated_doc, cases = _build_matrix_profiles(
+        base_profile=base_profile,
+        profiles_file=source_profiles_file,
+        ideal_rate=getattr(args, "ideal_rate", "1gbit"),
+        jitter_ms=float(getattr(args, "jitter_ms", 30.0)),
+        latency_values=_parse_values(getattr(args, "latency_values", "30,60,100,140,180,220")),
+        rate_hz_values=_parse_values(getattr(args, "rate_hz_values", "20,15,10,5,1")),
+        qos_cases=_parse_qos_cases(getattr(args, "qos_cases", "best_effort:1,reliable:1,best_effort:10,reliable:10")),
+        axes=_parse_matrix_axes(getattr(args, "axes", "all")),
+        size=int(getattr(args, "size", 1)),
+        fixed_rate_hz=float(getattr(args, "rate_hz", 20.0)),
+        min_duration_s=float(getattr(args, "min_duration", 20.0)),
+        min_messages=int(getattr(args, "min_messages", 100)),
+    )
+    generated_profiles_file = run_dir / "generated-profiles.yaml"
+    generated_profiles_file.write_text(yaml.safe_dump(generated_doc, sort_keys=False), encoding="utf-8")
+    args.profiles_file = str(generated_profiles_file)
+
+    session_name = BENCHMARK_SESSIONS_BY_GENRE["matrix"]
+    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    result_context = _benchmark_result_context(
+        args,
+        genre="matrix",
+        profile=base_profile,
+        run_dir=run_dir,
+        session=session_context,
+    )
+    result_context["matrix"] = {
+        "source_profiles_file": str(source_profiles_file),
+        "generated_profiles_file": str(generated_profiles_file),
+        "base_profile": base_profile,
+    }
+
+    raw_run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, session_name)
+
+    def run_point_with_session_options(
+        *,
+        profile: str | None,
+        load: dict[str, Any],
+        duration_s: float,
+        out_dir: Path,
+        session_options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        previous = _activate_benchmark_session_options(args, session_name, out_dir, session_options)
+        try:
+            return raw_run_point(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
+        finally:
+            if session_options:
+                _restore_benchmark_session_options(args, previous)
+
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_matrix(
+            run_point_with_session_options,
+            cases=cases,
+            max_loss_pct=getattr(args, "max_loss", 5.0),
+            max_latency_ms=getattr(args, "max_latency_ms", 300.0),
+            topic=getattr(args, "topic", ""),
+            out_dir=run_dir,
+            result_context=result_context,
+            generated_profiles_file=generated_profiles_file,
+        )
+
+    out_file_name = getattr(args, "out", "matrix.jsonl")
+    if artifacts_dir:
+        out_path = artifacts_dir / Path(out_file_name).name
+    else:
+        out_path = Path(out_file_name)
+
+    run_matrix_file = run_dir / "matrix.jsonl"
+    if run_matrix_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(run_matrix_file, out_path)
+        print(f"Matrix rows copied to {out_path}")
+
+    return 0
+
+
 def benchmark_plot(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark plot``."""
     from .cli import _load_runtime_config
@@ -2901,6 +3417,55 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
     )
     sensitivity_parser.add_argument("--out", default="sensitivity.jsonl", help="Output sensitivity JSONL file.")
     sensitivity_parser.set_defaults(func=benchmark_sensitivity)
+
+    # --- matrix ---
+    matrix_parser = benchmark_subparsers.add_parser(
+        "matrix",
+        help="Run a fixed-jitter matrix over latency, publish frequency, and QoS settings.",
+    )
+    _add_benchmark_common_args(matrix_parser, ota_benchmark=ota_benchmark)
+    matrix_parser.add_argument("--profile", required=True, help="Static base profile whose latency ratio is reused.")
+    matrix_parser.add_argument("--max-loss", type=float, default=5.0, help="Oracle: max loss %%.")
+    matrix_parser.add_argument("--max-latency-ms", type=float, default=300.0, help="Oracle: max p95 latency (ms).")
+    matrix_parser.add_argument("--rate-hz", type=float, default=20.0, help="Fixed publish rate for non-Hz axes.")
+    matrix_parser.add_argument("--size", type=int, default=1, help="Payload size (bytes).")
+    matrix_parser.add_argument("--topic", default="", help="Topic to evaluate.")
+    matrix_parser.add_argument("--ideal-rate", default="1gbit", help="High-quality shaped-link rate.")
+    matrix_parser.add_argument("--jitter-ms", type=float, default=30.0, help="Fixed jitter in milliseconds.")
+    matrix_parser.add_argument(
+        "--latency-values",
+        default="30,60,100,140,180,220",
+        help="Comma/range list of uplink mean delays in milliseconds; downlink preserves the base profile ratio.",
+    )
+    matrix_parser.add_argument(
+        "--rate-hz-values",
+        default="20,15,10,5,1",
+        help="Comma/range list of publish frequencies for the Hz axis.",
+    )
+    matrix_parser.add_argument(
+        "--qos-cases",
+        default="best_effort:1,reliable:1,best_effort:10,reliable:10",
+        help="Comma list of QoS cases as reliability:depth.",
+    )
+    matrix_parser.add_argument(
+        "--axes",
+        default="all",
+        help="Comma list of matrix axes to run: all, latency, hz, qos.",
+    )
+    matrix_parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=20.0,
+        help="Minimum seconds per matrix point.",
+    )
+    matrix_parser.add_argument(
+        "--min-messages",
+        type=int,
+        default=100,
+        help="Minimum intended published messages per matrix point.",
+    )
+    matrix_parser.add_argument("--out", default="matrix.jsonl", help="Output matrix JSONL file.")
+    matrix_parser.set_defaults(func=benchmark_matrix)
 
 
 def _register_benchmark_plot_parser(benchmark_subparsers: Any) -> None:

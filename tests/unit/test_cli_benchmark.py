@@ -25,6 +25,7 @@ from rosotacom.cli_benchmark import (
     _benchmark_child_command,
     _benchmark_ota_target,
     _benchmark_profiles_file,
+    _build_matrix_profiles,
     _build_sensitivity_profiles,
     _initialize_interactive_log,
     _is_ota_benchmark,
@@ -35,6 +36,7 @@ from rosotacom.cli_benchmark import (
     _start_interactive_benchmark,
     collect_transit_summary,
     drive_capacity,
+    drive_matrix,
     drive_ramp,
     drive_sensitivity,
     drive_sweep,
@@ -364,6 +366,85 @@ def test_sensitivity_profile_generation_and_driver(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Matrix driver
+# --------------------------------------------------------------------------- #
+
+
+def test_matrix_profile_generation_and_driver(tmp_path: Path) -> None:
+    profiles_file = tmp_path / "profiles.yaml"
+    profiles_file.write_text(
+        "profiles:\n"
+        "  cellular-4g-degraded:\n"
+        "    uplink:\n"
+        "      { rate: 1mbit, delay: 180ms, jitter: 50ms, distribution: normal, loss: 3% }\n"
+        "    downlink: { rate: 10mbit, delay: 100ms, jitter: 30ms, loss: 1% }\n",
+        encoding="utf-8",
+    )
+    generated, cases = _build_matrix_profiles(
+        base_profile="cellular-4g-degraded",
+        profiles_file=profiles_file,
+        ideal_rate="1gbit",
+        jitter_ms=30.0,
+        latency_values=[180.0],
+        rate_hz_values=[20.0, 1.0],
+        qos_cases=[{"reliability": "reliable", "depth": 1}, {"reliability": "best_effort", "depth": 10}],
+        axes=["latency", "hz", "qos"],
+        size=1,
+        fixed_rate_hz=20.0,
+        min_duration_s=20.0,
+        min_messages=100,
+    )
+    generated_file = tmp_path / "generated-profiles.yaml"
+    generated_file.write_text(yaml.safe_dump(generated, sort_keys=False), encoding="utf-8")
+
+    seen: list[dict[str, Any]] = []
+
+    def probe(
+        *,
+        profile: str | None,
+        load: dict[str, Any],
+        duration_s: float,
+        out_dir: Path,
+        session_options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        seen.append(
+            {
+                "profile": profile,
+                "rate": load["rate"],
+                "duration_s": duration_s,
+                "session_options": session_options,
+            }
+        )
+        return _make_stub_probe(loss_pct=0.0, latency_p95=25.0)(
+            profile=profile,
+            load=load,
+            duration_s=duration_s,
+            out_dir=out_dir,
+        )
+
+    rows = drive_matrix(
+        probe,
+        cases=cases,
+        max_loss_pct=5.0,
+        max_latency_ms=300.0,
+        topic="",
+        out_dir=tmp_path,
+        generated_profiles_file=generated_file,
+    )
+
+    assert any(row["axis"] == "reference" for row in rows)
+    assert any(row["axis"] == "qos" and row["qos"] == {"reliability": "best_effort", "depth": 10} for row in rows)
+    assert any(item["rate"] == 1.0 and item["duration_s"] == 100.0 for item in seen)
+    assert any((item["session_options"] or {}).get("qos_reliability") == "reliable" for item in seen)
+    assert generated["metadata"]["latency_model"]["downlink_ratio"] == pytest.approx(100.0 / 180.0)
+    assert (tmp_path / "matrix.jsonl").is_file()
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["genre"] == "matrix"
+    assert result_doc["result"]["analysis"]["reference_profile"].startswith("matrix_jitter")
+    assert result_doc["result"]["analysis"]["axes"]["qos"]["points"] == 2
+
+
+# --------------------------------------------------------------------------- #
 # Budget save/load/compare roundtrip (CLI-level)
 # --------------------------------------------------------------------------- #
 
@@ -688,6 +769,16 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.loss_values == "0,0.5,1,3,5"
     assert args.axes == "all"
 
+    # Matrix.
+    args = parser.parse_args(["benchmark", "matrix", "--profile", "cellular-4g-degraded"])
+    assert args.benchmark_command == "matrix"
+    assert args.jitter_ms == 30.0
+    assert args.latency_values == "30,60,100,140,180,220"
+    assert args.rate_hz_values == "20,15,10,5,1"
+    assert args.qos_cases == "best_effort:1,reliable:1,best_effort:10,reliable:10"
+    assert args.min_duration == 20.0
+    assert args.min_messages == 100
+
     # Plot.
     args = parser.parse_args(["benchmark", "plot", "results.jsonl"])
     assert args.benchmark_command == "plot"
@@ -832,7 +923,17 @@ def test_benchmark_session_copy_pins_requested_rmw(tmp_path: Path) -> None:
     session_dir = project / "sessions" / "bench_1_1_capacity"
     session_dir.mkdir(parents=True)
     (session_dir / "session-definition.yaml").write_text(
-        "peers:\n  a: {}\n  b: {}\nshared:\n  rmw: fastdds\n",
+        "peers:\n"
+        "  a: {}\n"
+        "  b: {}\n"
+        "shared:\n"
+        "  rmw: fastdds\n"
+        "  qos:\n"
+        "    defaults:\n"
+        "      depth: 1\n"
+        "    for_role:\n"
+        "      ota_sub: { reliability: best_effort }\n"
+        "      ota_pub: { reliability: best_effort }\n",
         encoding="utf-8",
     )
     ros2docker = project / "ros2docker.json"
@@ -860,6 +961,8 @@ def test_benchmark_session_copy_pins_requested_rmw(tmp_path: Path) -> None:
         profiles_file=None,
         artifacts_dir=None,
         rmw="cyclone",
+        qos_reliability="reliable",
+        qos_depth=10,
     )
 
     context = _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
@@ -867,8 +970,12 @@ def test_benchmark_session_copy_pins_requested_rmw(tmp_path: Path) -> None:
     copied_config = Path(context["config_path"])
     copied = yaml.safe_load(copied_config.read_text(encoding="utf-8"))
     assert copied["shared"]["rmw"] == "cyclone"
+    assert copied["shared"]["qos"]["defaults"]["depth"] == 10
+    assert copied["shared"]["qos"]["for_role"]["ota_sub"]["reliability"] == "reliable"
+    assert copied["shared"]["qos"]["for_role"]["ota_pub"]["reliability"] == "reliable"
     assert args.session_configs_dir[0] == str(run_dir / "session-configs")
     assert context["runtime_implementation"] == "rmw_cyclonedds_cpp"
+    assert context["qos"] == {"reliability": "reliable", "depth": 10}
 
 
 def test_benchmark_ota_target_defaults_to_benchmark_session() -> None:

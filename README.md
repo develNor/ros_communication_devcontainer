@@ -474,14 +474,18 @@ the final candidate. By default jitter and loss are searched as a coupled
 practical tradeoff curve; pass `--loss-coupling independent` if you want network
 loss treated as its own axis. For an exact `--max-loss 0` target, rosotacom
 automatically keeps shaped network loss at `0%` and searches jitter separately,
-so the reproducible command encodes the same policy used for the measurement.
-The chosen profile, target slack, all probes, and the nearby failing neighbors
-are written to `result.json`, `requirements.jsonl`, and
-`generated-profiles.yaml`:
+so the reproducible command encodes the same policy used for the measurement. If
+the zero-loss boundary is noisy, repeat each candidate and require a pass count;
+for example, `--probe-repeats 10 --probe-min-passes 9 --bad-lossy-count 10`
+defines a good case as at least nine clean repeats and records bad-case neighbors
+where all ten repeats lose messages. The chosen profile, target slack, repeat
+statistics, all probes, and the nearby failing neighbors are written to
+`result.json`, `requirements.jsonl`, and `generated-profiles.yaml`:
 
 ```bash
 rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 5 --max-latency-ms 250
 rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 0 --max-latency-ms 250
+rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 0 --max-latency-ms 250 --downlink-mode lan --probe-repeats 10 --probe-min-passes 9 --bad-lossy-count 10
 ```
 
 Use `rosotacom ota-benchmark` for the same probes over deployment peers, without

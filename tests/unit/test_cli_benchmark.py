@@ -34,6 +34,7 @@ from rosotacom.cli_benchmark import (
     _parse_values,
     _peer_catmux_attach_script,
     _prepare_benchmark_session_config,
+    _profile_requires_netem_seed,
     _requirements_jitter_loss_pct,
     _requirements_target_quality,
     _result_once_script,
@@ -503,6 +504,7 @@ def test_requirements_driver_finds_tight_profile_with_stubbed_probe(tmp_path: Pa
         out_dir=tmp_path,
         bandwidth_high_bps=10_000_000.0,
         bandwidth_low_bps=1_000_000.0,
+        latency_base_ms=0.0,
         latency_high_ms=300.0,
         jitter_high_ms=60.0,
         loss_high_pct=10.0,
@@ -574,6 +576,7 @@ def test_requirements_driver_can_search_coupled_jitter_loss(tmp_path: Path) -> N
         out_dir=tmp_path,
         bandwidth_high_bps=100_000_000.0,
         bandwidth_low_bps=10_000_000.0,
+        latency_base_ms=0.0,
         latency_high_ms=0.0,
         jitter_high_ms=50.0,
         loss_high_pct=10.0,
@@ -640,6 +643,7 @@ def test_requirements_zero_loss_target_clamps_network_loss(tmp_path: Path) -> No
         out_dir=tmp_path,
         bandwidth_high_bps=100_000_000.0,
         bandwidth_low_bps=10_000_000.0,
+        latency_base_ms=0.0,
         latency_high_ms=0.0,
         jitter_high_ms=40.0,
         loss_high_pct=10.0,
@@ -683,7 +687,7 @@ def test_requirements_repeat_policy_finds_good_and_bad_zero_loss_cases(tmp_path:
         jitter = parse_ms(generated["profiles"][profile]["uplink"].get("jitter", 0), "jitter")
         repeat_index = profile_counts.get(profile, 0) + 1
         profile_counts[profile] = repeat_index
-        lossy = jitter >= 10.0 or repeat_index == 10
+        lossy = jitter > 10.0 or repeat_index == 10
         return {
             "topics": {
                 "/test": {
@@ -711,7 +715,8 @@ def test_requirements_repeat_policy_finds_good_and_bad_zero_loss_cases(tmp_path:
         out_dir=tmp_path,
         bandwidth_high_bps=100_000_000.0,
         bandwidth_low_bps=10_000_000.0,
-        latency_high_ms=0.0,
+        latency_base_ms=30.0,
+        latency_high_ms=30.0,
         jitter_high_ms=20.0,
         loss_high_pct=0.0,
         axes=_parse_requirements_axes("jitter"),
@@ -725,6 +730,8 @@ def test_requirements_repeat_policy_finds_good_and_bad_zero_loss_cases(tmp_path:
         probe_repeats=10,
         probe_min_passes=9,
         bad_lossy_count=10,
+        netem_seed=12345,
+        jitter_guard_ratio=0.1,
         result_context={"test": True},
         generated_profiles_file=generated_file,
     )
@@ -737,6 +744,19 @@ def test_requirements_repeat_policy_finds_good_and_bad_zero_loss_cases(tmp_path:
     assert result["bounds"]["jitter"]["last_bad"]["repeat"]["lossy_count"] == 10
     assert result["analysis"]["bad_cases_observed"]["jitter"]["repeat"]["bad_case"] is True
     assert result["analysis"]["final_target_quality"]["repeat_pass_count"] == 9
+    assert result["analysis"]["netem_seed"] == 12345
+    assert result["analysis"]["jitter_guard_ratio"] == 0.1
+    assert result["analysis"]["guarded_axes"]["jitter"]["selected"]["jitter_ms"] == 10.0
+    assert result["analysis"]["guarded_axes"]["jitter"]["guarded"]["jitter_ms"] == 9.0
+    assert result["profile"]["candidate"]["uplink_latency_ms"] == 30.0
+    assert result["profile"]["candidate"]["jitter_ms"] == 9.0
+    generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
+    assert generated["metadata"]["search"]["netem_seed"] == 12345
+    assert generated["metadata"]["search"]["jitter_guard_ratio"] == 0.1
+    assert generated["metadata"]["search"]["latency_base_ms"] == 30.0
+    assert generated["profiles"]["requirements_final"]["uplink"]["delay"] == "30ms"
+    assert generated["profiles"]["requirements_final"]["uplink"]["jitter"] == "9ms"
+    assert generated["profiles"]["requirements_final"]["uplink"]["seed"] == 12345
 
 
 def test_requirements_bandwidth_refine_recovers_when_previous_fail_becomes_pass(tmp_path: Path) -> None:
@@ -782,6 +802,7 @@ def test_requirements_bandwidth_refine_recovers_when_previous_fail_becomes_pass(
         out_dir=tmp_path,
         bandwidth_high_bps=16_000_000.0,
         bandwidth_low_bps=1_000_000.0,
+        latency_base_ms=0.0,
         latency_high_ms=0.0,
         jitter_high_ms=0.0,
         loss_high_pct=0.0,
@@ -793,6 +814,7 @@ def test_requirements_bandwidth_refine_recovers_when_previous_fail_becomes_pass(
         distribution="normal",
         final_refine_iterations=1,
         loss_coupling="jitter",
+        bandwidth_guard_ratio=0.1,
         result_context={"test": True},
         generated_profiles_file=generated_file,
     )
@@ -800,6 +822,77 @@ def test_requirements_bandwidth_refine_recovers_when_previous_fail_becomes_pass(
     assert result["bounds"]["bandwidth"]["status"] == "bounded_after_floor_reset"
     assert result["bounds"]["bandwidth"]["tight"] is True
     assert result["bounds"]["bandwidth"]["last_fail"]
+    selected_bw = result["bounds"]["bandwidth"]["selected"]["bandwidth_bps"]
+    assert result["profile"]["candidate"]["bandwidth_bps"] == pytest.approx(selected_bw * 1.1)
+    assert result["analysis"]["guarded_axes"]["bandwidth"]["selected"]["bandwidth_bps"] == pytest.approx(selected_bw)
+
+
+def test_requirements_bandwidth_probe_repeats_can_be_cheaper_than_final(tmp_path: Path) -> None:
+    from rosotacom.network_profiles import parse_rate_bps
+
+    generated_file = tmp_path / "generated-profiles.yaml"
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        assert profile is not None
+        generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
+        rate_bps = parse_rate_bps(generated["profiles"][profile]["uplink"]["rate"])
+        passes = rate_bps >= 4_000_000.0
+        return {
+            "topics": {
+                "/test": {
+                    "expected": 100,
+                    "delivered": 100,
+                    "lost": 0,
+                    "loss_pct": 0.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": 50.0, "p95": 90.0 if passes else 300.0},
+                    "jitter_ms": {"p50": 1.0, "p95": 1.0},
+                }
+            }
+        }
+
+    result = drive_requirements(
+        probe,
+        max_loss_pct=0.0,
+        max_latency_ms=250.0,
+        rate_hz=20.0,
+        size=18_000,
+        streams=1,
+        qos_reliability="best_effort",
+        qos_depth=1,
+        topic="/test",
+        out_dir=tmp_path,
+        bandwidth_high_bps=16_000_000.0,
+        bandwidth_low_bps=1_000_000.0,
+        latency_base_ms=30.0,
+        latency_high_ms=30.0,
+        jitter_high_ms=0.0,
+        loss_high_pct=0.0,
+        axes=_parse_requirements_axes("bandwidth"),
+        min_duration_s=20.0,
+        min_messages=100,
+        search_iterations=1,
+        search_rounds=1,
+        distribution="normal",
+        final_refine_iterations=0,
+        loss_coupling="jitter",
+        probe_repeats=3,
+        probe_min_passes=3,
+        bad_lossy_count=1,
+        bandwidth_probe_repeats=1,
+        result_context={"test": True},
+        generated_profiles_file=generated_file,
+    )
+
+    bandwidth_rows = [row for row in result["rows"] if row["axis"] == "bandwidth"]
+    assert bandwidth_rows
+    assert all(row["repeat"]["configured_repeats"] == 1 for row in bandwidth_rows)
+    assert result["rows"][0]["axis"] == "baseline"
+    assert result["rows"][0]["repeat"]["configured_repeats"] == 3
+    assert result["rows"][-1]["axis"] == "combined"
+    assert result["rows"][-1]["repeat"]["configured_repeats"] == 3
+    assert result["analysis"]["bandwidth_probe_repeats"] == 1
+    assert result["analysis"]["final_passes"] is True
 
 
 def test_requirements_zero_loss_target_reports_loss_as_limiter() -> None:
@@ -811,6 +904,30 @@ def test_requirements_zero_loss_target_reports_loss_as_limiter() -> None:
 
     assert quality["limiting_metric"] == "loss"
     assert quality["utilization"] == math.inf
+
+
+def test_profile_requires_netem_seed_only_when_seeded_netem_is_generated() -> None:
+    from rosotacom.network_profiles import DirectionShaping, Profile, TimelineSegment
+
+    rate_only = Profile("rate-only", "static", uplink=DirectionShaping(rate_bps=1_000_000.0, seed=123))
+    seeded_static = Profile(
+        "seeded-static",
+        "static",
+        uplink=DirectionShaping(delay_ms=30.0, jitter_ms=10.0, seed=123),
+    )
+    seeded_timeline = Profile(
+        "seeded-timeline",
+        "timeline",
+        timeline=(
+            TimelineSegment(for_s=1.0, uplink=DirectionShaping(rate_bps=1_000_000.0)),
+            TimelineSegment(for_s=1.0, downlink=DirectionShaping(delay_ms=30.0, jitter_ms=10.0, seed=123)),
+        ),
+    )
+
+    assert _profile_requires_netem_seed(None) is False
+    assert _profile_requires_netem_seed(rate_only) is False
+    assert _profile_requires_netem_seed(seeded_static) is True
+    assert _profile_requires_netem_seed(seeded_timeline) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -980,7 +1097,17 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
     monkeypatch.setattr(cli, "_write_docker_log", lambda *args: None)
     monkeypatch.setattr(cli, "_stop_container_name", lambda name, runtime: stopped.append(name) or True)
     monkeypatch.setattr(cli, "_remove_smoke_network", lambda name: networks_removed.append(name))
-    monkeypatch.setattr(benchmark_cli, "collect_transit_summary", lambda instance_dir: {"topics": {}})
+    publish_windows: list[tuple[float, float] | None] = []
+
+    def fake_collect_transit_summary(
+        instance_dir: Path,
+        *,
+        publish_window: tuple[float, float] | None = None,
+    ) -> dict[str, Any]:
+        publish_windows.append(publish_window)
+        return {"topics": {}}
+
+    monkeypatch.setattr(benchmark_cli, "collect_transit_summary", fake_collect_transit_summary)
     monkeypatch.setattr(benchmark_cli.time, "sleep", lambda seconds: None)
     commands: list[list[str]] = []
 
@@ -1015,6 +1142,7 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
     assert all(args.peer_address == cli._smoke_peer_address_args(smoke_network.peer_ips) for args in started)
     assert stopped == ["container_a", "container_b"]
     assert networks_removed == [smoke_network.name]
+    assert publish_windows and publish_windows[0] is not None
     assert any(
         command[:6] == ["docker", "exec", "-u", "root", "container_a", "tc"] and "3%" in command for command in commands
     )
@@ -1159,6 +1287,7 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.bandwidth_high == "auto"
     assert args.bandwidth_high_factor == 8.0
     assert args.bandwidth_low_factor == 1.0
+    assert args.latency_base_ms == 0.0
     assert args.latency_high_ms is None
     assert args.search_iterations == 6
     assert args.search_rounds == 1
@@ -1168,7 +1297,11 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.probe_repeats == 1
     assert args.probe_min_passes is None
     assert args.bad_lossy_count is None
+    assert args.bandwidth_probe_repeats is None
     assert args.search_order == "auto"
+    assert args.netem_seed is None
+    assert args.jitter_guard_ratio == 0.0
+    assert args.bandwidth_guard_ratio == 0.0
 
     # Plot.
     args = parser.parse_args(["benchmark", "plot", "results.jsonl"])

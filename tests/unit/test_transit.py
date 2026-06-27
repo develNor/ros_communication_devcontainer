@@ -4,18 +4,20 @@ import json
 from pathlib import Path
 
 from rosotacom.transit import (
+    filter_transit_records_by_publish_window,
     join_transit_records,
     load_transit_records,
     summarize_transit_records,
 )
 
 
-def _record(seq: int, status: str, ota_ms: float | None = None) -> dict:
+def _record(seq: int, status: str, ota_ms: float | None = None, t_wrap: float | None = None) -> dict:
     return {
         "kind": "transit",
         "topic": "/x",
         "seq": seq,
         "status": status,
+        "t_wrap": t_wrap,
         "sections": {"ota_hop_ms": ota_ms},
         "jitter_ms": 2.0 if ota_ms is not None else None,
     }
@@ -54,3 +56,23 @@ def test_join_keeps_same_topic_sequence_from_different_sources() -> None:
     assert len(joined) == 2
     summary = summarize_transit_records([a, b])["topics"]
     assert set(summary) == {"a->b:/x", "b->a:/x"}
+
+
+def test_filter_transit_records_by_publish_window_keeps_only_bounded_losses() -> None:
+    records = [
+        {**_record(1, "delivered", 10.0, 9.9), "source": "a", "target": "b"},
+        {**_record(2, "lost"), "source": "a", "target": "b"},
+        {**_record(3, "delivered", 10.0, 10.1), "source": "a", "target": "b"},
+        {**_record(4, "lost"), "source": "a", "target": "b"},
+        {**_record(5, "delivered", 10.0, 10.5), "source": "a", "target": "b"},
+        {**_record(6, "lost"), "source": "a", "target": "b"},
+        {**_record(7, "delivered", 10.0, 11.2), "source": "a", "target": "b"},
+    ]
+
+    filtered = filter_transit_records_by_publish_window(records, start_s=10.0, end_s=11.0)
+
+    assert [(record["seq"], record["status"]) for record in filtered] == [
+        (3, "delivered"),
+        (4, "lost"),
+        (5, "delivered"),
+    ]

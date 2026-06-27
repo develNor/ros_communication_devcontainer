@@ -478,14 +478,23 @@ so the reproducible command encodes the same policy used for the measurement. If
 the zero-loss boundary is noisy, repeat each candidate and require a pass count;
 for example, `--probe-repeats 10 --probe-min-passes 9 --bad-lossy-count 10`
 defines a good case as at least nine clean repeats and records bad-case neighbors
-where all ten repeats lose messages. The chosen profile, target slack, repeat
-statistics, all probes, and the nearby failing neighbors are written to
+where all ten repeats lose messages. Add `--netem-seed <n>` when you want the
+generated jitter/loss draw to be replayable across repeated boundary searches.
+For local Docker benchmarks, rosotacom copies the host `tc` binary into seeded
+benchmark containers when the container distro `tc` is too old for
+`netem seed`; the host `tc` must support `seed SEED`. For a practical good-case
+reference, `--jitter-guard-ratio 0.10` records the tight jitter boundary but
+uses 10% less jitter for later axes and the final profile;
+`--bandwidth-guard-ratio 0.10` does the symmetric thing for bandwidth by using
+10% more bandwidth after finding the lower bound. The chosen profile, target
+slack, repeat statistics, all probes, and the nearby failing neighbors are written to
 `result.json`, `requirements.jsonl`, and `generated-profiles.yaml`:
 
 ```bash
 rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 5 --max-latency-ms 250
 rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 0 --max-latency-ms 250
-rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 0 --max-latency-ms 250 --downlink-mode lan --probe-repeats 10 --probe-min-passes 9 --bad-lossy-count 10
+rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 0 --max-latency-ms 250 --latency-base-ms 30 --downlink-mode lan --probe-repeats 10 --probe-min-passes 9 --bad-lossy-count 10 --jitter-guard-ratio 0.10 --bandwidth-guard-ratio 0.10 --netem-seed 424242
+rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 0 --max-latency-ms 250 --latency-base-ms 30 --downlink-mode lan --axes jitter,bandwidth --bandwidth-high-factor 8 --bandwidth-low-factor 1 --jitter-high-ms 40 --search-iterations 7 --final-refine-iterations 0 --search-rounds 1 --min-duration 20 --min-messages 100 --probe-repeats 1 --bandwidth-probe-repeats 1 --netem-seed 424242 --jitter-guard-ratio 0.20 --bandwidth-guard-ratio 0.20
 ```
 
 Use `rosotacom ota-benchmark` for the same probes over deployment peers, without

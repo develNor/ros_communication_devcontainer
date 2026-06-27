@@ -161,9 +161,13 @@ def _find_events_files(instance_dir: Path) -> list[Path]:
     return sorted(instance_dir.rglob("status/events.jsonl"))
 
 
-def collect_transit_summary(instance_dir: Path) -> dict[str, Any]:
+def collect_transit_summary(
+    instance_dir: Path,
+    *,
+    publish_window: tuple[float, float] | None = None,
+) -> dict[str, Any]:
     """Load and summarize transit records from an instance's artifact tree."""
-    from .transit import load_transit_records, summarize_transit_records
+    from .transit import filter_transit_records_by_publish_window, load_transit_records, summarize_transit_records
 
     events_files = _find_events_files(instance_dir)
     if not events_files:
@@ -172,6 +176,12 @@ def collect_transit_summary(instance_dir: Path) -> dict[str, Any]:
             "Did the benchmark point run long enough to produce transit records?"
         )
     records = load_transit_records(events_files)
+    if publish_window is not None:
+        records = filter_transit_records_by_publish_window(
+            records,
+            start_s=publish_window[0],
+            end_s=publish_window[1],
+        )
     return summarize_transit_records(records)
 
 
@@ -225,6 +235,26 @@ def _normalize_benchmark_profile(profile: str | None) -> str | None:
 
 def _benchmark_profile_label(profile: str | None) -> str:
     return _normalize_benchmark_profile(profile) or "none"
+
+
+def _direction_requires_netem_seed(shaping: Any) -> bool:
+    return bool(
+        shaping is not None and getattr(shaping, "seed", None) is not None and getattr(shaping, "has_netem", False)
+    )
+
+
+def _profile_requires_netem_seed(profile: Any) -> bool:
+    if profile is None:
+        return False
+    if getattr(profile, "is_timeline", False):
+        return any(
+            _direction_requires_netem_seed(getattr(segment, "uplink", None))
+            or _direction_requires_netem_seed(getattr(segment, "downlink", None))
+            for segment in getattr(profile, "timeline", ())
+        )
+    return _direction_requires_netem_seed(getattr(profile, "uplink", None)) or _direction_requires_netem_seed(
+        getattr(profile, "downlink", None)
+    )
 
 
 def _apply_benchmark_qos_options(
@@ -1526,6 +1556,7 @@ def _direction_to_yaml(
     distribution: str | None = None,
     loss_pct: float | None = None,
     loss_correlation_pct: float | None = None,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     spec: dict[str, Any] = {}
     if rate is not None:
@@ -1540,6 +1571,8 @@ def _direction_to_yaml(
         spec["loss"] = _format_yaml_pct(loss_pct)
         if loss_correlation_pct is not None and loss_pct > 0.0:
             spec["loss_correlation"] = _format_yaml_pct(loss_correlation_pct)
+    if seed is not None:
+        spec["seed"] = seed
     return spec
 
 
@@ -1557,6 +1590,7 @@ def _profile_to_yaml(profile: Any) -> dict[str, Any]:
             distribution=direction_obj.distribution,
             loss_pct=direction_obj.loss_pct,
             loss_correlation_pct=direction_obj.loss_correlation_pct,
+            seed=direction_obj.seed,
         )
 
     return {"uplink": direction(profile.uplink), "downlink": direction(profile.downlink)}
@@ -2233,6 +2267,7 @@ def _requirements_profile_spec(
     distribution: str,
     downlink_ratio: float,
     downlink_mode: str,
+    netem_seed: int | None = None,
 ) -> dict[str, Any]:
     latency_downlink_ms = candidate.latency_ms * downlink_ratio
     delay_uplink = candidate.latency_ms if candidate.latency_ms > 0.0 or candidate.jitter_ms > 0.0 else None
@@ -2247,6 +2282,7 @@ def _requirements_profile_spec(
             jitter_ms=candidate.jitter_ms if candidate.jitter_ms > 0.0 else None,
             distribution=distribution,
             loss_pct=loss,
+            seed=netem_seed if delay_downlink is not None or loss is not None else None,
         )
     )
     return {
@@ -2256,6 +2292,7 @@ def _requirements_profile_spec(
             jitter_ms=candidate.jitter_ms if candidate.jitter_ms > 0.0 else None,
             distribution=distribution,
             loss_pct=loss,
+            seed=netem_seed if delay_uplink is not None or loss is not None else None,
         ),
         "downlink": downlink,
     }
@@ -2430,6 +2467,7 @@ def drive_requirements(
     out_dir: Path,
     bandwidth_high_bps: float,
     bandwidth_low_bps: float,
+    latency_base_ms: float,
     latency_high_ms: float,
     jitter_high_ms: float,
     loss_high_pct: float,
@@ -2446,7 +2484,11 @@ def drive_requirements(
     probe_repeats: int = 1,
     probe_min_passes: int | None = None,
     bad_lossy_count: int | None = None,
+    bandwidth_probe_repeats: int | None = None,
     search_order: str = "auto",
+    netem_seed: int | None = None,
+    jitter_guard_ratio: float = 0.0,
+    bandwidth_guard_ratio: float = 0.0,
     result_context: dict[str, Any] | None = None,
     generated_profiles_file: Path | None = None,
     profile_prefix: str = "requirements",
@@ -2457,6 +2499,10 @@ def drive_requirements(
         raise ValueError("Bandwidth bounds must be > 0.")
     if bandwidth_low_bps >= bandwidth_high_bps:
         raise ValueError("bandwidth-low must be smaller than bandwidth-high.")
+    if latency_base_ms < 0.0:
+        raise ValueError("latency-base-ms must be >= 0.")
+    if latency_base_ms > latency_high_ms:
+        raise ValueError("latency-base-ms must be <= latency-high-ms.")
     if search_iterations < 1:
         raise ValueError("search_iterations must be >= 1.")
     if search_rounds < 1:
@@ -2467,6 +2513,10 @@ def drive_requirements(
         raise ValueError("loss_coupling must be 'independent' or 'jitter'.")
     if downlink_mode not in {"mirror", "lan"}:
         raise ValueError("downlink_mode must be 'mirror' or 'lan'.")
+    if not 0.0 <= jitter_guard_ratio < 1.0:
+        raise ValueError("jitter-guard-ratio must be within [0, 1).")
+    if bandwidth_guard_ratio < 0.0:
+        raise ValueError("bandwidth-guard-ratio must be >= 0.")
 
     thresholds = OracleThresholds(max_loss_pct=max_loss_pct, max_latency_ms=max_latency_ms)
     required_passes = _requirements_default_min_passes(
@@ -2477,6 +2527,15 @@ def drive_requirements(
     bad_lossy_threshold = bad_lossy_count if bad_lossy_count is not None else probe_repeats
     if not 1 <= bad_lossy_threshold <= probe_repeats:
         raise ValueError("bad_lossy_count must be within [1, probe_repeats].")
+    bandwidth_repeats = bandwidth_probe_repeats if bandwidth_probe_repeats is not None else probe_repeats
+    if bandwidth_repeats < 1:
+        raise ValueError("bandwidth_probe_repeats must be >= 1.")
+    bandwidth_required_passes = _requirements_default_min_passes(
+        probe_repeats=bandwidth_repeats,
+        max_loss_pct=max_loss_pct,
+        explicit_min_passes=min(probe_min_passes, bandwidth_repeats) if probe_min_passes is not None else None,
+    )
+    bandwidth_bad_lossy_threshold = min(bad_lossy_threshold, bandwidth_repeats)
     requested_axes = list(axes)
     selected_axes = list(requested_axes)
     strict_zero_loss_target = max_loss_pct <= 0.0
@@ -2495,7 +2554,7 @@ def drive_requirements(
     load = {"size_a": size, "rate": rate_hz, "streams": streams}
     load_info = _load_context(load)
     duration_s = _duration_for_min_messages(rate_hz, min_duration_s=min_duration_s, min_messages=min_messages)
-    ideal = _RequirementCandidate(bandwidth_bps=bandwidth_high_bps)
+    ideal = _RequirementCandidate(bandwidth_bps=bandwidth_high_bps, latency_ms=latency_base_ms)
     candidate = ideal
     rows: list[dict[str, Any]] = []
     measurements: list[dict[str, Any]] = []
@@ -2521,6 +2580,7 @@ def drive_requirements(
                 "skipped_axes": skipped_axes,
                 "bandwidth_low_bps": bandwidth_low_bps,
                 "bandwidth_high_bps": bandwidth_high_bps,
+                "latency_base_ms": latency_base_ms,
                 "latency_high_ms": latency_high_ms,
                 "jitter_high_ms": jitter_high_ms,
                 "loss_high_pct": loss_high_pct,
@@ -2536,7 +2596,13 @@ def drive_requirements(
                 "probe_repeats": probe_repeats,
                 "probe_min_passes": required_passes,
                 "bad_lossy_count": bad_lossy_threshold,
+                "bandwidth_probe_repeats": bandwidth_repeats,
+                "bandwidth_probe_min_passes": bandwidth_required_passes,
+                "bandwidth_bad_lossy_count": bandwidth_bad_lossy_threshold,
                 "search_order": search_order,
+                "netem_seed": netem_seed,
+                "jitter_guard_ratio": jitter_guard_ratio,
+                "bandwidth_guard_ratio": bandwidth_guard_ratio,
             },
         },
     }
@@ -2548,6 +2614,9 @@ def drive_requirements(
 
     def probe(candidate_to_probe: _RequirementCandidate, *, axis: str, phase: str) -> dict[str, Any]:
         nonlocal profile_counter
+        local_probe_repeats = bandwidth_repeats if axis == "bandwidth" else probe_repeats
+        local_required_passes = bandwidth_required_passes if axis == "bandwidth" else required_passes
+        local_bad_lossy_threshold = bandwidth_bad_lossy_threshold if axis == "bandwidth" else bad_lossy_threshold
         profile_counter += 1
         profile_name = _requirements_profile_name(profile_prefix, profile_counter, axis, candidate_to_probe)
         generated_doc["profiles"][profile_name] = _requirements_profile_spec(
@@ -2555,12 +2624,13 @@ def drive_requirements(
             distribution=distribution,
             downlink_ratio=downlink_ratio,
             downlink_mode=downlink_mode,
+            netem_seed=netem_seed,
         )
         write_profiles()
         samples: list[dict[str, Any]] = []
         sample_measurements: list[dict[str, Any]] = []
         selected_topic = ""
-        for repeat_index in range(1, probe_repeats + 1):
+        for repeat_index in range(1, local_probe_repeats + 1):
             summary = run_point(profile=profile_name, load=load, duration_s=duration_s, out_dir=out_dir)
             sample_topic, topic_data = _selected_topic(summary, topic)
             rows_for_print = _topic_rows(summary, topic)
@@ -2599,6 +2669,14 @@ def drive_requirements(
                     "sample": sample,
                 }
             )
+            running_pass_count = sum(1 for item in samples if item["passes"])
+            running_lossy_count = sum(1 for item in samples if not item["loss_free"])
+            remaining = local_probe_repeats - repeat_index
+            pass_impossible = running_pass_count + remaining < local_required_passes
+            bad_achieved = running_lossy_count >= local_bad_lossy_threshold
+            bad_still_possible = running_lossy_count + remaining >= local_bad_lossy_threshold
+            if pass_impossible and (bad_achieved or not bad_still_possible):
+                break
 
         pass_count = sum(1 for sample in samples if sample["passes"])
         loss_free_count = sum(1 for sample in samples if sample["loss_free"])
@@ -2622,19 +2700,20 @@ def drive_requirements(
             loss_pct = max(loss_values) if loss_values else 100.0
         latency_p95 = max(latency_values) if latency_values else None
         jitter_p95 = max(jitter_values) if jitter_values else None
-        passes = pass_count >= required_passes
+        passes = pass_count >= local_required_passes
         repeat_summary = {
             "sample_count": len(samples),
-            "required_passes": required_passes,
+            "configured_repeats": local_probe_repeats,
+            "required_passes": local_required_passes,
             "pass_count": pass_count,
             "fail_count": len(samples) - pass_count,
             "pass_ratio": pass_count / len(samples) if samples else 0.0,
             "loss_free_count": loss_free_count,
             "loss_free_ratio": loss_free_count / len(samples) if samples else 0.0,
             "lossy_count": lossy_count,
-            "bad_lossy_count": bad_lossy_threshold,
-            "good_case": pass_count >= required_passes,
-            "bad_case": lossy_count >= bad_lossy_threshold,
+            "bad_lossy_count": local_bad_lossy_threshold,
+            "good_case": pass_count >= local_required_passes,
+            "bad_case": lossy_count >= local_bad_lossy_threshold,
         }
         row = {
             "profile": profile_name,
@@ -2665,19 +2744,19 @@ def drive_requirements(
             max_loss_pct=max_loss_pct,
             max_latency_ms=max_latency_ms,
         )
-        if probe_repeats > 1:
+        if local_probe_repeats > 1:
             target_quality.update(
                 {
-                    "repeat_sample_count": probe_repeats,
-                    "repeat_required_passes": required_passes,
+                    "repeat_sample_count": len(samples),
+                    "repeat_required_passes": local_required_passes,
                     "repeat_pass_count": pass_count,
                     "repeat_loss_free_count": loss_free_count,
-                    "repeat_bad_lossy_count": bad_lossy_threshold,
+                    "repeat_bad_lossy_count": local_bad_lossy_threshold,
                 }
             )
             if not passes or strict_zero_loss_target:
                 target_quality["limiting_metric"] = "repeat"
-            target_quality["utilization"] = required_passes / pass_count if pass_count > 0 else math.inf
+            target_quality["utilization"] = local_required_passes / pass_count if pass_count > 0 else math.inf
         row["target_quality"] = target_quality
         rows.append(row)
         measurements.append({"row": row, "samples": sample_measurements})
@@ -2898,6 +2977,34 @@ def drive_requirements(
             "last_bad": last_row_ref(bad_row),
         }
 
+    guarded_axes: dict[str, Any] = {}
+
+    def apply_axis_guard(axis: str, selected: _RequirementCandidate) -> _RequirementCandidate:
+        if axis == "bandwidth" and bandwidth_guard_ratio > 0.0:
+            guarded_bandwidth = min(bandwidth_high_bps, selected.bandwidth_bps * (1.0 + bandwidth_guard_ratio))
+            guarded = _requirements_with_axis(selected, "bandwidth", guarded_bandwidth)
+            guard_ratio = bandwidth_guard_ratio
+        elif axis in {"jitter", "jitter_loss"} and jitter_guard_ratio > 0.0:
+            guarded_jitter = max(0.0, selected.jitter_ms * (1.0 - jitter_guard_ratio))
+            guarded = _requirements_with_axis(selected, "jitter", guarded_jitter)
+            guard_ratio = jitter_guard_ratio
+        else:
+            return selected
+        guarded_axes[axis] = {
+            "guard_ratio": guard_ratio,
+            "selected": _requirements_candidate_context(
+                selected,
+                downlink_ratio=downlink_ratio,
+                downlink_mode=downlink_mode,
+            ),
+            "guarded": _requirements_candidate_context(
+                guarded,
+                downlink_ratio=downlink_ratio,
+                downlink_mode=downlink_mode,
+            ),
+        }
+        return guarded
+
     baseline = probe(candidate, axis="baseline", phase="ideal")
     if not baseline["passes"]:
         requirements_path = out_dir / "requirements.jsonl"
@@ -2918,7 +3025,12 @@ def drive_requirements(
             "probe_repeats": probe_repeats,
             "probe_min_passes": required_passes,
             "bad_lossy_count": bad_lossy_threshold,
+            "bandwidth_probe_repeats": bandwidth_repeats,
+            "bandwidth_probe_min_passes": bandwidth_required_passes,
+            "bandwidth_bad_lossy_count": bandwidth_bad_lossy_threshold,
             "search_order": search_order,
+            "jitter_guard_ratio": jitter_guard_ratio,
+            "bandwidth_guard_ratio": bandwidth_guard_ratio,
         }
         _write_benchmark_result(
             out_dir,
@@ -2939,6 +3051,7 @@ def drive_requirements(
                 "bounds": {
                     "bandwidth_low_bps": bandwidth_low_bps,
                     "bandwidth_high_bps": bandwidth_high_bps,
+                    "latency_base_ms": latency_base_ms,
                     "latency_high_ms": latency_high_ms,
                     "jitter_high_ms": jitter_high_ms,
                     "loss_high_pct": loss_high_pct,
@@ -2952,7 +3065,13 @@ def drive_requirements(
                 "probe_repeats": probe_repeats,
                 "probe_min_passes": required_passes,
                 "bad_lossy_count": bad_lossy_threshold,
+                "bandwidth_probe_repeats": bandwidth_repeats,
+                "bandwidth_probe_min_passes": bandwidth_required_passes,
+                "bandwidth_bad_lossy_count": bandwidth_bad_lossy_threshold,
                 "search_order": search_order,
+                "netem_seed": netem_seed,
+                "jitter_guard_ratio": jitter_guard_ratio,
+                "bandwidth_guard_ratio": bandwidth_guard_ratio,
                 "generated_profiles_file": generated_profiles_file.name if generated_profiles_file else None,
             },
             result={
@@ -2981,6 +3100,7 @@ def drive_requirements(
                 phase_label=f"round{round_index}",
                 iterations=search_iterations,
             )
+            candidate = apply_axis_guard(axis, candidate)
 
     if final_refine_iterations:
         for axis in selected_axes:
@@ -2997,6 +3117,7 @@ def drive_requirements(
                 if axis != "bandwidth"
                 else None,
             )
+            candidate = apply_axis_guard(axis, candidate)
 
     final_profile_name = _safe_case_token(f"{profile_prefix}_final")
     generated_doc["profiles"][final_profile_name] = _requirements_profile_spec(
@@ -3004,6 +3125,7 @@ def drive_requirements(
         distribution=distribution,
         downlink_ratio=downlink_ratio,
         downlink_mode=downlink_mode,
+        netem_seed=netem_seed,
     )
     write_profiles()
     final_row = probe(candidate, axis="combined", phase="final")
@@ -3040,7 +3162,14 @@ def drive_requirements(
         "probe_repeats": probe_repeats,
         "probe_min_passes": required_passes,
         "bad_lossy_count": bad_lossy_threshold,
+        "bandwidth_probe_repeats": bandwidth_repeats,
+        "bandwidth_probe_min_passes": bandwidth_required_passes,
+        "bandwidth_bad_lossy_count": bandwidth_bad_lossy_threshold,
         "search_order": search_order,
+        "netem_seed": netem_seed,
+        "jitter_guard_ratio": jitter_guard_ratio,
+        "bandwidth_guard_ratio": bandwidth_guard_ratio,
+        "guarded_axes": guarded_axes,
         "bad_cases_observed": {
             axis: bound.get("last_bad")
             for axis, bound in bounds.items()
@@ -3086,6 +3215,7 @@ def drive_requirements(
             "bounds": {
                 "bandwidth_low_bps": bandwidth_low_bps,
                 "bandwidth_high_bps": bandwidth_high_bps,
+                "latency_base_ms": latency_base_ms,
                 "latency_high_ms": latency_high_ms,
                 "jitter_high_ms": jitter_high_ms,
                 "loss_high_pct": loss_high_pct,
@@ -3099,7 +3229,13 @@ def drive_requirements(
             "probe_repeats": probe_repeats,
             "probe_min_passes": required_passes,
             "bad_lossy_count": bad_lossy_threshold,
+            "bandwidth_probe_repeats": bandwidth_repeats,
+            "bandwidth_probe_min_passes": bandwidth_required_passes,
+            "bandwidth_bad_lossy_count": bandwidth_bad_lossy_threshold,
             "search_order": search_order,
+            "netem_seed": netem_seed,
+            "jitter_guard_ratio": jitter_guard_ratio,
+            "bandwidth_guard_ratio": bandwidth_guard_ratio,
             "generated_profiles_file": generated_profiles_file.name if generated_profiles_file else None,
         },
         result=result,
@@ -3615,16 +3751,42 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 if profile_obj is None:
                     raise ValueError(f"Profile {profile_name!r} not found in profiles file {profiles_file}.")
 
+            container_tc_overrides: dict[str, str] = {}
+
+            def install_seeded_tc(container_name: str) -> str:
+                host_tc = shutil.which("tc")
+                if host_tc is None:
+                    raise RuntimeError(
+                        "netem seed was requested, but no host tc binary was found to copy into the container."
+                    )
+                target = "/tmp/rosotacom-host-tc"
+                commands = [
+                    ["docker", "cp", host_tc, f"{container_name}:{target}"],
+                    ["docker", "exec", "-u", "root", container_name, "chmod", "0755", target],
+                    ["docker", "exec", "-u", "root", container_name, target, "-V"],
+                ]
+                for cmd in commands:
+                    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    if res.returncode != 0:
+                        raise RuntimeError(
+                            f"failed to install seed-capable tc in {container_name}: "
+                            f"{' '.join(cmd)} -> {res.stderr or res.stdout}"
+                        )
+                print(f"  netem seed support in {container_name}: using host tc {host_tc} as {target}")
+                return target
+
             def make_container_runner(container_name: str) -> Callable[[Sequence[str]], None]:
                 def run(argv: Sequence[str]) -> None:
                     # Execute tc command inside container namespace as root.
-                    cmd = ["docker", "exec", "-u", "root", container_name] + list(argv)
+                    adjusted_argv = list(argv)
+                    if adjusted_argv and adjusted_argv[0] == "tc":
+                        adjusted_argv[0] = container_tc_overrides.get(container_name, "tc")
+                    cmd = ["docker", "exec", "-u", "root", container_name] + adjusted_argv
                     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
                     if res.returncode != 0:
-                        print(
-                            f"Warning: Command failed in {container_name}: "
-                            f"{' '.join(cmd)} -> {res.stderr or res.stdout}",
-                            file=sys.stderr,
+                        raise RuntimeError(
+                            f"network shaping command failed in {container_name}: "
+                            f"{' '.join(cmd)} -> {res.stderr or res.stdout}"
                         )
 
                 return run
@@ -3649,6 +3811,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
             b_container = None
             shapers = []
             peer_steps = {}
+            measurement_window: tuple[float, float] | None = None
 
             try:
                 _ensure_smoke_network(smoke_network.name, smoke_network.subnet)
@@ -3670,6 +3833,10 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 )
                 if not getattr(args, "dry_run", False):
                     time.sleep(12)
+
+                if profile_obj is not None and _profile_requires_netem_seed(profile_obj):
+                    container_tc_overrides[a_container] = install_seeded_tc(a_container)
+                    container_tc_overrides[b_container] = install_seeded_tc(b_container)
 
                 # 1. Start the publishers
                 for cmd in pub_cmds:
@@ -3748,8 +3915,9 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 # 4. Verify shaping was applied (diagnostic)
                 if profile_obj is not None and not getattr(args, "dry_run", False):
                     for label, container in [("A (uplink)", a_container), ("B (downlink)", b_container)]:
+                        tc_binary = container_tc_overrides.get(container, "tc")
                         res = subprocess.run(
-                            ["docker", "exec", "-u", "root", container, "tc", "qdisc", "show", "dev", "eth0"],
+                            ["docker", "exec", "-u", "root", container, tc_binary, "qdisc", "show", "dev", "eth0"],
                             capture_output=True,
                             text=True,
                             check=False,
@@ -3757,6 +3925,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                         print(f"  qdisc on {label} ({container}): {(res.stdout or '').strip()}")
 
                 # 5. Measure traffic under shaped conditions
+                measurement_start_s = time.time()
                 if profile_obj is not None and profile_obj.is_timeline:
                     num_steps = len(profile_obj.timeline)
                     for i in range(num_steps):
@@ -3767,6 +3936,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                         time.sleep(step_duration)
                 else:
                     time.sleep(duration_s)
+                measurement_window = (measurement_start_s, time.time())
             finally:
                 for shaper in shapers:
                     shaper.teardown()
@@ -3793,7 +3963,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
             dest = out_dir / "probes" / probe_name
             shutil.copytree(smoke_instance.host_dir, dest, dirs_exist_ok=True)
 
-            return collect_transit_summary(smoke_instance.host_dir)
+            return collect_transit_summary(smoke_instance.host_dir, publish_window=measurement_window)
 
     return run_point
 
@@ -4187,7 +4357,7 @@ def benchmark_matrix(args: argparse.Namespace) -> int:
 def benchmark_requirements(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark requirements``."""
     from .cli import _load_runtime_config
-    from .network_profiles import parse_rate_bps
+    from .network_profiles import parse_rate_bps, parse_seed
 
     if getattr(args, "interactive", False):
         return _start_interactive_benchmark(args, "requirements")
@@ -4241,8 +4411,13 @@ def benchmark_requirements(args: argparse.Namespace) -> int:
     else:
         bandwidth_low_bps = max(1.0, offered_bw * float(getattr(args, "bandwidth_low_factor", 1.0)))
     max_latency_ms = float(getattr(args, "max_latency_ms", 250.0))
+    latency_base_ms = float(getattr(args, "latency_base_ms", 0.0))
     latency_high_raw = getattr(args, "latency_high_ms", None)
     latency_high_ms = min(float(latency_high_raw), max_latency_ms) if latency_high_raw is not None else max_latency_ms
+    netem_seed_raw = getattr(args, "netem_seed", None)
+    netem_seed = parse_seed(netem_seed_raw, "netem_seed") if netem_seed_raw is not None else None
+    jitter_guard_ratio = float(getattr(args, "jitter_guard_ratio", 0.0))
+    bandwidth_guard_ratio = float(getattr(args, "bandwidth_guard_ratio", 0.0))
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, session_name)
     with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
@@ -4259,6 +4434,7 @@ def benchmark_requirements(args: argparse.Namespace) -> int:
             out_dir=run_dir,
             bandwidth_high_bps=bandwidth_high_bps,
             bandwidth_low_bps=bandwidth_low_bps,
+            latency_base_ms=latency_base_ms,
             latency_high_ms=latency_high_ms,
             jitter_high_ms=float(getattr(args, "jitter_high_ms", 120.0)),
             loss_high_pct=float(getattr(args, "loss_high", 20.0)),
@@ -4275,7 +4451,11 @@ def benchmark_requirements(args: argparse.Namespace) -> int:
             probe_repeats=int(getattr(args, "probe_repeats", 1)),
             probe_min_passes=getattr(args, "probe_min_passes", None),
             bad_lossy_count=getattr(args, "bad_lossy_count", None),
+            bandwidth_probe_repeats=getattr(args, "bandwidth_probe_repeats", None),
             search_order=str(getattr(args, "search_order", "auto")),
+            netem_seed=netem_seed,
+            jitter_guard_ratio=jitter_guard_ratio,
+            bandwidth_guard_ratio=bandwidth_guard_ratio,
             result_context=result_context,
             generated_profiles_file=generated_profiles_file,
             profile_prefix=str(getattr(args, "profile_prefix", "requirements")),
@@ -4614,6 +4794,12 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
         help="Default bandwidth floor as a factor of offered stream bandwidth.",
     )
     requirements_parser.add_argument(
+        "--latency-base-ms",
+        type=float,
+        default=0.0,
+        help="Initial/fixed uplink delay before searching worse latency values.",
+    )
+    requirements_parser.add_argument(
         "--latency-high-ms",
         type=float,
         help="Worst latency ceiling to try while searching; default is --max-latency-ms.",
@@ -4712,10 +4898,41 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
         help="Mark a candidate as a bad case when at least this many repeats lose messages; default is all repeats.",
     )
     requirements_parser.add_argument(
+        "--bandwidth-probe-repeats",
+        type=int,
+        help=(
+            "Override --probe-repeats for bandwidth bisection probes. "
+            "Use this when bandwidth is latency/backlog limited and jitter/final probes still need strict repeats."
+        ),
+    )
+    requirements_parser.add_argument(
         "--search-order",
         choices=["auto", "input"],
         default="auto",
         help="auto searches jitter before bandwidth/latency for exact zero-loss targets; input preserves axis order.",
+    )
+    requirements_parser.add_argument(
+        "--netem-seed",
+        type=int,
+        help="Seed for generated netem qdiscs so jitter/loss draws can be replayed on hosts whose tc supports it.",
+    )
+    requirements_parser.add_argument(
+        "--jitter-guard-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "After finding a zero-loss jitter boundary, use this fractional margin for later axes and the final "
+            "good-case profile; e.g. 0.10 uses 10%% less jitter than the boundary."
+        ),
+    )
+    requirements_parser.add_argument(
+        "--bandwidth-guard-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "After finding a bandwidth boundary, use this fractional margin for the final good-case profile; "
+            "e.g. 0.10 uses 10%% more bandwidth than the boundary."
+        ),
     )
     requirements_parser.add_argument(
         "--profile-prefix",

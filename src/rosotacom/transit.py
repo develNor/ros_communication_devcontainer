@@ -58,6 +58,64 @@ def join_transit_records(records: Iterable[dict[str, Any]]) -> list[dict[str, An
     return [joined[key] for key in sorted(joined)]
 
 
+def filter_transit_records_by_publish_window(
+    records: Iterable[dict[str, Any]],
+    *,
+    start_s: float,
+    end_s: float,
+    time_field: str = "t_wrap",
+) -> list[dict[str, Any]]:
+    """Keep records whose publish time falls inside a measurement window.
+
+    Lost records do not carry timestamps. For each source/topic/target stream,
+    keep lost sequence records only when they are bounded by delivered/reordered
+    records inside the window. This excludes startup and teardown sequence gaps
+    without hiding losses that happened during the measured interval.
+    """
+    if end_s < start_s:
+        raise ValueError("end_s must be >= start_s")
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for record in join_transit_records(records):
+        key = (
+            str(record.get("source") or ""),
+            str(record.get("target") or ""),
+            str(record.get("topic") or ""),
+        )
+        grouped.setdefault(key, []).append(record)
+
+    filtered: list[dict[str, Any]] = []
+    for key in sorted(grouped):
+        stream = grouped[key]
+        timed: list[dict[str, Any]] = []
+        for record in stream:
+            stamp = record.get(time_field)
+            if stamp is None:
+                continue
+            if start_s <= float(stamp) <= end_s:
+                timed.append(record)
+        if not timed:
+            continue
+        seq_min = min(int(record["seq"]) for record in timed)
+        seq_max = max(int(record["seq"]) for record in timed)
+        for record in stream:
+            if record.get("status") == "lost":
+                seq = int(record["seq"])
+                if seq_min <= seq <= seq_max:
+                    filtered.append(record)
+                continue
+            if record in timed:
+                filtered.append(record)
+    return sorted(
+        filtered,
+        key=lambda record: (
+            str(record.get("source") or ""),
+            str(record.get("target") or ""),
+            str(record.get("topic") or ""),
+            int(record["seq"]),
+        ),
+    )
+
+
 def summarize_transit_records(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     by_topic: dict[str, list[dict[str, Any]]] = {}
     for record in join_transit_records(records):

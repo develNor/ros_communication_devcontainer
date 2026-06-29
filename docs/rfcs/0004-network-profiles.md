@@ -90,9 +90,10 @@ profiles:
 ```
 
 - **static** — constant `{rate, delay, jitter, distribution, loss,
-  loss_correlation, reorder, duplicate}` per direction. `loss_correlation` (netem
-  state/`gemodel`) makes loss bursty rather than independent — closer to real
-  radio loss.
+  loss_correlation, reorder, duplicate, seed}` per direction. `loss_correlation`
+  (netem state/`gemodel`) makes loss bursty rather than independent — closer to
+  real radio loss. `seed` maps to `tc netem seed SEED` when supported, making the
+  generated random delay/loss draw replayable.
 - **timeline** — an ordered list of `{ for: <dur>, <static-params> | outage }`
   segments. A recovery benchmark (RFC 0005) *is* a timeline profile; `outage` is
   the step whose recovery is measured.
@@ -183,10 +184,11 @@ RFC 0002's `calibrate` / `--suggest` machinery, **per profile**:
   endpoints survive, recovery is "catch up") vs link-down (forces RMW
   re-discovery, a harsher recovery). They test different recoveries — see Open
   questions.
-- **Run-to-run variation.** `delay`/`loss` draws are RNG-driven; a profile bounds
-  behaviour, it does not make runs byte-identical. That is acceptable (and the
-  conditional bands are calibrated with margin); seed only if exact replay is ever
-  needed.
+- **Run-to-run variation.** `delay`/`loss` draws are RNG-driven; an unseeded
+  profile bounds behaviour, it does not make runs byte-identical. Use `seed` for
+  replayable netem draws when calibrating tight zero-loss boundaries. Local Docker
+  benchmarks can copy a seed-capable host `tc` into benchmark containers when the
+  container distro `tc` does not understand `netem seed`.
 - **Asymmetry, not absolute one-way truth.** Per-direction *shaping* is exact, but
   reading per-direction *latency* back out still depends on the clock-offset
   handling in RFC 0003.

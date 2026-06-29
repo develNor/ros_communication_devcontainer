@@ -115,6 +115,17 @@ def parse_pct(value: Any, what: str = "percentage") -> float:
     return pct
 
 
+def parse_seed(value: Any, what: str = "seed") -> int:
+    """``12345`` / ``"12345"`` -> a positive netem RNG seed."""
+    try:
+        seed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{what}: expected a positive integer, got {value!r}") from exc
+    if not 1 <= seed <= 0xFFFFFFFF:
+        raise ValueError(f"{what} must be within [1, 4294967295], got {value!r}")
+    return seed
+
+
 # --------------------------------------------------------------------------- #
 # Schema
 # --------------------------------------------------------------------------- #
@@ -133,6 +144,7 @@ class DirectionShaping:
     loss_correlation_pct: float | None = None  # netem correlated loss (needs loss)
     reorder_pct: float | None = None  # netem reorder (needs delay)
     duplicate_pct: float | None = None
+    seed: int | None = None
     burst: str = _DEFAULT_TBF_BURST  # tbf buffer, only used when rate_bps is set
     tbf_latency_ms: float = _DEFAULT_TBF_LATENCY_MS
 
@@ -221,6 +233,7 @@ _DIRECTION_KEYS = frozenset(
         "loss_correlation",
         "reorder",
         "duplicate",
+        "seed",
         "burst",
         "tbf_latency",
     }
@@ -245,6 +258,7 @@ def parse_direction(spec: Mapping[str, Any] | None) -> DirectionShaping | None:
         ),
         reorder_pct=parse_pct(spec["reorder"], "reorder") if "reorder" in spec else None,
         duplicate_pct=parse_pct(spec["duplicate"], "duplicate") if "duplicate" in spec else None,
+        seed=parse_seed(spec["seed"], "seed") if "seed" in spec else None,
         burst=str(spec.get("burst", _DEFAULT_TBF_BURST)),
         tbf_latency_ms=parse_ms(spec["tbf_latency"], "tbf_latency")
         if "tbf_latency" in spec
@@ -384,6 +398,8 @@ def _netem_args(shaping: DirectionShaping) -> list[str]:
         args += ["duplicate", _pct(shaping.duplicate_pct)]
     if shaping.reorder_pct is not None:
         args += ["reorder", _pct(shaping.reorder_pct)]
+    if shaping.seed is not None:
+        args += ["seed", str(shaping.seed)]
     return args
 
 

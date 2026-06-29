@@ -22,6 +22,7 @@ from rosotacom.network_profiles import (
     parse_profiles,
     parse_rate_bps,
     parse_seconds,
+    parse_seed,
     resolve_profile_selection,
     shaping_commands,
     teardown_command,
@@ -49,10 +50,13 @@ def test_duration_and_pct_parsing() -> None:
     assert parse_seconds("500ms") == 0.5
     assert parse_pct("2%") == 2.0
     assert parse_pct(100) == 100.0
+    assert parse_seed("12345") == 12345
     with pytest.raises(ValueError):
         parse_pct("150%")
     with pytest.raises(ValueError):
         parse_seconds("0s")
+    with pytest.raises(ValueError):
+        parse_seed(0)
 
 
 # --- direction schema + validation ----------------------------------------- #
@@ -180,6 +184,35 @@ def test_netem_arg_ordering_is_valid() -> None:
         "1%",
         "reorder",
         "5%",
+    ]
+
+
+def test_shaping_commands_emit_netem_seed() -> None:
+    commands = shaping_commands(
+        "tun0",
+        DirectionShaping(delay_ms=100.0, jitter_ms=20.0, distribution="normal", loss_pct=1.0, seed=12345),
+    )
+    assert commands == [
+        [
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            "tun0",
+            "root",
+            "handle",
+            "10:",
+            "netem",
+            "delay",
+            "100ms",
+            "20ms",
+            "distribution",
+            "normal",
+            "loss",
+            "1%",
+            "seed",
+            "12345",
+        ]
     ]
 
 

@@ -32,6 +32,7 @@ from typing import Any, cast
 import yaml
 
 DEFAULT_BENCHMARK_RMW = "cyclone"
+DEFAULT_BENCHMARK_DRAIN_S = 2.0
 BENCHMARK_RESULT_FILE = "result.json"
 BENCHMARK_SESSIONS_BY_GENRE = {
     "capacity": "bench_1_1_capacity",
@@ -255,6 +256,13 @@ def _profile_requires_netem_seed(profile: Any) -> bool:
     return _direction_requires_netem_seed(getattr(profile, "uplink", None)) or _direction_requires_netem_seed(
         getattr(profile, "downlink", None)
     )
+
+
+def _benchmark_drain_s(args: argparse.Namespace) -> float:
+    drain_s = float(getattr(args, "drain_s", DEFAULT_BENCHMARK_DRAIN_S))
+    if drain_s < 0.0:
+        raise ValueError("drain-s must be >= 0.")
+    return drain_s
 
 
 def _apply_benchmark_qos_options(
@@ -3428,6 +3436,15 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
     parser.add_argument("--dry-run", action="store_true", help="Show commands but do not run them.")
     parser.add_argument("--artifacts-dir", help="Output directory for all benchmark artifacts.")
     parser.add_argument(
+        "--drain-s",
+        type=float,
+        default=DEFAULT_BENCHMARK_DRAIN_S,
+        help=(
+            "Seconds to keep benchmark peers and shaping alive after stopping synthetic publishers, "
+            f"so delayed in-flight messages can arrive before teardown (default: {DEFAULT_BENCHMARK_DRAIN_S:g})."
+        ),
+    )
+    parser.add_argument(
         "--target",
         help="OTA target session or scenario (default for OTA: the benchmark genre session).",
     )
@@ -3501,6 +3518,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
         _ota_start_peers,
         _ota_start_session_publishers,
         _ota_stop_peers,
+        _ota_stop_session_publishers,
         _ota_teardown_profile,
         _ota_write_manifest,
         _ota_write_state,
@@ -3567,6 +3585,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
             runtime, plan, target = _resolve_ota_smoke_context(smoke_args)
             dry_run = smoke_args.dry_run
+            drain_s = _benchmark_drain_s(args)
             _profile_name, profile_obj = _resolve_ota_profile(runtime, target, smoke_args)
             sudo_passwords = _ota_network_sudo_passwords(
                 plan,
@@ -3660,6 +3679,9 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                             time.sleep(step_duration)
                     else:
                         time.sleep(duration_s)
+                    _ota_stop_session_publishers(target, plan, dry_run=dry_run)
+                    if drain_s > 0.0:
+                        time.sleep(drain_s)
             finally:
                 _ota_teardown_profile(shapers)
                 _ota_collect_logs(instance, plan, dry_run=dry_run)
@@ -3721,6 +3743,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
             instance_id = getattr(args, "instance_id", None) or _new_instance_id()
             smoke_instance = _resolve_session_instance(runtime, session, instance_id)
             smoke_network = _noninteractive_smoke_network_config(runtime, session, smoke_instance.instance_id)
+            drain_s = _benchmark_drain_s(args)
 
             peer_address_args = _smoke_peer_address_args(smoke_network.peer_ips)
             cfg = _effective_session_config(session.host_dir, runtime)
@@ -3807,11 +3830,20 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 )
                 pub_cmds.append(cmd)
 
-            a_container = None
-            b_container = None
-            shapers = []
-            peer_steps = {}
+            a_container: str | None = None
+            b_container: str | None = None
+            lab_shapers: list[ProfileShaper] = []
+            lab_peer_steps: dict[str, tuple[ProfileShaper, Any]] = {}
             measurement_window: tuple[float, float] | None = None
+
+            def stop_local_publishers() -> None:
+                if not a_container:
+                    return
+                subprocess.run(
+                    ["docker", "exec", a_container, "pkill", "-f", "sized_publisher"],
+                    capture_output=True,
+                    check=False,
+                )
 
             try:
                 _ensure_smoke_network(smoke_network.name, smoke_network.subnet)
@@ -3890,26 +3922,26 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     if profile_obj.is_timeline:
                         # Peer A shapes uplink (egress to B)
                         shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
-                        shapers.append(shaper_a)
+                        lab_shapers.append(shaper_a)
                         steps_a = expand_timeline(profile_obj, "eth0", direction="uplink")
-                        peer_steps["a"] = (shaper_a, steps_a)
+                        lab_peer_steps["a"] = (shaper_a, steps_a)
 
                         # Peer B shapes downlink (egress to A)
                         shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
-                        shapers.append(shaper_b)
+                        lab_shapers.append(shaper_b)
                         steps_b = expand_timeline(profile_obj, "eth0", direction="downlink")
-                        peer_steps["b"] = (shaper_b, steps_b)
+                        lab_peer_steps["b"] = (shaper_b, steps_b)
 
-                        for shaper in shapers:
+                        for shaper in lab_shapers:
                             shaper.arm([])
                     else:
                         if profile_obj.uplink and not profile_obj.uplink.is_empty:
                             shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
-                            shapers.append(shaper_a)
+                            lab_shapers.append(shaper_a)
                             shaper_a.arm(shaping_commands("eth0", profile_obj.uplink))
                         if profile_obj.downlink and not profile_obj.downlink.is_empty:
                             shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
-                            shapers.append(shaper_b)
+                            lab_shapers.append(shaper_b)
                             shaper_b.arm(shaping_commands("eth0", profile_obj.downlink))
 
                 # 4. Verify shaping was applied (diagnostic)
@@ -3930,15 +3962,19 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     num_steps = len(profile_obj.timeline)
                     for i in range(num_steps):
                         step_duration = profile_obj.timeline[i].for_s
-                        for shaper, steps in peer_steps.values():
+                        for shaper, steps in lab_peer_steps.values():
                             step = steps[i]
                             shaper.apply(step.commands)
                         time.sleep(step_duration)
                 else:
                     time.sleep(duration_s)
-                measurement_window = (measurement_start_s, time.time())
+                measurement_end_s = time.time()
+                stop_local_publishers()
+                if drain_s > 0.0:
+                    time.sleep(drain_s)
+                measurement_window = (measurement_start_s, measurement_end_s)
             finally:
-                for shaper in shapers:
+                for shaper in lab_shapers:
                     shaper.teardown()
 
                 for cleanup_container in [a_container, b_container]:

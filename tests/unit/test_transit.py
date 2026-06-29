@@ -76,3 +76,22 @@ def test_filter_transit_records_by_publish_window_keeps_only_bounded_losses() ->
         (4, "lost"),
         (5, "delivered"),
     ]
+
+
+def test_filter_transit_records_by_publish_window_keeps_delayed_tail_delivery() -> None:
+    records = [
+        {**_record(1, "delivered", 10.0, 10.0), "source": "a", "target": "b"},
+        {**_record(2, "delivered", 50.0, 10.99), "source": "a", "target": "b"},
+        {**_record(3, "delivered", 10.0, 11.1), "source": "a", "target": "b"},
+    ]
+
+    filtered = filter_transit_records_by_publish_window(records, start_s=10.0, end_s=11.0)
+    summary = summarize_transit_records(filtered)["topics"]["a->b:/x"]
+
+    assert [(record["seq"], record["status"]) for record in filtered] == [
+        (1, "delivered"),
+        (2, "delivered"),
+    ]
+    assert summary["expected"] == 2
+    assert summary["lost"] == 0
+    assert summary["ota_hop_ms"]["p95"] == 50.0

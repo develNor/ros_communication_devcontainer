@@ -22,6 +22,7 @@ import rosotacom.cli as cli
 import rosotacom.cli_benchmark as benchmark_cli
 from rosotacom.cli_benchmark import (
     BENCHMARK_RESULT_FILE,
+    DEFAULT_BENCHMARK_DRAIN_S,
     DEFAULT_BENCHMARK_RMW,
     _benchmark_child_command,
     _benchmark_ota_target,
@@ -1108,7 +1109,8 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
         return {"topics": {}}
 
     monkeypatch.setattr(benchmark_cli, "collect_transit_summary", fake_collect_transit_summary)
-    monkeypatch.setattr(benchmark_cli.time, "sleep", lambda seconds: None)
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(benchmark_cli.time, "sleep", lambda seconds: sleep_calls.append(float(seconds)))
     commands: list[list[str]] = []
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -1149,6 +1151,23 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
     assert any(
         command[:6] == ["docker", "exec", "-u", "root", "container_b", "tc"] and "1%" in command for command in commands
     )
+    assert sleep_calls[-2:] == [0.1, DEFAULT_BENCHMARK_DRAIN_S]
+    uplink_add = next(
+        i
+        for i, command in enumerate(commands)
+        if command[:8] == ["docker", "exec", "-u", "root", "container_a", "tc", "qdisc", "add"]
+    )
+    publisher_stop = next(
+        i
+        for i, command in enumerate(commands)
+        if i > uplink_add and command == ["docker", "exec", "container_a", "pkill", "-f", "sized_publisher"]
+    )
+    final_uplink_teardown = max(
+        i
+        for i, command in enumerate(commands)
+        if command[:8] == ["docker", "exec", "-u", "root", "container_a", "tc", "qdisc", "del"]
+    )
+    assert publisher_stop < final_uplink_teardown
 
 
 # --------------------------------------------------------------------------- #
@@ -1186,6 +1205,7 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.benchmark_command == "capacity"
     assert args.knob == "size"
     assert args.rmw == DEFAULT_BENCHMARK_RMW
+    assert args.drain_s == DEFAULT_BENCHMARK_DRAIN_S
     assert args.ota_benchmark is False
     assert args.sudo_mode == "passwordless"
     assert _is_ota_benchmark(args) is False

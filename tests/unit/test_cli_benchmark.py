@@ -31,6 +31,7 @@ from rosotacom.cli_benchmark import (
     _build_sensitivity_profiles,
     _initialize_interactive_log,
     _is_ota_benchmark,
+    _parse_loss_boundary_axes,
     _parse_requirements_axes,
     _parse_values,
     _peer_catmux_attach_script,
@@ -42,6 +43,7 @@ from rosotacom.cli_benchmark import (
     _start_interactive_benchmark,
     collect_transit_summary,
     drive_capacity,
+    drive_loss_boundaries,
     drive_matrix,
     drive_ramp,
     drive_requirements,
@@ -896,6 +898,96 @@ def test_requirements_bandwidth_probe_repeats_can_be_cheaper_than_final(tmp_path
     assert result["analysis"]["final_passes"] is True
 
 
+def test_loss_boundaries_driver_finds_discrete_good_and_bad_cases(tmp_path: Path) -> None:
+    from rosotacom.network_profiles import parse_ms, parse_rate_bps
+
+    generated_file = tmp_path / "generated-profiles.yaml"
+    candidate_counts: dict[tuple[int, int], int] = {}
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        assert profile is not None
+        generated = yaml.safe_load(generated_file.read_text(encoding="utf-8"))
+        spec = generated["profiles"][profile]["uplink"]
+        bandwidth = parse_rate_bps(spec["rate"])
+        jitter = parse_ms(spec.get("jitter", 0), "jitter")
+        key = (int(round(bandwidth / 100_000.0)), int(round(jitter)))
+        sample_index = candidate_counts.get(key, 0) + 1
+        candidate_counts[key] = sample_index
+
+        if bandwidth < 3_200_000.0:
+            lossy = True
+        elif jitter <= 18.0:
+            lossy = False
+        elif jitter >= 27.0:
+            lossy = True
+        else:
+            lossy = sample_index % 2 == 0
+
+        lost = 3 if lossy else 0
+        expected = 400
+        latency_p95 = 35.0 + jitter
+        return {
+            "topics": {
+                "/test": {
+                    "expected": expected,
+                    "delivered": expected - lost,
+                    "lost": lost,
+                    "loss_pct": lost / expected * 100.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": latency_p95 * 0.6, "p95": latency_p95},
+                    "jitter_ms": {"p50": jitter * 0.5, "p95": jitter},
+                }
+            }
+        }
+
+    result = drive_loss_boundaries(
+        probe,
+        max_latency_ms=250.0,
+        rate_hz=20.0,
+        size=18_000,
+        streams=1,
+        qos_reliability="best_effort",
+        qos_depth=1,
+        topic="/test",
+        out_dir=tmp_path,
+        axes=_parse_loss_boundary_axes("bandwidth,jitter"),
+        bandwidth_low_bps=3_000_000.0,
+        bandwidth_high_bps=4_000_000.0,
+        bandwidth_step_bps=100_000.0,
+        latency_base_ms=30.0,
+        jitter_low_ms=0.0,
+        jitter_high_ms=30.0,
+        jitter_step_ms=1.0,
+        min_duration_s=20.0,
+        min_messages=100,
+        distribution="normal",
+        downlink_mode="lan",
+        probe_repeats=10,
+        good_clean_count=10,
+        bad_lossy_count=10,
+        result_context={"test": True},
+        generated_profiles_file=generated_file,
+    )
+
+    bandwidth_boundary = result["boundaries"]["bandwidth"]
+    assert bandwidth_boundary["good_boundary"]["candidate"]["bandwidth_bps"] == pytest.approx(3_200_000.0)
+    assert bandwidth_boundary["bad_boundary"]["candidate"]["bandwidth_bps"] == pytest.approx(3_100_000.0)
+    assert bandwidth_boundary["tight"] is True
+
+    jitter_boundary = result["boundaries"]["jitter"]
+    assert jitter_boundary["good_boundary"]["candidate"]["jitter_ms"] == pytest.approx(18.0)
+    assert jitter_boundary["first_not_good"]["candidate"]["jitter_ms"] == pytest.approx(19.0)
+    assert jitter_boundary["bad_boundary"]["candidate"]["jitter_ms"] == pytest.approx(27.0)
+    assert jitter_boundary["last_not_bad"]["candidate"]["jitter_ms"] == pytest.approx(26.0)
+    assert jitter_boundary["mixed_zone"] == {"low_ms": 19.0, "high_ms": 26.0}
+
+    assert result["combined_good"]["classification"] == "good"
+    assert (tmp_path / "loss-boundaries.json").is_file()
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["genre"] == "loss-boundaries"
+    assert result_doc["result"]["analysis"]["seed_policy"] == "seedless"
+
+
 def test_requirements_zero_loss_target_reports_loss_as_limiter() -> None:
     quality = _requirements_target_quality(
         {"loss_pct": 0.25, "latency_p95_ms": 10.0},
@@ -1322,6 +1414,23 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.netem_seed is None
     assert args.jitter_guard_ratio == 0.0
     assert args.bandwidth_guard_ratio == 0.0
+
+    # Loss boundaries.
+    args = parser.parse_args(["benchmark", "loss-boundaries"])
+    assert args.benchmark_command == "loss-boundaries"
+    assert args.max_latency_ms == 250.0
+    assert args.rate_hz == 20.0
+    assert args.size == 18_000
+    assert args.axes == "all"
+    assert args.bandwidth_high == "auto"
+    assert args.bandwidth_step == "0.1mbit"
+    assert args.latency_base_ms == 30.0
+    assert args.jitter_high_ms == 40.0
+    assert args.jitter_step_ms == 1.0
+    assert args.downlink_mode == "lan"
+    assert args.probe_repeats == 10
+    assert args.netem_seed is None
+    assert args.netem_seeds is None
 
     # Plot.
     args = parser.parse_args(["benchmark", "plot", "results.jsonl"])

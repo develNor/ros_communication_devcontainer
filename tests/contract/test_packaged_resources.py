@@ -116,6 +116,18 @@ def test_domain_bridge_generates_ota_dds_config_before_launch() -> None:
     assert commands[1].startswith("ros2 run domain_bridge domain_bridge")
 
 
+def test_ota_bridge_static_peers_include_same_host_domain_bridge() -> None:
+    plugin = yaml.safe_load(
+        (cli.WS_DIR / "session" / "content" / "base" / "session_plugin_base.yaml").read_text(encoding="utf-8")
+    )
+
+    for window_name in ("IN", "OUT"):
+        window = next(window for window in plugin["windows"] if window["name"] == window_name)
+        bridge_commands = window["splits"][0]["commands"]
+
+        assert 'export ROS_STATIC_PEERS="${ip_local};${ip_remote}"' in bridge_commands[3]
+
+
 def test_native_chatter_waiter_reads_topic_info_without_broken_pipe(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

@@ -581,8 +581,8 @@ def _initialize_interactive_log(full_log: Path, command: Sequence[str]) -> None:
 
 def _benchmark_run_script(command: Sequence[str], full_log: Path, session_name: str) -> str:
     pattern = (
-        r"probe\(|Probe time bins saved|Benchmark result saved|Capacity result|Capacity:|Ramp curve copied|Recovery metrics copied|"
-        r"Sweep frontier copied|ERROR|Error|Warning|benchmark exited"
+        r"probe\(|Probe time bins saved|Benchmark result saved|Capacity result|Capacity:|Ramp curve copied|"
+        r"Recovery metrics copied|Sweep frontier copied|ERROR|Error|Warning|benchmark exited"
     )
     script = f"""
 import pathlib

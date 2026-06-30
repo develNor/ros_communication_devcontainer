@@ -44,20 +44,6 @@ RMW_CASES: list[dict[str, Any]] = [
         "rmw": {"local": "zenoh", "ota": "zenoh_connect_endpoints"},
     },
     {
-        "name": "1_heartbeat_fastdds-local_cyclone-ota",
-        "rmw": {
-            "local": {"fastdds": {"config": "fastdds_unicast.xml"}},
-            "ota": {"cyclone": {"config": "cyclonedds_minimal.xml"}},
-        },
-    },
-    {
-        "name": "1_heartbeat_cyclone-local_fastdds-ota",
-        "rmw": {
-            "local": {"cyclone": {"config": "cyclonedds_minimal.xml"}},
-            "ota": {"fastdds": {"config": "fastdds_unicast.xml"}},
-        },
-    },
-    {
         "name": "1_heartbeat_cyclone-local_zenoh-ros2dds-ota",
         "rmw": {"local": "cyclone", "ota": "zenoh_ros2dds"},
     },

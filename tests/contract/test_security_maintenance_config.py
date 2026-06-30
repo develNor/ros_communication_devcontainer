@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 DEPENDABOT_PATH = PACKAGE_ROOT / ".github" / "dependabot.yml"
 IMAGE_SCAN_PATH = PACKAGE_ROOT / ".github" / "workflows" / "image-scan.yml"
@@ -119,3 +121,25 @@ def test_local_check_derivation_and_generated_rmw_matrix_drive_test_configs() ->
     e2e_smoke = (PACKAGE_ROOT / "tests" / "e2e" / "test_smoke.py").read_text(encoding="utf-8")
     assert "local_check_sessions()" in e2e_smoke
     assert "ROSOTACOM_RUN_FULL_E2E" in e2e_smoke
+
+
+def test_generated_rmw_matrix_omits_mixed_dds_split_domain_cases() -> None:
+    rmw_matrix_dir = PACKAGE_ROOT / "tests" / "sessions" / "rmw_matrix"
+
+    def rmw_name(value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict) and len(value) == 1:
+            return next(iter(value))
+        raise AssertionError(f"unexpected rmw side spec: {value!r}")
+
+    unsupported_cases: list[str] = []
+    for session_file in sorted(rmw_matrix_dir.glob("*/session-definition.yaml")):
+        session = yaml.safe_load(session_file.read_text(encoding="utf-8"))
+        rmw = session["shared"]["rmw"]
+        local = rmw_name(rmw["local"])
+        ota = rmw_name(rmw["ota"])
+        if {local, ota} == {"cyclone", "fastdds"}:
+            unsupported_cases.append(session_file.parent.name)
+
+    assert not unsupported_cases

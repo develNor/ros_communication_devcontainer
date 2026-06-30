@@ -15,6 +15,7 @@
 
   "build_args": {
     "BASE_IMAGE": "osrf/ros:kilted-desktop-full-noble",
-    "DIGEST": "@sha256:29eb6f48bb06549aba004a7a4b12c00ece23b156731df12cf1f3c1ae1b0fd178"
+    "DIGEST": "@sha256:29eb6f48bb06549aba004a7a4b12c00ece23b156731df12cf1f3c1ae1b0fd178",
+    "APT_PACKAGES": "ros-kilted-rmw-cyclonedds-cpp"
   }
 }

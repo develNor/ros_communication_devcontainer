@@ -73,6 +73,10 @@ def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
     assert default_build_args["DIGEST"].startswith("@sha256:")
     assert default_build_args["BASE_IMAGE"] == example_build_args["BASE_IMAGE"]
     assert default_build_args["DIGEST"] == example_build_args["DIGEST"]
+    for build_args in (default_build_args, example_build_args):
+        apt_packages = set(str(build_args["APT_PACKAGES"]).split())
+        assert "ros-kilted-domain-bridge" in apt_packages
+        assert "ros-kilted-rmw-cyclonedds-cpp" in apt_packages
 
 
 def test_shell_entrypoints_pass_syntax_check() -> None:

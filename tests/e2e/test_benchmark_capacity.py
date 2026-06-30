@@ -11,7 +11,7 @@ import pytest
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_TIMEOUT_S = 900
 SMOKE_NETWORK_NAME = "rosotacom-smoke"
-CAPACITY_PROFILE = "cellular-4g-capacity-ci"
+CAPACITY_PROFILE = "rate-limited-capacity-ci"
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.skipif(
@@ -59,6 +59,38 @@ def _run(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str
     return result
 
 
+def _benchmark_result_path(stdout: str) -> Path:
+    prefix = "Benchmark result saved to "
+    result_paths = [Path(line.removeprefix(prefix)) for line in stdout.splitlines() if line.startswith(prefix)]
+    if not result_paths:
+        raise AssertionError(f"Benchmark output did not report a result.json path.\nSTDOUT:\n{stdout}")
+    return result_paths[-1]
+
+
+def _assert_capacity_result(
+    stdout: str,
+    *,
+    expected_capacity: int | None,
+    expected_probe_value: int,
+    expected_passed: bool,
+) -> None:
+    result_path = _benchmark_result_path(stdout)
+    assert result_path.is_file(), f"Benchmark result file does not exist: {result_path}"
+    doc = json.loads(result_path.read_text(encoding="utf-8"))
+
+    assert doc["genre"] == "capacity"
+    assert doc["result"]["slice"]["knob"] == "size"
+    assert doc["result"]["capacity"] == expected_capacity
+    assert doc["verdict"]["passed"] is expected_passed
+    probes = doc["measurements"]["probes"]
+    assert len(probes) == 1
+    assert probes[0]["value"] == expected_probe_value
+    assert probes[0]["passed"] is expected_passed
+    assert probes[0]["load"]["offered_bandwidth_bps"] is not None
+    if expected_passed:
+        assert probes[0]["topics"]
+
+
 @pytest.fixture(scope="session")
 def copied_example_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
     project = tmp_path_factory.mktemp("rosotacom") / "examples"
@@ -66,14 +98,10 @@ def copied_example_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
     _run([sys.executable, "-m", "rosotacom", "examples", "create", str(project)], timeout=60)
 
     # Keep the smoke deterministic: these cases validate capacity against the
-    # rate limit, not stochastic packet-loss sampling.
+    # rate limit, not delay/jitter/loss side effects.
     profiles_yaml = project / "profiles.yaml"
     profiles_yaml.write_text(
-        "profiles:\n"
-        f"  {CAPACITY_PROFILE}:\n"
-        "    uplink:   { rate: 1mbit,  delay: 180ms, jitter: 50ms,\n"
-        "                distribution: normal, loss: 0%, loss_correlation: 0% }\n"
-        "    downlink: { rate: 10mbit, delay: 100ms, jitter: 30ms, loss: 0% }\n",
+        f"profiles:\n  {CAPACITY_PROFILE}:\n    uplink:   {{ rate: 1mbit }}\n    downlink: {{ rate: 10mbit }}\n",
         encoding="utf-8",
     )
     return project
@@ -109,8 +137,7 @@ def test_benchmark_capacity_good_case(copied_example_project: Path) -> None:
         "cyclone",
     ]
     result = _run(cmd, timeout=BENCHMARK_TIMEOUT_S)
-    # The output should contain: Capacity: size=1
-    assert "Capacity: size=1" in result.stdout
+    _assert_capacity_result(result.stdout, expected_capacity=1, expected_probe_value=1, expected_passed=True)
 
 
 def test_benchmark_capacity_bad_case(copied_example_project: Path) -> None:
@@ -143,5 +170,4 @@ def test_benchmark_capacity_bad_case(copied_example_project: Path) -> None:
         "cyclone",
     ]
     result = _run(cmd, timeout=BENCHMARK_TIMEOUT_S)
-    # The output should contain: Capacity: size=None
-    assert "Capacity: size=None" in result.stdout
+    _assert_capacity_result(result.stdout, expected_capacity=None, expected_probe_value=18000, expected_passed=False)

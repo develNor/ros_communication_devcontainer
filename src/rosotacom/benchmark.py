@@ -417,8 +417,10 @@ def characterize_probe_records(
     joined_records = join_transit_records(records)
     if not joined_records:
         return []
-    period_s = nominal_period_s if nominal_period_s is not None else _infer_nominal_period_s(
-        joined_records, time_field=time_field
+    period_s = (
+        nominal_period_s
+        if nominal_period_s is not None
+        else _infer_nominal_period_s(joined_records, time_field=time_field)
     )
     period_s = float(period_s or 0.0)
 

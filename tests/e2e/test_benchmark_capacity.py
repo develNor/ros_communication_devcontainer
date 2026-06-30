@@ -11,6 +11,7 @@ import pytest
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_TIMEOUT_S = 900
 SMOKE_NETWORK_NAME = "rosotacom-smoke"
+CAPACITY_PROFILE = "cellular-4g-capacity-ci"
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.skipif(
@@ -64,14 +65,15 @@ def copied_example_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     _run([sys.executable, "-m", "rosotacom", "examples", "create", str(project)], timeout=60)
 
-    # Overwrite profiles.yaml to include cellular-4g-degraded profile
+    # Keep the smoke deterministic: these cases validate capacity against the
+    # rate limit, not stochastic packet-loss sampling.
     profiles_yaml = project / "profiles.yaml"
     profiles_yaml.write_text(
         "profiles:\n"
-        "  cellular-4g-degraded:\n"
+        f"  {CAPACITY_PROFILE}:\n"
         "    uplink:   { rate: 1mbit,  delay: 180ms, jitter: 50ms,\n"
-        "                distribution: normal, loss: 3%, loss_correlation: 25% }\n"
-        "    downlink: { rate: 10mbit, delay: 100ms, jitter: 30ms, loss: 1% }\n",
+        "                distribution: normal, loss: 0%, loss_correlation: 0% }\n"
+        "    downlink: { rate: 10mbit, delay: 100ms, jitter: 30ms, loss: 0% }\n",
         encoding="utf-8",
     )
     return project
@@ -88,7 +90,7 @@ def test_benchmark_capacity_good_case(copied_example_project: Path) -> None:
         "--rosotacom-config",
         str(copied_example_project / "rosotacom.yaml"),
         "--profile",
-        "cellular-4g-degraded",
+        CAPACITY_PROFILE,
         "--knob",
         "size",
         "--low",
@@ -122,7 +124,7 @@ def test_benchmark_capacity_bad_case(copied_example_project: Path) -> None:
         "--rosotacom-config",
         str(copied_example_project / "rosotacom.yaml"),
         "--profile",
-        "cellular-4g-degraded",
+        CAPACITY_PROFILE,
         "--knob",
         "size",
         "--low",

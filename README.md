@@ -500,12 +500,28 @@ rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability bes
 rosotacom benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 0 --max-latency-ms 250 --latency-base-ms 30 --downlink-mode lan --axes jitter,bandwidth --bandwidth-high-factor 8 --bandwidth-low-factor 1 --jitter-high-ms 40 --search-iterations 7 --final-refine-iterations 0 --search-rounds 1 --min-duration 20 --min-messages 100 --probe-repeats 1 --bandwidth-probe-repeats 1 --netem-seed 424242 --jitter-guard-ratio 0.20 --bandwidth-guard-ratio 0.20
 ```
 
+Use `benchmark loss-boundaries` when the question is specifically “where does
+the first ROS 2 loss appear?” It searches bandwidth and jitter as discrete axes:
+bandwidth reports the lowest loss-free rate and the adjacent lower bad rate at
+`--bandwidth-step`; jitter reports the highest fully clean value, the first
+non-clean neighbor, the lowest fully lossy value, and the mixed zone between
+them at `--jitter-step-ms`. Seedless runs are the best empirical estimate for a
+host/link, a single `--netem-seed` is useful for replay/debugging one random
+jitter sequence, and `--netem-seeds 101,102,...` is the reproducible compromise
+when you want several replayable jitter draws instead of overfitting one seed:
+
+```bash
+rosotacom benchmark loss-boundaries --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-latency-ms 250 --latency-base-ms 30 --downlink-mode lan --bandwidth-low 2.8mbit --bandwidth-high 4mbit --bandwidth-step 0.1mbit --jitter-low-ms 0 --jitter-high-ms 40 --jitter-step-ms 1 --min-duration 20 --min-messages 100 --probe-repeats 10
+rosotacom benchmark loss-boundaries --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-latency-ms 250 --latency-base-ms 30 --downlink-mode lan --bandwidth-low 2.8mbit --bandwidth-high 4mbit --bandwidth-step 0.1mbit --jitter-low-ms 0 --jitter-high-ms 40 --jitter-step-ms 1 --min-duration 20 --min-messages 100 --probe-repeats 1 --netem-seeds 101,102,103,104,105,106,107,108,109,110
+```
+
 Use `rosotacom ota-benchmark` for the same probes over deployment peers, without
 having to name a target:
 
 ```bash
 rosotacom ota-benchmark capacity --profile cellular-4g-degraded --knob size --low 1 --high 1 --max-loss 30 --max-latency-ms 1000 --duration 10 --repeats 1 --peer a=seat_tks --peer b=majestic_tks
 rosotacom ota-benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 5 --max-latency-ms 250 --peer a=seat_tks --peer b=majestic_tks
+rosotacom ota-benchmark loss-boundaries --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-latency-ms 250 --latency-base-ms 30 --downlink-mode lan --bandwidth-low 2.8mbit --bandwidth-high 4mbit --bandwidth-step 0.1mbit --jitter-high-ms 40 --jitter-step-ms 1 --probe-repeats 10 --peer a=seat_tks --peer b=majestic_tks
 ```
 
 OTA benchmarks default to the benchmark session for the selected genre. Pass

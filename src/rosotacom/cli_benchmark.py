@@ -42,6 +42,7 @@ BENCHMARK_SESSIONS_BY_GENRE = {
     "sensitivity": "bench_1_1_capacity",
     "matrix": "bench_1_1_capacity",
     "requirements": "bench_1_1_capacity",
+    "loss-boundaries": "bench_1_1_capacity",
 }
 
 
@@ -3282,6 +3283,587 @@ def drive_requirements(
 
 
 # --------------------------------------------------------------------------- #
+# Benchmark driver: loss boundaries
+# --------------------------------------------------------------------------- #
+
+
+def _parse_loss_boundary_axes(raw: str) -> list[str]:
+    available = ("bandwidth", "jitter")
+    aliases = {"bw": "bandwidth", "rate": "bandwidth"}
+    axes = [aliases.get(value.strip().lower(), value.strip().lower()) for value in raw.split(",") if value.strip()]
+    if not axes or "all" in axes:
+        return list(available)
+    unknown = sorted(set(axes) - set(available))
+    if unknown:
+        raise ValueError(f"Unknown loss-boundary axes: {', '.join(unknown)}")
+    return [axis for axis in available if axis in axes]
+
+
+def _parse_netem_seed_values(raw: str | None) -> list[int]:
+    if raw is None or not raw.strip():
+        return []
+    from .network_profiles import parse_seed
+
+    seeds: list[int] = []
+    for token in raw.split(","):
+        value = token.strip()
+        if not value:
+            continue
+        seeds.append(parse_seed(value, "netem-seeds"))
+    return seeds
+
+
+def _loss_boundary_step_units(low: float, high: float, step: float, *, label: str) -> tuple[int, int]:
+    if step <= 0.0:
+        raise ValueError(f"{label}-step must be > 0.")
+    if low < 0.0 or high < 0.0:
+        raise ValueError(f"{label} bounds must be >= 0.")
+    if low >= high:
+        raise ValueError(f"{label}-low must be smaller than {label}-high.")
+    low_units = int(math.floor(low / step + 1e-9))
+    high_units = int(math.ceil(high / step - 1e-9))
+    if low_units >= high_units:
+        raise ValueError(f"{label} bounds collapse at the configured step.")
+    return low_units, high_units
+
+
+def drive_loss_boundaries(
+    run_point: RunPointFn,
+    *,
+    max_latency_ms: float,
+    rate_hz: float,
+    size: int,
+    streams: int,
+    qos_reliability: str,
+    qos_depth: int,
+    topic: str,
+    out_dir: Path,
+    axes: Sequence[str],
+    bandwidth_low_bps: float,
+    bandwidth_high_bps: float,
+    bandwidth_step_bps: float,
+    latency_base_ms: float,
+    jitter_low_ms: float,
+    jitter_high_ms: float,
+    jitter_step_ms: float,
+    min_duration_s: float,
+    min_messages: int,
+    distribution: str,
+    downlink_ratio: float = 1.0,
+    downlink_mode: str = "lan",
+    probe_repeats: int = 10,
+    good_clean_count: int | None = None,
+    bad_lossy_count: int | None = None,
+    netem_seed: int | None = None,
+    netem_seeds: Sequence[int] = (),
+    result_context: dict[str, Any] | None = None,
+    generated_profiles_file: Path | None = None,
+    profile_prefix: str = "loss_boundary",
+) -> dict[str, Any]:
+    """Find discrete zero-loss good/bad boundaries for bandwidth and jitter."""
+
+    if downlink_mode not in {"mirror", "lan"}:
+        raise ValueError("downlink_mode must be 'mirror' or 'lan'.")
+    if latency_base_ms < 0.0:
+        raise ValueError("latency-base-ms must be >= 0.")
+    if probe_repeats < 1:
+        raise ValueError("probe-repeats must be >= 1.")
+    if netem_seed is not None and netem_seeds:
+        raise ValueError("Use either netem_seed or netem_seeds, not both.")
+
+    selected_axes = _parse_loss_boundary_axes(",".join(axes))
+    bandwidth_low_units, bandwidth_high_units = _loss_boundary_step_units(
+        bandwidth_low_bps,
+        bandwidth_high_bps,
+        bandwidth_step_bps,
+        label="bandwidth",
+    )
+    jitter_low_units, jitter_high_units = _loss_boundary_step_units(
+        jitter_low_ms,
+        jitter_high_ms,
+        jitter_step_ms,
+        label="jitter",
+    )
+
+    if netem_seeds:
+        sample_seeds: tuple[int | None, ...] = tuple(seed for seed in netem_seeds for _ in range(probe_repeats))
+        seed_policy = "seed_set"
+    elif netem_seed is not None:
+        sample_seeds = tuple(netem_seed for _ in range(probe_repeats))
+        seed_policy = "fixed_seed"
+    else:
+        sample_seeds = tuple(None for _ in range(probe_repeats))
+        seed_policy = "seedless"
+    sample_count = len(sample_seeds)
+    required_good = good_clean_count if good_clean_count is not None else sample_count
+    required_bad = bad_lossy_count if bad_lossy_count is not None else sample_count
+    if not 1 <= required_good <= sample_count:
+        raise ValueError("good-clean-count must be within [1, total samples].")
+    if not 1 <= required_bad <= sample_count:
+        raise ValueError("bad-lossy-count must be within [1, total samples].")
+
+    load = {"size_a": size, "rate": rate_hz, "streams": streams}
+    load_info = _load_context(load)
+    duration_s = _duration_for_min_messages(rate_hz, min_duration_s=min_duration_s, min_messages=min_messages)
+    rows: list[dict[str, Any]] = []
+    measurements: list[dict[str, Any]] = []
+    boundaries: dict[str, Any] = {}
+    row_cache: dict[tuple[str, int, str], dict[str, Any]] = {}
+    generated_doc: dict[str, Any] = {
+        "profiles": {},
+        "metadata": {
+            "kind": "benchmark-loss-boundaries-generated",
+            "stream": {
+                "rate_hz": rate_hz,
+                "size_bytes": size,
+                "streams": streams,
+                "qos": {"reliability": qos_reliability, "depth": qos_depth},
+                "offered_bandwidth_bps": load_info.get("offered_bandwidth_bps"),
+            },
+            "search": {
+                "axes": selected_axes,
+                "bandwidth_low_bps": bandwidth_low_bps,
+                "bandwidth_high_bps": bandwidth_high_bps,
+                "bandwidth_step_bps": bandwidth_step_bps,
+                "latency_base_ms": latency_base_ms,
+                "jitter_low_ms": jitter_low_ms,
+                "jitter_high_ms": jitter_high_ms,
+                "jitter_step_ms": jitter_step_ms,
+                "distribution": distribution,
+                "downlink_ratio": downlink_ratio,
+                "downlink_mode": downlink_mode,
+                "probe_repeats": probe_repeats,
+                "sample_count": sample_count,
+                "good_clean_count": required_good,
+                "bad_lossy_count": required_bad,
+                "seed_policy": seed_policy,
+                "netem_seed": netem_seed,
+                "netem_seeds": list(netem_seeds),
+            },
+            "thresholds": {
+                "max_ros2_loss_pct": 0.0,
+                "max_latency_ms": max_latency_ms,
+            },
+        },
+    }
+    profile_counter = 0
+
+    def write_profiles() -> None:
+        if generated_profiles_file is not None:
+            generated_profiles_file.write_text(yaml.safe_dump(generated_doc, sort_keys=False), encoding="utf-8")
+
+    def axis_value(axis: str, unit: int) -> float:
+        if axis == "bandwidth":
+            return unit * bandwidth_step_bps
+        if axis == "jitter":
+            return unit * jitter_step_ms
+        raise ValueError(f"Unknown axis {axis!r}.")
+
+    def candidate_for_axis(axis: str, unit: int) -> _RequirementCandidate:
+        if axis == "bandwidth":
+            return _RequirementCandidate(
+                bandwidth_bps=axis_value(axis, unit),
+                latency_ms=latency_base_ms,
+                jitter_ms=0.0,
+                loss_pct=0.0,
+            )
+        if axis == "jitter":
+            return _RequirementCandidate(
+                bandwidth_bps=bandwidth_high_bps,
+                latency_ms=latency_base_ms,
+                jitter_ms=axis_value(axis, unit),
+                loss_pct=0.0,
+            )
+        raise ValueError(f"Unknown axis {axis!r}.")
+
+    def candidate_for_combined() -> _RequirementCandidate:
+        bandwidth_candidate = boundaries.get("bandwidth", {}).get("good_boundary", {}).get("candidate", {})
+        jitter_candidate = boundaries.get("jitter", {}).get("good_boundary", {}).get("candidate", {})
+        bandwidth = float(bandwidth_candidate.get("bandwidth_bps") or bandwidth_high_bps)
+        jitter = float(jitter_candidate.get("jitter_ms") or 0.0)
+        return _RequirementCandidate(
+            bandwidth_bps=bandwidth,
+            latency_ms=latency_base_ms,
+            jitter_ms=jitter,
+            loss_pct=0.0,
+        )
+
+    def row_ref(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "candidate": row.get("candidate"),
+            "classification": row.get("classification"),
+            "loss_pct": row.get("loss_pct"),
+            "latency_p95_ms": row.get("latency_p95_ms"),
+            "repeat": row.get("repeat"),
+        }
+
+    def classify(
+        candidate: _RequirementCandidate,
+        *,
+        axis: str,
+        unit: int,
+        mode: str,
+        phase: str,
+        use_cache: bool = True,
+    ) -> dict[str, Any]:
+        nonlocal profile_counter
+        cache_key = (axis, unit, mode)
+        if use_cache and cache_key in row_cache:
+            return row_cache[cache_key]
+
+        samples: list[dict[str, Any]] = []
+        sample_measurements: list[dict[str, Any]] = []
+        selected_topic = ""
+        for sample_index, sample_seed in enumerate(sample_seeds, start=1):
+            profile_counter += 1
+            seed_suffix = "seedless" if sample_seed is None else f"seed{sample_seed}"
+            profile_name = _safe_case_token(
+                f"{profile_prefix}_{profile_counter:03d}_{axis}_{phase}_{mode}_sample{sample_index}_{seed_suffix}"
+            )
+            generated_doc["profiles"][profile_name] = _requirements_profile_spec(
+                candidate,
+                distribution=distribution,
+                downlink_ratio=downlink_ratio,
+                downlink_mode=downlink_mode,
+                netem_seed=sample_seed,
+            )
+            write_profiles()
+            summary = run_point(profile=profile_name, load=load, duration_s=duration_s, out_dir=out_dir)
+            sample_topic, topic_data = _selected_topic(summary, topic)
+            rows_for_print = _topic_rows(summary, topic)
+            if sample_topic and not selected_topic:
+                selected_topic = sample_topic
+            sample_loss_pct = float(topic_data.get("loss_pct", 100.0)) if topic_data else 100.0
+            sample_lost = int(topic_data.get("lost", 0)) if topic_data and topic_data.get("lost") is not None else None
+            sample_latency_p95 = (topic_data.get("ota_hop_ms") or {}).get("p95") if topic_data else None
+            sample_jitter_p95 = (topic_data.get("jitter_ms") or {}).get("p95") if topic_data else None
+            loss_free = bool(sample_loss_pct <= 0.0 and (sample_lost is None or sample_lost == 0))
+            latency_ok = bool(sample_latency_p95 is not None and float(sample_latency_p95) <= max_latency_ms)
+            good = loss_free and latency_ok
+            lossy = not loss_free
+            sample = {
+                "sample": sample_index,
+                "seed": sample_seed,
+                "topic": sample_topic,
+                "expected": topic_data.get("expected") if topic_data else None,
+                "delivered": topic_data.get("delivered") if topic_data else None,
+                "lost": sample_lost,
+                "reordered": topic_data.get("reordered") if topic_data else None,
+                "loss_pct": sample_loss_pct,
+                "latency_p95_ms": float(sample_latency_p95) if sample_latency_p95 is not None else None,
+                "jitter_p95_ms": float(sample_jitter_p95) if sample_jitter_p95 is not None else None,
+                "loss_free": loss_free,
+                "latency_ok": latency_ok,
+                "good": good,
+                "lossy": lossy,
+            }
+            samples.append(sample)
+            sample_measurements.append(
+                {
+                    "sample": sample_index,
+                    "seed": sample_seed,
+                    "topics": rows_for_print,
+                    "summary": summary,
+                    "sample_result": sample,
+                }
+            )
+
+            good_count = sum(1 for item in samples if item["good"])
+            lossy_count = sum(1 for item in samples if item["lossy"])
+            remaining = sample_count - sample_index
+            if mode == "good" and good_count + remaining < required_good:
+                break
+            if mode == "bad" and lossy_count + remaining < required_bad:
+                break
+
+        good_count = sum(1 for sample in samples if sample["good"])
+        loss_free_count = sum(1 for sample in samples if sample["loss_free"])
+        lossy_count = sum(1 for sample in samples if sample["lossy"])
+        expected_total = sum(int(sample["expected"]) for sample in samples if sample.get("expected") is not None)
+        delivered_total = sum(int(sample["delivered"]) for sample in samples if sample.get("delivered") is not None)
+        lost_total = sum(int(sample["lost"]) for sample in samples if sample.get("lost") is not None)
+        reordered_total = sum(int(sample["reordered"]) for sample in samples if sample.get("reordered") is not None)
+        latency_values = [
+            float(sample["latency_p95_ms"]) for sample in samples if sample.get("latency_p95_ms") is not None
+        ]
+        jitter_values = [
+            float(sample["jitter_p95_ms"]) for sample in samples if sample.get("jitter_p95_ms") is not None
+        ]
+        loss_pct = lost_total / expected_total * 100.0 if expected_total > 0 else 100.0
+        good_case = good_count >= required_good
+        bad_case = lossy_count >= required_bad
+        if good_case:
+            classification = "good"
+        elif bad_case:
+            classification = "bad"
+        elif loss_free_count > 0 and lossy_count > 0:
+            classification = "mixed"
+        elif lossy_count > 0:
+            classification = "lossy"
+        else:
+            classification = "quality_fail"
+        repeat_summary = {
+            "sample_count": len(samples),
+            "configured_samples": sample_count,
+            "probe_repeats": probe_repeats,
+            "good_clean_count": required_good,
+            "bad_lossy_count": required_bad,
+            "good_count": good_count,
+            "loss_free_count": loss_free_count,
+            "lossy_count": lossy_count,
+            "good_case": good_case,
+            "bad_case": bad_case,
+            "seed_policy": seed_policy,
+        }
+        row = {
+            "axis": axis,
+            "phase": phase,
+            "mode": mode,
+            "candidate": _requirements_candidate_context(
+                candidate,
+                downlink_ratio=downlink_ratio,
+                downlink_mode=downlink_mode,
+            ),
+            "classification": classification,
+            "good_case": good_case,
+            "bad_case": bad_case,
+            "topic": selected_topic,
+            "expected": expected_total,
+            "delivered": delivered_total,
+            "lost": lost_total,
+            "reordered": reordered_total,
+            "loss_pct": loss_pct,
+            "latency_p95_ms": max(latency_values) if latency_values else None,
+            "jitter_p95_ms": max(jitter_values) if jitter_values else None,
+            "load": load_info,
+            "duration_s": duration_s,
+            "qos": {"reliability": qos_reliability, "depth": qos_depth},
+            "repeat": repeat_summary,
+            "samples": samples,
+        }
+        rows.append(row)
+        measurements.append({"row": row, "samples": sample_measurements})
+        row_cache[cache_key] = row
+        print(
+            f"  loss-boundary({axis}[{phase}:{mode}] "
+            f"{_format_requirements_profile(candidate, downlink_ratio=downlink_ratio, downlink_mode=downlink_mode)}): "
+            f"{classification.upper()} clean={good_count}/{sample_count} lossy={lossy_count}/{sample_count} "
+            f"loss={round(loss_pct, 3)}% p95={row['latency_p95_ms']}ms"
+        )
+        return row
+
+    def classify_axis_unit(axis: str, unit: int, *, mode: str, phase: str) -> dict[str, Any]:
+        return classify(candidate_for_axis(axis, unit), axis=axis, unit=unit, mode=mode, phase=phase)
+
+    def search_bandwidth() -> dict[str, Any]:
+        high_row = classify_axis_unit("bandwidth", bandwidth_high_units, mode="good", phase="ceiling")
+        low_row = classify_axis_unit("bandwidth", bandwidth_low_units, mode="good", phase="floor")
+        if not high_row["good_case"]:
+            return {
+                "status": "ceiling_not_good",
+                "tight": False,
+                "resolution_bps": bandwidth_step_bps,
+                "ceiling": row_ref(high_row),
+                "floor": row_ref(low_row),
+            }
+        if low_row["good_case"]:
+            return {
+                "status": "floor_still_good",
+                "tight": False,
+                "resolution_bps": bandwidth_step_bps,
+                "good_boundary": row_ref(low_row),
+                "bad_boundary": None,
+                "not_good_neighbor": None,
+            }
+
+        fail_unit = bandwidth_low_units
+        pass_unit = bandwidth_high_units
+        while pass_unit - fail_unit > 1:
+            mid_unit = (pass_unit + fail_unit) // 2
+            mid_row = classify_axis_unit("bandwidth", mid_unit, mode="good", phase="bisect")
+            if mid_row["good_case"]:
+                pass_unit = mid_unit
+            else:
+                fail_unit = mid_unit
+
+        good_row = classify_axis_unit("bandwidth", pass_unit, mode="good", phase="confirm-good")
+        not_good_row = classify_axis_unit("bandwidth", fail_unit, mode="good", phase="confirm-not-good")
+        bad_row = classify_axis_unit("bandwidth", fail_unit, mode="bad", phase="confirm-bad")
+        bad_unit = fail_unit if bad_row["bad_case"] else None
+        scan_unit = fail_unit - 1
+        while bad_unit is None and scan_unit >= bandwidth_low_units:
+            scan_row = classify_axis_unit("bandwidth", scan_unit, mode="bad", phase="bad-scan")
+            if scan_row["bad_case"]:
+                bad_unit = scan_unit
+                bad_row = scan_row
+                break
+            scan_unit -= 1
+        return {
+            "status": "bounded" if bad_unit is not None else "bounded_without_bad_neighbor",
+            "tight": bad_unit == pass_unit - 1,
+            "resolution_bps": bandwidth_step_bps,
+            "good_boundary": row_ref(good_row),
+            "not_good_neighbor": row_ref(not_good_row),
+            "bad_boundary": row_ref(bad_row) if bad_unit is not None else None,
+        }
+
+    def search_jitter() -> dict[str, Any]:
+        low_good_row = classify_axis_unit("jitter", jitter_low_units, mode="good", phase="floor-good")
+        high_good_row = classify_axis_unit("jitter", jitter_high_units, mode="good", phase="ceiling-good")
+        high_bad_row = classify_axis_unit("jitter", jitter_high_units, mode="bad", phase="ceiling-bad")
+        if not low_good_row["good_case"]:
+            return {
+                "status": "floor_not_good",
+                "tight": False,
+                "resolution_ms": jitter_step_ms,
+                "floor": row_ref(low_good_row),
+                "ceiling": row_ref(high_good_row),
+            }
+        if high_good_row["good_case"]:
+            return {
+                "status": "ceiling_still_good",
+                "tight": False,
+                "resolution_ms": jitter_step_ms,
+                "good_boundary": row_ref(high_good_row),
+                "first_not_good": None,
+                "bad_boundary": None,
+            }
+
+        good_unit = jitter_low_units
+        not_good_unit = jitter_high_units
+        while not_good_unit - good_unit > 1:
+            mid_unit = (not_good_unit + good_unit) // 2
+            mid_row = classify_axis_unit("jitter", mid_unit, mode="good", phase="good-bisect")
+            if mid_row["good_case"]:
+                good_unit = mid_unit
+            else:
+                not_good_unit = mid_unit
+        good_row = classify_axis_unit("jitter", good_unit, mode="good", phase="confirm-good")
+        first_not_good_row = classify_axis_unit("jitter", not_good_unit, mode="good", phase="confirm-not-good")
+
+        bad_boundary_row: dict[str, Any] | None = None
+        last_not_bad_row: dict[str, Any] | None = None
+        if high_bad_row["bad_case"]:
+            not_bad_unit = good_unit
+            bad_unit = jitter_high_units
+            while bad_unit - not_bad_unit > 1:
+                mid_unit = (bad_unit + not_bad_unit) // 2
+                mid_row = classify_axis_unit("jitter", mid_unit, mode="bad", phase="bad-bisect")
+                if mid_row["bad_case"]:
+                    bad_unit = mid_unit
+                else:
+                    not_bad_unit = mid_unit
+            bad_boundary_row = classify_axis_unit("jitter", bad_unit, mode="bad", phase="confirm-bad")
+            last_not_bad_row = classify_axis_unit("jitter", not_bad_unit, mode="bad", phase="confirm-not-bad")
+
+        mixed_low = axis_value("jitter", good_unit + 1) if good_unit + 1 < jitter_high_units else None
+        bad_candidate = bad_boundary_row.get("candidate") if bad_boundary_row else None
+        bad_jitter = bad_candidate.get("jitter_ms") if isinstance(bad_candidate, dict) else None
+        mixed_high = float(bad_jitter) - jitter_step_ms if bad_jitter is not None else None
+        if mixed_low is not None and mixed_high is not None and mixed_low > mixed_high:
+            mixed_low = None
+            mixed_high = None
+        return {
+            "status": "bounded" if bad_boundary_row is not None else "good_bounded_bad_unbounded",
+            "tight": bad_boundary_row is not None,
+            "resolution_ms": jitter_step_ms,
+            "good_boundary": row_ref(good_row),
+            "first_not_good": row_ref(first_not_good_row),
+            "bad_boundary": row_ref(bad_boundary_row),
+            "last_not_bad": row_ref(last_not_bad_row),
+            "mixed_zone": {"low_ms": mixed_low, "high_ms": mixed_high},
+        }
+
+    for axis in selected_axes:
+        if axis == "bandwidth":
+            boundaries["bandwidth"] = search_bandwidth()
+        elif axis == "jitter":
+            boundaries["jitter"] = search_jitter()
+
+    combined_row: dict[str, Any] | None = None
+    if set(selected_axes) == {"bandwidth", "jitter"}:
+        combined = candidate_for_combined()
+        combined_row = classify(
+            combined,
+            axis="combined",
+            unit=0,
+            mode="good",
+            phase="combined-good",
+            use_cache=False,
+        )
+
+    result = {
+        "stream": {
+            "load": load_info,
+            "qos": {"reliability": qos_reliability, "depth": qos_depth},
+        },
+        "target": {
+            "max_ros2_loss_pct": 0.0,
+            "max_latency_ms": max_latency_ms,
+        },
+        "search": generated_doc["metadata"]["search"],
+        "boundaries": boundaries,
+        "combined_good": row_ref(combined_row),
+        "rows": rows,
+        "analysis": {
+            "status": (
+                "bounded" if all(boundaries.get(axis, {}).get("tight") for axis in selected_axes) else "not_tight"
+            ),
+            "seed_policy": seed_policy,
+            "sample_count": sample_count,
+            "interpretation": {
+                "seedless": "best empirical estimate for this host/run; repeat the command to check drift.",
+                "fixed_seed": "replays one netem random sequence; useful for debugging, but can overfit.",
+                "seed_set": "replays several netem random sequences; best reproducible compromise.",
+            }[seed_policy],
+        },
+    }
+    boundaries_path = out_dir / "loss-boundaries.json"
+    boundaries_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_benchmark_result(
+        out_dir,
+        genre="loss-boundaries",
+        context=result_context,
+        configuration={
+            "load": load_info,
+            "duration_s": duration_s,
+            "thresholds": result["target"],
+            "topic": topic or None,
+            "search": generated_doc["metadata"]["search"],
+            "generated_profiles_file": generated_profiles_file.name if generated_profiles_file else None,
+        },
+        result=result,
+        measurements={"points": measurements},
+        verdict={
+            "passed": result["analysis"]["status"] == "bounded",
+            "status": str(result["analysis"]["status"]),
+        },
+        artifacts={
+            "loss_boundaries": boundaries_path.name,
+            "generated_profiles": generated_profiles_file.name if generated_profiles_file else None,
+            "stdout": "stdout.txt",
+            "probes_dir": "probes",
+        },
+    )
+    write_profiles()
+    print(f"Loss boundaries saved to {boundaries_path}")
+    for axis, boundary in boundaries.items():
+        good = boundary.get("good_boundary", {}).get("candidate") if isinstance(boundary, dict) else None
+        bad = boundary.get("bad_boundary", {}).get("candidate") if isinstance(boundary, dict) else None
+        if axis == "bandwidth" and isinstance(good, dict):
+            good_label = _format_bps(good.get("bandwidth_bps"))
+            bad_label = _format_bps(bad.get("bandwidth_bps")) if isinstance(bad, dict) else "unbounded"
+            print(f"Bandwidth boundary: good={good_label}, bad={bad_label}")
+        elif axis == "jitter" and isinstance(good, dict):
+            good_label = f"{good.get('jitter_ms')}ms"
+            bad_label = f"{bad.get('jitter_ms')}ms" if isinstance(bad, dict) else "unbounded"
+            print(f"Jitter boundary: good={good_label}, bad={bad_label}")
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 
@@ -4512,6 +5094,116 @@ def benchmark_requirements(args: argparse.Namespace) -> int:
     return 0
 
 
+def benchmark_loss_boundaries(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark loss-boundaries``."""
+    from .cli import _load_runtime_config
+    from .network_profiles import parse_rate_bps, parse_seed
+
+    if getattr(args, "interactive", False):
+        return _start_interactive_benchmark(args, "loss-boundaries")
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+    run_dir = _setup_benchmark_run_dir(args, "loss-boundaries", None)
+    generated_profiles_file = run_dir / "generated-profiles.yaml"
+    generated_profiles_file.write_text(
+        yaml.safe_dump(
+            {
+                "profiles": {},
+                "metadata": {
+                    "kind": "benchmark-loss-boundaries-generated",
+                    "status": "initializing",
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    args.profiles_file = str(generated_profiles_file)
+    args.qos_reliability = getattr(args, "qos_reliability", None) or "best_effort"
+    args.qos_depth = int(getattr(args, "qos_depth", None) or 1)
+
+    session_name = BENCHMARK_SESSIONS_BY_GENRE["requirements"]
+    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    result_context = _benchmark_result_context(
+        args,
+        genre="loss-boundaries",
+        profile=None,
+        run_dir=run_dir,
+        session=session_context,
+    )
+    result_context["loss_boundaries"] = {
+        "generated_profiles_file": str(generated_profiles_file),
+    }
+
+    rate_hz = float(getattr(args, "rate_hz", 20.0))
+    size = int(getattr(args, "size", 18_000))
+    streams = int(getattr(args, "streams", 1))
+    offered_bw = (size * 8.0 * rate_hz * streams) if size > 0 and rate_hz > 0 else 1.0
+    bandwidth_high_raw = str(getattr(args, "bandwidth_high", "auto"))
+    if bandwidth_high_raw.lower() == "auto":
+        bandwidth_high_bps = max(1.0, offered_bw * float(getattr(args, "bandwidth_high_factor", 8.0)))
+    else:
+        bandwidth_high_bps = parse_rate_bps(bandwidth_high_raw)
+    bandwidth_low_raw = getattr(args, "bandwidth_low", None)
+    if bandwidth_low_raw:
+        bandwidth_low_bps = parse_rate_bps(bandwidth_low_raw)
+    else:
+        bandwidth_low_bps = max(1.0, offered_bw * float(getattr(args, "bandwidth_low_factor", 1.0)))
+    bandwidth_step_bps = parse_rate_bps(str(getattr(args, "bandwidth_step", "0.1mbit")))
+    netem_seed_raw = getattr(args, "netem_seed", None)
+    netem_seed = parse_seed(netem_seed_raw, "netem_seed") if netem_seed_raw is not None else None
+    netem_seeds = _parse_netem_seed_values(getattr(args, "netem_seeds", None))
+
+    run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, session_name)
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_loss_boundaries(
+            run_point,
+            max_latency_ms=float(getattr(args, "max_latency_ms", 250.0)),
+            rate_hz=rate_hz,
+            size=size,
+            streams=streams,
+            qos_reliability=str(args.qos_reliability),
+            qos_depth=int(args.qos_depth),
+            topic=getattr(args, "topic", ""),
+            out_dir=run_dir,
+            axes=_parse_loss_boundary_axes(getattr(args, "axes", "all")),
+            bandwidth_low_bps=bandwidth_low_bps,
+            bandwidth_high_bps=bandwidth_high_bps,
+            bandwidth_step_bps=bandwidth_step_bps,
+            latency_base_ms=float(getattr(args, "latency_base_ms", 30.0)),
+            jitter_low_ms=float(getattr(args, "jitter_low_ms", 0.0)),
+            jitter_high_ms=float(getattr(args, "jitter_high_ms", 40.0)),
+            jitter_step_ms=float(getattr(args, "jitter_step_ms", 1.0)),
+            min_duration_s=float(getattr(args, "min_duration", 20.0)),
+            min_messages=int(getattr(args, "min_messages", 100)),
+            distribution=str(getattr(args, "distribution", "normal")),
+            downlink_ratio=float(getattr(args, "downlink_ratio", 1.0)),
+            downlink_mode=str(getattr(args, "downlink_mode", "lan")),
+            probe_repeats=int(getattr(args, "probe_repeats", 10)),
+            good_clean_count=getattr(args, "good_clean_count", None),
+            bad_lossy_count=getattr(args, "bad_lossy_count", None),
+            netem_seed=netem_seed,
+            netem_seeds=netem_seeds,
+            result_context=result_context,
+            generated_profiles_file=generated_profiles_file,
+            profile_prefix=str(getattr(args, "profile_prefix", "loss_boundary")),
+        )
+
+    out_file_name = getattr(args, "out", "loss-boundaries.json")
+    if artifacts_dir:
+        out_path = artifacts_dir / Path(out_file_name).name
+    else:
+        out_path = Path(out_file_name)
+    run_boundaries_file = run_dir / "loss-boundaries.json"
+    if run_boundaries_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(run_boundaries_file, out_path)
+        print(f"Loss boundaries copied to {out_path}")
+
+    return 0
+
+
 def benchmark_plot(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark plot``."""
     from .cli import _load_runtime_config
@@ -4977,6 +5669,134 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
     )
     requirements_parser.add_argument("--out", default="requirements.jsonl", help="Output requirements JSONL file.")
     requirements_parser.set_defaults(func=benchmark_requirements)
+
+    # --- loss-boundaries ---
+    loss_boundaries_parser = benchmark_subparsers.add_parser(
+        "loss-boundaries",
+        help="Find discrete zero-loss good/bad boundaries for bandwidth and jitter.",
+    )
+    _add_benchmark_common_args(loss_boundaries_parser, ota_benchmark=ota_benchmark)
+    loss_boundaries_parser.add_argument(
+        "--max-latency-ms",
+        type=float,
+        default=250.0,
+        help="Maximum acceptable p95 latency while classifying a zero-loss good case.",
+    )
+    loss_boundaries_parser.add_argument("--rate-hz", type=float, default=20.0, help="ROS 2 publish rate (Hz).")
+    loss_boundaries_parser.add_argument("--size", type=int, default=18_000, help="Payload size (bytes).")
+    loss_boundaries_parser.add_argument("--streams", type=int, default=1, help="Parallel stream count.")
+    loss_boundaries_parser.add_argument("--topic", default="", help="Topic to evaluate.")
+    loss_boundaries_parser.add_argument(
+        "--axes",
+        default="all",
+        help="Comma list of loss boundary axes to search: all, bandwidth, jitter.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--bandwidth-high",
+        default="auto",
+        help="Known-good bandwidth ceiling; auto uses offered bandwidth times --bandwidth-high-factor.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--bandwidth-high-factor",
+        type=float,
+        default=8.0,
+        help="Auto bandwidth ceiling as a factor of offered stream bandwidth.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--bandwidth-low",
+        help="Bandwidth floor; default is offered bandwidth times --bandwidth-low-factor.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--bandwidth-low-factor",
+        type=float,
+        default=1.0,
+        help="Default bandwidth floor as a factor of offered stream bandwidth.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--bandwidth-step",
+        default="0.1mbit",
+        help="Discrete bandwidth tolerance/resolution.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--latency-base-ms",
+        type=float,
+        default=30.0,
+        help="Fixed uplink delay used while searching bandwidth and jitter boundaries.",
+    )
+    loss_boundaries_parser.add_argument("--jitter-low-ms", type=float, default=0.0, help="Jitter search floor.")
+    loss_boundaries_parser.add_argument("--jitter-high-ms", type=float, default=40.0, help="Jitter search ceiling.")
+    loss_boundaries_parser.add_argument(
+        "--jitter-step-ms",
+        type=float,
+        default=1.0,
+        help="Discrete jitter tolerance/resolution.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=20.0,
+        help="Minimum seconds per probe.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--min-messages",
+        type=int,
+        default=100,
+        help="Minimum intended published messages per probe.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--distribution",
+        default="normal",
+        choices=["normal", "pareto", "paretonormal"],
+        help="netem jitter distribution.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--downlink-ratio",
+        type=float,
+        default=1.0,
+        help="Downlink latency as a ratio of uplink latency when --downlink-mode=mirror.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--downlink-mode",
+        choices=["mirror", "lan"],
+        default="lan",
+        help="lan leaves downlink unshaped for mobile-upload/LAN-download tests.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--probe-repeats",
+        type=int,
+        default=10,
+        help="Seedless/fixed-seed samples per candidate, or samples per seed when --netem-seeds is used.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--good-clean-count",
+        type=int,
+        help="Samples that must be loss-free and below latency limit to classify a good case; default is all samples.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--bad-lossy-count",
+        type=int,
+        help="Samples that must lose messages to classify a bad case; default is all samples.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--netem-seed",
+        type=int,
+        help="Single netem seed for exact replay/debugging.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--netem-seeds",
+        help="Comma list of netem seeds; each seed is probed for reproducible multi-seed boundaries.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--profile-prefix",
+        default="loss_boundary",
+        help="Prefix for generated profile names.",
+    )
+    loss_boundaries_parser.add_argument(
+        "--out",
+        default="loss-boundaries.json",
+        help="Output loss boundary JSON file.",
+    )
+    loss_boundaries_parser.set_defaults(func=benchmark_loss_boundaries)
 
 
 def _register_benchmark_plot_parser(benchmark_subparsers: Any) -> None:

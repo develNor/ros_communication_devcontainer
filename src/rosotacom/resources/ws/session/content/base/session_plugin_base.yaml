@@ -283,7 +283,7 @@ windows:
         # For zenoh_ros2dds the OTA domain is loopback-only (zenoh is the inter-host
         # transport), so confine discovery to localhost instead of statically peering
         # the remote host — otherwise the OTA-domain DDS double-delivers alongside zenoh.
-        - if [ '${use_zenoh_ros2dds}' = "True" ] || [ '${use_zenoh_ros2dds}' = "true" ]; then export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST; else export ROS_STATIC_PEERS="${ip_remote}"; fi
+        - if [ '${use_zenoh_ros2dds}' = "True" ] || [ '${use_zenoh_ros2dds}' = "true" ]; then export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST; else export ROS_STATIC_PEERS="${ip_local};${ip_remote}"; fi
         - ros2 run com_py bridge_in --ros-args
             -p base_topic_files:=[${topic_list_paths_inbound}]
             -p local_name:=${local_name}
@@ -308,7 +308,7 @@ windows:
         # For zenoh_ros2dds the OTA domain is loopback-only (zenoh is the inter-host
         # transport), so confine discovery to localhost instead of statically peering
         # the remote host — otherwise the OTA-domain DDS double-delivers alongside zenoh.
-        - if [ '${use_zenoh_ros2dds}' = "True" ] || [ '${use_zenoh_ros2dds}' = "true" ]; then export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST; else export ROS_STATIC_PEERS="${ip_remote}"; fi
+        - if [ '${use_zenoh_ros2dds}' = "True" ] || [ '${use_zenoh_ros2dds}' = "true" ]; then export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST; else export ROS_STATIC_PEERS="${ip_local};${ip_remote}"; fi
         - ros2 run com_py bridge_out --ros-args
             -p base_topic_files:=[${topic_list_paths_outbound}]
             -p local_name:=${local_name}

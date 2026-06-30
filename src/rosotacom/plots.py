@@ -28,6 +28,72 @@ def _require_matplotlib() -> tuple[Any, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Fixed probe — time-series characterization
+# --------------------------------------------------------------------------- #
+
+
+def plot_probe_timeseries(
+    bins: Sequence[dict[str, Any]],
+    *,
+    out: str | Path,
+    title: str = "Probe time series",
+) -> Path:
+    """Render 1-second probe bins: latency/loss plus delivered Hz/bandwidth."""
+    _, plt = _require_matplotlib()
+    out = Path(out)
+
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in bins:
+        topic = str(row.get("topic") or "")
+        attempt = int(row.get("attempt", 1) or 1)
+        grouped.setdefault((topic, attempt), []).append(row)
+
+    fig, (ax_quality, ax_rate) = plt.subplots(2, 1, sharex=True, figsize=(10, 6))
+    ax_loss = ax_quality.twinx()
+    ax_bw = ax_rate.twinx()
+    cmap = plt.colormaps["tab10"].resampled(max(len(grouped), 1))
+
+    for index, ((topic, attempt), rows) in enumerate(sorted(grouped.items())):
+        rows = sorted(rows, key=lambda row: float(row["bin_start_s"]))
+        xs = [float(row["bin_start_s"]) for row in rows]
+        latency = [row.get("latency_p95_ms") for row in rows]
+        loss = [float(row.get("loss_pct") or 0.0) for row in rows]
+        hz = [float(row.get("delivered_hz") or 0.0) for row in rows]
+        bandwidth_mbps = [float(row.get("payload_bandwidth_bps") or 0.0) / 1_000_000.0 for row in rows]
+        label = topic or "topic"
+        if len({key[1] for key in grouped}) > 1:
+            label = f"{label} #{attempt}"
+        color = cmap(index)
+        ax_quality.plot(xs, latency, "o-", color=color, label=f"{label} latency p95")
+        ax_loss.plot(xs, loss, "x--", color=color, alpha=0.65, label=f"{label} loss")
+        ax_rate.plot(xs, hz, "o-", color=color, label=f"{label} delivered Hz")
+        ax_bw.plot(xs, bandwidth_mbps, "s--", color=color, alpha=0.65, label=f"{label} payload Mbit/s")
+
+    ax_quality.set_ylabel("Latency p95 (ms)")
+    ax_loss.set_ylabel("Loss (%)")
+    ax_rate.set_ylabel("Delivered Hz")
+    ax_bw.set_ylabel("Payload (Mbit/s)")
+    ax_rate.set_xlabel("Time since first publish (s)")
+    ax_quality.set_title(title)
+
+    handles: list[Any] = []
+    labels: list[str] = []
+    for axis in (ax_quality, ax_loss, ax_rate, ax_bw):
+        axis_handles, axis_labels = axis.get_legend_handles_labels()
+        handles.extend(axis_handles)
+        labels.extend(axis_labels)
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=2, fontsize="x-small")
+        fig.tight_layout(rect=(0, 0, 1, 0.88))
+    else:
+        fig.tight_layout()
+
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # 1.1 / 2.1 — capacity frontier
 # --------------------------------------------------------------------------- #
 

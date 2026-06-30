@@ -35,6 +35,7 @@ DEFAULT_BENCHMARK_RMW = "cyclone"
 DEFAULT_BENCHMARK_DRAIN_S = 2.0
 BENCHMARK_RESULT_FILE = "result.json"
 BENCHMARK_SESSIONS_BY_GENRE = {
+    "probe": "bench_1_1_capacity",
     "capacity": "bench_1_1_capacity",
     "sweep": "bench_1_2_load_sweep",
     "ramp": "bench_1_3_ramp",
@@ -580,7 +581,7 @@ def _initialize_interactive_log(full_log: Path, command: Sequence[str]) -> None:
 
 def _benchmark_run_script(command: Sequence[str], full_log: Path, session_name: str) -> str:
     pattern = (
-        r"probe\(|Benchmark result saved|Capacity result|Capacity:|Ramp curve copied|Recovery metrics copied|"
+        r"probe\(|Probe time bins saved|Benchmark result saved|Capacity result|Capacity:|Ramp curve copied|Recovery metrics copied|"
         r"Sweep frontier copied|ERROR|Error|Warning|benchmark exited"
     )
     script = f"""
@@ -1038,6 +1039,175 @@ def _default_run_point(
 
 
 # --------------------------------------------------------------------------- #
+# Benchmark driver: fixed probe
+# --------------------------------------------------------------------------- #
+
+
+def _run_probe_attempt(
+    run_point: RunPointFn,
+    *,
+    profile: str | None,
+    load: dict[str, Any],
+    duration_s: float,
+    out_dir: Path,
+    topic: str = "",
+    bin_s: float | None = None,
+) -> dict[str, Any]:
+    """Run one fixed-load benchmark point and collect the shared per-topic view."""
+    summary = run_point(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
+    rows = _topic_rows(summary, topic)
+    load_info = _load_context(load)
+    result: dict[str, Any] = {
+        "summary": summary,
+        "topics": rows,
+        "load": load_info,
+    }
+    if bin_s is not None:
+        from .benchmark import characterize_probe_records
+
+        records = _load_raw_records_from_out(out_dir)
+        rate_hz = float(load.get("rate", load.get("rate_hz", 0.0)) or 0.0)
+        result["raw_record_count"] = len(records)
+        result["time_bins"] = characterize_probe_records(
+            records,
+            bin_s=bin_s,
+            nominal_period_s=(1.0 / rate_hz) if rate_hz > 0.0 else None,
+            topic=topic,
+        )
+    return result
+
+
+def drive_probe(
+    run_point: RunPointFn,
+    *,
+    profile: str | None,
+    size: int = 18_000,
+    rate_hz: float = 20.0,
+    streams: int = 1,
+    topic: str = "",
+    repeats: int = 1,
+    duration_s: float = 60.0,
+    bin_s: float = 1.0,
+    render_plot: bool = True,
+    out_dir: Path,
+    result_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run a fixed probe and characterize time-dependent latency/loss behavior."""
+    if repeats < 1:
+        raise ValueError("repeats must be >= 1.")
+    if size < 0:
+        raise ValueError("size must be >= 0.")
+    if rate_hz <= 0.0:
+        raise ValueError("rate_hz must be > 0.")
+    if streams < 1:
+        raise ValueError("streams must be >= 1.")
+
+    profile = _normalize_benchmark_profile(profile)
+    profile_label = _benchmark_profile_label(profile)
+    load: dict[str, Any] = {"size_a": size, "rate": rate_hz}
+    if streams != 1:
+        load["streams"] = streams
+    load_info = _load_context(load)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    attempts: list[dict[str, Any]] = []
+    time_bins: list[dict[str, Any]] = []
+    for attempt in range(1, repeats + 1):
+        attempt_dir = out_dir / "attempts" / f"attempt_{attempt:02d}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        attempt_result = _run_probe_attempt(
+            run_point,
+            profile=profile,
+            load=load,
+            duration_s=duration_s,
+            out_dir=attempt_dir,
+            topic=topic,
+            bin_s=bin_s,
+        )
+        attempt_bins = [
+            {
+                "attempt": attempt,
+                "profile": profile_label,
+                **bin_row,
+            }
+            for bin_row in attempt_result.get("time_bins", [])
+        ]
+        time_bins.extend(attempt_bins)
+        attempts.append(
+            {
+                "attempt": attempt,
+                "artifact_dir": str(attempt_dir.relative_to(out_dir)),
+                "raw_record_count": attempt_result.get("raw_record_count", 0),
+                "time_bin_count": len(attempt_bins),
+                "topics": attempt_result["topics"],
+                "summary": attempt_result["summary"],
+            }
+        )
+        print(
+            f"  probe(attempt={attempt}/{repeats}): "
+            f"offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} "
+            f"bins={len(attempt_bins)} {_format_topic_rows(attempt_result['topics'])}"
+        )
+
+    bins_path = out_dir / "time-bins.jsonl"
+    bins_path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in time_bins) + ("\n" if time_bins else ""),
+        encoding="utf-8",
+    )
+
+    artifacts: dict[str, Any] = {"time_bins": bins_path.name, "stdout": "stdout.txt", "attempts_dir": "attempts"}
+    plot_error: str | None = None
+    if render_plot and time_bins:
+        try:
+            from .plots import plot_probe_timeseries
+
+            plot_path = plot_probe_timeseries(time_bins, out=out_dir / "probe-timeseries.png")
+            artifacts["plot"] = plot_path.name
+            print(f"Probe plot saved to {plot_path}")
+        except Exception as exc:
+            plot_error = str(exc)
+            artifacts["plot_error"] = plot_error
+            print(f"Probe plot skipped: {plot_error}", file=sys.stderr)
+
+    result = {
+        "profile": profile_label,
+        "load": load_info,
+        "attempts": [
+            {
+                "attempt": attempt["attempt"],
+                "raw_record_count": attempt["raw_record_count"],
+                "time_bin_count": attempt["time_bin_count"],
+                "topics": attempt["topics"],
+            }
+            for attempt in attempts
+        ],
+        "time_bin_count": len(time_bins),
+        "plot_error": plot_error,
+    }
+    result_path = _write_benchmark_result(
+        out_dir,
+        genre="probe",
+        context=result_context,
+        configuration={
+            "profile": profile_label,
+            "load": load_info,
+            "topic": topic or None,
+            "repeats": repeats,
+            "duration_s": duration_s,
+            "bin_s": bin_s,
+            "render_plot": render_plot,
+        },
+        result=result,
+        measurements={"attempts": attempts, "time_bins": time_bins},
+        verdict={"passed": True, "status": "completed"},
+        artifacts=artifacts,
+    )
+    result["result_file"] = str(result_path)
+    print(f"Probe time bins saved to {bins_path}")
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Benchmark driver: capacity
 # --------------------------------------------------------------------------- #
 
@@ -1092,15 +1262,23 @@ def drive_capacity(
 
         results: list[bool] = []
         for attempt in range(repeats):
-            summary = run_point(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
+            attempt_result = _run_probe_attempt(
+                run_point,
+                profile=profile,
+                load=load,
+                duration_s=duration_s,
+                out_dir=out_dir,
+                topic=topic,
+            )
+            summary = attempt_result["summary"]
             topics = summary.get("topics", {})
-            rows = _topic_rows(summary, topic)
+            rows = attempt_result["topics"]
             if topic:
                 passes = oracle_passes_topic(topics.get(topic, {}), thresholds)
             else:
                 passes = all(oracle_passes_topic(t, thresholds) for t in topics.values()) if topics else False
             results.append(passes)
-            load_info = _load_context(load)
+            load_info = attempt_result["load"]
             probe_results.append(
                 {
                     "knob": knob,
@@ -4586,6 +4764,66 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
     return run_point
 
 
+def benchmark_probe(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark probe``."""
+    from .cli import _load_runtime_config
+
+    if getattr(args, "interactive", False):
+        return _start_interactive_benchmark(args, "probe")
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+
+    run_dir = _setup_benchmark_run_dir(args, "probe", args.profile)
+    session_context = _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
+    result_context = _benchmark_result_context(
+        args,
+        genre="probe",
+        profile=args.profile,
+        run_dir=run_dir,
+        session=session_context,
+    )
+
+    run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_1_capacity")
+
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        result = drive_probe(
+            run_point,
+            profile=args.profile,
+            size=getattr(args, "size", 18_000),
+            rate_hz=getattr(args, "rate_hz", 20.0),
+            streams=getattr(args, "streams", 1),
+            topic=getattr(args, "topic", ""),
+            repeats=getattr(args, "repeats", 1),
+            duration_s=getattr(args, "duration", 60.0),
+            bin_s=getattr(args, "bin_s", 1.0),
+            render_plot=getattr(args, "plot", True),
+            out_dir=run_dir,
+            result_context=result_context,
+        )
+
+    out_file_name = getattr(args, "out", "time-bins.jsonl")
+    if artifacts_dir:
+        out_path = artifacts_dir / Path(out_file_name).name
+    else:
+        out_path = Path(out_file_name)
+
+    run_bins_file = run_dir / "time-bins.jsonl"
+    if run_bins_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(run_bins_file, out_path)
+        print(f"Probe time bins copied to {out_path}")
+
+    plot_file = run_dir / "probe-timeseries.png"
+    if plot_file.is_file() and artifacts_dir:
+        plot_out = artifacts_dir / plot_file.name
+        shutil.copy2(plot_file, plot_out)
+        print(f"Probe plot copied to {plot_out}")
+
+    print(f"Probe: {result['time_bin_count']} bins → {run_dir / BENCHMARK_RESULT_FILE}")
+    return 0
+
+
 def benchmark_capacity(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark capacity``."""
     from .cli import _load_runtime_config
@@ -5210,6 +5448,7 @@ def benchmark_plot(args: argparse.Namespace) -> int:
     from .plots import (
         plot_capacity_frontier,
         plot_offered_bw,
+        plot_probe_timeseries,
         plot_ramp,
         plot_recovery_timeline,
         plot_topic_heatmap,
@@ -5228,7 +5467,7 @@ def benchmark_plot(args: argparse.Namespace) -> int:
         inputs_to_plot.append(Path(input_path_raw))
     elif artifacts_dir:
         # Search for standard files. Exclude budgets.jsonl since it has no plot format
-        for name in ("curve.jsonl", "recovery.json", "frontier.jsonl"):
+        for name in ("time-bins.jsonl", "curve.jsonl", "recovery.json", "frontier.jsonl"):
             candidate = artifacts_dir / name
             if candidate.is_file():
                 inputs_to_plot.append(candidate)
@@ -5252,6 +5491,8 @@ def benchmark_plot(args: argparse.Namespace) -> int:
 
             if plot_type == "frontier":
                 plot_capacity_frontier(data, out=out)
+            elif plot_type == "probe":
+                plot_probe_timeseries(data, out=out)
             elif plot_type == "offered_bw":
                 plot_offered_bw(data, out=out)
             elif plot_type == "ramp":
@@ -5266,7 +5507,7 @@ def benchmark_plot(args: argparse.Namespace) -> int:
                 plot_topic_heatmap(per_topic, out=out)
             else:
                 print(
-                    f"Unknown plot type: {plot_type!r}. Use: frontier, offered_bw, ramp, recovery, heatmap.",
+                    f"Unknown plot type: {plot_type!r}. Use: frontier, probe, offered_bw, ramp, recovery, heatmap.",
                     file=sys.stderr,
                 )
                 return 1
@@ -5297,6 +5538,8 @@ def _infer_plot_type(data: list[dict[str, Any]], filename: str) -> str:
     """Best-effort inference of the plot type from the data shape and filename."""
     if "frontier" in filename:
         return "frontier"
+    if "time-bins" in filename or "probe" in filename:
+        return "probe"
     if "curve" in filename:
         return "ramp"
     if "recovery" in filename:
@@ -5308,6 +5551,8 @@ def _infer_plot_type(data: list[dict[str, Any]], filename: str) -> str:
         raise ValueError("Budget files (e.g. budgets.jsonl) contain target thresholds and cannot be plotted directly.")
     if "capacity" in first or "bandwidth_bps" in first:
         return "frontier"
+    if "bin_start_s" in first and "delivered_hz" in first:
+        return "probe"
     if "value" in first and "metric" in first:
         return "ramp"
     if "t_recover" in first:
@@ -5323,6 +5568,26 @@ def _infer_plot_type(data: list[dict[str, Any]], filename: str) -> str:
 
 
 def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchmark: bool) -> None:
+    # --- probe ---
+    probe_parser = benchmark_subparsers.add_parser(
+        "probe",
+        help="Run one fixed load under a profile and write time-binned latency/loss/Hz/bandwidth metrics.",
+    )
+    _add_benchmark_common_args(probe_parser, ota_benchmark=ota_benchmark)
+    probe_parser.add_argument("--profile", required=True, help="Network profile name.")
+    probe_parser.add_argument("--size", type=int, default=18_000, help="Payload size (bytes).")
+    probe_parser.add_argument("--rate-hz", type=float, default=20.0, help="Publish rate (Hz).")
+    probe_parser.add_argument("--streams", type=int, default=1, help="Parallel stream count.")
+    probe_parser.add_argument("--topic", default="", help="Topic to characterize (default: all).")
+    probe_parser.add_argument("--duration", type=float, default=60.0, help="Seconds per probe attempt.")
+    probe_parser.add_argument("--repeats", type=int, default=1, help="Repeat the same fixed probe this many times.")
+    probe_parser.add_argument("--bin-s", type=float, default=1.0, help="Time-bin width in seconds.")
+    probe_parser.add_argument("--out", default="time-bins.jsonl", help="Output time-bin JSONL file.")
+    probe_plot = probe_parser.add_mutually_exclusive_group()
+    probe_plot.add_argument("--plot", dest="plot", action="store_true", help="Render probe-timeseries.png.")
+    probe_plot.add_argument("--no-plot", dest="plot", action="store_false", help="Skip plot rendering.")
+    probe_parser.set_defaults(func=benchmark_probe, plot=True)
+
     # --- capacity ---
     cap_parser = benchmark_subparsers.add_parser(
         "capacity",
@@ -5805,12 +6070,16 @@ def _register_benchmark_plot_parser(benchmark_subparsers: Any) -> None:
         "plot",
         help="Render a benchmark figure from a results file.",
     )
-    plot_parser.add_argument("input", nargs="?", help="Input file (budgets.jsonl, curve.jsonl, recovery.json, etc.).")
+    plot_parser.add_argument(
+        "input",
+        nargs="?",
+        help="Input file (time-bins.jsonl, curve.jsonl, recovery.json, frontier.jsonl, etc.).",
+    )
     plot_parser.add_argument("--out", help="Output figure path (default: <input>.png).")
     plot_parser.add_argument("--artifacts-dir", help="Output directory for all benchmark artifacts.")
     plot_parser.add_argument(
         "--type",
-        choices=["auto", "frontier", "offered_bw", "ramp", "recovery", "heatmap"],
+        choices=["auto", "frontier", "probe", "offered_bw", "ramp", "recovery", "heatmap"],
         default="auto",
         help="Plot type (default: auto-detect from data).",
     )

@@ -469,6 +469,17 @@ shaping context, thresholds, verdict, and per-topic loss/latency/jitter metrics.
 For live benchmark probes, `--duration` is the shaped publish window; after that
 rosotacom stops synthetic publishers and waits `--drain-s` seconds before
 tearing down shaping, so delayed in-flight messages are not miscounted as loss.
+Use `benchmark probe` when you want a fixed payload/rate under one profile
+instead of a breakpoint search. It writes the normal `result.json` plus
+`time-bins.jsonl` with per-second loss, delivered Hz, payload bandwidth, and
+p50/p95 latency/jitter bins; by default it also renders `probe-timeseries.png`
+when the optional plotting dependency is installed:
+
+```bash
+rosotacom benchmark probe --profile cellular-4g-typical --size 18000 --rate-hz 20 --duration 20 --repeats 1
+rosotacom benchmark plot time-bins.jsonl --type probe
+```
+
 Use `benchmark requirements` when you want rosotacom to search for a tight
 network profile for a stream and quality target. The driver starts from ideal
 conditions, uses a geometric boundary search for bandwidth, linear boundary
@@ -519,6 +530,7 @@ Use `rosotacom ota-benchmark` for the same probes over deployment peers, without
 having to name a target:
 
 ```bash
+rosotacom ota-benchmark probe --profile cellular-4g-degraded --size 18000 --rate-hz 20 --duration 20 --repeats 1 --peer a=seat_tks --peer b=majestic_tks
 rosotacom ota-benchmark capacity --profile cellular-4g-degraded --knob size --low 1 --high 1 --max-loss 30 --max-latency-ms 1000 --duration 10 --repeats 1 --peer a=seat_tks --peer b=majestic_tks
 rosotacom ota-benchmark requirements --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-loss 5 --max-latency-ms 250 --peer a=seat_tks --peer b=majestic_tks
 rosotacom ota-benchmark loss-boundaries --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-latency-ms 250 --latency-base-ms 30 --downlink-mode lan --bandwidth-low 2.8mbit --bandwidth-high 4mbit --bandwidth-step 0.1mbit --jitter-high-ms 40 --jitter-step-ms 1 --probe-repeats 10 --peer a=seat_tks --peer b=majestic_tks

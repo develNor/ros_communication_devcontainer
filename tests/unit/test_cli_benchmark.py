@@ -45,6 +45,7 @@ from rosotacom.cli_benchmark import (
     drive_capacity,
     drive_loss_boundaries,
     drive_matrix,
+    drive_probe,
     drive_ramp,
     drive_requirements,
     drive_sensitivity,
@@ -100,6 +101,97 @@ def _make_stub_probe(
         }
 
     return stub
+
+
+# --------------------------------------------------------------------------- #
+# Fixed probe driver
+# --------------------------------------------------------------------------- #
+
+
+def test_probe_driver_writes_time_bins_from_transit_records(tmp_path: Path) -> None:
+    def stub(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        events_dir = out_dir / "logs" / "b" / "status"
+        events_dir.mkdir(parents=True)
+        records = [
+            {
+                "kind": "transit",
+                "source": "a",
+                "target": "b",
+                "topic": "/test",
+                "seq": 0,
+                "status": "delivered",
+                "t_wrap": 1.0,
+                "sections": {"ota_hop_ms": 10.0},
+                "size_bytes": 100,
+            },
+            {
+                "kind": "transit",
+                "source": "a",
+                "target": "b",
+                "topic": "/test",
+                "seq": 1,
+                "status": "lost",
+                "t_wrap": None,
+                "sections": {"ota_hop_ms": None},
+                "size_bytes": None,
+            },
+            {
+                "kind": "transit",
+                "source": "a",
+                "target": "b",
+                "topic": "/test",
+                "seq": 2,
+                "status": "delivered",
+                "t_wrap": 2.0,
+                "sections": {"ota_hop_ms": 20.0},
+                "size_bytes": 200,
+            },
+        ]
+        (events_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "topics": {
+                "/test": {
+                    "expected": 3,
+                    "delivered": 2,
+                    "lost": 1,
+                    "loss_pct": 33.333,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": 10.0, "p95": 20.0},
+                    "jitter_ms": {"p50": None, "p95": None},
+                }
+            }
+        }
+
+    result = drive_probe(
+        stub,
+        profile="losssless-typical",
+        size=18_000,
+        rate_hz=2.0,
+        repeats=1,
+        duration_s=2.0,
+        bin_s=1.0,
+        render_plot=False,
+        out_dir=tmp_path,
+    )
+
+    bins = [json.loads(line) for line in (tmp_path / "time-bins.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert result["profile"] == "losssless-typical"
+    assert result["time_bin_count"] == 2
+    assert bins[0]["topic"] == "a->b:/test"
+    assert bins[0]["expected"] == 2
+    assert bins[0]["delivered"] == 1
+    assert bins[0]["lost"] == 1
+    assert bins[0]["loss_pct"] == 50.0
+    assert bins[0]["delivered_hz"] == 1.0
+    assert bins[0]["payload_bandwidth_bps"] == 800.0
+    assert bins[1]["latency_p95_ms"] == 20.0
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["genre"] == "probe"
+    assert result_doc["configuration"]["bin_s"] == 1.0
+    assert result_doc["artifacts"]["time_bins"] == "time-bins.jsonl"
 
 
 # --------------------------------------------------------------------------- #
@@ -1274,6 +1366,17 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     register_benchmark_parser(subparsers)
+
+    # Probe.
+    args = parser.parse_args(["benchmark", "probe", "--profile", "losssless-typical"])
+    assert args.benchmark_command == "probe"
+    assert args.size == 18_000
+    assert args.rate_hz == 20.0
+    assert args.bin_s == 1.0
+    assert args.plot is True
+
+    args = parser.parse_args(["benchmark", "probe", "--profile", "losssless-typical", "--no-plot"])
+    assert args.plot is False
 
     # Capacity.
     args = parser.parse_args(

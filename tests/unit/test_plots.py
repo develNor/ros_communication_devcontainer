@@ -20,6 +20,7 @@ from rosotacom.plots import (  # noqa: E402, I001
     _require_matplotlib,
     plot_capacity_frontier,
     plot_offered_bw,
+    plot_probe_timeseries,
     plot_ramp,
     plot_recovery_timeline,
     plot_topic_heatmap,
@@ -64,6 +65,27 @@ TOPIC_HEATMAP: dict[str, dict[str, float]] = {
     "/cmd_vel": {"wifi_good": 0.0, "wifi_bad": 0.2, "lte": 0.0},
 }
 
+PROBE_BINS: list[dict] = [
+    {
+        "attempt": 1,
+        "topic": "/bench_capacity",
+        "bin_start_s": 0.0,
+        "loss_pct": 0.0,
+        "latency_p95_ms": 50.0,
+        "delivered_hz": 20.0,
+        "payload_bandwidth_bps": 2_880_000.0,
+    },
+    {
+        "attempt": 1,
+        "topic": "/bench_capacity",
+        "bin_start_s": 1.0,
+        "loss_pct": 10.0,
+        "latency_p95_ms": 120.0,
+        "delivered_hz": 18.0,
+        "payload_bandwidth_bps": 2_592_000.0,
+    },
+]
+
 
 # -- smoke tests ------------------------------------------------------------ #
 
@@ -78,6 +100,13 @@ def test_capacity_frontier_writes_figure(tmp_path: Path) -> None:
 def test_offered_bw_writes_figure(tmp_path: Path) -> None:
     out = tmp_path / "offered.png"
     result = plot_offered_bw(OFFERED_BW_RESULTS, out=out)
+    assert result == out
+    assert out.stat().st_size > 0
+
+
+def test_probe_timeseries_writes_figure(tmp_path: Path) -> None:
+    out = tmp_path / "probe.png"
+    result = plot_probe_timeseries(PROBE_BINS, out=out)
     assert result == out
     assert out.stat().st_size > 0
 

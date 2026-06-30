@@ -10,12 +10,14 @@ What lives here is everything that can be exercised by a deterministic host test
 * sweep bounds + the shared-link guard (an unshaped run never saturates the LAN);
 * the budget store and the regression compare (per ``(SHA, profile, genre)``);
 * recovery-metric extraction from a timeline of RFC 0003 transit records;
+* fixed-probe time-bin characterization for latency/loss/Hz/bandwidth plots;
 * the coarse linear-ramp curve (monitor-only trend).
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -310,6 +312,208 @@ def find_baseline(entries: Iterable[BudgetEntry], *, profile: str, genre: str) -
     """Most recent recorded entry for a ``(profile, genre)`` — the regression baseline."""
     matching = [entry for entry in entries if entry.key.profile == profile and entry.key.genre == genre]
     return matching[-1] if matching else None
+
+
+# --------------------------------------------------------------------------- #
+# Fixed probe — time-binned connection characterization
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ProbeBin:
+    topic: str
+    bin_start_s: float
+    bin_end_s: float
+    expected: int
+    delivered: int
+    lost: int
+    loss_pct: float
+    delivered_hz: float
+    expected_hz: float
+    payload_bandwidth_bps: float
+    mean_size_bytes: float | None
+    latency_p50_ms: float | None
+    latency_p95_ms: float | None
+    jitter_p50_ms: float | None
+    jitter_p95_ms: float | None
+    inter_arrival_p50_ms: float | None
+    inter_arrival_p95_ms: float | None
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
+    return round(ordered[rank], 3)
+
+
+def _transit_topic_label(record: dict[str, Any]) -> str:
+    topic = str(record.get("topic") or "")
+    source = str(record.get("source") or "")
+    target = str(record.get("target") or "")
+    return f"{source}->{target}:{topic}" if source or target else topic
+
+
+def _section_ms(record: dict[str, Any], *names: str) -> float | None:
+    sections = record.get("sections")
+    if not isinstance(sections, dict):
+        return None
+    for name in names:
+        value = sections.get(name)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _infer_nominal_period_s(records: Sequence[dict[str, Any]], *, time_field: str) -> float | None:
+    candidates: list[float] = []
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for record in records:
+        key = (
+            str(record.get("source") or ""),
+            str(record.get("target") or ""),
+            str(record.get("topic") or ""),
+        )
+        grouped.setdefault(key, []).append(record)
+
+    for stream in grouped.values():
+        stamped = sorted(
+            (record for record in stream if record.get(time_field) is not None),
+            key=lambda record: int(record["seq"]),
+        )
+        for previous, current in zip(stamped, stamped[1:], strict=False):
+            seq_delta = int(current["seq"]) - int(previous["seq"])
+            time_delta = float(current[time_field]) - float(previous[time_field])
+            if seq_delta > 0 and time_delta >= 0.0:
+                candidates.append(time_delta / seq_delta)
+    if not candidates:
+        return None
+    ordered = sorted(candidates)
+    return ordered[len(ordered) // 2]
+
+
+def characterize_probe_records(
+    records: Iterable[dict[str, Any]],
+    *,
+    bin_s: float = 1.0,
+    nominal_period_s: float | None = None,
+    topic: str = "",
+    time_field: str = "t_wrap",
+) -> list[dict[str, Any]]:
+    """Summarize one fixed probe as per-topic time bins.
+
+    Bins are aligned to the first observed publish timestamp and use publish
+    time, not arrival time, so latency/loss spikes line up with the traffic that
+    caused them. Lost records often lack timestamps; when a nominal period is
+    supplied (usually ``1 / rate_hz``), their send time is reconstructed from
+    sequence number just like the recovery metrics do.
+    """
+    if bin_s <= 0.0:
+        raise ValueError("bin_s must be > 0.")
+
+    from .transit import join_transit_records
+
+    joined_records = join_transit_records(records)
+    if not joined_records:
+        return []
+    period_s = nominal_period_s if nominal_period_s is not None else _infer_nominal_period_s(
+        joined_records, time_field=time_field
+    )
+    period_s = float(period_s or 0.0)
+
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for record in joined_records:
+        key = (
+            str(record.get("source") or ""),
+            str(record.get("target") or ""),
+            str(record.get("topic") or ""),
+        )
+        grouped.setdefault(key, []).append(record)
+
+    expanded: list[tuple[str, dict[str, Any], float]] = []
+    for _key, stream in sorted(grouped.items()):
+        stream = sorted(stream, key=lambda record: int(record["seq"]))
+        stamped = [record for record in stream if record.get(time_field) is not None]
+        anchor = min(stamped or stream, key=lambda record: int(record["seq"]))
+        seq0 = int(anchor["seq"])
+        t0 = float(anchor.get(time_field) or 0.0)
+        for record in stream:
+            label = _transit_topic_label(record)
+            if topic and topic not in {label, str(record.get("topic") or "")}:
+                continue
+            expanded.append(
+                (
+                    label,
+                    record,
+                    _send_time(record, seq0=seq0, t0=t0, period_s=period_s, time_field=time_field),
+                )
+            )
+    if not expanded:
+        return []
+
+    first_send_s = min(send_t for _label, _record, send_t in expanded)
+    buckets: dict[tuple[str, float], dict[str, Any]] = {}
+    for label, record, send_t in expanded:
+        relative_s = max(0.0, send_t - first_send_s)
+        bucket_start = math.floor(relative_s / bin_s) * bin_s
+        bucket = buckets.setdefault(
+            (label, bucket_start),
+            {
+                "topic": label,
+                "bin_start_s": bucket_start,
+                "bin_end_s": bucket_start + bin_s,
+                "expected": 0,
+                "delivered": 0,
+                "lost": 0,
+                "payload_bytes": 0.0,
+                "latencies": [],
+                "jitters": [],
+                "inter_arrivals": [],
+            },
+        )
+        bucket["expected"] += 1
+        if record.get("status") == "lost":
+            bucket["lost"] += 1
+            continue
+        bucket["delivered"] += 1
+        if record.get("size_bytes") is not None:
+            bucket["payload_bytes"] += float(record["size_bytes"])
+        latency_ms = _section_ms(record, "ota_hop_ms", "ota_hop_uncorrected_ms")
+        if latency_ms is not None:
+            bucket["latencies"].append(latency_ms)
+        if record.get("jitter_ms") is not None:
+            bucket["jitters"].append(float(record["jitter_ms"]))
+        if record.get("inter_arrival_ms") is not None:
+            bucket["inter_arrivals"].append(float(record["inter_arrival_ms"]))
+
+    rows: list[dict[str, Any]] = []
+    for (_label, _bucket_start), bucket in sorted(buckets.items()):
+        expected = int(bucket["expected"])
+        delivered = int(bucket["delivered"])
+        lost = int(bucket["lost"])
+        payload_bytes = float(bucket["payload_bytes"])
+        row = ProbeBin(
+            topic=str(bucket["topic"]),
+            bin_start_s=round(float(bucket["bin_start_s"]), 6),
+            bin_end_s=round(float(bucket["bin_end_s"]), 6),
+            expected=expected,
+            delivered=delivered,
+            lost=lost,
+            loss_pct=round(100.0 * lost / expected, 3) if expected else 0.0,
+            delivered_hz=round(delivered / bin_s, 3),
+            expected_hz=round(expected / bin_s, 3),
+            payload_bandwidth_bps=round(payload_bytes * 8.0 / bin_s, 3),
+            mean_size_bytes=round(payload_bytes / delivered, 3) if delivered else None,
+            latency_p50_ms=_percentile(bucket["latencies"], 0.50),
+            latency_p95_ms=_percentile(bucket["latencies"], 0.95),
+            jitter_p50_ms=_percentile(bucket["jitters"], 0.50),
+            jitter_p95_ms=_percentile(bucket["jitters"], 0.95),
+            inter_arrival_p50_ms=_percentile(bucket["inter_arrivals"], 0.50),
+            inter_arrival_p95_ms=_percentile(bucket["inter_arrivals"], 0.95),
+        )
+        rows.append(asdict(row))
+    return rows
 
 
 # --------------------------------------------------------------------------- #

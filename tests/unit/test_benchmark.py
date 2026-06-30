@@ -16,6 +16,7 @@ from rosotacom.benchmark import (
     OutageWindow,
     SweepBounds,
     capacity_binary_search,
+    characterize_probe_records,
     compare_to_budget,
     expand_size_pattern,
     find_baseline,
@@ -138,6 +139,109 @@ def test_find_capacity_never_searches_past_the_shared_link_budget() -> None:
     # Capacity clamped to the 1 MB/s budget at 10 Hz (100 KB), never the 1 MB request.
     assert result.capacity == 100_000
     assert max(probed) <= 100_000
+
+
+# --- fixed probe characterization ------------------------------------------ #
+
+
+def test_characterize_probe_records_bins_loss_latency_hz_and_bandwidth() -> None:
+    records = [
+        {
+            "kind": "transit",
+            "source": "a",
+            "target": "b",
+            "topic": "/x",
+            "seq": 0,
+            "status": "delivered",
+            "t_wrap": 10.0,
+            "sections": {"ota_hop_ms": 10.0},
+            "size_bytes": 100,
+            "jitter_ms": 1.0,
+            "inter_arrival_ms": None,
+        },
+        {
+            "kind": "transit",
+            "source": "a",
+            "target": "b",
+            "topic": "/x",
+            "seq": 1,
+            "status": "lost",
+            "t_wrap": None,
+            "sections": {"ota_hop_ms": None},
+            "size_bytes": None,
+            "jitter_ms": None,
+            "inter_arrival_ms": None,
+        },
+        {
+            "kind": "transit",
+            "source": "a",
+            "target": "b",
+            "topic": "/x",
+            "seq": 2,
+            "status": "delivered",
+            "t_wrap": 11.0,
+            "sections": {"ota_hop_ms": 20.0},
+            "size_bytes": 100,
+            "jitter_ms": 2.0,
+            "inter_arrival_ms": 500.0,
+        },
+        {
+            "kind": "transit",
+            "source": "a",
+            "target": "b",
+            "topic": "/x",
+            "seq": 3,
+            "status": "delivered",
+            "t_wrap": 11.5,
+            "sections": {"ota_hop_ms": 30.0},
+            "size_bytes": 200,
+            "jitter_ms": 3.0,
+            "inter_arrival_ms": 500.0,
+        },
+    ]
+
+    bins = characterize_probe_records(records, bin_s=1.0, nominal_period_s=0.5)
+
+    assert bins == [
+        {
+            "topic": "a->b:/x",
+            "bin_start_s": 0.0,
+            "bin_end_s": 1.0,
+            "expected": 2,
+            "delivered": 1,
+            "lost": 1,
+            "loss_pct": 50.0,
+            "delivered_hz": 1.0,
+            "expected_hz": 2.0,
+            "payload_bandwidth_bps": 800.0,
+            "mean_size_bytes": 100.0,
+            "latency_p50_ms": 10.0,
+            "latency_p95_ms": 10.0,
+            "jitter_p50_ms": 1.0,
+            "jitter_p95_ms": 1.0,
+            "inter_arrival_p50_ms": None,
+            "inter_arrival_p95_ms": None,
+        },
+        {
+            "topic": "a->b:/x",
+            "bin_start_s": 1.0,
+            "bin_end_s": 2.0,
+            "expected": 2,
+            "delivered": 2,
+            "lost": 0,
+            "loss_pct": 0.0,
+            "delivered_hz": 2.0,
+            "expected_hz": 2.0,
+            "payload_bandwidth_bps": 2400.0,
+            "mean_size_bytes": 150.0,
+            "latency_p50_ms": 20.0,
+            "latency_p95_ms": 30.0,
+            "jitter_p50_ms": 2.0,
+            "jitter_p95_ms": 3.0,
+            "inter_arrival_p50_ms": 500.0,
+            "inter_arrival_p95_ms": 500.0,
+        },
+    ]
 
 
 # --- budget store + regression compare ------------------------------------- #

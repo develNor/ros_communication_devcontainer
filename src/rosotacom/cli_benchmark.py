@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import json
 import math
 import shlex
@@ -337,6 +338,12 @@ def _prepare_benchmark_session_config(args: argparse.Namespace, session_name: st
         reliability=getattr(args, "qos_reliability", None),
         depth=getattr(args, "qos_depth", None),
     )
+    stream_options = None
+    if session_name == "bench_1_1_capacity":
+        stream_options = _expand_benchmark_capacity_stream_topics(
+            cfg,
+            int(getattr(args, "streams", 1) or 1),
+        )
     config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
     existing_raw = getattr(args, "session_configs_dir", None)
@@ -359,6 +366,7 @@ def _prepare_benchmark_session_config(args: argparse.Namespace, session_name: st
         "rmw": rmw,
         "runtime_implementation": _rmw_runtime_implementation(rmw),
         "qos": qos_options,
+        "streams": stream_options,
     }
 
 
@@ -538,16 +546,64 @@ def _probe_load(
     return load
 
 
-def _sized_publisher_param_args(topic_name: str, load: dict[str, Any]) -> list[str]:
+def _benchmark_stream_topic_name(topic_name: str, index: int) -> str:
+    return f"{topic_name}_{index}"
+
+
+def _expand_benchmark_capacity_stream_topics(cfg: dict[str, Any], streams: int) -> dict[str, Any] | None:
+    if streams < 1:
+        raise ValueError("streams must be >= 1.")
+    if streams == 1:
+        return None
+
+    topics = cfg.setdefault("topics", {})
+    if not isinstance(topics, dict):
+        raise RuntimeError("Benchmark session config 'topics' must be a mapping.")
+    a_to_b = topics.get("a_to_b")
+    if not isinstance(a_to_b, list) or len(a_to_b) != 1:
+        raise RuntimeError("Multi-stream capacity benchmark sessions must define exactly one a_to_b topic template.")
+
+    template = a_to_b[0]
+    if not isinstance(template, dict):
+        raise RuntimeError("Benchmark session topic template must be a mapping.")
+    topic_name = template.get("topic")
+    if not isinstance(topic_name, str) or not topic_name:
+        raise RuntimeError("Benchmark session topic template must define a non-empty topic.")
+
+    expanded_topics: list[str] = []
+    expanded_specs: list[dict[str, Any]] = []
+    for index in range(streams):
+        spec = copy.deepcopy(template)
+        stream_topic = _benchmark_stream_topic_name(topic_name, index)
+        spec["topic"] = stream_topic
+        expanded_specs.append(spec)
+        expanded_topics.append(stream_topic)
+    topics["a_to_b"] = expanded_specs
+    return {"count": streams, "base_topic": topic_name, "topics": expanded_topics}
+
+
+def _publisher_streams_for_topic_specs(topic_specs: Sequence[Any], load: dict[str, Any]) -> int:
+    streams = int(load.get("streams", 1) or 1)
+    if streams > 1 and len(topic_specs) >= streams:
+        return 1
+    return streams
+
+
+def _sized_publisher_param_args(
+    topic_name: str,
+    load: dict[str, Any],
+    *,
+    streams: int | None = None,
+) -> list[str]:
     rate = load.get("rate", 20.0)
-    streams = load.get("streams", 1)
+    publisher_streams = int(streams if streams is not None else load.get("streams", 1) or 1)
     params = [
         "-p",
         f"topic:={topic_name}",
         "-p",
         f"rate:={rate}",
         "-p",
-        f"streams:={streams}",
+        f"streams:={publisher_streams}",
     ]
 
     pattern = load.get("pattern")
@@ -4679,16 +4735,23 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
             ros_setup_a = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "a")
             topics_a = cfg.get("topics", {}).get("a_to_b", [])
+            publisher_streams = _publisher_streams_for_topic_specs(topics_a, load)
             pub_cmds = []
-            for topic_spec in topics_a:
+            for topic_index, topic_spec in enumerate(topics_a):
                 topic_name = topic_spec.get("topic")
                 publisher_args = " ".join(
-                    shlex.quote(str(part)) for part in _sized_publisher_param_args(topic_name, load)
+                    shlex.quote(str(part))
+                    for part in _sized_publisher_param_args(topic_name, load, streams=publisher_streams)
+                )
+                log_path = (
+                    "${ROSOTACOM_LOGS_DIR}/a/sized_publisher.log"
+                    if len(topics_a) == 1
+                    else f"${{ROSOTACOM_LOGS_DIR}}/a/sized_publisher_{topic_index}.log"
                 )
                 cmd = (
                     f"{ros_setup_a} && timeout 300 ros2 run com_py sized_publisher --ros-args "
                     f"{publisher_args} "
-                    f'> "${{ROSOTACOM_LOGS_DIR}}/a/sized_publisher.log" 2>&1'
+                    f'> "{log_path}" 2>&1'
                 )
                 pub_cmds.append(cmd)
 

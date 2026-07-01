@@ -268,6 +268,27 @@ def test_sized_publisher_args_include_size_pattern_and_zero_payload() -> None:
         "-p",
         "size:=0",
     ]
+    assert benchmark_cli._sized_publisher_param_args(
+        "/bench_capacity_0",
+        {"size_a": 9000, "rate": 20.0, "streams": 2},
+        streams=1,
+    ) == [
+        "-p",
+        "topic:=/bench_capacity_0",
+        "-p",
+        "rate:=20.0",
+        "-p",
+        "streams:=1",
+        "-p",
+        "size:=9000",
+    ]
+
+
+def test_publisher_streams_collapse_for_expanded_stream_topics() -> None:
+    topics = [{"topic": "/bench_capacity_0"}, {"topic": "/bench_capacity_1"}]
+
+    assert benchmark_cli._publisher_streams_for_topic_specs(topics, {"streams": 2}) == 1
+    assert benchmark_cli._publisher_streams_for_topic_specs([{"topic": "/bench_capacity"}], {"streams": 2}) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -1824,6 +1845,72 @@ def test_benchmark_session_copy_pins_requested_rmw(tmp_path: Path) -> None:
     assert args.session_configs_dir[0] == str(run_dir / "session-configs")
     assert context["runtime_implementation"] == "rmw_cyclonedds_cpp"
     assert context["qos"] == {"reliability": "reliable", "depth": 10}
+
+
+def test_benchmark_session_copy_expands_capacity_stream_topics(tmp_path: Path) -> None:
+    import argparse
+
+    import yaml
+
+    project = tmp_path / "project"
+    session_dir = project / "sessions" / "bench_1_1_capacity"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session-definition.yaml").write_text(
+        "peers:\n"
+        "  a: {}\n"
+        "  b: {}\n"
+        "shared:\n"
+        "  rmw: cyclone\n"
+        "topics:\n"
+        "  a_to_b:\n"
+        "    - topic: /bench_capacity\n"
+        "      type: com_msgs/msg/SizedPayload\n"
+        "      processing:\n"
+        "        use_ota_wrapper: true\n",
+        encoding="utf-8",
+    )
+    ros2docker = project / "ros2docker.json"
+    ros2docker.write_text("{}", encoding="utf-8")
+    config_file = project / "rosotacom.yaml"
+    config_file.write_text(
+        yaml.safe_dump(
+            {
+                "ros2docker_config": str(ros2docker),
+                "session_configs_dir": ["sessions"],
+                "session_instances_dir": "session-instances",
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    args = argparse.Namespace(
+        rosotacom_config=str(config_file),
+        ros2docker_config=None,
+        session_configs_dir=None,
+        scenario_configs_dir=None,
+        session_instances_dir=None,
+        deployment=None,
+        profiles_file=None,
+        artifacts_dir=None,
+        rmw="cyclone",
+        qos_reliability=None,
+        qos_depth=None,
+        streams=2,
+    )
+
+    context = _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
+
+    copied = yaml.safe_load(Path(context["config_path"]).read_text(encoding="utf-8"))
+    topics = copied["topics"]["a_to_b"]
+    assert [topic["topic"] for topic in topics] == ["/bench_capacity_0", "/bench_capacity_1"]
+    assert all(topic["type"] == "com_msgs/msg/SizedPayload" for topic in topics)
+    assert all(topic["processing"] == {"use_ota_wrapper": True} for topic in topics)
+    assert context["streams"] == {
+        "count": 2,
+        "base_topic": "/bench_capacity",
+        "topics": ["/bench_capacity_0", "/bench_capacity_1"],
+    }
 
 
 def test_benchmark_ota_target_defaults_to_benchmark_session() -> None:

@@ -588,7 +588,7 @@ def test_scenario_tmux_commands_keep_ctrl_b_and_use_full_windows(
     assert "--network-name scenario-net --network-ip 10.139.0.2" in joined
     assert "scenario _run-application demo" in joined
     assert "--network-name container:rosotacom_test_com_to_b" in joined
-    assert "waiting for container: rosotacom_test_com_to_b" in joined
+    assert "waiting for container readiness: rosotacom_test_com_to_b" in joined
     assert sum("new-window" in command for command in calls) == 1
     assert not any("split-window" in command for command in calls)
     assert any(
@@ -667,7 +667,7 @@ def test_interactive_smoke_tmux_uses_full_windows_and_metadata(
     assert "scenario _run-application demo --identity a --application local_app" in joined
     assert "--network-name container:rosotacom_test_com_to_b" in joined
     assert "waiting for generated config" in joined
-    assert "waiting for container" in joined
+    assert "waiting for container readiness" in joined
     assert any(command[-1] == "smoke-scenario-demo:verification" for command in calls if "select-window" in command)
 
 

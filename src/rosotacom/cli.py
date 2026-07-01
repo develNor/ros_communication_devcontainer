@@ -3704,9 +3704,7 @@ def _create_scenario_tmux(
             )
         )
         if application_network:
-            application_command = (
-                f"{_wait_for_container_running_script(communication_container)}; {application_command}"
-            )
+            application_command = f"{_wait_for_container_ready_script(communication_container)}; {application_command}"
         created_window = subprocess.run(
             _tmux_command(
                 runtime,
@@ -5866,6 +5864,25 @@ def _wait_for_container_running_script(container_name: str) -> str:
     )
 
 
+def _wait_for_container_ready_script(container_name: str, timeout_s: int = 600) -> str:
+    quoted = shlex.quote(container_name)
+    marker = shlex.quote("Sourced ROS 2 workspace overlay")
+    return (
+        f"end=$(( $(date +%s) + {timeout_s} )); "
+        "while :; do "
+        f"if docker logs {quoted} 2>&1 | grep -Fq {marker}; then "
+        f"echo '[INFO] container ready: {quoted}'; break; "
+        "fi; "
+        f"state=$(docker inspect -f '{{{{.State.Running}}}}' {quoted} 2>/dev/null || true); "
+        f"if [ \"$state\" = false ]; then echo '[ERROR] container exited before ready: {quoted}' >&2; exit 1; fi; "
+        'if [ "$(date +%s)" -ge "$end" ]; then '
+        f"echo '[ERROR] timed out waiting for container readiness: {quoted}' >&2; exit 1; "
+        "fi; "
+        f"echo '[INFO] waiting for container readiness: {quoted}'; sleep 2; "
+        "done"
+    )
+
+
 def _create_interactive_smoke_tmux(
     runtime: RuntimeConfig,
     target: InteractiveSmokeTarget,
@@ -5998,7 +6015,7 @@ def _create_interactive_smoke_tmux(
                 )
                 script = (
                     f"{_wait_for_peer_spec_script(instance, peer)}; "
-                    f"{_wait_for_container_running_script(communication_container)}; "
+                    f"{_wait_for_container_ready_script(communication_container)}; "
                     f"exec {command}"
                 )
                 created_window = subprocess.run(

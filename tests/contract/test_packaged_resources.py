@@ -74,9 +74,31 @@ def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
     assert default_build_args["BASE_IMAGE"] == example_build_args["BASE_IMAGE"]
     assert default_build_args["DIGEST"] == example_build_args["DIGEST"]
     for build_args in (default_build_args, example_build_args):
+        assert build_args["INSTALL_ZENOH"] == "1"
         apt_packages = set(str(build_args["APT_PACKAGES"]).split())
         assert "ros-kilted-domain-bridge" in apt_packages
         assert "ros-kilted-rmw-cyclonedds-cpp" in apt_packages
+        assert "ros-kilted-ffmpeg-image-transport-msgs" in apt_packages
+
+
+def test_external_ros2docker_configs_install_selected_rmw_implementations() -> None:
+    configs = sorted(cli.EXAMPLE_PROJECT_DIR.glob("scripts/**/external.ros2docker.json"))
+    assert configs
+
+    offenders: list[str] = []
+    for config_path in configs:
+        config = cli.load_config(config_path, resolve_run_args=False)
+        run_args = [str(value) for value in config.get("run_args", []) or []]
+        if "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" not in run_args:
+            continue
+
+        build_args = config.get("build_args", {}) or {}
+        apt_packages = set(str(build_args.get("APT_PACKAGES", "")).split())
+        if "ros-kilted-rmw-cyclonedds-cpp" not in apt_packages:
+            rel = config_path.relative_to(cli.EXAMPLE_PROJECT_DIR)
+            offenders.append(f"{rel} selects rmw_cyclonedds_cpp but does not install its package")
+
+    assert not offenders
 
 
 def test_shell_entrypoints_pass_syntax_check() -> None:

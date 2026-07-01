@@ -7,6 +7,9 @@ from pathlib import Path
 import pytest
 
 from rosotacom.benchmark import (
+    SETTLED,
+    TRANSITION,
+    WARMUP,
     BudgetEntry,
     BudgetKey,
     CapacitySlice,
@@ -17,7 +20,9 @@ from rosotacom.benchmark import (
     SweepBounds,
     capacity_binary_search,
     characterize_probe_records,
+    classify_probe_settling,
     compare_to_budget,
+    exclude_probe_warmup,
     expand_size_pattern,
     find_baseline,
     find_capacity,
@@ -242,6 +247,130 @@ def test_characterize_probe_records_bins_loss_latency_hz_and_bandwidth() -> None
             "inter_arrival_p95_ms": 500.0,
         },
     ]
+
+
+# --- fixed-probe settling / warm-up exclusion ------------------------------ #
+
+
+def test_classify_probe_settling_splits_warmup_transition_and_settled() -> None:
+    # 20 un-impaired warm-up samples, one partial packet as shaping engages,
+    # then the settled operating regime.
+    warmup = [5.0, 4.5, 5.5, 4.8, 5.2, 6.0, 4.9, 5.1, 5.3, 4.7] * 2
+    settled = [80.0, 78.0, 84.0, 77.0, 88.0, 81.0, 79.0, 86.0, 74.0, 83.0] * 3
+    latencies = [*warmup, 21.0, *settled]
+
+    result = classify_probe_settling(latencies)
+
+    assert result.onset_index == len(warmup) + 1
+    assert result.labels[: len(warmup)] == [WARMUP] * len(warmup)
+    assert result.labels[len(warmup)] == TRANSITION
+    assert all(label == SETTLED for label in result.labels[len(warmup) + 1 :])
+    assert result.excluded_count == len(warmup) + 1
+
+
+def test_classify_probe_settling_keeps_ramping_impaired_regime_whole() -> None:
+    # Bufferbloat: warm-up floor, one partial transition packet, then a latency
+    # ramp with no plateau (a shaped rate below the offered load). The whole ramp
+    # is the profile under test and must be kept — only warm-up + transition drop.
+    warmup = [5.0, 4.5, 5.5, 4.8, 5.2, 6.0, 4.9, 5.1, 5.3, 4.7] * 2
+    ramp = [96.0 + 6.0 * i for i in range(60)]  # 96 → ~450 ms, monotonically rising
+    latencies = [*warmup, 48.0, *ramp]
+
+    result = classify_probe_settling(latencies)
+
+    assert result.onset_index == len(warmup) + 1
+    assert result.labels[: len(warmup)] == [WARMUP] * len(warmup)
+    assert result.labels[len(warmup)] == TRANSITION  # the 48 ms partial packet
+    assert all(label == SETTLED for label in result.labels[len(warmup) + 1 :])
+
+
+def test_classify_probe_settling_keeps_everything_without_a_clear_step() -> None:
+    # Impairment live from the first packet: no warm-up floor, no step.
+    latencies = [80.0, 78.0, 84.0, 77.0, 88.0, 81.0, 79.0, 86.0, 74.0, 83.0] * 3
+
+    result = classify_probe_settling(latencies)
+
+    assert result.onset_index is None
+    assert result.excluded_count == 0
+    assert set(result.labels) == {SETTLED}
+
+
+def test_classify_probe_settling_keeps_a_smooth_ramp_without_warmup() -> None:
+    # A pure ramp with no low warm-up floor has no sharp step — keep everything.
+    latencies = [96.0 + 4.0 * i for i in range(80)]  # 96 → ~412 ms, smooth
+
+    result = classify_probe_settling(latencies)
+
+    assert result.onset_index is None
+    assert set(result.labels) == {SETTLED}
+
+
+def test_classify_probe_settling_ignores_short_series() -> None:
+    latencies = [5.0, 5.0, 80.0, 80.0]
+
+    result = classify_probe_settling(latencies)
+
+    assert result.labels == [SETTLED] * 4
+    assert result.onset_index is None
+
+
+def _probe_stream(latencies: list[float], *, period_s: float = 0.05, t0: float = 100.0) -> list[dict]:
+    """Build joined transit records at a fixed rate — one delivered packet per latency."""
+    return [
+        {
+            "kind": "transit",
+            "source": "a",
+            "target": "b",
+            "topic": "/x",
+            "seq": seq,
+            "status": "delivered",
+            "t_wrap": t0 + seq * period_s,
+            "sections": {"ota_hop_ms": latency},
+            "size_bytes": 100,
+        }
+        for seq, latency in enumerate(latencies)
+    ]
+
+
+def test_exclude_probe_warmup_drops_prefix_and_reports_onset() -> None:
+    warmup = [5.0] * 20
+    settled = [80.0] * 40
+    records = _probe_stream([*warmup, 21.0, *settled])
+
+    kept, onset = exclude_probe_warmup(records, nominal_period_s=0.05)
+
+    # The 20 warm-up samples and the one transition packet are dropped.
+    assert len(kept) == len(settled)
+    assert {record["sections"]["ota_hop_ms"] for record in kept} == {80.0}
+    # Onset is the send time of the first settled packet (seq 21).
+    assert onset == pytest.approx(100.0 + 21 * 0.05)
+
+
+def test_exclude_probe_warmup_keeps_all_without_a_step() -> None:
+    records = _probe_stream([80.0] * 40)
+
+    kept, onset = exclude_probe_warmup(records, nominal_period_s=0.05)
+
+    assert len(kept) == len(records)
+    assert onset is None
+
+
+def test_characterize_probe_records_excludes_warmup_and_reanchors_to_onset() -> None:
+    warmup = [5.0] * 20
+    settled = [80.0] * 60  # 3 s of settled traffic at 20 Hz
+    records = _probe_stream([*warmup, 21.0, *settled])
+
+    excluded = characterize_probe_records(records, bin_s=1.0, nominal_period_s=0.05)
+    included = characterize_probe_records(records, bin_s=1.0, nominal_period_s=0.05, exclude_warmup=False)
+
+    # Re-anchored: the settled regime starts at bin 0, and no bin carries the
+    # warm-up latency floor.
+    assert excluded[0]["bin_start_s"] == 0.0
+    assert all(row["latency_p50_ms"] > 50.0 for row in excluded)
+    # Without exclusion the warm-up is binned from the first publish and shows up
+    # as an extra low-latency bin at the front.
+    assert len(included) > len(excluded)
+    assert included[0]["latency_p50_ms"] < 10.0
 
 
 # --- budget store + regression compare ------------------------------------- #

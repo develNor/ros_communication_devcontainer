@@ -1063,16 +1063,35 @@ def _run_probe_attempt(
         "load": load_info,
     }
     if bin_s is not None:
-        from .benchmark import characterize_probe_records
+        from .benchmark import characterize_probe_records, exclude_probe_warmup
 
         records = _load_raw_records_from_out(out_dir)
         rate_hz = float(load.get("rate", load.get("rate_hz", 0.0)) or 0.0)
+        nominal_period_s = (1.0 / rate_hz) if rate_hz > 0.0 else None
         result["raw_record_count"] = len(records)
+
+        # Drop the un-impaired warm-up plateau and the partial-impairment
+        # transition packet so neither the time bins nor the per-topic p95/loss
+        # summary reflect start-up artefacts (RFC 0005, "characterise the profile
+        # under test, not the setup"). Detection is conservative: without a clear
+        # step nothing is dropped and the full-run summary stands.
+        settled, onset = exclude_probe_warmup(records, nominal_period_s=nominal_period_s)
+        if onset is not None:
+            from .transit import summarize_transit_records
+
+            summary = summarize_transit_records(settled)
+            rows = _topic_rows(summary, topic)
+            result["summary"] = summary
+            result["topics"] = rows
+            result["warmup_excluded"] = len(records) - len(settled)
+            result["settled_onset_s"] = round(onset, 6)
+
         result["time_bins"] = characterize_probe_records(
-            records,
+            settled,
             bin_s=bin_s,
-            nominal_period_s=(1.0 / rate_hz) if rate_hz > 0.0 else None,
+            nominal_period_s=nominal_period_s,
             topic=topic,
+            exclude_warmup=False,
         )
     return result
 
@@ -1133,20 +1152,24 @@ def drive_probe(
             for bin_row in attempt_result.get("time_bins", [])
         ]
         time_bins.extend(attempt_bins)
+        warmup_excluded = int(attempt_result.get("warmup_excluded", 0) or 0)
         attempts.append(
             {
                 "attempt": attempt,
                 "artifact_dir": str(attempt_dir.relative_to(out_dir)),
                 "raw_record_count": attempt_result.get("raw_record_count", 0),
+                "warmup_excluded": warmup_excluded,
+                "settled_onset_s": attempt_result.get("settled_onset_s"),
                 "time_bin_count": len(attempt_bins),
                 "topics": attempt_result["topics"],
                 "summary": attempt_result["summary"],
             }
         )
+        warmup_note = f" warmup_excluded={warmup_excluded}" if warmup_excluded else ""
         print(
             f"  probe(attempt={attempt}/{repeats}): "
             f"offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} "
-            f"bins={len(attempt_bins)} {_format_topic_rows(attempt_result['topics'])}"
+            f"bins={len(attempt_bins)}{warmup_note} {_format_topic_rows(attempt_result['topics'])}"
         )
 
     bins_path = out_dir / "time-bins.jsonl"

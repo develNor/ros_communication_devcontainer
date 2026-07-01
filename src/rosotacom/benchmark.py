@@ -393,6 +393,198 @@ def _infer_nominal_period_s(records: Sequence[dict[str, Any]], *, time_field: st
     return ordered[len(ordered) // 2]
 
 
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    return ordered[mid] if n % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def _mad(values: Sequence[float]) -> float:
+    """Median absolute deviation — a spread estimate that ignores outliers."""
+    center = _median(values)
+    return _median([abs(v - center) for v in values])
+
+
+# Per-sample settling labels. Only ``SETTLED`` samples reflect the profile under
+# test; the others are start-up artefacts and are excluded from summaries.
+SETTLED = "settled"
+WARMUP = "warmup"
+TRANSITION = "transition"
+
+
+@dataclass(frozen=True)
+class ProbeSettling:
+    """Result of :func:`classify_probe_settling` for one time-ordered stream."""
+
+    labels: list[str]  # one of SETTLED / WARMUP / TRANSITION per input sample
+    onset_index: int | None  # first index of the settled regime, or None if all settled
+
+    @property
+    def excluded_count(self) -> int:
+        return sum(1 for label in self.labels if label != SETTLED)
+
+
+def classify_probe_settling(
+    latencies_ms: Sequence[float],
+    *,
+    min_points: int = 12,
+    step_window: int = 6,
+    min_step_ratio: float = 3.0,
+    min_step_ms: float = 15.0,
+    settle_fraction: float = 0.5,
+    warmup_mad_k: float = 5.0,
+) -> ProbeSettling:
+    """Split a time-ordered fixed-probe latency series into warm-up and impaired.
+
+    A fixed probe starts before the tc/netem shaping is applied, so the leading
+    packets sit at the un-impaired transport floor (a few ms). When shaping
+    engages the latency jumps sharply to the impaired regime — which may be a
+    stable plateau *or* a rising ramp (a shaped rate below the offered load builds
+    an ever-growing queue, i.e. bufferbloat). The detector therefore anchors on
+    the **sharp upward step from the low floor**, not on any plateau, so a ramping
+    profile is kept whole instead of being mistaken for a long transition.
+
+    Around the step three regimes are labelled:
+
+    * ``WARMUP`` — leading packets still at the floor (network delay ≈ 0);
+    * ``TRANSITION`` — the packet(s) in flight as shaping engages, seeing only a
+      partial delay (floor < latency < impaired regime);
+    * ``SETTLED`` — the impaired regime under test, kept for characterisation.
+
+    Detection is conservative: without a clear low-floor→high step (``impaired``
+    at least ``min_step_ratio``× **or** ``min_step_ms`` above the floor) every
+    sample is ``SETTLED`` and nothing is excluded — e.g. impairment live from the
+    first packet, a no-op profile, or a smooth ramp with no warm-up.
+
+    ``latencies_ms`` must already be ordered by send time.
+    """
+    n = len(latencies_ms)
+    if n < min_points:
+        return ProbeSettling([SETTLED] * n, None)
+
+    latencies = list(latencies_ms)
+    window = max(1, min(step_window, n // 2))
+
+    # Locate the sharpest upward step: the largest ratio between the windowed
+    # median just after an index and just before it. The un-impaired floor is the
+    # lowest level in the run, so the warm-up→impaired jump dominates, and windowed
+    # medians keep a single ramp spike from masquerading as the step.
+    step_index: int | None = None
+    best_ratio = 1.0
+    for i in range(window, n - window):
+        pre = _median(latencies[i - window : i])
+        post = _median(latencies[i : i + window])
+        if pre <= 0.0:
+            continue
+        ratio = post / pre
+        if ratio > best_ratio:
+            best_ratio = ratio
+            step_index = i
+    if step_index is None:
+        return ProbeSettling([SETTLED] * n, None)
+
+    floor = _median(latencies[max(0, step_index - window) : step_index])
+    impaired = _median(latencies[step_index : step_index + window])
+    step_is_real = impaired >= floor * min_step_ratio or impaired - floor >= min_step_ms
+    if best_ratio < min_step_ratio or not step_is_real:
+        return ProbeSettling([SETTLED] * n, None)
+
+    warmup_hi = floor + max(warmup_mad_k * _mad(latencies[:step_index]), 0.02 * (impaired - floor))
+    impaired_lo = floor + settle_fraction * (impaired - floor)
+
+    # Onset = first packet that reaches *and holds* the impaired regime, so the
+    # partial transition packet(s) below ``impaired_lo`` stay out of it.
+    onset: int | None = None
+    for i in range(n):
+        if latencies[i] >= impaired_lo:
+            ahead = latencies[i : i + window]
+            if sum(1 for v in ahead if v >= impaired_lo) >= 0.7 * len(ahead):
+                onset = i
+                break
+    if not onset:  # None or 0 → nothing clean to exclude
+        return ProbeSettling([SETTLED] * n, None)
+
+    labels = [SETTLED if i >= onset else (TRANSITION if v > warmup_hi else WARMUP) for i, v in enumerate(latencies)]
+    return ProbeSettling(labels, onset)
+
+
+def _probe_onset_send_time(
+    stream: Sequence[dict[str, Any]],
+    *,
+    seq0: int,
+    t0: float,
+    period_s: float,
+    time_field: str,
+) -> float | None:
+    """Send-time at which one stream's impairment settles, or None if no warm-up step."""
+    delivered: list[tuple[float, float]] = []
+    for record in stream:
+        if record.get("status") == "lost":
+            continue
+        latency_ms = _section_ms(record, "ota_hop_ms", "ota_hop_uncorrected_ms")
+        if latency_ms is None:
+            continue
+        send_t = _send_time(record, seq0=seq0, t0=t0, period_s=period_s, time_field=time_field)
+        delivered.append((send_t, latency_ms))
+    delivered.sort(key=lambda point: point[0])
+    settling = classify_probe_settling([latency for _, latency in delivered])
+    if settling.onset_index is None:
+        return None
+    return delivered[settling.onset_index][0]
+
+
+def exclude_probe_warmup(
+    joined_records: Sequence[dict[str, Any]],
+    *,
+    nominal_period_s: float | None = None,
+    time_field: str = "t_wrap",
+) -> tuple[list[dict[str, Any]], float | None]:
+    """Drop the warm-up/transition prefix from already-joined transit records.
+
+    Returns ``(settled_records, onset_send_time)`` where ``onset_send_time`` is the
+    earliest per-stream impairment onset on the publish timeline — the origin that
+    re-anchors "time since first publish" so ``t=0`` is where shaping is fully
+    applied. Streams with no clear warm-up step are kept whole; when no stream
+    shows a step, nothing is dropped and ``onset_send_time`` is ``None``.
+    """
+    joined = list(joined_records)
+    if not joined:
+        return [], None
+    period_s = (
+        nominal_period_s if nominal_period_s is not None else _infer_nominal_period_s(joined, time_field=time_field)
+    ) or 0.0
+
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for record in joined:
+        key = (
+            str(record.get("source") or ""),
+            str(record.get("target") or ""),
+            str(record.get("topic") or ""),
+        )
+        grouped.setdefault(key, []).append(record)
+
+    kept: list[dict[str, Any]] = []
+    onsets: list[float] = []
+    for _key, stream in grouped.items():
+        stream = sorted(stream, key=lambda record: int(record["seq"]))
+        stamped = [record for record in stream if record.get(time_field) is not None]
+        anchor = min(stamped or stream, key=lambda record: int(record["seq"]))
+        seq0 = int(anchor["seq"])
+        t0 = float(anchor.get(time_field) or 0.0)
+        onset = _probe_onset_send_time(stream, seq0=seq0, t0=t0, period_s=period_s, time_field=time_field)
+        if onset is None:
+            kept.extend(stream)
+            continue
+        onsets.append(onset)
+        kept.extend(
+            record
+            for record in stream
+            if _send_time(record, seq0=seq0, t0=t0, period_s=period_s, time_field=time_field) >= onset
+        )
+    return kept, (min(onsets) if onsets else None)
+
+
 def characterize_probe_records(
     records: Iterable[dict[str, Any]],
     *,
@@ -400,14 +592,20 @@ def characterize_probe_records(
     nominal_period_s: float | None = None,
     topic: str = "",
     time_field: str = "t_wrap",
+    exclude_warmup: bool = True,
 ) -> list[dict[str, Any]]:
     """Summarize one fixed probe as per-topic time bins.
 
-    Bins are aligned to the first observed publish timestamp and use publish
-    time, not arrival time, so latency/loss spikes line up with the traffic that
-    caused them. Lost records often lack timestamps; when a nominal period is
-    supplied (usually ``1 / rate_hz``), their send time is reconstructed from
-    sequence number just like the recovery metrics do.
+    Bins use publish time, not arrival time, so latency/loss spikes line up with
+    the traffic that caused them. Lost records often lack timestamps; when a
+    nominal period is supplied (usually ``1 / rate_hz``), their send time is
+    reconstructed from sequence number just like the recovery metrics do.
+
+    With ``exclude_warmup`` (the default) the un-impaired warm-up plateau and the
+    partial-impairment transition packet are dropped via
+    :func:`exclude_probe_warmup`, and the bins are aligned to the impairment
+    onset so ``bin_start_s == 0`` is where shaping is fully applied. Set it False
+    to bin the raw timeline from the first publish.
     """
     if bin_s <= 0.0:
         raise ValueError("bin_s must be > 0.")
@@ -423,6 +621,11 @@ def characterize_probe_records(
         else _infer_nominal_period_s(joined_records, time_field=time_field)
     )
     period_s = float(period_s or 0.0)
+
+    if exclude_warmup:
+        joined_records, _onset = exclude_probe_warmup(joined_records, nominal_period_s=period_s, time_field=time_field)
+        if not joined_records:
+            return []
 
     grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for record in joined_records:

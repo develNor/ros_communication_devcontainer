@@ -81,6 +81,28 @@ def test_teardown_tolerates_a_missing_qdisc() -> None:
     assert not shaper.armed
 
 
+def test_apply_tolerates_timeline_cleanup_with_no_qdisc() -> None:
+    runner = FakeRunner(fail_on="del")
+    shaper = ProfileShaper("tun0", runner)
+    shaping = ["tc", "qdisc", "add", "dev", "tun0", "root", "handle", "10:", "netem", "delay", "50ms"]
+
+    shaper.apply([teardown_command("tun0"), shaping])
+
+    assert runner.calls == [teardown_command("tun0"), shaping]
+    assert shaper.armed
+
+
+def test_apply_reraises_timeline_shaping_failures() -> None:
+    runner = FakeRunner(fail_on="add")
+    shaper = ProfileShaper("tun0", runner)
+    shaping = ["tc", "qdisc", "add", "dev", "tun0", "root", "handle", "10:", "netem", "delay", "50ms"]
+
+    with pytest.raises(RuntimeError, match="boom on 'add'"):
+        shaper.apply([teardown_command("tun0"), shaping])
+
+    assert runner.calls == [teardown_command("tun0"), shaping]
+
+
 # --- revert on stop and on error (the context manager) --------------------- #
 
 

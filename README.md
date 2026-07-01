@@ -477,6 +477,7 @@ when the optional plotting dependency is installed:
 
 ```bash
 rosotacom benchmark probe --profile cellular-4g-typical --size 18000 --rate-hz 20 --duration 20 --repeats 1
+rosotacom benchmark probe --profile cellular-4g-typical --size-pattern 1x20KB+1x0KB --rate-hz 10 --duration 20 --repeats 1
 rosotacom benchmark plot time-bins.jsonl --type probe
 ```
 

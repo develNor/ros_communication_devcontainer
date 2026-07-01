@@ -52,6 +52,99 @@ def parse_size_pattern(pattern: str) -> list[str]:
     return tokens
 
 
+def parse_payload_size_bytes(raw: str) -> int:
+    """Parse a payload byte size with optional decimal/binary units."""
+    text = raw.strip()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([A-Za-z]*)", text)
+    if not match:
+        raise ValueError(f"Invalid payload size {raw!r}. Use values like 20000, 20KB, or 20KiB.")
+
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    units = {
+        "": 1,
+        "b": 1,
+        "k": 1_000,
+        "kb": 1_000,
+        "m": 1_000_000,
+        "mb": 1_000_000,
+        "g": 1_000_000_000,
+        "gb": 1_000_000_000,
+        "ki": 1024,
+        "kib": 1024,
+        "mi": 1024 * 1024,
+        "mib": 1024 * 1024,
+        "gi": 1024 * 1024 * 1024,
+        "gib": 1024 * 1024 * 1024,
+    }
+    if unit not in units:
+        raise ValueError(f"Invalid payload size unit {match.group(2)!r}. Use B, KB, MB, KiB, or MiB.")
+    bytes_value = value * units[unit]
+    if bytes_value < 0 or not bytes_value.is_integer():
+        raise ValueError(f"Payload size {raw!r} does not resolve to a whole non-negative byte count.")
+    return int(bytes_value)
+
+
+def _compress_size_pattern(tokens: Sequence[str]) -> str:
+    compressed: list[str] = []
+    current = tokens[0]
+    count = 1
+    for token in tokens[1:]:
+        if token == current:
+            count += 1
+            continue
+        compressed.append(f"{current}*{count}")
+        current = token
+        count = 1
+    compressed.append(f"{current}*{count}")
+    return ",".join(compressed)
+
+
+def parse_size_pattern_load(pattern: str) -> dict[str, Any]:
+    """Parse ``1x20KB+1x0KB`` into ``sized_publisher`` a/b load parameters.
+
+    Pattern terms are ``COUNTxSIZE`` or just ``SIZE``, separated by ``+`` or
+    ``,``. Decimal units (KB/MB/GB) use powers of 1000; binary units
+    (KiB/MiB/GiB) use powers of 1024. The current ROS publisher supports up to
+    two distinct payload sizes, mapped to ``size_a`` and ``size_b``.
+    """
+    if not pattern.strip():
+        raise ValueError("size pattern must not be empty.")
+
+    label_by_size: dict[int, str] = {}
+    size_by_label: dict[str, int] = {}
+    tokens: list[str] = []
+
+    for raw_term in re.split(r"[+,]", pattern):
+        term = raw_term.strip()
+        if not term:
+            raise ValueError(f"Invalid size pattern {pattern!r}: empty term.")
+        match = re.fullmatch(r"(?:(\d+)\s*[x*]\s*)?(.+)", term)
+        if not match:
+            raise ValueError(f"Invalid size pattern term {raw_term!r}. Use terms like 1x20KB or 0KB.")
+        count = int(match.group(1) or "1")
+        if count < 1:
+            raise ValueError(f"Size pattern term {raw_term!r} must repeat at least once.")
+        size = parse_payload_size_bytes(match.group(2))
+        label = label_by_size.get(size)
+        if label is None:
+            if len(label_by_size) >= 2:
+                raise ValueError("size pattern supports at most two distinct payload sizes.")
+            label = "a" if not label_by_size else "b"
+            label_by_size[size] = label
+            size_by_label[label] = size
+        tokens.extend([label] * count)
+
+    load: dict[str, Any] = {
+        "size_a": size_by_label["a"],
+        "pattern": _compress_size_pattern(tokens),
+        "size_pattern": pattern,
+    }
+    if "b" in size_by_label:
+        load["size_b"] = size_by_label["b"]
+    return load
+
+
 def expand_size_pattern(pattern: str, size_a: int, size_b: int | None = None) -> list[int]:
     """Expand a pattern into the concrete cyclic byte-size sequence it publishes."""
     if size_a < 0:

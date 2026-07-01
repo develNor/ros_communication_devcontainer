@@ -32,7 +32,9 @@ from rosotacom.benchmark import (
     offered_bandwidth_bps,
     oracle_passes,
     oracle_passes_topic,
+    parse_payload_size_bytes,
     parse_size_pattern,
+    parse_size_pattern_load,
     pattern_mean_bytes,
     recovery_metrics,
     save_budget,
@@ -52,6 +54,20 @@ def test_size_pattern_generation_matches_a_b_sequence() -> None:
     assert pattern_mean_bytes("a*4,b*1", size_a=0, size_b=70_000) == 14_000
 
 
+def test_human_size_pattern_load_maps_to_a_b_publisher_params() -> None:
+    assert parse_payload_size_bytes("20KB") == 20_000
+    assert parse_payload_size_bytes("20KiB") == 20 * 1024
+
+    load = parse_size_pattern_load("1x20KB+1x0KB")
+    assert load == {
+        "size_a": 20_000,
+        "size_b": 0,
+        "pattern": "a*1,b*1",
+        "size_pattern": "1x20KB+1x0KB",
+    }
+    assert pattern_mean_bytes(load["pattern"], load["size_a"], load["size_b"]) == 10_000
+
+
 def test_size_pattern_rejects_unset_b_and_bad_tokens() -> None:
     with pytest.raises(ValueError):
         expand_size_pattern("a,b", size_a=10)  # size_b missing
@@ -59,6 +75,8 @@ def test_size_pattern_rejects_unset_b_and_bad_tokens() -> None:
         parse_size_pattern("c*2")
     with pytest.raises(ValueError):
         parse_size_pattern("a*0")
+    with pytest.raises(ValueError):
+        parse_size_pattern_load("1x20KB+1x10KB+1x0KB")
 
 
 # --- capacity binary-search driver + oracle -------------------------------- #

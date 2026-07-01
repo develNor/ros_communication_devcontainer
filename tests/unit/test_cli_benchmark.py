@@ -194,6 +194,82 @@ def test_probe_driver_writes_time_bins_from_transit_records(tmp_path: Path) -> N
     assert result_doc["artifacts"]["time_bins"] == "time-bins.jsonl"
 
 
+def test_probe_driver_accepts_size_pattern_load(tmp_path: Path) -> None:
+    seen_loads: list[dict[str, Any]] = []
+
+    def stub(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        seen_loads.append(dict(load))
+        return {
+            "topics": {
+                "/test": {
+                    "expected": 2,
+                    "delivered": 2,
+                    "lost": 0,
+                    "loss_pct": 0.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": 10.0, "p95": 10.0},
+                    "jitter_ms": {"p50": 1.0, "p95": 1.0},
+                }
+            }
+        }
+
+    result = drive_probe(
+        stub,
+        profile="lossless-typical",
+        size_pattern="1x20KB+1x0KB",
+        rate_hz=10.0,
+        repeats=1,
+        duration_s=1.0,
+        bin_s=1.0,
+        render_plot=False,
+        out_dir=tmp_path,
+    )
+
+    assert seen_loads == [
+        {
+            "size_a": 20_000,
+            "size_b": 0,
+            "pattern": "a*1,b*1",
+            "size_pattern": "1x20KB+1x0KB",
+            "rate": 10.0,
+        }
+    ]
+    assert result["load"]["mean_payload_bytes"] == 10_000.0
+    assert result["load"]["offered_bandwidth_bps"] == 800_000.0
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["configuration"]["load"]["parameters"]["size_pattern"] == "1x20KB+1x0KB"
+
+
+def test_sized_publisher_args_include_size_pattern_and_zero_payload() -> None:
+    assert benchmark_cli._sized_publisher_param_args(
+        "/bench_capacity",
+        {
+            "size_a": 20_000,
+            "size_b": 0,
+            "pattern": "a*1,b*1",
+            "rate": 10.0,
+            "streams": 1,
+        },
+    ) == [
+        "-p",
+        "topic:=/bench_capacity",
+        "-p",
+        "rate:=10.0",
+        "-p",
+        "streams:=1",
+        "-p",
+        "size_a:=20000",
+        "-p",
+        "pattern:=a*1,b*1",
+        "-p",
+        "size_b:=0",
+    ]
+    assert benchmark_cli._sized_publisher_param_args("/bench_capacity", {"size_a": 0})[-2:] == [
+        "-p",
+        "size:=0",
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Capacity driver
 # --------------------------------------------------------------------------- #
@@ -1374,9 +1450,25 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.rate_hz == 20.0
     assert args.bin_s == 1.0
     assert args.plot is True
+    assert args.size_pattern is None
 
     args = parser.parse_args(["benchmark", "probe", "--profile", "losssless-typical", "--no-plot"])
     assert args.plot is False
+
+    args = parser.parse_args(
+        [
+            "benchmark",
+            "probe",
+            "--profile",
+            "lossless-typical",
+            "--size-pattern",
+            "1x20KB+1x0KB",
+            "--rate-hz",
+            "10",
+        ]
+    )
+    assert args.size_pattern == "1x20KB+1x0KB"
+    assert args.rate_hz == 10.0
 
     # Capacity.
     args = parser.parse_args(

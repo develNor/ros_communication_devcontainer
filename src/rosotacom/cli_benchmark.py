@@ -516,6 +516,57 @@ def _load_context(load: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _probe_load(
+    *,
+    size: int,
+    size_pattern: str | None,
+    rate_hz: float,
+    streams: int,
+) -> dict[str, Any]:
+    if size_pattern is not None:
+        from .benchmark import parse_size_pattern_load
+
+        load = parse_size_pattern_load(size_pattern)
+    else:
+        if size < 0:
+            raise ValueError("size must be >= 0.")
+        load = {"size_a": size}
+
+    load["rate"] = rate_hz
+    if streams != 1:
+        load["streams"] = streams
+    return load
+
+
+def _sized_publisher_param_args(topic_name: str, load: dict[str, Any]) -> list[str]:
+    rate = load.get("rate", 20.0)
+    streams = load.get("streams", 1)
+    params = [
+        "-p",
+        f"topic:={topic_name}",
+        "-p",
+        f"rate:={rate}",
+        "-p",
+        f"streams:={streams}",
+    ]
+
+    pattern = load.get("pattern")
+    if pattern:
+        size_a = load.get("size_a", load.get("size", 66000))
+        params.extend(["-p", f"size_a:={size_a}", "-p", f"pattern:={pattern}"])
+        if load.get("size_b") is not None:
+            params.extend(["-p", f"size_b:={load['size_b']}"])
+        return params
+
+    size = load.get("size")
+    if size is None:
+        size = load.get("size_a")
+    if size is None:
+        size = 66000
+    params.extend(["-p", f"size:={size}"])
+    return params
+
+
 def _benchmark_ota_target(args: argparse.Namespace, session_name: str) -> tuple[str, str]:
     target = getattr(args, "target", None)
     target_type = getattr(args, "target_type", None)
@@ -1101,6 +1152,7 @@ def drive_probe(
     *,
     profile: str | None,
     size: int = 18_000,
+    size_pattern: str | None = None,
     rate_hz: float = 20.0,
     streams: int = 1,
     topic: str = "",
@@ -1114,8 +1166,6 @@ def drive_probe(
     """Run a fixed probe and characterize time-dependent latency/loss behavior."""
     if repeats < 1:
         raise ValueError("repeats must be >= 1.")
-    if size < 0:
-        raise ValueError("size must be >= 0.")
     if rate_hz <= 0.0:
         raise ValueError("rate_hz must be > 0.")
     if streams < 1:
@@ -1123,9 +1173,7 @@ def drive_probe(
 
     profile = _normalize_benchmark_profile(profile)
     profile_label = _benchmark_profile_label(profile)
-    load: dict[str, Any] = {"size_a": size, "rate": rate_hz}
-    if streams != 1:
-        load["streams"] = streams
+    load = _probe_load(size=size, size_pattern=size_pattern, rate_hz=rate_hz, streams=streams)
     load_info = _load_context(load)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4630,17 +4678,16 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 return run
 
             ros_setup_a = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "a")
-            rate = load.get("rate", 20.0)
-            size = load.get("size") or load.get("size_a") or 66000
-            streams = load.get("streams", 1)
-
             topics_a = cfg.get("topics", {}).get("a_to_b", [])
             pub_cmds = []
             for topic_spec in topics_a:
                 topic_name = topic_spec.get("topic")
+                publisher_args = " ".join(
+                    shlex.quote(str(part)) for part in _sized_publisher_param_args(topic_name, load)
+                )
                 cmd = (
                     f"{ros_setup_a} && timeout 300 ros2 run com_py sized_publisher --ros-args "
-                    f"-p topic:={shlex.quote(topic_name)} -p size:={size} -p rate:={rate} -p streams:={streams} "
+                    f"{publisher_args} "
                     f'> "${{ROSOTACOM_LOGS_DIR}}/a/sized_publisher.log" 2>&1'
                 )
                 pub_cmds.append(cmd)
@@ -4846,6 +4893,7 @@ def benchmark_probe(args: argparse.Namespace) -> int:
             run_point,
             profile=args.profile,
             size=getattr(args, "size", 18_000),
+            size_pattern=getattr(args, "size_pattern", None),
             rate_hz=getattr(args, "rate_hz", 20.0),
             streams=getattr(args, "streams", 1),
             topic=getattr(args, "topic", ""),
@@ -5653,6 +5701,11 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
     _add_benchmark_common_args(probe_parser, ota_benchmark=ota_benchmark)
     probe_parser.add_argument("--profile", required=True, help="Network profile name.")
     probe_parser.add_argument("--size", type=int, default=18_000, help="Payload size (bytes).")
+    probe_parser.add_argument(
+        "--size-pattern",
+        default=None,
+        help="Cyclic payload sizes such as 1x20KB+1x0KB; overrides --size when set.",
+    )
     probe_parser.add_argument("--rate-hz", type=float, default=20.0, help="Publish rate (Hz).")
     probe_parser.add_argument("--streams", type=int, default=1, help="Parallel stream count.")
     probe_parser.add_argument("--topic", default="", help="Topic to characterize (default: all).")

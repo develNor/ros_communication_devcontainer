@@ -335,3 +335,107 @@ def plot_topic_heatmap(
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Raw fixed probe — individual packet latencies and packet losses
+# --------------------------------------------------------------------------- #
+
+
+def plot_probe_raw(
+    records: Sequence[dict[str, Any]],
+    *,
+    out: str | Path,
+    title: str = "Probe raw latency and loss",
+) -> Path:
+    """Render raw probe transit records: individual packet latencies and losses."""
+    _, plt = _require_matplotlib()
+    out = Path(out)
+
+    from .benchmark import _infer_nominal_period_s, _section_ms, _send_time
+
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in records:
+        source = str(row.get("source") or "")
+        target = str(row.get("target") or "")
+        topic = str(row.get("topic") or "")
+        topic_label = f"{source}->{target}:{topic}" if source or target else topic
+        attempt = int(row.get("attempt", 1) or 1)
+        grouped.setdefault((topic_label, attempt), []).append(row)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    cmap = plt.colormaps["tab10"].resampled(max(len(grouped), 1))
+
+    all_lost_xs: list[float] = []
+    max_latency = 0.0
+
+    for index, ((label, attempt), stream) in enumerate(sorted(grouped.items())):
+        stream = sorted(stream, key=lambda record: int(record.get("seq", 0)))
+
+        time_field = "t_wrap"
+        period_s = _infer_nominal_period_s(stream, time_field=time_field)
+        period_s = float(period_s or 0.0)
+
+        stamped = [record for record in stream if record.get(time_field) is not None]
+        if not stamped:
+            continue
+        anchor = min(stamped, key=lambda record: int(record.get("seq", 0)))
+        seq0 = int(anchor["seq"])
+        t0 = float(anchor.get(time_field) or 0.0)
+
+        expanded = []
+        for record in stream:
+            send_t = _send_time(record, seq0=seq0, t0=t0, period_s=period_s, time_field=time_field)
+            expanded.append((record, send_t))
+
+        if not expanded:
+            continue
+
+        first_send_s = min(send_t for _, send_t in expanded)
+
+        xs_delivered = []
+        ys_latency = []
+        xs_lost = []
+
+        for record, send_t in expanded:
+            x = max(0.0, send_t - first_send_s)
+            if record.get("status") == "lost":
+                xs_lost.append(x)
+            else:
+                latency_ms = _section_ms(record, "ota_hop_ms", "ota_hop_uncorrected_ms")
+                if latency_ms is not None:
+                    xs_delivered.append(x)
+                    ys_latency.append(latency_ms)
+                    if latency_ms > max_latency:
+                        max_latency = latency_ms
+
+        color = cmap(index)
+        stream_label = label
+        if len({key[1] for key in grouped}) > 1:
+            stream_label = f"{stream_label} #{attempt}"
+
+        if xs_delivered:
+            ax.scatter(xs_delivered, ys_latency, color=color, s=12, alpha=0.6, label=f"{stream_label} latency")
+
+        if xs_lost:
+            all_lost_xs.extend(xs_lost)
+
+    ax.set_ylim(bottom=0.0)
+    ymin, ymax = ax.get_ylim()
+
+    if all_lost_xs:
+        ax.vlines(all_lost_xs, ymin, ymax, colors="crimson", alpha=0.3, linewidth=1.0, label="lost packet")
+
+    ax.set_ylabel("Latency (ms)")
+    ax.set_xlabel("Time since first publish (s)")
+    ax.set_title(title)
+
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles, strict=False))
+    if by_label:
+        ax.legend(by_label.values(), by_label.keys(), loc="upper right", fontsize="small")
+
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out

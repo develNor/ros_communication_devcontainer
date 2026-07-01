@@ -21,6 +21,7 @@ from rosotacom.plots import (  # noqa: E402, I001
     plot_capacity_frontier,
     plot_offered_bw,
     plot_probe_timeseries,
+    plot_probe_raw,
     plot_ramp,
     plot_recovery_timeline,
     plot_topic_heatmap,
@@ -86,6 +87,42 @@ PROBE_BINS: list[dict] = [
     },
 ]
 
+RAW_RECORDS: list[dict] = [
+    {
+        "kind": "transit",
+        "peer": "b",
+        "source": "a",
+        "target": "b",
+        "topic": "/bench_capacity",
+        "seq": 0,
+        "status": "delivered",
+        "t_wrap": 10.0,
+        "sections": {"ota_hop_ms": 10.0},
+        "size_bytes": 100,
+    },
+    {
+        "kind": "transit",
+        "peer": "b",
+        "source": "a",
+        "target": "b",
+        "topic": "/bench_capacity",
+        "seq": 1,
+        "status": "lost",
+    },
+    {
+        "kind": "transit",
+        "peer": "b",
+        "source": "a",
+        "target": "b",
+        "topic": "/bench_capacity",
+        "seq": 2,
+        "status": "delivered",
+        "t_wrap": 11.0,
+        "sections": {"ota_hop_ms": 20.0},
+        "size_bytes": 200,
+    },
+]
+
 
 # -- smoke tests ------------------------------------------------------------ #
 
@@ -107,6 +144,13 @@ def test_offered_bw_writes_figure(tmp_path: Path) -> None:
 def test_probe_timeseries_writes_figure(tmp_path: Path) -> None:
     out = tmp_path / "probe.png"
     result = plot_probe_timeseries(PROBE_BINS, out=out)
+    assert result == out
+    assert out.stat().st_size > 0
+
+
+def test_probe_raw_writes_figure(tmp_path: Path) -> None:
+    out = tmp_path / "probe_raw.png"
+    result = plot_probe_raw(RAW_RECORDS, out=out)
     assert result == out
     assert out.stat().st_size > 0
 

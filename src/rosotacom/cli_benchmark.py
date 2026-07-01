@@ -1159,11 +1159,20 @@ def drive_probe(
     plot_error: str | None = None
     if render_plot and time_bins:
         try:
-            from .plots import plot_probe_timeseries
+            from .plots import plot_probe_raw, plot_probe_timeseries
 
             plot_path = plot_probe_timeseries(time_bins, out=out_dir / "probe-timeseries.png")
             artifacts["plot"] = plot_path.name
             print(f"Probe plot saved to {plot_path}")
+
+            try:
+                raw_records = _load_raw_records_from_out(out_dir)
+                if raw_records:
+                    raw_plot_path = plot_probe_raw(raw_records, out=out_dir / "probe-raw.png")
+                    artifacts["plot_raw"] = raw_plot_path.name
+                    print(f"Probe raw plot saved to {raw_plot_path}")
+            except Exception as raw_exc:
+                print(f"Probe raw plot skipped: {raw_exc}", file=sys.stderr)
         except Exception as exc:
             plot_error = str(exc)
             artifacts["plot_error"] = plot_error
@@ -1531,12 +1540,35 @@ def _load_raw_records_from_out(out_dir: Path) -> list[dict[str, Any]]:
     """Load raw transit records from the most recent run's events files."""
     from .transit import join_transit_records, load_transit_records
 
+    # Check if there are attempt subdirectories
+    attempts_dirs = sorted(out_dir.glob("attempts/attempt_*"))
+    if attempts_dirs:
+        records: list[dict[str, Any]] = []
+        for attempt_dir in attempts_dirs:
+            try:
+                attempt = int(attempt_dir.name.split("_")[-1])
+            except ValueError:
+                attempt = 1
+            events = sorted(attempt_dir.rglob("status/events.jsonl"))
+            if not events:
+                events = sorted(attempt_dir.rglob("events.jsonl"))
+            if events:
+                joined = join_transit_records(load_transit_records(events))
+                for r in joined:
+                    r["attempt"] = attempt
+                records.extend(joined)
+        return records
+
     events = sorted(out_dir.rglob("status/events.jsonl"))
     if not events:
         events = sorted(out_dir.rglob("events.jsonl"))
     if not events:
         return []
-    return join_transit_records(load_transit_records(events))
+    joined = join_transit_records(load_transit_records(events))
+    for r in joined:
+        if "attempt" not in r:
+            r["attempt"] = 1
+    return joined
 
 
 # --------------------------------------------------------------------------- #
@@ -5448,6 +5480,7 @@ def benchmark_plot(args: argparse.Namespace) -> int:
     from .plots import (
         plot_capacity_frontier,
         plot_offered_bw,
+        plot_probe_raw,
         plot_probe_timeseries,
         plot_ramp,
         plot_recovery_timeline,
@@ -5493,6 +5526,26 @@ def benchmark_plot(args: argparse.Namespace) -> int:
                 plot_capacity_frontier(data, out=out)
             elif plot_type == "probe":
                 plot_probe_timeseries(data, out=out)
+                try:
+                    raw_records = _load_raw_records_from_out(input_path.parent)
+                    if raw_records:
+                        raw_out = (
+                            Path(args.out).parent / "probe-raw.png"
+                            if getattr(args, "out", None)
+                            else input_path.parent / "probe-raw.png"
+                        )
+                        if getattr(args, "out", None) and Path(args.out) == raw_out:
+                            raw_out = Path(args.out).parent / "probe-raw.png"
+                        plot_probe_raw(raw_records, out=raw_out)
+                        print(f"Probe raw plot saved to {raw_out}")
+                except Exception:
+                    pass
+            elif plot_type == "probe-raw":
+                raw_out = Path(args.out) if getattr(args, "out", None) else input_path.parent / "probe-raw.png"
+                raw_records = _load_raw_records_from_out(input_path.parent)
+                plot_probe_raw(raw_records, out=raw_out)
+                print(f"Probe raw plot saved to {raw_out}")
+
             elif plot_type == "offered_bw":
                 plot_offered_bw(data, out=out)
             elif plot_type == "ramp":
@@ -5507,7 +5560,8 @@ def benchmark_plot(args: argparse.Namespace) -> int:
                 plot_topic_heatmap(per_topic, out=out)
             else:
                 print(
-                    f"Unknown plot type: {plot_type!r}. Use: frontier, probe, offered_bw, ramp, recovery, heatmap.",
+                    f"Unknown plot type: {plot_type!r}. Use: frontier, probe, "
+                    "probe-raw, offered_bw, ramp, recovery, heatmap.",
                     file=sys.stderr,
                 )
                 return 1
@@ -6079,7 +6133,7 @@ def _register_benchmark_plot_parser(benchmark_subparsers: Any) -> None:
     plot_parser.add_argument("--artifacts-dir", help="Output directory for all benchmark artifacts.")
     plot_parser.add_argument(
         "--type",
-        choices=["auto", "frontier", "probe", "offered_bw", "ramp", "recovery", "heatmap"],
+        choices=["auto", "frontier", "probe", "probe-raw", "offered_bw", "ramp", "recovery", "heatmap"],
         default="auto",
         help="Plot type (default: auto-detect from data).",
     )

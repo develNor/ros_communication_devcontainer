@@ -352,7 +352,15 @@ def plot_probe_raw(
     _, plt = _require_matplotlib()
     out = Path(out)
 
-    from .benchmark import _infer_nominal_period_s, _section_ms, _send_time
+    from .benchmark import (
+        SETTLED,
+        TRANSITION,
+        WARMUP,
+        _infer_nominal_period_s,
+        _section_ms,
+        _send_time,
+        classify_probe_settling,
+    )
 
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for row in records:
@@ -367,7 +375,7 @@ def plot_probe_raw(
     cmap = plt.colormaps["tab10"].resampled(max(len(grouped), 1))
 
     all_lost_xs: list[float] = []
-    max_latency = 0.0
+    reanchored = False
 
     for index, ((label, attempt), stream) in enumerate(sorted(grouped.items())):
         stream = sorted(stream, key=lambda record: int(record.get("seq", 0)))
@@ -393,41 +401,102 @@ def plot_probe_raw(
 
         first_send_s = min(send_t for _, send_t in expanded)
 
-        xs_delivered = []
-        ys_latency = []
-        xs_lost = []
-
+        # Delivered samples in send-time order, so the settling detector sees the
+        # warm-up → settled step in the order it happened.
+        delivered: list[tuple[float, float]] = []
+        stream_lost_xs: list[float] = []
         for record, send_t in expanded:
             x = max(0.0, send_t - first_send_s)
             if record.get("status") == "lost":
-                xs_lost.append(x)
-            else:
-                latency_ms = _section_ms(record, "ota_hop_ms", "ota_hop_uncorrected_ms")
-                if latency_ms is not None:
-                    xs_delivered.append(x)
-                    ys_latency.append(latency_ms)
-                    if latency_ms > max_latency:
-                        max_latency = latency_ms
+                stream_lost_xs.append(x)
+                continue
+            latency_ms = _section_ms(record, "ota_hop_ms", "ota_hop_uncorrected_ms")
+            if latency_ms is not None:
+                delivered.append((x, latency_ms))
+        delivered.sort(key=lambda point: point[0])
+
+        settling = classify_probe_settling([lat for _, lat in delivered])
+        # Re-anchor time so t=0 is the impairment onset: the settled regime starts
+        # at 0 and the excluded setup (warm-up/transition) falls at negative time.
+        onset_x = (
+            delivered[settling.onset_index][0]
+            if settling.onset_index is not None and settling.onset_index < len(delivered)
+            else 0.0
+        )
+        reanchored = reanchored or bool(onset_x)
+
+        regimes: dict[str, tuple[list[float], list[float]]] = {
+            SETTLED: ([], []),
+            WARMUP: ([], []),
+            TRANSITION: ([], []),
+        }
+        for (x, lat), sample_label in zip(delivered, settling.labels, strict=True):
+            xs, ys = regimes[sample_label]
+            xs.append(x - onset_x)
+            ys.append(lat)
+        all_lost_xs.extend(x - onset_x for x in stream_lost_xs)
 
         color = cmap(index)
         stream_label = label
         if len({key[1] for key in grouped}) > 1:
             stream_label = f"{stream_label} #{attempt}"
 
-        if xs_delivered:
-            ax.scatter(xs_delivered, ys_latency, color=color, s=12, alpha=0.6, label=f"{stream_label} latency")
+        s_xs, s_ys = regimes[SETTLED]
+        if s_xs:
+            ax.scatter(s_xs, s_ys, color=color, s=12, alpha=0.6, label=f"{stream_label} latency")
 
-        if xs_lost:
-            all_lost_xs.extend(xs_lost)
+        w_xs, w_ys = regimes[WARMUP]
+        if w_xs:
+            ax.scatter(
+                w_xs,
+                w_ys,
+                facecolors="none",
+                edgecolors="0.6",
+                s=14,
+                alpha=0.7,
+                label="excluded: warm-up (pre-impairment)",
+            )
+
+        t_xs, t_ys = regimes[TRANSITION]
+        if t_xs:
+            ax.scatter(
+                t_xs,
+                t_ys,
+                color="crimson",
+                marker="x",
+                s=55,
+                linewidths=1.6,
+                label="excluded: transition (partial)",
+            )
+
+        # Dashed line at the onset (t=0 once re-anchored), so the split is obvious.
+        if onset_x:
+            ax.axvline(
+                0.0,
+                color="0.5",
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.8,
+                label="impairment onset (t=0)",
+            )
 
     ax.set_ylim(bottom=0.0)
     ymin, ymax = ax.get_ylim()
 
-    if all_lost_xs:
-        ax.vlines(all_lost_xs, ymin, ymax, colors="crimson", alpha=0.3, linewidth=1.0, label="lost packet")
+    # After re-anchoring, losses at t<0 happened during setup (e.g. the packet
+    # dropped as the qdisc changed); they are excluded like the warm-up, so the
+    # settled-window summary correctly reports them as no loss.
+    setup_lost = [x for x in all_lost_xs if x < 0.0]
+    real_lost = [x for x in all_lost_xs if x >= 0.0]
+    if real_lost:
+        ax.vlines(real_lost, ymin, ymax, colors="crimson", alpha=0.3, linewidth=1.0, label="lost packet")
+    if setup_lost:
+        ax.vlines(setup_lost, ymin, ymax, colors="0.6", alpha=0.4, linewidth=1.0, label="excluded: setup loss")
 
     ax.set_ylabel("Latency (ms)")
-    ax.set_xlabel("Time since first publish (s)")
+    ax.set_xlabel(
+        "Time relative to impairment onset (s); setup at t<0" if reanchored else "Time since first publish (s)"
+    )
     ax.set_title(title)
 
     handles, labels = ax.get_legend_handles_labels()

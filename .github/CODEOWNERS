@@ -1,0 +1,8 @@
+# CODEOWNERS file for ros_communication_devcontainer
+# High-risk CI, release, and packaging surfaces
+/.github/                     @develNor
+/pyproject.toml               @develNor
+/justfile                     @develNor
+/docs/release.md              @develNor
+/docs/release-notes/          @develNor
+/src/rosotacom/resources/     @develNor

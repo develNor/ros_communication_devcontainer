@@ -21,6 +21,8 @@
 
 ## Checks
 
+- [ ] `just lint-workflows`
+- [ ] `just lint-build`
 - [ ] `just lint`
 - [ ] `just typecheck`
 - [ ] `just test-unit`

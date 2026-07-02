@@ -68,8 +68,16 @@ def test_cli_resource_constants_point_inside_package_resources() -> None:
 
 
 def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
-    default_build_args = cli.load_config(cli.DEFAULT_ROS2DOCKER_CONFIG)["build_args"]
-    example_build_args = cli.load_config(cli.EXAMPLE_PROJECT_DIR / "ros2docker.json")["build_args"]
+    default_config = cli.load_config(cli.DEFAULT_ROS2DOCKER_CONFIG)
+    example_config = cli.load_config(cli.EXAMPLE_PROJECT_DIR / "ros2docker.json")
+
+    assert default_config.get("profile") is None
+    assert not default_config.get("profiles")
+    assert example_config.get("profile") is None
+    assert not example_config.get("profiles")
+
+    default_build_args = default_config["build_args"]
+    example_build_args = example_config["build_args"]
 
     assert default_build_args["BASE_IMAGE"] == "osrf/ros:kilted-desktop-full-noble"
     assert default_build_args["DIGEST"].startswith("@sha256:")
@@ -111,10 +119,41 @@ def test_shell_entrypoints_pass_syntax_check() -> None:
         subprocess.run(["bash", "-n", str(script)], check=True)
 
     subprocess.run(["bash", "-n", str(cli.WS_DIR / "session" / "creation" / "catmux_log_setup.sh")], check=True)
+    subprocess.run(["bash", "-n", str(PACKAGE_ROOT / "install.sh")], check=True)
     subprocess.run(
         ["python3", "-m", "py_compile", str(cli.WS_DIR / "session" / "creation" / "strip_ansi.py")],
         check=True,
     )
+
+
+def test_all_owned_configs_parse_and_validate() -> None:
+    from rosotacom.cli import load_config
+
+    # 1. ros2docker.json.example
+    load_config(cli.DEFAULT_ROS2DOCKER_CONFIG)
+
+    # 2. rosotacom.yaml example
+    yaml.safe_load(cli.EXAMPLE_PROJECT_DIR.joinpath("rosotacom.yaml").read_text(encoding="utf-8"))
+
+    # 3. profiles.yaml
+    # Tested by test_packaged_example_profiles_parse
+
+    # 4. deployment.example.yaml
+    yaml.safe_load(cli.EXAMPLE_PROJECT_DIR.joinpath("deployment.example.yaml").read_text(encoding="utf-8"))
+
+    # 5. ros2docker.json
+    load_config(cli.EXAMPLE_PROJECT_DIR / "ros2docker.json")
+
+    # 6. session and scenario definitions
+    session_files = sorted(cli.EXAMPLE_PROJECT_DIR.glob("sessions/*/session-definition.yaml"))
+    assert session_files
+    for session_file in session_files:
+        yaml.safe_load(session_file.read_text(encoding="utf-8"))
+
+    scenario_files = sorted(cli.EXAMPLE_PROJECT_DIR.glob("scenarios/*/scenario-definition.yaml"))
+    assert scenario_files
+    for scenario_file in scenario_files:
+        yaml.safe_load(scenario_file.read_text(encoding="utf-8"))
 
 
 def test_base_plugin_catmux_commands_are_strings() -> None:

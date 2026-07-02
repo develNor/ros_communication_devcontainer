@@ -215,6 +215,7 @@ class SmokeTopicSpec:
     label: str
     enforce_bounds: bool
     use_default_bounds: bool = False
+    delivery_mode: str = "stream"
     publish_topic: str | None = None
     publish_type: str | None = None
     publish_rate: float = 5.0
@@ -1622,7 +1623,7 @@ def _ota_packaged_source_bundle(destination: Path) -> Path:
                 'name = "rosotacom"',
                 f'version = "{__version__}"',
                 'requires-python = ">=3.10"',
-                'dependencies = ["argcomplete>=3.6,<4", "PyYAML>=6", "ros2docker>=0.1.2,<0.2"]',
+                'dependencies = ["argcomplete>=3.6,<4", "PyYAML>=6", "ros2docker>=0.1.3,<0.2"]',
                 "",
                 "[project.scripts]",
                 'rosotacom = "rosotacom.cli:main"',
@@ -5131,7 +5132,20 @@ def _smoke_postprocessed_topic(entry: Any, pipe: dict[str, Any]) -> str:
         return str(pipe["comp_in"])
     if pipe.get("ota_wrap"):
         return str(pipe["ota_in"])
+    if pipe.get("framebridge") == "global_to_local":
+        return str(pipe["fb_g2l_base"])
     return str(pipe["final"])
+
+
+def _smoke_source_publish_topic(
+    cfg: dict[str, Any],
+    source_peer_key: str,
+    receiver_peer_key: str,
+    entry: Any,
+    pipe: dict[str, Any],
+) -> str:
+    source_topic = str(pipe["final"]) if pipe.get("framebridge") == "global_to_local" else entry.base
+    return _smoke_forward_topic_for_inbound(cfg, source_peer_key, receiver_peer_key, source_topic)
 
 
 def _smoke_expect_bounds(expect: Any) -> tuple[float | None, float | None, float | None]:
@@ -5147,6 +5161,13 @@ def _smoke_expect_bounds(expect: Any) -> tuple[float | None, float | None, float
         else None
     )
     return hz_min, hz_max, max_delay_s
+
+
+def _smoke_expect_mode(expect: Any) -> str:
+    if not isinstance(expect, dict):
+        return "stream"
+    mode = str(expect.get("mode", "stream")).strip().lower() or "stream"
+    return mode if mode in {"stream", "latched", "existence"} else "stream"
 
 
 def _smoke_publish_qos(qos: Any) -> dict[str, Any] | None:
@@ -5182,6 +5203,20 @@ def _smoke_native_publish_rate(expect: Any) -> float:
     return _smoke_publish_rate(expect)
 
 
+def _smoke_source_publish_rate(expect: Any, pipe: dict[str, Any]) -> float:
+    native_rate = _smoke_native_publish_rate(expect)
+    if isinstance(expect, dict) and expect.get("smoke_native_hz") is not None:
+        return native_rate
+    drop_count = pipe.get("drop_count")
+    window_size = pipe.get("window_size")
+    if drop_count is None or window_size is None:
+        return native_rate
+    delivered_per_window = int(window_size) - int(drop_count)
+    if delivered_per_window <= 0:
+        return native_rate
+    return native_rate * (int(window_size) / delivered_per_window)
+
+
 def _smoke_rmw_spec(cfg: dict[str, Any]) -> Any:
     peers = cfg.get("peers", {}) or {}
     if not isinstance(peers, dict):
@@ -5198,6 +5233,17 @@ def _smoke_rmw_env_value(cfg: dict[str, Any]) -> str | None:
     if local_impl is None:
         return None
     return str(session_gen.RMW_ALIASES.get(local_impl, local_impl))
+
+
+SMOKE_CYCLONEDDS_MAX_AUTO_PARTICIPANT_INDEX = 99
+
+
+def _smoke_default_cyclonedds_uri() -> str:
+    return (
+        "<CycloneDDS><Domain><Discovery><ParticipantIndex>auto</ParticipantIndex>"
+        f"<MaxAutoParticipantIndex>{SMOKE_CYCLONEDDS_MAX_AUTO_PARTICIPANT_INDEX}</MaxAutoParticipantIndex>"
+        "</Discovery></Domain></CycloneDDS>"
+    )
 
 
 def _smoke_local_domain_id(cfg: dict[str, Any], receiver_peer_key: str) -> str | None:
@@ -5246,7 +5292,11 @@ def _smoke_ros_setup(config_container_dir: str, cfg: dict[str, Any], receiver_pe
     local_domain_id = _smoke_local_domain_id(cfg, receiver_peer_key)
     if local_domain_id:
         commands.append(f"export ROS_DOMAIN_ID={shlex.quote(local_domain_id)}")
-    commands.extend(_smoke_local_config_commands(config_container_dir, cfg, receiver_peer_key))
+    local_config_commands = _smoke_local_config_commands(config_container_dir, cfg, receiver_peer_key)
+    if local_config_commands:
+        commands.extend(local_config_commands)
+    elif rmw_env == "rmw_cyclonedds_cpp":
+        commands.append(f"export CYCLONEDDS_URI={shlex.quote(_smoke_default_cyclonedds_uri())}")
     return " && ".join(commands)
 
 
@@ -5256,7 +5306,7 @@ def _smoke_ros_setup(config_container_dir: str, cfg: dict[str, Any], receiver_pe
 SMOKE_HZ_MIN = 5.0
 SMOKE_HZ_MAX = 20.0
 SMOKE_MAX_DELAY_S = 1.0
-SMOKE_PUBLISHER_DURATION_S = 900.0
+SMOKE_PUBLISHER_DURATION_S = 3600.0
 ISOLATION_PROBE_TOPIC = "/local_only"
 
 
@@ -5320,6 +5370,7 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
             received_topic = _smoke_receiver_final_topic(cfg, src, dst, postprocessed_topic)
             inbound_topic = _smoke_inbound_forward_topic(cfg, src, dst, final_topic)
             expect_hz_min, expect_hz_max, expect_max_delay_s = _smoke_expect_bounds(entry.expect)
+            expect_mode = _smoke_expect_mode(entry.expect)
             specs.extend(
                 [
                     SmokeTopicSpec(
@@ -5328,18 +5379,19 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
                         topic=inbound_topic,
                         label=f"{src}->{dst} inbound bridge topic",
                         enforce_bounds=False,
+                        delivery_mode=expect_mode,
                     ),
                     SmokeTopicSpec(
                         source_peer_key=src,
                         receiver_peer_key=dst,
                         topic=received_topic,
                         label=f"{src}->{dst} final topic",
-                        enforce_bounds=any(
-                            value is not None for value in (expect_hz_min, expect_hz_max, expect_max_delay_s)
-                        ),
-                        publish_topic=_smoke_forward_topic_for_inbound(cfg, src, dst, entry.base),
+                        enforce_bounds=expect_mode == "stream"
+                        and any(value is not None for value in (expect_hz_min, expect_hz_max, expect_max_delay_s)),
+                        delivery_mode=expect_mode,
+                        publish_topic=_smoke_source_publish_topic(cfg, src, dst, entry, pipe),
                         publish_type=entry.msg_type,
-                        publish_rate=_smoke_native_publish_rate(entry.expect),
+                        publish_rate=_smoke_source_publish_rate(entry.expect, pipe),
                         hz_min=expect_hz_min,
                         hz_max=expect_hz_max,
                         max_delay_s=expect_max_delay_s,
@@ -5372,6 +5424,19 @@ def _verify_received_topics(
         topic = spec.topic
         label = spec.label
         log_line(f"Waiting for {label} ({topic}) in {container_name}")
+        if spec.delivery_mode in {"latched", "existence"}:
+            present = False
+            for _ in range(10):
+                if _topic_present(container_name, ros_setup, topic):
+                    present = True
+                    break
+                time.sleep(1)
+            if not present:
+                errors.append(f"{label} ({topic}) not present in {container_name}")
+                continue
+            log_line(f"OK: {label} ({topic}) is present in {container_name} ({spec.delivery_mode})")
+            log_line(_smoke_metric_line(label=label, topic=topic, container_name=container_name, hz=None, delay_s=None))
+            continue
         output = _wait_for_topic_hz(container_name, ros_setup, topic)
         if detail_log:
             detail_log(f"\n--- {label} ({topic}) in {container_name} ---\n{output}")
@@ -5424,6 +5489,12 @@ def _smoke_publish_message(msg_type: str) -> str:
         return "{header: {frame_id: base_link}, twist: {linear: {x: 1.0}, angular: {z: 0.1}}}"
     if normalized in {"tf2_msgs/msg/TFMessage", "tf2_msgs/TFMessage"}:
         return "{transforms: [{header: {frame_id: map}, child_frame_id: base_link, transform: {rotation: {w: 1.0}}}]}"
+    if normalized in {"visualization_msgs/msg/MarkerArray", "visualization_msgs/MarkerArray"}:
+        return (
+            "{markers: [{header: {frame_id: map}, ns: smoke, id: 1, type: 1, action: 0, "
+            "pose: {orientation: {w: 1.0}}, scale: {x: 1.0, y: 1.0, z: 1.0}, "
+            "color: {r: 0.0, g: 0.7, b: 1.0, a: 1.0}}]}"
+        )
     if normalized == "nav_msgs/msg/OccupancyGrid":
         return (
             "{header: {frame_id: map}, "
@@ -5432,6 +5503,21 @@ def _smoke_publish_message(msg_type: str) -> str:
         )
     if normalized in {"sensor_msgs/msg/CameraInfo", "sensor_msgs/CameraInfo"}:
         return "{header: {frame_id: camera}, height: 1, width: 1}"
+    if normalized in {"sensor_msgs/msg/CompressedImage", "sensor_msgs/CompressedImage"}:
+        return (
+            "{header: {frame_id: camera}, format: png, data: ["
+            "137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, "
+            "0, 0, 0, 32, 0, 0, 0, 32, 8, 2, 0, 0, 0, 252, 24, 237, 163, "
+            "0, 0, 0, 93, 73, 68, 65, 84, 72, 13, 181, 193, 1, 1, 0, 0, "
+            "0, 130, 160, 124, 238, 243, 90, 17, 80, 115, 69, 205, 21, 53, "
+            "87, 212, 92, 81, 115, 69, 205, 21, 53, 87, 212, 92, 81, 115, "
+            "69, 205, 21, 53, 87, 212, 92, 81, 115, 69, 205, 21, 53, 87, "
+            "212, 92, 81, 115, 69, 205, 21, 53, 87, 212, 92, 81, 115, 69, "
+            "205, 21, 53, 87, 212, 92, 81, 115, 69, 205, 21, 53, 87, 212, "
+            "92, 81, 115, 69, 205, 21, 53, 87, 212, 92, 13, 245, 197, 48, "
+            "1, 194, 66, 132, 57, "
+            "0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]}"
+        )
     if normalized in {"sensor_msgs/msg/NavSatFix", "sensor_msgs/NavSatFix"}:
         return (
             "{header: {frame_id: gps}, status: {status: 0, service: 1}, "

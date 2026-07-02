@@ -49,6 +49,98 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     assert "just test-e2e-smoke" in merge_gate
 
 
+def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
+    content = MERGE_GATE_PATH.read_text(encoding="utf-8")
+    data = yaml.safe_load(content)
+    jobs = data["jobs"]
+
+    # 1. ci-success depends on the new required jobs
+    ci_success = jobs["ci-success"]
+    needs = ci_success["needs"]
+    expected_jobs = {"workflow-lint", "dependency-review", "build-lint", "merge-lightweight", "package", "fast-e2e"}
+    assert expected_jobs.issubset(set(needs))
+
+    # Check that required jobs are validated in the bash step of ci-success
+    check_step = next(step for step in ci_success["steps"] if step.get("name") == "Check required jobs")
+    run_script = check_step["run"]
+    for job in expected_jobs:
+        if job == "dependency-review":
+            assert f"needs.{job}.result" in run_script
+        else:
+            assert f"needs.{job}.result" + ' }}" != "success' in run_script
+
+    # 2. required jobs do not use continue-on-error: true or || true masking
+    for job_name in expected_jobs:
+        job = jobs[job_name]
+        assert job.get("continue-on-error", False) is False
+        for step in job.get("steps", []):
+            assert step.get("continue-on-error", False) is False
+            run_cmd = step.get("run", "")
+            # Ensure no masking with || true or || exit 0
+            assert "|| true" not in run_cmd
+            assert "|| exit 0" not in run_cmd
+
+
+def test_dependency_review_configuration() -> None:
+    content = MERGE_GATE_PATH.read_text(encoding="utf-8")
+    data = yaml.safe_load(content)
+
+    dep_review_job = data["jobs"]["dependency-review"]
+    step = next(step for step in dep_review_job["steps"] if "dependency-review-action" in step.get("uses", ""))
+
+    with_opts = step["with"]
+    assert with_opts["fail-on-severity"] == "high"
+    assert "development" in with_opts["fail-on-scopes"]
+    assert "runtime" in with_opts["fail-on-scopes"]
+
+    # Check license policy denying strong-copyleft GPL/AGPL/LGPL
+    deny_licenses = with_opts["deny-licenses"]
+    for lic in ["GPL-1.0-only", "GPL-2.0-only", "GPL-3.0-only", "AGPL-3.0-only", "LGPL-2.1-only", "LGPL-3.0-only"]:
+        assert lic in deny_licenses
+
+
+def test_actionlint_pins_are_in_sync() -> None:
+    pre_commit_path = PACKAGE_ROOT / ".pre-commit-config.yaml"
+    pre_commit_data = yaml.safe_load(pre_commit_path.read_text(encoding="utf-8"))
+
+    actionlint_repo = next(repo for repo in pre_commit_data["repos"] if "github.com/rhysd/actionlint" in repo["repo"])
+    pre_commit_version = actionlint_repo["rev"].lstrip("v")
+
+    merge_gate_content = MERGE_GATE_PATH.read_text(encoding="utf-8")
+    merge_gate_data = yaml.safe_load(merge_gate_content)
+    workflow_lint_job = merge_gate_data["jobs"]["workflow-lint"]
+    install_step = next(step for step in workflow_lint_job["steps"] if step.get("name") == "Install actionlint")
+    assert f'ACTIONLINT_VERSION="{pre_commit_version}"' in install_step["run"]
+
+
+def test_codeowners_covers_high_risk_paths() -> None:
+    codeowners_path = PACKAGE_ROOT / ".github" / "CODEOWNERS"
+    assert codeowners_path.is_file()
+
+    content = codeowners_path.read_text(encoding="utf-8")
+    lines = [line.strip() for line in content.splitlines() if line.strip() and not line.startswith("#")]
+
+    expected_paths = {
+        "/.github/",
+        "/pyproject.toml",
+        "/justfile",
+        "/docs/release.md",
+        "/docs/release-notes/",
+        "/src/rosotacom/resources/",
+    }
+
+    covered_paths = set()
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2:
+            path = parts[0]
+            owner = parts[1]
+            assert owner == "@develNor"
+            covered_paths.add(path)
+
+    assert expected_paths.issubset(covered_paths)
+
+
 def test_full_e2e_workflow_runs_nightly_and_supports_manual_dispatch() -> None:
     full_e2e = FULL_E2E_PATH.read_text(encoding="utf-8")
 

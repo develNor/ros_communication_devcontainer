@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317
 # Mirror the current catmux/tmux pane to a per-instance log file.
 #
 # This file is sourced from catmux common.before_commands. It must be tolerant:

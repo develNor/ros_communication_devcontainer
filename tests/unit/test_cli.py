@@ -4,9 +4,12 @@ import argparse
 import base64
 import io
 import os
+import re
+import struct
 import subprocess
 import sys
 import tarfile
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1913,7 +1916,7 @@ def test_stop_list_doctor_and_smoke_host_flows(
         == 0
     )
     assert publisher_durations == [rosotacom.SMOKE_PUBLISHER_DURATION_S]
-    assert rosotacom.SMOKE_PUBLISHER_DURATION_S == 900.0
+    assert rosotacom.SMOKE_PUBLISHER_DURATION_S == 3600.0
     assert networks_created == [(smoke_network.name, smoke_network.subnet)]
     assert [(args.identity, args.network_name, args.network_ip) for args in started] == [
         ("a", smoke_network.name, smoke_network.peer_ips["a"]),
@@ -2009,8 +2012,25 @@ def test_smoke_crossed_topics_include_native_chatter_direction() -> None:
         for s in rosotacom._smoke_publish_specs(cfg, source_peer_key="b")
     ] == [("b", "a", "/chatter")]
     assert rosotacom._smoke_publish_specs(cfg, source_peer_key="a") == []
-    assert "export ROS_DOMAIN_ID=46" in rosotacom._smoke_ros_setup("/config", cfg, "a")
-    assert "export ROS_DOMAIN_ID=47" in rosotacom._smoke_ros_setup("/config", cfg, "b")
+    setup_a = rosotacom._smoke_ros_setup("/config", cfg, "a")
+    setup_b = rosotacom._smoke_ros_setup("/config", cfg, "b")
+    assert "export ROS_DOMAIN_ID=46" in setup_a
+    assert "export ROS_DOMAIN_ID=47" in setup_b
+    assert "export CYCLONEDDS_URI=" in setup_a
+    assert "MaxAutoParticipantIndex>99<" in setup_a
+
+
+def test_smoke_ros_setup_keeps_explicit_cyclonedds_config() -> None:
+    cfg = yaml.safe_load(
+        (rosotacom.EXAMPLE_PROJECT_DIR / "sessions" / "1_heartbeat_status" / "session-definition.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    setup = rosotacom._smoke_ros_setup("/config", cfg, "a")
+
+    assert "export CYCLONEDDS_URI=file:///config/a/local_dds.xml" in setup
+    assert "MaxAutoParticipantIndex" not in setup
 
 
 def test_smoke_publish_specs_use_source_target_prefix_and_qos() -> None:
@@ -2051,6 +2071,74 @@ def test_smoke_publish_specs_use_source_target_prefix_and_qos() -> None:
     assert "--qos-durability transient_local" in command
 
 
+def test_smoke_global_to_local_publishes_and_asserts_generated_pipeline_topics() -> None:
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {
+            "a": {"domain_id": 46, "outbound": {"target_prefix": {"use_target_prefix": True}}},
+            "b": {"domain_id": 47},
+        },
+        "shared": {"processing_suffixes": {"framebridge_global": "/globalframe"}},
+        "topics": {
+            "a_to_b": [
+                {
+                    "topic": "/move_base_free/goal",
+                    "type": "geometry_msgs/msg/PoseStamped",
+                    "processing": {"framebridge": "global_to_local"},
+                    "expect": {"mode": "latched", "presence": "required"},
+                }
+            ]
+        },
+    }
+
+    specs = rosotacom._received_crossed_topics(cfg, "b")
+
+    assert [(s.topic, s.label, s.publish_topic) for s in specs] == [
+        ("/com/in/a/to_b/move_base_free/goal/globalframe", "a->b inbound bridge topic", None),
+        ("/move_base_free/goal", "a->b final topic", "/to_b/move_base_free/goal/globalframe"),
+    ]
+    assert [s.delivery_mode for s in specs] == ["latched", "latched"]
+    assert not specs[-1].enforce_bounds
+
+
+def test_verify_received_topics_checks_latched_presence_not_rate(monkeypatch: pytest.MonkeyPatch) -> None:
+    spec = rosotacom.SmokeTopicSpec(
+        source_peer_key="b",
+        receiver_peer_key="a",
+        topic="/b/site/latched",
+        label="b->a final topic",
+        enforce_bounds=False,
+        delivery_mode="latched",
+    )
+    log_lines: list[str] = []
+    present_checks: list[str] = []
+
+    monkeypatch.setattr(rosotacom, "_received_crossed_topics", lambda cfg, receiver: [spec])
+
+    def fake_present(container: str, ros_setup: str, topic: str) -> bool:
+        present_checks.append(topic)
+        return True
+
+    monkeypatch.setattr(rosotacom, "_topic_present", fake_present)
+    monkeypatch.setattr(
+        rosotacom,
+        "_wait_for_topic_hz",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("latched topics must not use topic hz")),
+    )
+
+    errors = rosotacom._verify_received_topics(
+        "container_a",
+        "source ros",
+        {},
+        "a",
+        log_line=log_lines.append,
+    )
+
+    assert errors == []
+    assert present_checks == ["/b/site/latched"]
+    assert any("is present" in line and "latched" in line for line in log_lines)
+
+
 def test_smoke_probe_false_keeps_topic_out_of_synthetic_runner() -> None:
     cfg = {
         "peers": {"a": {}, "b": {}},
@@ -2073,6 +2161,13 @@ def test_smoke_native_publish_rate_override() -> None:
     assert rosotacom._smoke_native_publish_rate({"smoke_native_hz": 10, "hz": {"min": 3, "max": 7}}) == 10.0
     # Without the override it falls back to the derived rate (midpoint of bounds).
     assert rosotacom._smoke_native_publish_rate({"hz": {"min": 4, "max": 6}}) == 5.0
+
+
+def test_smoke_source_publish_rate_compensates_derived_drop_rate() -> None:
+    pipe = {"drop_count": 1, "window_size": 2}
+
+    assert rosotacom._smoke_source_publish_rate({"hz": {"min": 2}}, pipe) == 6.0
+    assert rosotacom._smoke_source_publish_rate({"smoke_native_hz": 10, "hz": {"min": 2}}, pipe) == 10.0
 
 
 def test_drop_example_source_publishes_at_native_rate() -> None:
@@ -2112,7 +2207,9 @@ def test_restamp_example_uses_stale_stamped_header_source() -> None:
         "geometry_msgs/msg/PoseStamped",
         "geometry_msgs/msg/TwistStamped",
         "tf2_msgs/msg/TFMessage",
+        "visualization_msgs/msg/MarkerArray",
         "sensor_msgs/msg/CameraInfo",
+        "sensor_msgs/msg/CompressedImage",
         "sensor_msgs/msg/NavSatFix",
         "gps_msgs/msg/GPSFix",
         "com_msgs/msg/CompressedData",
@@ -2121,6 +2218,32 @@ def test_restamp_example_uses_stale_stamped_header_source() -> None:
 )
 def test_smoke_publish_message_supports_remote_assist_anonymized_types(msg_type: str) -> None:
     assert rosotacom._smoke_publish_message(msg_type)
+
+
+def test_smoke_compressed_image_payload_is_valid_png_for_ffmpeg_path() -> None:
+    msg = rosotacom._smoke_publish_message("sensor_msgs/msg/CompressedImage")
+    match = re.search(r"data: \[([^\]]+)\]", msg)
+    assert match is not None
+    png = bytes(int(item.strip()) for item in match.group(1).split(","))
+
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    chunks: list[tuple[bytes, bytes]] = []
+    offset = 8
+    while offset < len(png):
+        length = struct.unpack(">I", png[offset : offset + 4])[0]
+        chunk_type = png[offset + 4 : offset + 8]
+        chunk_data = png[offset + 8 : offset + 8 + length]
+        expected_crc = struct.unpack(">I", png[offset + 8 + length : offset + 12 + length])[0]
+        actual_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+        assert actual_crc == expected_crc
+        chunks.append((chunk_type, chunk_data))
+        offset += 12 + length
+
+    assert offset == len(png)
+    assert chunks[0][0] == b"IHDR"
+    assert struct.unpack(">II", chunks[0][1][:8]) == (32, 32)
+    assert any(chunk_type == b"IDAT" for chunk_type, _ in chunks)
+    assert chunks[-1][0] == b"IEND"
 
 
 def test_named_stage_latency_is_left_to_status_oracle() -> None:

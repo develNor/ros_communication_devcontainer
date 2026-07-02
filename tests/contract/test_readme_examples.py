@@ -71,6 +71,8 @@ def test_packaged_example_project_contains_documented_heartbeat_session() -> Non
     assert "rosotacom scenario start 2_native_chatter" in readme
     assert "rosotacom smoke 2_native_chatter --interactive" in readme
     assert "rosotacom smoke 14_remote_assist_anonymized" in readme
+    assert "rosotacom smoke 15_remote_assist_anonymized_costmap" in readme
+    assert "rosotacom smoke 16_remote_assist_anonymized_camera" in readme
     assert "rosotacom ota-smoke 2_native_chatter \\" in readme
     assert "--peer-ssh b=robot-b" in readme
     assert (cli.EXAMPLE_PROJECT_DIR / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()

@@ -26,6 +26,8 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
         "resources/examples/sessions/1_heartbeat/session-definition.yaml",
         "resources/examples/sessions/1_heartbeat_status/session-definition.yaml",
         "resources/examples/sessions/14_remote_assist_anonymized/session-definition.yaml",
+        "resources/examples/sessions/15_remote_assist_anonymized_costmap/session-definition.yaml",
+        "resources/examples/sessions/16_remote_assist_anonymized_camera/session-definition.yaml",
         "resources/examples/scenarios/2_native_chatter/scenario-definition.yaml",
         "resources/ws/session/creation/run_session.py",
         "resources/ws/session/creation/catmux_log_setup.sh",

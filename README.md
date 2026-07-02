@@ -456,6 +456,12 @@ The `sessions/` directory contains curated built-in session definitions:
 - `14_remote_assist_anonymized`: generic processed replay shape for the
   remote-assist OTA contract; run it with
   `rosotacom smoke 14_remote_assist_anonymized`
+- `15_remote_assist_anonymized_costmap`: single-stream cut of example 14 —
+  only `/topic5`, the anonymized compressed occupancy-grid stream; run it with
+  `rosotacom smoke 15_remote_assist_anonymized_costmap`
+- `16_remote_assist_anonymized_camera`: single-stream cut of example 14 —
+  only `/topic9`, the anonymized ffmpeg camera stream; run it with
+  `rosotacom smoke 16_remote_assist_anonymized_camera`
 
 Transport-combination coverage lives under `tests/sessions/rmw_matrix` and is
 generated from `tests/sessions/generate_rmw_matrix.py`.

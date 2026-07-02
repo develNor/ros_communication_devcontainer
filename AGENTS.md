@@ -9,6 +9,9 @@ Read first:
 - `CONTRIBUTING.md` for setup, checks, CI, PR workflow, and releases.
 - `DEVELOPMENT_PRINCIPLES.md` for quality rules.
 - `docs/work-items.md` for issue-driven work tracking.
+- `docs/quality-model.md` for hard vs. soft checks, the task hierarchy, and the
+  shared task contract.
+- `docs/owner-runbook.md` for owner-facing entrypoints and gates.
 - `.github/ISSUE_TEMPLATE/` for reusable task recipes.
 
 Shared workflow:
@@ -28,6 +31,10 @@ Shared workflow:
 - Update tests and docs when CLI, config, package, Docker, or public runtime behavior changes.
 - Validate what you build: every behaviour you implement should be verified by something that runs, wherever possible and sensible. Prefer automation (unit/contract test > an example exercised in CI smoke > a scripted check); fall back to a documented manual check only when automation is genuinely impossible, and say why. Add the verification in the same change as the behaviour.
 - Keep docs reachable: every doc must be linkable from `README.md` (directly, or via a doc already linked there — e.g. a new RFC goes in `docs/rfcs/README.md`). Link new docs in the same change, and link any orphan you notice.
+- Run quality workflow issues diagnosis-first: use
+  `.github/ISSUE_TEMPLATE/repository-diagnosis.md` before opening audit,
+  cleanup, or redesign work, and create only the follow-up issues that diagnosis
+  names.
 - Do not skip, weaken, or delete tests/CI to make a change pass.
 - Enable GitHub auto-merge after opening the PR whenever repository policy
   allows it. Use this repository's allowed/default merge method; currently only

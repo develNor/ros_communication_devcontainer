@@ -81,26 +81,28 @@ def test_teardown_tolerates_a_missing_qdisc() -> None:
     assert not shaper.armed
 
 
-def test_apply_tolerates_timeline_cleanup_with_no_qdisc() -> None:
-    runner = FakeRunner(fail_on="del")
+def test_apply_runs_step_commands_as_is() -> None:
+    # Timeline steps update the qdisc tree in place (`replace`) — apply must run
+    # them verbatim, with no clean-slate of its own between steps.
+    runner = FakeRunner()
     shaper = ProfileShaper("tun0", runner)
-    shaping = ["tc", "qdisc", "add", "dev", "tun0", "root", "handle", "10:", "netem", "delay", "50ms"]
+    shaping = ["tc", "qdisc", "replace", "dev", "tun0", "root", "handle", "10:", "netem", "delay", "50ms"]
 
-    shaper.apply([teardown_command("tun0"), shaping])
+    shaper.apply([shaping])
 
-    assert runner.calls == [teardown_command("tun0"), shaping]
+    assert runner.calls == [shaping]
     assert shaper.armed
 
 
 def test_apply_reraises_timeline_shaping_failures() -> None:
-    runner = FakeRunner(fail_on="add")
+    runner = FakeRunner(fail_on="replace")
     shaper = ProfileShaper("tun0", runner)
-    shaping = ["tc", "qdisc", "add", "dev", "tun0", "root", "handle", "10:", "netem", "delay", "50ms"]
+    shaping = ["tc", "qdisc", "replace", "dev", "tun0", "root", "handle", "10:", "netem", "delay", "50ms"]
 
-    with pytest.raises(RuntimeError, match="boom on 'add'"):
-        shaper.apply([teardown_command("tun0"), shaping])
+    with pytest.raises(RuntimeError, match="boom on 'replace'"):
+        shaper.apply([shaping])
 
-    assert runner.calls == [teardown_command("tun0"), shaping]
+    assert runner.calls == [shaping]
 
 
 # --- revert on stop and on error (the context manager) --------------------- #
@@ -109,7 +111,7 @@ def test_apply_reraises_timeline_shaping_failures() -> None:
 def test_context_manager_reverts_on_normal_exit() -> None:
     runner = FakeRunner()
     with ProfileShaper("tun0", runner) as shaper:
-        shaper.apply([["tc", "qdisc", "add", "dev", "tun0", "root", "handle", "10:", "netem", "loss", "1%"]])
+        shaper.apply([["tc", "qdisc", "replace", "dev", "tun0", "root", "handle", "10:", "netem", "loss", "1%"]])
         assert shaper.armed
     assert runner.calls[-2:] == [teardown_command("tun0"), restore_link_command("tun0")]
     assert not shaper.armed
@@ -119,7 +121,7 @@ def test_context_manager_reverts_on_error_and_reraises() -> None:
     runner = FakeRunner()
     with pytest.raises(ValueError, match="run blew up"):
         with ProfileShaper("tun0", runner) as shaper:
-            shaper.apply([["tc", "qdisc", "add", "dev", "tun0", "root", "handle", "10:", "netem", "loss", "1%"]])
+            shaper.apply([["tc", "qdisc", "replace", "dev", "tun0", "root", "handle", "10:", "netem", "loss", "1%"]])
             raise ValueError("run blew up")
     # The error propagates, but the interface is still reverted.
     assert runner.calls[-2:] == [teardown_command("tun0"), restore_link_command("tun0")]

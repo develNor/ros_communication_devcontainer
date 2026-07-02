@@ -194,7 +194,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     needs: preflight-success
-    if: needs.preflight-success.result == 'success'
+    if: always() && !cancelled() && needs.preflight-success.result == 'success'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -234,7 +234,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     needs: preflight-success
-    if: needs.preflight-success.result == 'success'
+    if: always() && !cancelled() && needs.preflight-success.result == 'success'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -274,7 +274,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     needs: preflight-success
-    if: needs.preflight-success.result == 'success'
+    if: always() && !cancelled() && needs.preflight-success.result == 'success'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -314,7 +314,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     needs: preflight-success
-    if: needs.preflight-success.result == 'success'
+    if: always() && !cancelled() && needs.preflight-success.result == 'success'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -354,7 +354,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     needs: preflight-success
-    if: needs.preflight-success.result == 'success'
+    if: always() && !cancelled() && needs.preflight-success.result == 'success'
     steps:
       - name: Check out repository
         uses: actions/checkout@v6

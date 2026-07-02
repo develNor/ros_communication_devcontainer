@@ -103,19 +103,13 @@ def test_actionlint_pins_are_in_sync() -> None:
     pre_commit_path = PACKAGE_ROOT / ".pre-commit-config.yaml"
     pre_commit_data = yaml.safe_load(pre_commit_path.read_text(encoding="utf-8"))
 
-    actionlint_repo = next(
-        repo for repo in pre_commit_data["repos"]
-        if "github.com/rhysd/actionlint" in repo["repo"]
-    )
+    actionlint_repo = next(repo for repo in pre_commit_data["repos"] if "github.com/rhysd/actionlint" in repo["repo"])
     pre_commit_version = actionlint_repo["rev"].lstrip("v")
 
     merge_gate_content = MERGE_GATE_PATH.read_text(encoding="utf-8")
     merge_gate_data = yaml.safe_load(merge_gate_content)
     workflow_lint_job = merge_gate_data["jobs"]["workflow-lint"]
-    install_step = next(
-        step for step in workflow_lint_job["steps"]
-        if step.get("name") == "Install actionlint"
-    )
+    install_step = next(step for step in workflow_lint_job["steps"] if step.get("name") == "Install actionlint")
     assert f'ACTIONLINT_VERSION="{pre_commit_version}"' in install_step["run"]
 
 

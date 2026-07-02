@@ -148,7 +148,6 @@ def test_all_owned_configs_parse_and_validate() -> None:
         yaml.safe_load(scenario_file.read_text(encoding="utf-8"))
 
 
-
 def test_base_plugin_catmux_commands_are_strings() -> None:
     plugin = yaml.safe_load(
         (cli.WS_DIR / "session" / "content" / "base" / "session_plugin_base.yaml").read_text(encoding="utf-8")

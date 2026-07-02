@@ -255,6 +255,9 @@ session/scenario definition. It:
 3. Renames the handoff topics to generic names like `/topic1`, `/topic2`, etc.
 4. Replaces message contents with mock payloads while preserving message shape,
    timestamps, payload lengths, bag QoS metadata, and playback QoS overrides.
+   For ffmpeg camera packets it additionally preserves the keyframe flag and
+   `pts`, keeping the GOP burst structure analyzable — see
+   [docs/ffmpeg-keyframes.md](docs/ffmpeg-keyframes.md).
 5. Generates a self-contained `rosotacom` project containing the anonymized bag,
    processed-topic session definition, replay scenario, QoS overrides, and an
    anonymization manifest.

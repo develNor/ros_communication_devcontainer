@@ -74,6 +74,26 @@ class MockMessage:
         self.nested_list = [MockInner("subsecret", 8)]
 
 
+class MockFFMPEGPacket:
+    """Mimics ffmpeg_image_transport_msgs FFMPEGPacket (ROS 2 slots carry a
+    leading underscore); only the class NAME drives the preserve rules."""
+
+    __slots__ = ["_header", "_width", "_height", "_encoding", "_pts", "_flags", "_is_bigendian", "_data"]
+
+    def __init__(self):
+        self._header = Time(1, 2)
+        self._width = 640
+        self._height = 480
+        self._encoding = "h264"
+        self._pts = 987
+        self._flags = 1
+        self._is_bigendian = False
+        self._data = b"\x01\x02\x03"
+
+
+MockFFMPEGPacket.__name__ = "FFMPEGPacket"
+
+
 def test_anonymize_msg_recursive_replacement() -> None:
     msg = MockMessage()
     anonymize_bag.anonymize_msg(msg)
@@ -95,42 +115,57 @@ def test_anonymize_msg_recursive_replacement() -> None:
     assert msg.nested_list[0].inner_int == 0
 
 
-def test_anonymize_bag_writer_preserves_offered_qos_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    bag_dir = tmp_path / "processed_bag"
-    bag_dir.mkdir()
-    offered_qos = [{"reliability": "reliable", "durability": "transient_local", "depth": 1}]
-    metadata = {
-        "rosbag2_bagfile_information": {
-            "storage_identifier": "mcap",
-            "topics_with_message_count": [
-                {
-                    "message_count": 1,
-                    "topic_metadata": {
-                        "name": "/processed",
-                        "type": "std_msgs/msg/String",
-                        "serialization_format": "cdr",
-                        "offered_qos_profiles": offered_qos,
-                    },
-                }
-            ],
-        }
-    }
-    with open(bag_dir / "metadata.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(metadata, f)
+def test_anonymize_msg_preserves_ffmpeg_keyframe_structure() -> None:
+    """flags (bit 0 = AV_PKT_FLAG_KEY) and pts survive anonymization so GOP
+    analysis works on anonymized replay bags; everything else is still zeroed."""
+    msg = MockFFMPEGPacket()
+    anonymize_bag.anonymize_msg(msg)
 
+    assert msg._flags == 1
+    assert msg._pts == 987
+    assert msg._data == b"\x00\x00\x00"
+    assert msg._encoding == "xxxx"
+    assert msg._width == 0
+    assert msg._height == 0
+
+
+class FakeTopicMetadata:
+    def __init__(self, id, name, type, serialization_format, offered_qos_profiles):
+        self.id = id
+        self.name = name
+        self.type = type
+        self.serialization_format = serialization_format
+        self.offered_qos_profiles = offered_qos_profiles
+
+
+def _fake_reader_cls(topics: list[FakeTopicMetadata], messages: list[tuple[str, bytes, int]]):
     class FakeReader:
         def __init__(self) -> None:
-            self.done = False
+            self._remaining = list(messages)
 
         def open(self, *args, **kwargs) -> None:
             pass
 
+        def get_all_topics_and_types(self):
+            return topics
+
         def has_next(self) -> bool:
-            return not self.done
+            return bool(self._remaining)
 
         def read_next(self):
-            self.done = True
-            return "/processed", b"serialized", 123
+            return self._remaining.pop(0)
+
+    return FakeReader
+
+
+def test_anonymize_bag_writer_reuses_reader_topic_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Output topics must be registered from the reader's own typed
+    TopicMetadata (incl. its QoS objects) — re-parsing metadata.yaml into dicts
+    breaks the rosbag2_py TopicMetadata constructor."""
+    bag_dir = tmp_path / "processed_bag"
+    bag_dir.mkdir()
+    offered_qos = ["<opaque rosbag2 QoS object>"]
+    input_metadata = FakeTopicMetadata(1, "/processed", "std_msgs/msg/String", "cdr", offered_qos)
 
     created_topics = []
     writes = []
@@ -145,15 +180,11 @@ def test_anonymize_bag_writer_preserves_offered_qos_profiles(tmp_path: Path, mon
         def write(self, *args) -> None:
             writes.append(args)
 
-    class FakeTopicMetadata:
-        def __init__(self, id, name, type, serialization_format, offered_qos_profiles):
-            self.id = id
-            self.name = name
-            self.type = type
-            self.serialization_format = serialization_format
-            self.offered_qos_profiles = offered_qos_profiles
-
-    monkeypatch.setattr(anonymize_bag.rosbag2_py, "SequentialReader", FakeReader)
+    monkeypatch.setattr(
+        anonymize_bag.rosbag2_py,
+        "SequentialReader",
+        _fake_reader_cls([input_metadata], [("/processed", b"serialized", 123)]),
+    )
     monkeypatch.setattr(anonymize_bag.rosbag2_py, "SequentialWriter", FakeWriter)
     monkeypatch.setattr(anonymize_bag.rosbag2_py, "TopicMetadata", FakeTopicMetadata)
     monkeypatch.setattr(anonymize_bag.rosbag2_py, "StorageOptions", lambda **kwargs: kwargs)
@@ -177,30 +208,19 @@ def test_anonymize_bag_writer_preserves_offered_qos_profiles(tmp_path: Path, mon
 
     assert anonymize_bag.main() == 0
     assert created_topics[0].name == "/topic1"
-    assert created_topics[0].offered_qos_profiles == offered_qos
+    assert created_topics[0].type == "std_msgs/msg/String"
+    assert created_topics[0].serialization_format == "cdr"
+    assert created_topics[0].offered_qos_profiles is offered_qos
     assert writes == [("/topic1", b"anonymized", 123)]
 
 
 def test_anonymize_bag_fails_when_mapped_topic_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     bag_dir = tmp_path / "processed_bag"
     bag_dir.mkdir()
-    metadata = {
-        "rosbag2_bagfile_information": {
-            "storage_identifier": "mcap",
-            "topics_with_message_count": [
-                {
-                    "message_count": 1,
-                    "topic_metadata": {
-                        "name": "/present",
-                        "type": "std_msgs/msg/String",
-                        "serialization_format": "cdr",
-                    },
-                }
-            ],
-        }
-    }
-    with open(bag_dir / "metadata.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(metadata, f)
+    present = FakeTopicMetadata(1, "/present", "std_msgs/msg/String", "cdr", [])
+    monkeypatch.setattr(anonymize_bag.rosbag2_py, "SequentialReader", _fake_reader_cls([present], []))
+    monkeypatch.setattr(anonymize_bag.rosbag2_py, "StorageOptions", lambda **kwargs: kwargs)
+    monkeypatch.setattr(anonymize_bag.rosbag2_py, "ConverterOptions", lambda *args: args)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -349,6 +369,9 @@ def test_anonymize_cli_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert len(container_runs) == 1
     override, extra_args = container_runs[0]
     assert override["container_name"] == "rosotacom_anonymizer"
+    # Batch job must stay headless-safe: a TTY aborts without a terminal.
+    assert override["tty"] is False
+    assert override["stdin_open"] is False
     assert "anonymize_bag.py" in override["command"]
     assert f"/input_parent_dir/{bag_dir.name}" in override["command"]
 

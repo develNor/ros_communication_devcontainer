@@ -7297,8 +7297,10 @@ def anonymize_command(args: argparse.Namespace) -> int:
                 "image_name": image_name,
                 "run_type": "command",
                 "command": " ".join(container_command),
-                "tty": True,
-                "stdin_open": True,
+                # Batch job: a TTY would make headless runs (CI, agents) abort
+                # with "cannot attach stdin to a TTY-enabled container".
+                "tty": False,
+                "stdin_open": False,
             },
             extra_run_args=extra_run_args,
         )

@@ -68,8 +68,16 @@ def test_cli_resource_constants_point_inside_package_resources() -> None:
 
 
 def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
-    default_build_args = cli.load_config(cli.DEFAULT_ROS2DOCKER_CONFIG)["build_args"]
-    example_build_args = cli.load_config(cli.EXAMPLE_PROJECT_DIR / "ros2docker.json")["build_args"]
+    default_config = cli.load_config(cli.DEFAULT_ROS2DOCKER_CONFIG)
+    example_config = cli.load_config(cli.EXAMPLE_PROJECT_DIR / "ros2docker.json")
+
+    assert default_config.get("profile") is None
+    assert not default_config.get("profiles")
+    assert example_config.get("profile") is None
+    assert not example_config.get("profiles")
+
+    default_build_args = default_config["build_args"]
+    example_build_args = example_config["build_args"]
 
     assert default_build_args["BASE_IMAGE"] == "osrf/ros:kilted-desktop-full-noble"
     assert default_build_args["DIGEST"].startswith("@sha256:")

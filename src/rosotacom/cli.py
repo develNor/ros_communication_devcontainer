@@ -1549,7 +1549,7 @@ def _ota_packaged_source_bundle(destination: Path) -> Path:
                 'name = "rosotacom"',
                 f'version = "{__version__}"',
                 'requires-python = ">=3.10"',
-                'dependencies = ["argcomplete>=3.6,<4", "PyYAML>=6", "ros2docker>=0.1.2,<0.2"]',
+                'dependencies = ["argcomplete>=3.6,<4", "PyYAML>=6", "ros2docker>=0.1.3,<0.2"]',
                 "",
                 "[project.scripts]",
                 'rosotacom = "rosotacom.cli:main"',

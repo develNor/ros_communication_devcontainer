@@ -2256,3 +2256,64 @@ def test_tee_stream_and_stdout_redirection(tmp_path: Path) -> None:
     assert "Hello from test stderr" in log_content
     assert "sub stdout" in log_content
     assert "sub stderr" in log_content
+
+
+def test_probe_driver_prints_latency_and_arrival_spacing_details(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fixed probe prints the full latency distribution, the first/last-third
+    p50 trend, and the arrival-spacing bunching stats (RFC 0005 characterization)."""
+    from rosotacom.transit import summarize_transit_records
+
+    # 12 messages at 100 ms cadence; latency ramps 10 -> 65 ms; one stalled
+    # arrival gap (300 ms) immediately followed by a bunched one (5 ms).
+    gaps = [None, 100.0, 100.0, 100.0, 100.0, 100.0, 300.0, 5.0, 100.0, 100.0, 100.0, 100.0]
+    records = [
+        {
+            "kind": "transit",
+            "source": "a",
+            "target": "b",
+            "topic": "/test",
+            "seq": seq,
+            "status": "delivered",
+            "t_wrap": 10.0 + 0.1 * seq,
+            "sections": {"ota_hop_ms": 10.0 + 5.0 * seq},
+            "jitter_ms": 2.0,
+            "inter_arrival_ms": gaps[seq],
+            "size_bytes": 100,
+        }
+        for seq in range(12)
+    ]
+
+    def stub(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        events_dir = out_dir / "logs" / "b" / "status"
+        events_dir.mkdir(parents=True)
+        (events_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+        )
+        return summarize_transit_records(records)
+
+    result = drive_probe(
+        stub,
+        profile="lossless-typical",
+        size=100,
+        rate_hz=10.0,
+        repeats=1,
+        duration_s=1.2,
+        bin_s=1.0,
+        render_plot=False,
+        out_dir=tmp_path,
+    )
+
+    out = capsys.readouterr().out
+    assert "p50=35.0ms p95=65.0ms" in out
+    assert "latency_ms: min=10.0 p50=35.0 mean=37.5 p95=65.0 p99=65.0 max=65.0 std=" in out
+    assert "latency_p50_trend_ms: first_third=15.0 last_third=55.0 delta=+40.0" in out
+    assert "inter_arrival_ms: min=5.0 p05=5.0 p50=100.0" in out
+    assert (
+        "arrival_spacing vs nominal=100.0ms: bunched(<50.0ms)=9.091% stalled(>150.0ms)=9.091% stall_then_bunch=100.0%"
+        in out
+    )
+    row = result["attempts"][0]["topics"][0]
+    assert row["latency_trend_ms"]["delta"] == 40.0
+    assert row["inter_arrival_ms"]["stall_then_bunch_pct"] == 100.0

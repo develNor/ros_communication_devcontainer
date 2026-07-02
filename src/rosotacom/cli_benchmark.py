@@ -1059,8 +1059,11 @@ def _topic_rows(summary: dict[str, Any], topic: str = "") -> list[dict[str, Any]
     rows: list[dict[str, Any]] = []
     for topic_name, topic_data in selected:
         topic_data = topic_data if isinstance(topic_data, dict) else {}
-        ota = topic_data.get("ota_hop_ms") or {}
-        jitter = topic_data.get("jitter_ms") or {}
+
+        def stat_block(name: str, data: dict[str, Any] = topic_data) -> dict[str, Any]:
+            value = data.get(name)
+            return dict(value) if isinstance(value, dict) else {}
+
         rows.append(
             {
                 "topic": str(topic_name),
@@ -1069,14 +1072,10 @@ def _topic_rows(summary: dict[str, Any], topic: str = "") -> list[dict[str, Any]
                 "lost": topic_data.get("lost"),
                 "loss_pct": topic_data.get("loss_pct"),
                 "reordered": topic_data.get("reordered"),
-                "latency_ms": {
-                    "p50": ota.get("p50") if isinstance(ota, dict) else None,
-                    "p95": ota.get("p95") if isinstance(ota, dict) else None,
-                },
-                "jitter_ms": {
-                    "p50": jitter.get("p50") if isinstance(jitter, dict) else None,
-                    "p95": jitter.get("p95") if isinstance(jitter, dict) else None,
-                },
+                "latency_ms": stat_block("ota_hop_ms"),
+                "latency_trend_ms": stat_block("ota_hop_trend_ms"),
+                "jitter_ms": stat_block("jitter_ms"),
+                "inter_arrival_ms": stat_block("inter_arrival_ms"),
             }
         )
     return rows
@@ -1088,13 +1087,53 @@ def _format_topic_rows(rows: Sequence[dict[str, Any]]) -> str:
     parts = []
     for row in rows:
         loss = row.get("loss_pct")
-        latency_p95 = (row.get("latency_ms") or {}).get("p95")
+        latency = row.get("latency_ms") or {}
         jitter_p95 = (row.get("jitter_ms") or {}).get("p95")
         parts.append(
             f"{row.get('topic')}: delivered={row.get('delivered')}/{row.get('expected')} "
-            f"lost={row.get('lost')} loss={loss}% p95={latency_p95}ms jitter_p95={jitter_p95}ms"
+            f"lost={row.get('lost')} loss={loss}% p50={latency.get('p50')}ms p95={latency.get('p95')}ms "
+            f"jitter_p95={jitter_p95}ms"
         )
     return "; ".join(parts)
+
+
+def _format_stats(stats: dict[str, Any], keys: Sequence[str]) -> str:
+    parts = [f"{key}={stats[key]}" for key in keys if stats.get(key) is not None]
+    return " ".join(parts) if parts else "no data"
+
+
+def _format_topic_details(rows: Sequence[dict[str, Any]]) -> str:
+    """Multi-line per-topic distribution block printed under the probe summary line."""
+    from .transit import BUNCHED_GAP_FRACTION, STALLED_GAP_FRACTION
+
+    lines: list[str] = []
+    for row in rows:
+        lines.append(f"    {row.get('topic')}:")
+        lines.append(
+            "      latency_ms: "
+            + _format_stats(row.get("latency_ms") or {}, ("min", "p50", "mean", "p95", "p99", "max", "std"))
+        )
+        trend = row.get("latency_trend_ms") or {}
+        if trend.get("delta") is not None:
+            lines.append(
+                f"      latency_p50_trend_ms: first_third={trend.get('first_third_p50')} "
+                f"last_third={trend.get('last_third_p50')} delta={trend.get('delta'):+}"
+            )
+        lines.append("      jitter_ms: " + _format_stats(row.get("jitter_ms") or {}, ("p50", "mean", "p95", "max")))
+        spacing = row.get("inter_arrival_ms") or {}
+        lines.append(
+            "      inter_arrival_ms: "
+            + _format_stats(spacing, ("min", "p05", "p50", "mean", "p95", "p99", "max", "std"))
+        )
+        nominal = spacing.get("nominal_period_ms")
+        if nominal:
+            lines.append(
+                f"      arrival_spacing vs nominal={nominal}ms: "
+                f"bunched(<{round(BUNCHED_GAP_FRACTION * nominal, 3)}ms)={spacing.get('bunched_pct')}% "
+                f"stalled(>{round(STALLED_GAP_FRACTION * nominal, 3)}ms)={spacing.get('stalled_pct')}% "
+                f"stall_then_bunch={spacing.get('stall_then_bunch_pct')}%"
+            )
+    return "\n".join(lines)
 
 
 def _write_benchmark_result(
@@ -1275,6 +1314,9 @@ def drive_probe(
             f"offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} "
             f"bins={len(attempt_bins)}{warmup_note} {_format_topic_rows(attempt_result['topics'])}"
         )
+        details = _format_topic_details(attempt_result["topics"])
+        if details:
+            print(details)
 
     bins_path = out_dir / "time-bins.jsonl"
     bins_path.write_text(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 
 from rosotacom.transit import (
@@ -95,3 +96,68 @@ def test_filter_transit_records_by_publish_window_keeps_delayed_tail_delivery() 
     assert summary["expected"] == 2
     assert summary["lost"] == 0
     assert summary["ota_hop_ms"]["p95"] == 50.0
+
+
+def test_summarize_reports_full_latency_distribution() -> None:
+    records = [_record(seq, "delivered", ota_ms=10.0 + 5.0 * seq, t_wrap=10.0 + 0.1 * seq) for seq in range(12)]
+
+    latency = summarize_transit_records(records)["topics"]["/x"]["ota_hop_ms"]
+
+    assert latency["min"] == 10.0
+    assert latency["max"] == 65.0
+    assert latency["mean"] == 37.5
+    assert latency["p50"] == 35.0
+    assert latency["p95"] == 65.0
+    assert latency["p99"] == 65.0
+    assert latency["std"] == round(statistics.pstdev(10.0 + 5.0 * seq for seq in range(12)), 3)
+
+
+def test_summarize_reports_latency_trend_between_first_and_last_third() -> None:
+    # Latency ramps 10 -> 65 ms over 12 messages published at 100 ms cadence:
+    # the first-third median stays low, the last-third median is high.
+    records = [_record(seq, "delivered", ota_ms=10.0 + 5.0 * seq, t_wrap=10.0 + 0.1 * seq) for seq in range(12)]
+
+    trend = summarize_transit_records(records)["topics"]["/x"]["ota_hop_trend_ms"]
+
+    assert trend == {"first_third_p50": 15.0, "last_third_p50": 55.0, "delta": 40.0}
+
+
+def test_summarize_latency_trend_needs_enough_stamped_points() -> None:
+    records = [_record(seq, "delivered", ota_ms=10.0, t_wrap=10.0 + 0.1 * seq) for seq in range(5)]
+
+    trend = summarize_transit_records(records)["topics"]["/x"]["ota_hop_trend_ms"]
+
+    assert trend == {"first_third_p50": None, "last_third_p50": None, "delta": None}
+
+
+def test_summarize_reports_arrival_spacing_and_bunching() -> None:
+    # 12 messages sent equidistantly at 100 ms. Arrivals are on-cadence except one
+    # stalled gap (300 ms) immediately followed by a bunched gap (5 ms) — the
+    # head-of-line-blocking signature under test.
+    gaps = [None, 100.0, 100.0, 100.0, 100.0, 100.0, 300.0, 5.0, 100.0, 100.0, 100.0, 100.0]
+    records = [
+        {**_record(seq, "delivered", ota_ms=20.0, t_wrap=10.0 + 0.1 * seq), "inter_arrival_ms": gaps[seq]}
+        for seq in range(12)
+    ]
+
+    spacing = summarize_transit_records(records)["topics"]["/x"]["inter_arrival_ms"]
+
+    assert spacing["nominal_period_ms"] == 100.0
+    assert spacing["min"] == 5.0
+    assert spacing["max"] == 300.0
+    assert spacing["p50"] == 100.0
+    assert spacing["p05"] == 5.0
+    assert spacing["bunched_pct"] == round(100.0 / 11.0, 3)
+    assert spacing["stalled_pct"] == round(100.0 / 11.0, 3)
+    assert spacing["stall_then_bunch_pct"] == 100.0
+
+
+def test_summarize_arrival_spacing_without_timestamps_has_no_bunching_verdict() -> None:
+    records = [{**_record(seq, "delivered", ota_ms=20.0), "inter_arrival_ms": 100.0} for seq in range(4)]
+
+    spacing = summarize_transit_records(records)["topics"]["/x"]["inter_arrival_ms"]
+
+    assert spacing["p50"] == 100.0
+    assert spacing["nominal_period_ms"] is None
+    assert spacing["bunched_pct"] is None
+    assert spacing["stall_then_bunch_pct"] is None

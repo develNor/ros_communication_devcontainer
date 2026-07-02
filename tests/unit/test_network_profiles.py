@@ -13,8 +13,6 @@ from rosotacom.network_profiles import (
     TimelineSegment,
     expand_timeline,
     load_profiles_file,
-    outage_commands,
-    outage_restore_commands,
     parse_direction,
     parse_ms,
     parse_pct,
@@ -92,14 +90,15 @@ def test_parse_direction_rejects_unknown_keys_and_invalid_combos() -> None:
 
 
 def test_shaping_commands_tbf_root_with_netem_child() -> None:
-    # The canonical static cellular profile from the calibrated baseline.
+    # The canonical static cellular profile from the calibrated baseline. Emitted
+    # as `replace` (add-or-change): creates from a clean slate, updates in place.
     shaping = DirectionShaping(rate_bps=4_000_000, delay_ms=120.0, jitter_ms=30.0, distribution="normal", loss_pct=2.0)
     commands = shaping_commands("tun0", shaping)
     assert commands == [
         [
             "tc",
             "qdisc",
-            "add",
+            "replace",
             "dev",
             "tun0",
             "root",
@@ -116,7 +115,7 @@ def test_shaping_commands_tbf_root_with_netem_child() -> None:
         [
             "tc",
             "qdisc",
-            "add",
+            "replace",
             "dev",
             "tun0",
             "parent",
@@ -138,7 +137,7 @@ def test_shaping_commands_tbf_root_with_netem_child() -> None:
 def test_shaping_commands_netem_only_becomes_root() -> None:
     commands = shaping_commands("tun0", DirectionShaping(delay_ms=60.0, loss_pct=1.0))
     assert commands == [
-        ["tc", "qdisc", "add", "dev", "tun0", "root", "handle", "10:", "netem", "delay", "60ms", "loss", "1%"]
+        ["tc", "qdisc", "replace", "dev", "tun0", "root", "handle", "10:", "netem", "delay", "60ms", "loss", "1%"]
     ]
 
 
@@ -148,7 +147,7 @@ def test_shaping_commands_rate_only_and_empty() -> None:
         [
             "tc",
             "qdisc",
-            "add",
+            "replace",
             "dev",
             "eth0",
             "root",
@@ -196,7 +195,7 @@ def test_shaping_commands_emit_netem_seed() -> None:
         [
             "tc",
             "qdisc",
-            "add",
+            "replace",
             "dev",
             "tun0",
             "root",
@@ -220,20 +219,44 @@ def test_teardown_is_root_delete() -> None:
     assert teardown_command("tun0") == ["tc", "qdisc", "del", "dev", "tun0", "root"]
 
 
-# --- outage kinds (both named variants) ------------------------------------ #
+# --- outage kinds (both named variants, in the timeline tree) --------------- #
 
 
-def test_outage_catchup_is_full_loss_interface_up() -> None:
-    assert outage_commands("tun0", OUTAGE_CATCHUP) == [
-        ["tc", "qdisc", "del", "dev", "tun0", "root"],
-        ["tc", "qdisc", "add", "dev", "tun0", "root", "handle", "10:", "netem", "loss", "100%"],
+def test_timeline_catchup_is_in_place_full_loss_interface_up() -> None:
+    profile = parse_profile(
+        "o",
+        {
+            "timeline": [
+                {"for": "5s", "uplink": {"delay": "50ms"}},
+                {"for": "5s", "outage": "catchup"},
+                {"for": "5s", "uplink": {"delay": "50ms"}},
+            ]
+        },
+    )
+    steps = expand_timeline(profile, "tun0")
+    assert steps[1].commands == [
+        ["tc", "qdisc", "replace", "dev", "tun0", "root", "handle", "10:", "netem", "loss", "100%"]
     ]
-    assert outage_restore_commands("tun0", OUTAGE_CATCHUP) == [["tc", "qdisc", "del", "dev", "tun0", "root"]]
+    # The interface never goes down, and the exit is the same in-place change back.
+    assert all(cmd[0] == "tc" for step in steps for cmd in step.commands)
+    assert steps[2].commands == steps[0].commands
 
 
-def test_outage_reconnect_is_link_down() -> None:
-    assert outage_commands("tun0", OUTAGE_RECONNECT) == [["ip", "link", "set", "dev", "tun0", "down"]]
-    assert outage_restore_commands("tun0", OUTAGE_RECONNECT) == [["ip", "link", "set", "dev", "tun0", "up"]]
+def test_timeline_reconnect_downs_link_and_next_step_restores_it_first() -> None:
+    profile = parse_profile(
+        "o",
+        {
+            "timeline": [
+                {"for": "5s", "uplink": {"rate": "4mbit"}},
+                {"for": "5s", "outage": "reconnect"},
+                {"for": "5s", "uplink": {"rate": "4mbit"}},
+            ]
+        },
+    )
+    steps = expand_timeline(profile, "tun0")
+    assert steps[1].commands == [["ip", "link", "set", "dev", "tun0", "down"]]
+    assert steps[2].commands[0] == ["ip", "link", "set", "dev", "tun0", "up"]
+    assert steps[2].commands[1:] == steps[0].commands
 
 
 # --- profile parsing (static + timeline) ----------------------------------- #
@@ -304,10 +327,52 @@ def test_expand_timeline_places_steps_on_absolute_clock() -> None:
         (30.0, 35.0, OUTAGE_CATCHUP),
         (35.0, 75.0, None),
     ]
-    # Every shaping step first tears the previous qdisc down (idempotent), then arms its own.
-    assert steps[0].commands[0] == teardown_command("tun0")
-    assert steps[0].commands[1][:9] == ["tc", "qdisc", "add", "dev", "tun0", "root", "handle", "1:", "tbf"]
-    assert steps[1].commands == outage_commands("tun0", OUTAGE_CATCHUP)
+    # Every step replaces the same tbf(1:)+netem(10:) tree in place — including the
+    # catchup outage, which is a full-loss netem on an unlimited tbf stage.
+    assert steps[0].commands[0][:9] == ["tc", "qdisc", "replace", "dev", "tun0", "root", "handle", "1:", "tbf"]
+    netem_prefix = ["tc", "qdisc", "replace", "dev", "tun0", "parent", "1:", "handle", "10:", "netem"]
+    assert steps[0].commands[1][:10] == netem_prefix
+    assert steps[1].commands[0][8:10] == ["tbf", "rate"] and "10gbit" in steps[1].commands[0]
+    assert steps[1].commands[1][-3:] == ["netem", "loss", "100%"]
+
+
+def test_expand_timeline_replaces_one_constant_tree_no_teardown() -> None:
+    # The seamlessness contract: a del+add between steps drops netem's queue and
+    # opens an unshaped window, so steps may only `replace` an unchanging tree.
+    profile = parse_profile(
+        "stepping",
+        {
+            "timeline": [
+                {"for": "5s", "uplink": {"rate": "8mbit", "delay": "50ms", "jitter": "15ms", "distribution": "normal"}},
+                {"for": "5s", "uplink": {"rate": "8mbit", "delay": "50ms", "jitter": "15ms", "distribution": "normal"}},
+                {"for": "5s", "uplink": {"delay": "50ms"}},
+                {"for": "5s", "uplink": {"rate": "3mbit"}},
+            ]
+        },
+    )
+    steps = expand_timeline(profile, "tun0", direction="uplink")
+    assert {cmd[2] for step in steps for cmd in step.commands} == {"replace"}
+    # Identical consecutive segments produce identical (idempotent) commands.
+    assert steps[1].commands == steps[0].commands
+    # The tree shape is constant: every step arms both stages. A rate-less step
+    # keeps the tbf stage as effectively-unlimited; a netem-less step keeps the
+    # netem stage as a bare pass-through (netem change resets omitted params).
+    assert [len(step.commands) for step in steps] == [2, 2, 2, 2]
+    assert "10gbit" in steps[2].commands[0]
+    assert steps[3].commands[1][-1] == "netem"
+
+
+def test_expand_timeline_unshaped_direction_arms_nothing() -> None:
+    profile = parse_profile(
+        "uplink-only",
+        {
+            "timeline": [
+                {"for": "5s", "uplink": {"rate": "4mbit"}},
+                {"for": "5s", "uplink": {"rate": "2mbit"}},
+            ]
+        },
+    )
+    assert all(step.commands == [] for step in expand_timeline(profile, "tun0", direction="downlink"))
 
 
 def test_expand_timeline_uses_the_requested_direction() -> None:
@@ -324,8 +389,8 @@ def test_expand_timeline_uses_the_requested_direction() -> None:
     )
     up = expand_timeline(profile, "tun0", direction="uplink")[0]
     down = expand_timeline(profile, "tun0", direction="downlink")[0]
-    assert "1000000bit" in up.commands[1]
-    assert "25000000bit" in down.commands[1]
+    assert "1000000bit" in up.commands[0]
+    assert "25000000bit" in down.commands[0]
     with pytest.raises(ValueError):
         expand_timeline(profile, "tun0", direction="sideways")
 

@@ -1433,15 +1433,15 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
         command[:6] == ["docker", "exec", "-u", "root", "container_b", "tc"] and "1%" in command for command in commands
     )
     assert sleep_calls[-2:] == [0.1, DEFAULT_BENCHMARK_DRAIN_S]
-    uplink_add = next(
+    uplink_arm = next(
         i
         for i, command in enumerate(commands)
-        if command[:8] == ["docker", "exec", "-u", "root", "container_a", "tc", "qdisc", "add"]
+        if command[:8] == ["docker", "exec", "-u", "root", "container_a", "tc", "qdisc", "replace"]
     )
     publisher_stop = next(
         i
         for i, command in enumerate(commands)
-        if i > uplink_add and command == ["docker", "exec", "container_a", "pkill", "-f", "sized_publisher"]
+        if i > uplink_arm and command == ["docker", "exec", "container_a", "pkill", "-f", "sized_publisher"]
     )
     final_uplink_teardown = max(
         i

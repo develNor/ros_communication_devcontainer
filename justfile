@@ -92,4 +92,11 @@ _package-smoke:
 pre-commit:
 	{{python}} -m pre_commit run --all-files
 
-check: lint typecheck test-nondocker-cov docs package
+lint-workflows:
+	{{python}} -m pre_commit run actionlint --all-files
+
+lint-build:
+	{{bin}}/shellcheck install.sh src/rosotacom/resources/ws/session/creation/catmux_log_setup.sh src/rosotacom/resources/examples/scripts/**/*.sh
+	{{python}} -m pytest -q tests/contract/test_packaged_resources.py
+
+check: lint lint-workflows lint-build typecheck test-nondocker-cov docs package

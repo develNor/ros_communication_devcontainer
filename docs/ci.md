@@ -39,13 +39,14 @@ check is:
 ci-success
 ```
 
-The merge gate runs Python 3.10 through 3.14 non-Docker checks, package
-validation, and the Docker single-machine smoke matrix:
+The merge gate runs workflow lint, dependency/security review, runtime/build asset lint, Python 3.10 through 3.14 non-Docker checks, package validation, and the Docker single-machine smoke matrix:
 
 Python 3.10–3.14 are supported for the host CLI; Python 3.12 is the reference
 interpreter for packaging and Docker E2E jobs.
 
 ```bash
+just lint-workflows
+just lint-build
 just lint
 just typecheck
 just test-nondocker-cov

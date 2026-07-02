@@ -15,6 +15,69 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install actionlint
+        run: |
+          ACTIONLINT_VERSION="1.7.12"
+          CHECKSUM="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+          URL="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSL -o actionlint.tar.gz "$URL"
+          echo "${CHECKSUM}  actionlint.tar.gz" | sha256sum --check
+          tar -xzf actionlint.tar.gz actionlint
+          sudo mv actionlint /usr/local/bin/actionlint
+          rm actionlint.tar.gz
+
+      - name: Run actionlint
+        run: actionlint -color
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          fail-on-scopes: development, runtime
+          deny-licenses: GPL-1.0-only, GPL-1.0-or-later, GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later, AGPL-1.0-only, AGPL-1.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later, LGPL-2.0-only, LGPL-2.0-or-later, LGPL-2.1-only, LGPL-2.1-or-later, LGPL-3.0-only, LGPL-3.0-or-later
+
+  build-lint:
+    name: build-lint
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Run build lint
+        run: just lint-build
+
   merge-lightweight:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
@@ -139,12 +202,24 @@ jobs:
   ci-success:
     name: ci-success
     runs-on: ubuntu-latest
-    needs: [merge-lightweight, package, fast-e2e]
+    needs: [workflow-lint, dependency-review, build-lint, merge-lightweight, package, fast-e2e]
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
 
     steps:
       - name: Check required jobs
         run: |
+          if [[ "${{ needs.workflow-lint.result }}" != "success" ]]; then
+            echo "workflow-lint failed or was skipped: ${{ needs.workflow-lint.result }}"
+            exit 1
+          fi
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.dependency-review.result }}" != "success" ]]; then
+            echo "dependency-review failed: ${{ needs.dependency-review.result }}"
+            exit 1
+          fi
+          if [[ "${{ needs.build-lint.result }}" != "success" ]]; then
+            echo "build-lint failed or was skipped: ${{ needs.build-lint.result }}"
+            exit 1
+          fi
           if [[ "${{ needs.merge-lightweight.result }}" != "success" ]]; then
             echo "merge-lightweight failed or was skipped: ${{ needs.merge-lightweight.result }}"
             exit 1

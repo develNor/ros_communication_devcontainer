@@ -17,7 +17,7 @@ Describe the outcome this issue should achieve.
 
 ## Constraints
 
-- Follow `CONTRIBUTING.md`, `DEVELOPMENT_PRINCIPLES.md`, and `docs/work-items.md`.
+- Follow the shared [task contract](../../docs/quality-model.md#task-contract).
 - Keep the change small and coherent.
 - Do not skip, weaken, or delete tests/CI to make this pass.
 
@@ -37,3 +37,10 @@ Describe the outcome this issue should achieve.
 - [ ] `just docs`
 - [ ] `just check`
 - [ ] `just test-e2e-smoke`, if Docker/runtime behavior changed.
+
+## Final Report
+
+- Changed files:
+- Behavior or documentation changed:
+- Checks run:
+- Remaining risks or follow-up:

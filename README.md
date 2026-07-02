@@ -559,7 +559,8 @@ issue-driven work tracking in [docs/work-items.md](docs/work-items.md).
 The test and measurement architecture is recorded in the
 [design RFCs](docs/rfcs/README.md); see [docs/testing.md](docs/testing.md) for the
 test taxonomy and [docs/quality-audit.md](docs/quality-audit.md) for the periodic
-quality audit. Quality rules live in
+quality audit. Reusable maintainer procedures live in
+[docs/playbooks/README.md](docs/playbooks/README.md). Quality rules live in
 [DEVELOPMENT_PRINCIPLES.md](DEVELOPMENT_PRINCIPLES.md).
 
 ## Choosing the Transport Layer: CycloneDDS or Zenoh

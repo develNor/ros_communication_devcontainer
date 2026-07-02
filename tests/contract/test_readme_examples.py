@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 import rosotacom.cli as cli
+from rosotacom.deployment import load_deployment
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
@@ -29,6 +30,8 @@ def test_source_checkout_rosotacom_yaml_loads(monkeypatch: pytest.MonkeyPatch) -
     assert runtime.scenario_configs_dir == (cli.EXAMPLE_PROJECT_DIR / "scenarios",)
     assert runtime.session_instances_dir == PACKAGE_ROOT / "session-instances"
     assert runtime.deployment is None
+    assert runtime.profiles_file == cli.EXAMPLE_PROJECT_DIR / "profiles.yaml"
+    assert runtime.benchmarks_dir == (PACKAGE_ROOT.parent / "artifacts" / "benchmarks").resolve()
 
 
 def test_packaged_example_setup_paths_are_relative_to_example_root() -> None:
@@ -41,6 +44,24 @@ def test_packaged_example_setup_paths_are_relative_to_example_root() -> None:
         "session_instances_dir": "session-instances",
         "profiles": "profiles.yaml",
     }
+
+
+def test_packaged_deployment_example_loads_through_public_loader() -> None:
+    deployment = load_deployment(cli.EXAMPLE_PROJECT_DIR / "deployment.example.yaml")
+
+    assert deployment is not None
+    assert set(deployment.hosts) == {"machine-a", "machine-b"}
+    assert deployment.hosts["machine-a"].ssh is None
+    assert deployment.hosts["machine-b"].ssh == "robot-b"
+    assert deployment.values["example_router"] == "192.0.2.1"
+
+
+def test_project_setup_rejects_unknown_keys(tmp_path: Path) -> None:
+    config = tmp_path / "rosotacom.yaml"
+    config.write_text("legacy_inventory: inventory.yaml\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Unsupported rosotacom.yaml keys"):
+        cli._load_runtime_config(argparse.Namespace(rosotacom_config=str(config)))
 
 
 def test_packaged_example_project_contains_documented_heartbeat_session() -> None:

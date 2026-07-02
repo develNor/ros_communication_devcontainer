@@ -9,9 +9,18 @@ import sys
 from pathlib import Path
 
 import rosbag2_py
-import yaml
 from rclpy.serialization import deserialize_message, serialize_message
 from rosidl_runtime_py.utilities import get_message
+
+# Fields that anonymization must keep per message type (ROS 2 Python message
+# __slots__ carry a leading underscore). Anonymization deliberately preserves
+# structure, sizes, and timing; these fields are equally non-sensitive stream
+# structure. FFMPEGPacket.flags bit 0 (libav AV_PKT_FLAG_KEY) marks keyframes
+# and pts keeps the encode order -- both are essential for GOP-aware network
+# analysis of the replayed stream and reveal nothing about scene content.
+PRESERVED_SLOTS: dict[str, frozenset[str]] = {
+    "FFMPEGPacket": frozenset({"_flags", "_pts"}),
+}
 
 
 def anonymize_msg(msg) -> None:
@@ -19,7 +28,10 @@ def anonymize_msg(msg) -> None:
     if not hasattr(msg, "__slots__"):
         return
 
+    preserved = PRESERVED_SLOTS.get(type(msg).__name__, frozenset())
     for slot in msg.__slots__:
+        if slot in preserved:
+            continue
         val = getattr(msg, slot)
         if val is None:
             continue
@@ -66,25 +78,6 @@ def anonymize_msg(msg) -> None:
             setattr(msg, slot, type(val)(0))
 
 
-def get_topics_info(metadata_path: Path) -> dict[str, dict]:
-    if metadata_path.is_dir():
-        metadata_path = metadata_path / "metadata.yaml"
-    with open(metadata_path, encoding="utf-8") as f:
-        doc = yaml.safe_load(f) or {}
-    info = doc.get("rosbag2_bagfile_information", {})
-    topics_info = {}
-    for entry in info.get("topics_with_message_count", []):
-        meta = entry.get("topic_metadata", {})
-        name = meta.get("name")
-        if name:
-            topics_info[name] = {
-                "type": meta.get("type"),
-                "serialization_format": meta.get("serialization_format", "cdr"),
-                "offered_qos_profiles": meta.get("offered_qos_profiles", []),
-            }
-    return topics_info
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Anonymize a rosbag's messages and topics.")
     parser.add_argument("--input-bag", required=True, help="Path to input bag directory")
@@ -101,22 +94,25 @@ def main() -> int:
         print(f"Error: input bag '{input_path}' does not exist", file=sys.stderr)
         return 1
 
-    topics_info = get_topics_info(input_path)
-
-    missing_topics = [orig for orig in topics_map if orig not in topics_info]
-    if missing_topics:
-        print("Error: mapped topic(s) missing from the input bag:", file=sys.stderr)
-        for topic in missing_topics:
-            print(f"  {topic}", file=sys.stderr)
-        return 1
-    active_topics_map = dict(topics_map)
-
     # Initialize sequential reader
     reader = rosbag2_py.SequentialReader()
     reader.open(
         rosbag2_py.StorageOptions(uri=str(input_path), storage_id=args.storage_id),
         rosbag2_py.ConverterOptions("", ""),
     )
+
+    # The reader's typed TopicMetadata (with rosbag2_py.QoS offered profiles) is
+    # the only construction the writer accepts; re-parsing metadata.yaml into
+    # dicts breaks on current rosbag2.
+    input_topics = {tm.name: tm for tm in reader.get_all_topics_and_types()}
+
+    missing_topics = [orig for orig in topics_map if orig not in input_topics]
+    if missing_topics:
+        print("Error: mapped topic(s) missing from the input bag:", file=sys.stderr)
+        for topic in missing_topics:
+            print(f"  {topic}", file=sys.stderr)
+        return 1
+    active_topics_map = dict(topics_map)
 
     # Initialize sequential writer
     writer = rosbag2_py.SequentialWriter()
@@ -127,15 +123,16 @@ def main() -> int:
 
     # Register output topics with the writer
     for orig, anonymized in active_topics_map.items():
-        info = topics_info[orig]
-        topic_metadata = rosbag2_py.TopicMetadata(
-            id=0,
-            name=anonymized,
-            type=info["type"],
-            serialization_format=info["serialization_format"],
-            offered_qos_profiles=info["offered_qos_profiles"],
+        tm = input_topics[orig]
+        writer.create_topic(
+            rosbag2_py.TopicMetadata(
+                id=0,
+                name=anonymized,
+                type=tm.type,
+                serialization_format=tm.serialization_format,
+                offered_qos_profiles=tm.offered_qos_profiles,
+            )
         )
-        writer.create_topic(topic_metadata)
 
     # Read and anonymize messages
     print(f"Anonymizing bag: {input_path} -> {output_path}")
@@ -144,8 +141,7 @@ def main() -> int:
         topic, serialized_bytes, timestamp = reader.read_next()
         if topic in active_topics_map:
             anonymized_topic = active_topics_map[topic]
-            msg_type = topics_info[topic]["type"]
-            msg_cls = get_message(msg_type)
+            msg_cls = get_message(input_topics[topic].type)
             msg = deserialize_message(serialized_bytes, msg_cls)
             anonymize_msg(msg)
             anonymized_bytes = serialize_message(msg)

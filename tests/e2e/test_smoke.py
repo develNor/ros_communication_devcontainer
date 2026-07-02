@@ -66,6 +66,26 @@ REMOTE_ASSIST_ANON_SMOKE_SESSIONS = [
     for name in SMOKE_SESSIONS
     if name == "14_remote_assist_anonymized"
 ]
+# Single-stream cuts of the anonymized remote-assist contract: one heavy
+# stream per session so its delivery can be measured in isolation.
+SINGLE_STREAM_ANON_SMOKE_SESSIONS = [
+    pytest.param(name, topic, msg_type, id=f"remote-assist-anonymized-{label}")
+    for name, topic, msg_type, label in (
+        (
+            "15_remote_assist_anonymized_costmap",
+            "/topic5",
+            "com_msgs/msg/CompressedData",
+            "costmap",
+        ),
+        (
+            "16_remote_assist_anonymized_camera",
+            "/topic9",
+            "ffmpeg_image_transport_msgs/msg/FFMPEGPacket",
+            "camera",
+        ),
+    )
+    if name in SMOKE_SESSIONS
+]
 
 EXPECTED_HEARTBEAT_CHECKS = (
     "OK: generated plugin.yaml files use literal CLI addresses",
@@ -584,6 +604,36 @@ def test_local_remote_assist_anonymized_smoke_from_copied_example_project(
     _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
     _assert_metric_present(session_name, result.stdout, topic="/topic1", label="a->b final topic")
     _assert_metric_present(session_name, result.stdout, topic="/b/topic3", label="b->a final topic")
+
+
+@pytest.mark.parametrize(("session_name", "topic", "msg_type"), SINGLE_STREAM_ANON_SMOKE_SESSIONS)
+def test_local_single_stream_anonymized_smoke_from_copied_example_project(
+    copied_example_project: Path,
+    session_name: str,
+    topic: str,
+    msg_type: str,
+) -> None:
+    result = _run(_smoke_command(copied_example_project, session_name), timeout=900)
+
+    assert f"OK: smoke publisher b->a {topic} ({msg_type}) is advertising" in result.stdout
+    assert f"OK: b->a inbound bridge topic (/com/in/b{topic})" in result.stdout
+    assert f"OK: b->a final topic (/b{topic})" in result.stdout
+
+    artifact_dir = _artifact_dir(result.stdout)
+    config_dir = artifact_dir / "config"
+    # The session is a true single-stream cut: nothing but the heartbeat and the
+    # singled-out topic crosses the link.
+    assert (config_dir / "a_to_b_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_a",
+    ]
+    assert (config_dir / "b_to_a_topics.txt").read_text(encoding="utf-8").splitlines() == [
+        "/heartbeat_b",
+        topic,
+    ]
+
+    _assert_no_ros_or_catmux_errors(session_name, artifact_dir)
+    _assert_heartbeat_rate_and_latency_within_bounds(session_name, result.stdout)
+    _assert_metric_present(session_name, result.stdout, topic=f"/b{topic}", label="b->a final topic")
 
 
 def test_native_chatter_scenario_starts_apps_and_communication_together(

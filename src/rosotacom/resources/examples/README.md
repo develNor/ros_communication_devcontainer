@@ -104,6 +104,21 @@ The full replay scenario with bag-play applications is generated from a
 processed handoff trace by `rosotacom anonymize`; this packaged session is the
 small deterministic smoke target for that generated shape.
 
+Two single-stream cuts isolate the heavy streams of that contract so each can
+be measured over the link (rate regularity, latency, loss) without the other
+19 topics competing for it — everything else (peers, RMW, OTA QoS,
+heartbeat/status, expects) matches example 14:
+
+```bash
+rosotacom smoke 15_remote_assist_anonymized_costmap   # /topic5: compressed occupancy grid
+rosotacom smoke 16_remote_assist_anonymized_camera    # /topic9: ffmpeg camera packets
+```
+
+Each session header documents the pre-send baseline measured on the source
+recording (message-size distribution and inter-message regularity), the
+reference point for judging how well the received stream preserves the input
+cadence.
+
 ## Two-machine runs
 
 For a real two-machine run, pass both reachable addresses on both hosts:

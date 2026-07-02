@@ -105,6 +105,8 @@ def test_local_check_derivation_and_generated_rmw_matrix_drive_test_configs() ->
         "12_content_integrity",
         "13_link_latency",
         "14_remote_assist_anonymized",
+        "15_remote_assist_anonymized_costmap",
+        "16_remote_assist_anonymized_camera",
     }
     assert set(ota_suite_sessions(examples_dir)) == set(local_check_sessions(examples_dir))
 

@@ -74,15 +74,24 @@ from one-host smoke.
 
 ## Local Smoke
 
-`just test-e2e-smoke` runs the local-checkable curated examples. Smoke starts
-both peers, verifies crossed topics, checks local-only isolation, and then runs
-`rosotacom test` against the session self-report.
+`just test-e2e-smoke` runs the entire set of local-checkable curated examples. In CI and for local convenience, you can run specific E2E test slices or nodes:
+
+- `just test-e2e-core`: Runs core communication smoke tests.
+- `just test-e2e-transforms`: Runs transport transforms (compression, payload sizes).
+- `just test-e2e-remote-assist`: Runs anonymized remote assist streams.
+- `just test-e2e-runtime-tools`: Runs runtime utility/metrics E2E checks.
+- `just test-e2e-concurrency`: Runs concurrency/isolation gate checks.
+- `just test-e2e-node <nodeid>`: Reruns a specific pytest node ID directly.
 
 The generated RMW matrix is available as an opt-in full local slice:
 
 ```bash
 ROSOTACOM_RUN_E2E=1 ROSOTACOM_RUN_FULL_E2E=1 \
   .venv/bin/python -m pytest -q tests/e2e/test_smoke.py -m e2e
+```
+Or run a specific matrix session:
+```bash
+just test-e2e-rmw <session_name>
 ```
 
 ## OTA Gate

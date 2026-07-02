@@ -46,7 +46,11 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     assert "ci-success" in merge_gate
     assert "just test-nondocker-cov" in merge_gate
     assert "just package" in merge_gate
-    assert "just test-e2e-smoke" in merge_gate
+    assert "just test-e2e-core" in merge_gate
+    assert "just test-e2e-transforms" in merge_gate
+    assert "just test-e2e-remote-assist" in merge_gate
+    assert "just test-e2e-runtime-tools" in merge_gate
+    assert "just test-e2e-concurrency" in merge_gate
 
 
 def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
@@ -57,7 +61,19 @@ def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
     # 1. ci-success depends on the new required jobs
     ci_success = jobs["ci-success"]
     needs = ci_success["needs"]
-    expected_jobs = {"workflow-lint", "dependency-review", "build-lint", "merge-lightweight", "package", "fast-e2e"}
+    expected_jobs = {
+        "workflow-lint",
+        "dependency-review",
+        "build-lint",
+        "merge-lightweight",
+        "package",
+        "preflight-success",
+        "e2e-core",
+        "e2e-transforms",
+        "e2e-remote-assist",
+        "e2e-runtime-tools",
+        "e2e-concurrency",
+    }
     assert expected_jobs.issubset(set(needs))
 
     # Check that required jobs are validated in the bash step of ci-success
@@ -147,8 +163,9 @@ def test_full_e2e_workflow_runs_nightly_and_supports_manual_dispatch() -> None:
     assert "name: Nightly E2E" in full_e2e
     assert '- cron: "37 2 * * *"' in full_e2e
     assert "workflow_dispatch:" in full_e2e
-    assert "name: full-e2e" in full_e2e
-    assert "ROSOTACOM_RUN_FULL_E2E=1" in full_e2e
+    assert "name: smoke-e2e" in full_e2e
+    assert "rmw-matrix:" in full_e2e
+    assert "just test-e2e-rmw" in full_e2e
 
 
 def test_release_publishes_only_for_a_version_tag_via_repository_configuration() -> None:

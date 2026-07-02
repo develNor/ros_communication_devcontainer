@@ -9,7 +9,7 @@ venv:
 	{{python}} -m pip install --upgrade pip
 
 setup: venv
-	{{python}} -m pip install -e ".[dev,plots]"
+	{{python}} -m pip install -c requirements.txt -e ".[dev,plots]"
 	{{python}} -m pre_commit install
 
 format:

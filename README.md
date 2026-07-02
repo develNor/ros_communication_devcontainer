@@ -28,7 +28,7 @@ The ROS Communication DevContainer is a Docker-based solution designed to stream
 - Git for configuration management
 - Python 3 with virtual environment support (`python3-venv` on Debian/Ubuntu;
   for versioned Python packages this may be named like `python3.14-venv`)
-- `ros2docker` v0.1.2 or newer. The local installer below installs the pinned
+- `ros2docker` v0.1.3 or newer. The local installer below installs the pinned
   supported range into this checkout's virtual environment.
 - `tmux` for the optional `rosotacom scenario` orchestration commands
 - Machines connected to the same network (VPN or local WLAN)

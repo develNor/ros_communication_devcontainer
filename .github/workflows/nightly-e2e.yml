@@ -18,10 +18,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  full-e2e:
-    name: full-e2e
+  smoke-e2e:
+    name: smoke-e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
@@ -49,6 +49,58 @@ jobs:
       - name: Run local smoke slice
         run: just test-e2e-smoke
 
-      - name: Run generated RMW matrix
-        if: github.event.inputs.full-rmw-matrix != 'false'
-        run: ROSOTACOM_RUN_E2E=1 ROSOTACOM_RUN_FULL_E2E=1 .venv/bin/python -m pytest -q tests/e2e/test_smoke.py -m e2e
+      - name: Upload smoke session artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: session-instances-smoke
+          path: session-instances/
+          if-no-files-found: ignore
+
+  rmw-matrix:
+    name: rmw-${{ matrix.session }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name != 'schedule' || github.event.inputs.full-rmw-matrix != 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        session:
+          - cyclone-local-zenoh-ros2dds-ota
+          - cyclone-ota
+          - cyclone-ota-tuned
+          - fastdds
+          - zen-endpoints
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just and tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just tmux
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Show Docker environment
+        run: docker info
+
+      - name: Run generated RMW matrix session
+        run: just test-e2e-rmw ${{ matrix.session }}
+
+      - name: Upload RMW session artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: session-instances-rmw-${{ matrix.session }}
+          path: session-instances/
+          if-no-files-found: ignore

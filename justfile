@@ -42,6 +42,28 @@ test-e2e-smoke:
 
 test-e2e-fast: test-e2e-smoke
 
+test-e2e-core:
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "heartbeat or chatter"
+
+test-e2e-transforms:
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "occupancy_grid or sized_payload"
+
+test-e2e-remote-assist:
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "remote_assist"
+
+test-e2e-runtime-tools:
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "link_latency" tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py
+
+test-e2e-concurrency:
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_parallel_smoke.py
+
+test-e2e-node nodeid:
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q "{{nodeid}}"
+
+test-e2e-rmw session:
+	ROSOTACOM_RUN_E2E=1 ROSOTACOM_RUN_FULL_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "test_full_rmw_heartbeat_smoke_matrix and {{session}}"
+
+
 docs:
 	{{python}} -m pytest -q tests/contract/test_markdown_links.py tests/contract/test_readme_examples.py tests/contract/test_pytest_policy.py
 

@@ -39,7 +39,7 @@ check is:
 ci-success
 ```
 
-The merge gate runs workflow lint, dependency/security review, runtime/build asset lint, Python 3.10 through 3.14 non-Docker checks, package validation, and the Docker single-machine smoke matrix:
+The merge gate runs workflow lint, dependency/security review, runtime/build asset lint, Python 3.10 through 3.14 non-Docker checks, package validation, and the Docker single-machine smoke matrix (divided into 5 parallel lanes):
 
 Python 3.10–3.14 are supported for the host CLI; Python 3.12 is the reference
 interpreter for packaging and Docker E2E jobs.
@@ -52,7 +52,12 @@ just typecheck
 just test-nondocker-cov
 just docs
 just package
-just test-e2e-smoke
+# Parallel E2E lanes:
+just test-e2e-core
+just test-e2e-transforms
+just test-e2e-remote-assist
+just test-e2e-runtime-tools
+just test-e2e-concurrency
 ```
 
 The Python 3.12 leg uploads `coverage.xml` to Codecov with the `nondocker` flag.
@@ -60,9 +65,7 @@ Docker E2E is not collected for coverage.
 
 ## Docker E2E
 
-`just test-e2e-smoke` runs the local single-machine smoke matrix through Docker. It
-is a required merge-gate job because `rosotacom` exists to orchestrate
-Docker-backed ROS communication sessions. Each smoke run writes generated
+`just test-e2e-smoke` runs the entire local single-machine smoke matrix through Docker. In the CI merge gate, E2E testing is divided into parallel jobs (`e2e-core`, `e2e-transforms`, `e2e-remote-assist`, `e2e-runtime-tools`, `e2e-concurrency`) which run concurrently to minimize wall-clock time. Each smoke run writes generated
 config, catmux pane logs, Docker logs when available, and the smoke verification
 log under `session-instances/`; collect that directory as the first debugging
 artifact when an E2E job fails.

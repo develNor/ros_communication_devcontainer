@@ -80,7 +80,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum * > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
 
       - name: Upload distributions
         uses: actions/upload-artifact@v7

@@ -1373,7 +1373,10 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
     monkeypatch.setattr(cli, "_resolve_session", lambda session_name, runtime: session)
     monkeypatch.setattr(cli, "_resolve_session_instance", lambda runtime, session, instance_id=None: instance)
     monkeypatch.setattr(cli, "_effective_session_config", lambda *args, **kwargs: {"topics": {"a_to_b": []}})
-    monkeypatch.setattr(cli, "_ensure_smoke_network", lambda name, subnet: networks_created.append((name, subnet)))
+    monkeypatch.setattr(cli, "_list_docker_containers", lambda all_states=False: [])
+    monkeypatch.setattr(
+        cli, "_ensure_smoke_network", lambda name, subnet, labels=None: networks_created.append((name, subnet))
+    )
     monkeypatch.setattr(cli, "start_session", lambda args: started.append(args) or f"container_{args.identity}")
     monkeypatch.setattr(cli, "_smoke_ros_setup", lambda *args: "source /ros")
     monkeypatch.setattr(cli, "_write_docker_log", lambda *args: None)

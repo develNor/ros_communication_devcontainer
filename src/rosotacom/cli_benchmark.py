@@ -19,6 +19,7 @@ import contextlib
 import copy
 import json
 import math
+import re
 import shlex
 import shutil
 import subprocess
@@ -737,14 +738,18 @@ def _grep_log_fragment(log_path: Path, pattern: str, *, lines: int = 40) -> str:
     )
 
 
-def _peer_catmux_attach_script(identity: str, container_name: str, full_log: Path) -> str:
-    launch_pattern = f"{container_name}|--identity {identity}|identity {identity}|rosotacom session started"
+def _peer_catmux_attach_script(identity: str, container_pattern: str, full_log: Path) -> str:
+    # Container names are instance-scoped and allocated by the child benchmark
+    # process, so the container is discovered by pattern on every iteration.
+    launch_pattern = f"--identity {identity}|identity {identity}|rosotacom session started"
     return (
         "while true; do "
         "clear; date; "
-        f"container={shlex.quote(container_name)}; identity={shlex.quote(identity)}; "
-        'if ! docker inspect -f "{{.State.Running}}" "$container" >/dev/null 2>&1; then '
-        'echo "[INFO] waiting for benchmark peer $identity container: $container"; '
+        f"identity={shlex.quote(identity)}; "
+        f"container=$(docker ps --filter status=running --format '{{{{.Names}}}}' "
+        f"| grep -E {shlex.quote(container_pattern)} | head -n 1); "
+        'if [ -z "$container" ]; then '
+        f'echo "[INFO] waiting for benchmark peer $identity container matching:" {shlex.quote(container_pattern)}; '
         + _grep_log_fragment(full_log, launch_pattern)
         + "; "
         "sleep 1; continue; "
@@ -768,12 +773,13 @@ def _peer_catmux_attach_script(identity: str, container_name: str, full_log: Pat
 
 def _benchmark_peer_windows(args: argparse.Namespace, genre: str, full_log: Path) -> list[tuple[str, str, str]]:
     from .cli import (
-        _container_name,
         _effective_session_config,
         _load_runtime_config,
         _remote_peer_name,
         _resolve_session,
         _safe_path_token,
+        _sanitize_docker_name,
+        _workspace_container_prefix,
     )
 
     if getattr(args, "deployment", None):
@@ -787,9 +793,10 @@ def _benchmark_peer_windows(args: argparse.Namespace, genre: str, full_log: Path
         return []
     windows: list[tuple[str, str, str]] = []
     for identity in sorted(str(peer) for peer in peers):
-        container_name = _container_name(_remote_peer_name(cfg, identity), runtime)
+        suffix = _sanitize_docker_name(f"com_to_{_remote_peer_name(cfg, identity)}")
+        container_pattern = f"^{re.escape(_workspace_container_prefix(runtime))}[A-Za-z0-9.-]+_{re.escape(suffix)}$"
         window_name = _safe_path_token(f"{identity}_catmux")
-        windows.append((window_name, identity, _peer_catmux_attach_script(identity, container_name, full_log)))
+        windows.append((window_name, identity, _peer_catmux_attach_script(identity, container_pattern, full_log)))
     return windows
 
 
@@ -4439,6 +4446,11 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
         help="Create the interactive tmux session without attaching.",
     )
     parser.add_argument(
+        "--skip-conflict-check",
+        action="store_true",
+        help="Run even though another rosotacom run is active (metrics may be distorted).",
+    )
+    parser.add_argument(
         "--rmw",
         default=DEFAULT_BENCHMARK_RMW,
         help=f"RMW implementation or rosotacom RMW alias for benchmark sessions (default: {DEFAULT_BENCHMARK_RMW}).",
@@ -4454,6 +4466,24 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
         help="Override benchmark session QoS depth for the whole run.",
     )
     parser.set_defaults(ota_benchmark=ota_benchmark)
+
+
+def _abort_on_local_benchmark_conflicts(args: argparse.Namespace) -> None:
+    """Local benchmarks need a quiet host: concurrent runs distort latency/loss metrics."""
+    if getattr(args, "dry_run", False) or getattr(args, "skip_conflict_check", False):
+        return
+    from .cli import _conflict_error, _list_docker_containers
+
+    active = sorted(name for name, _networks in _list_docker_containers() if name.startswith("rosotacom_"))
+    if active:
+        raise _conflict_error(
+            "A rosotacom run is already active on this host; local benchmarks need exclusive resources"
+            " because concurrent load injects scheduling jitter into latency/loss metrics.",
+            active,
+            "Wait for it to finish or stop it first (`rosotacom ps` lists this workspace's runs;"
+            " `rosotacom stop <session>` / `rosotacom smoke <target> --stop` clean up),"
+            " or pass --skip-conflict-check.",
+        )
 
 
 def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPointFn:
@@ -4501,6 +4531,9 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
     from .network_shaper import ProfileShaper
 
     is_ota = _is_ota_benchmark(args)
+    if not is_ota:
+        # OTA runs check the peers instead (see _ota_preflight conflict checks).
+        _abort_on_local_benchmark_conflicts(args)
 
     def run_point(
         *,
@@ -4564,6 +4597,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     require_network_shaping_sudo=profile_obj is not None,
                     sudo_mode=smoke_args.sudo_mode,
                     sudo_passwords=sudo_passwords,
+                    check_conflicts=not getattr(args, "skip_conflict_check", False),
                 )
             _ota_prepare_hosts(smoke_args, runtime, plan)
             instance = _resolve_session_instance(
@@ -4716,7 +4750,9 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 "deployment": args.deployment,
                 "session_dir": session_name,
                 "mode": "detached",
-                "force": True,
+                # Names are instance-scoped; nothing to force-replace, and a
+                # parallel run's containers must never be stopped from here.
+                "force": False,
                 "rewrite_formatting": False,
                 "peer": [],
                 "peer_address": peer_address_args,
@@ -4813,7 +4849,13 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 )
 
             try:
-                _ensure_smoke_network(smoke_network.name, smoke_network.subnet)
+                from .cli import _smoke_network_labels, _smoke_target_key
+
+                _ensure_smoke_network(
+                    smoke_network.name,
+                    smoke_network.subnet,
+                    labels=_smoke_network_labels(runtime, _smoke_target_key("session", session.host_dir.name)),
+                )
                 a_container = start_session(
                     argparse.Namespace(
                         **common,

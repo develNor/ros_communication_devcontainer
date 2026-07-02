@@ -173,8 +173,10 @@ See the [example project README](src/rosotacom/resources/examples/README.md)
 for the copyable example layout, the
 [session configuration reference](session-configuration.md) for the session
 schema, the [deployment configuration reference](deployment-configuration.md) for
-the machine-specific schema and peer-binding precedence, and
-[terminology.md](terminology.md) for the project vocabulary.
+the machine-specific schema and peer-binding precedence,
+[terminology.md](terminology.md) for the project vocabulary, and
+[CONCURRENCY.md](CONCURRENCY.md) for what can run in parallel and how
+conflicting runs are detected and aborted.
 
 The normal examples intentionally contain no machine addresses. `rosotacom
 smoke` injects isolated Docker-network addresses, while manual and OTA runs
@@ -315,6 +317,13 @@ status. The outer prefix is `Ctrl-b`; use `Ctrl-b n`/`Ctrl-b p` for windows and
 When both names exist, interactive smoke treats `TARGET` as a scenario unless
 you pass `--target-type session`. Non-interactive `rosotacom smoke TARGET`
 keeps its existing session-only behavior.
+
+Local smoke runs of different targets are parallel-safe: every run gets
+instance-scoped container names and its own isolated Docker network. Starting a
+run that cannot coexist with an active one (same smoke target, same session
+identity, any benchmark) aborts immediately with the conflicting containers and
+the stop command. `rosotacom ps` shows what is active in this workspace;
+[CONCURRENCY.md](CONCURRENCY.md) documents the boundaries.
 
 For a real two-host OTA check with no deployment file, provide both addresses
 and only the SSH target needed to reach the remote peer:

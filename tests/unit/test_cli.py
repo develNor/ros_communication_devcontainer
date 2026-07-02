@@ -392,8 +392,8 @@ def test_scenario_definition_resolves_and_validates_strictly(tmp_path: Path) -> 
     assert definition.applications["a"][0].name == "local_app"
     assert definition.applications["a"][0].ros2docker_config == tmp_path / "apps" / "a.json"
     assert rosotacom._scenario_names(runtime) == ["demo"]
-    assert rosotacom._scenario_container_name(runtime, "demo", "a", "local_app") == (
-        "rosotacom_test_scenario_demo_a_local_app"
+    assert rosotacom._scenario_container_name(runtime, "demo", "a", "local_app", "run1") == (
+        "rosotacom_test_run1_scenario_demo_a_local_app"
     )
     assert rosotacom._scenario_application_image_name(runtime, definition.applications["a"][0]) == "ros2docker-test"
 
@@ -664,8 +664,8 @@ def test_interactive_smoke_tmux_uses_full_windows_and_metadata(
     assert "--smoke-managed" in joined
     assert "--network-name smoke-net --network-ip 10.137.42.2" in joined
     assert "--peer-address a=10.137.42.2 --peer-address b=10.137.42.3" in joined
-    assert "scenario _run-application demo --identity a --application local_app" in joined
-    assert "--network-name container:rosotacom_test_com_to_b" in joined
+    assert "scenario _run-application demo --identity a --application local_app --instance-id interactive" in joined
+    assert "--network-name container:rosotacom_test_interactive_com_to_b" in joined
     assert "waiting for generated config" in joined
     assert "waiting for container readiness" in joined
     assert any(command[-1] == "smoke-scenario-demo:verification" for command in calls if "select-window" in command)
@@ -708,6 +708,7 @@ def test_run_scenario_application_can_override_network(
                 scenario="demo",
                 identity="a",
                 application="local_app",
+                instance_id="run1",
                 network_name="smoke-net",
                 network_ip=None,
             )
@@ -717,7 +718,7 @@ def test_run_scenario_application_can_override_network(
 
     override = runs[0]["override"]
     assert isinstance(override, dict)
-    assert override["container_name"] == "rosotacom_test_scenario_demo_a_local_app"
+    assert override["container_name"] == "rosotacom_test_run1_scenario_demo_a_local_app"
     assert override["image_name"] == "app-image-test"
     assert override["run_args"] == ["-e", "ROS_DOMAIN_ID=46", "--network", "smoke-net", "--cap-add", "NET_ADMIN"]
 
@@ -1228,8 +1229,8 @@ def test_start_and_stop_scenario_manage_manifest_and_component_order(
     manifest = yaml.safe_load((instance.host_dir / "manifest.yaml").read_text(encoding="utf-8"))
     run = manifest["scenario_runs"]["demo:a"]
     assert run["tmux_session"] == "demo-a"
-    assert run["communication_container"] == "rosotacom_test_com_to_b"
-    assert run["applications"][0]["container_name"] == "rosotacom_test_scenario_demo_a_local_app"
+    assert run["communication_container"] == "rosotacom_test_managed_com_to_b"
+    assert run["applications"][0]["container_name"] == "rosotacom_test_managed_scenario_demo_a_local_app"
     assert run["applications"][0]["image_name"] == "ros2docker-test"
     assert calls == ["tmux-start"]
 
@@ -1237,6 +1238,11 @@ def test_start_and_stop_scenario_manage_manifest_and_component_order(
         rosotacom,
         "_stop_scenario_application",
         lambda *args, **kwargs: calls.append("application-stop") or True,
+    )
+    monkeypatch.setattr(
+        rosotacom,
+        "_matching_com_containers",
+        lambda runtime, remote, all_states=False: ["rosotacom_test_managed_com_to_b"],
     )
     monkeypatch.setattr(
         rosotacom,
@@ -1601,7 +1607,20 @@ def test_peer_binding_identity_and_command_helpers(tmp_path: Path, monkeypatch: 
     monkeypatch.setattr(rosotacom, "_get_local_ipv4s", lambda: ["10.0.0.1"])
     assert rosotacom._auto_identity(bindings) == "a"
     assert rosotacom._remote_peer_name(cfg, "a") == "remote/unit"
-    assert rosotacom._identity_container_names(cfg, runtime, "a") == ["rosotacom_abc_com_to_remote_unit"]
+    monkeypatch.setattr(
+        rosotacom,
+        "_list_docker_containers",
+        lambda all_states=False: [
+            ("rosotacom_abc_run1_com_to_remote_unit", ["bridge"]),
+            ("rosotacom_abc_run2_com_to_remote_unit", ["bridge"]),
+            ("rosotacom_other_run1_com_to_remote_unit", ["bridge"]),
+            ("rosotacom_abc_run1_com_to_elsewhere", ["bridge"]),
+        ],
+    )
+    assert rosotacom._identity_container_names(cfg, runtime, "a") == [
+        "rosotacom_abc_run1_com_to_remote_unit",
+        "rosotacom_abc_run2_com_to_remote_unit",
+    ]
 
     session = rosotacom.ResolvedSession(tmp_path, "/session/current", "absolute")
     instance = rosotacom.SessionInstance(
@@ -1721,6 +1740,7 @@ def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.Monkey
         lambda runtime, session, cfg, instance: ["--network", "host"],
     )
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "detached")
+    monkeypatch.setattr(rosotacom, "_list_docker_containers", lambda all_states=False: [])
     monkeypatch.setattr(rosotacom, "_stop_container_name", lambda *args, **kwargs: True)
     monkeypatch.setattr(rosotacom, "_wait_for_container_ready", lambda name: None)
     monkeypatch.setattr(rosotacom, "_write_docker_log", lambda *args, **kwargs: None)
@@ -1742,7 +1762,7 @@ def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.Monkey
         )
     )
 
-    assert container == "rosotacom_id_com_to_remote"
+    assert container == "rosotacom_id_unit_com_to_remote"
     assert [name for name, _ in calls] == ["build", "run", "exec"]
     assert calls[1][1]["override"]["run_type"] == "up"
     assert calls[2][1]["interactive"] is False
@@ -1763,6 +1783,7 @@ def test_start_session_attach_dispatches_command_run(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(rosotacom, "_scoped_image_name", lambda runtime: "image:id")
     monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg, instance: [])
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "attach")
+    monkeypatch.setattr(rosotacom, "_list_docker_containers", lambda all_states=False: [])
     monkeypatch.setattr(rosotacom, "_stop_container_name", lambda *args, **kwargs: True)
     monkeypatch.setattr(rosotacom, "_write_docker_log", lambda *args, **kwargs: None)
     monkeypatch.setattr(rosotacom, "ros2docker_build", lambda **kwargs: calls.append(("build", kwargs)), raising=False)
@@ -1830,7 +1851,11 @@ def test_stop_list_doctor_and_smoke_host_flows(
     monkeypatch.setattr(rosotacom, "_resolve_session", lambda session_dir, runtime: session)
     monkeypatch.setattr(rosotacom, "_resolve_session_instance", lambda runtime, session, instance_id=None: instance)
     monkeypatch.setattr(rosotacom, "_effective_session_config", lambda *args, **kwargs: cfg)
-    monkeypatch.setattr(rosotacom, "_identity_container_names", lambda cfg, runtime, identity=None: ["c1", "c2"])
+    monkeypatch.setattr(
+        rosotacom,
+        "_identity_container_names",
+        lambda cfg, runtime, identity=None, all_states=False: ["c1", "c2"],
+    )
     monkeypatch.setattr(rosotacom, "_stop_container_name", lambda name, runtime, **kwargs: stopped.append(name) or True)
     monkeypatch.setattr(rosotacom, "_ROS2DOCKER_IMPORT_ERROR", None)
     fake_ros2docker = type("FakeRos2Docker", (), {"__version__": "test", "__file__": __file__})
@@ -1853,9 +1878,10 @@ def test_stop_list_doctor_and_smoke_host_flows(
     monkeypatch.setattr(
         rosotacom,
         "_ensure_smoke_network",
-        lambda name, subnet: networks_created.append((name, subnet)),
+        lambda name, subnet, labels=None: networks_created.append((name, subnet)),
     )
     monkeypatch.setattr(rosotacom, "_remove_smoke_network", lambda name: networks_removed.append(name))
+    monkeypatch.setattr(rosotacom, "_matching_smoke_networks", lambda runtime, target_key: [])
     # Smoke's per-container delivery + isolation verification is exercised
     # end-to-end in tests/e2e; this unit test only drives the host flow
     # (start/stop/network), so stub the shared verification helpers as passing.

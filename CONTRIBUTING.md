@@ -28,6 +28,8 @@ This creates `.venv`, installs `.[dev]`, and installs pre-commit hooks.
 Run individual checks from the repository root:
 
 ```bash
+just lint-workflows
+just lint-build
 just lint
 just typecheck
 just test-unit

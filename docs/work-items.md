@@ -12,16 +12,36 @@ local files only for private scratch.
 
 ## Issue-Driven Workflow
 
-Use the matching issue template when one applies:
+Use the matching issue template when one applies. For broad quality work, start
+with `repository-diagnosis.md` through the `quality-workflow.md` orchestrator;
+the diagnosis decides which leaf issues to open.
 
 ```bash
-gh issue create --repo develNor/rosotacom --template work-item.md
-gh issue create --repo develNor/rosotacom --template test-ci-audit.md
-gh issue create --repo develNor/rosotacom --template documentation-audit.md
+gh issue create --repo develNor/ros_communication_devcontainer --template work-item.md
+gh issue create --repo develNor/ros_communication_devcontainer --template quality-workflow.md
+gh issue create --repo develNor/ros_communication_devcontainer --template repository-diagnosis.md
 ```
 
 Link PRs to issues with `Fixes #<number>`, `Closes #<number>`, or
 `Refs #<number>`.
+
+For the shared task contract and template hierarchy, see
+[quality-model.md](quality-model.md).
+
+## Working An Issue
+
+Before implementation starts, create or choose a well-scoped issue with the
+matching template when one applies.
+
+- Assign yourself to the issue while working.
+- Keep one coherent change per issue and PR.
+- Link the PR with `Fixes #<number>`, `Closes #<number>`, or `Refs #<number>`.
+- If implementation shows that the issue assumptions are wrong or incomplete,
+  add an issue comment describing the discovery and the chosen scope.
+- If the work is not possible or not sensible, add an issue comment explaining
+  why and apply a fitting triage label such as `question`, `invalid`, or
+  `help wanted`.
+- Report the PR URL and CI status after opening or updating the PR.
 
 ## Triage Labels
 

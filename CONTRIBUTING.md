@@ -2,6 +2,10 @@
 
 This is the canonical development workflow for `rosotacom`.
 
+For the diagnosis-first quality workflow and owner-facing entrypoints, see
+[docs/quality-model.md](docs/quality-model.md) and
+[docs/owner-runbook.md](docs/owner-runbook.md).
+
 ## Development Setup
 
 Prerequisites:
@@ -76,6 +80,10 @@ CI smoke > a scripted check) and treat manual checks as the explicit fallback.
 Check a validation item only once that verification actually exists and runs, and
 add it in the same change as the behaviour it covers. See
 [docs/rfcs/README.md](docs/rfcs/README.md) for the required RFC sections.
+
+Soft quality passes start with repository diagnosis and then create only the
+focused issues that diagnosis names. See [docs/quality-model.md](docs/quality-model.md)
+for the task hierarchy and shared task contract.
 
 Moving validated development work to `main` is a deliberate maintainer action.
 It may require an external OTA gate supplied by the repository operator; it is

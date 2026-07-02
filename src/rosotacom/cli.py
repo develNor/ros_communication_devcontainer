@@ -511,8 +511,65 @@ def _scoped_image_name_from_base(base: str, suffix: str) -> str:
     return f"{base}-{suffix}"
 
 
-def _container_name(remote_peer_name: str, runtime: RuntimeConfig) -> str:
-    return _sanitize_docker_name(f"rosotacom_{runtime.install_id}_com_to_{remote_peer_name}")
+def _instance_name_token(instance_id: str) -> str:
+    # Underscore-free so the instance component of a container name can be split
+    # off unambiguously (the surrounding name parts are underscore-separated).
+    return _safe_path_token(instance_id).replace("_", "-")
+
+
+def _workspace_container_prefix(runtime: RuntimeConfig) -> str:
+    return f"rosotacom_{runtime.install_id}_"
+
+
+def _container_name(remote_peer_name: str, runtime: RuntimeConfig, instance_id: str) -> str:
+    return _sanitize_docker_name(
+        f"rosotacom_{runtime.install_id}_{_instance_name_token(instance_id)}_com_to_{remote_peer_name}"
+    )
+
+
+def _split_workspace_container(name: str, runtime: RuntimeConfig) -> tuple[str, str] | None:
+    """Split a workspace container name into (instance_token, rest), or None."""
+    prefix = _workspace_container_prefix(runtime)
+    if not name.startswith(prefix):
+        return None
+    instance_token, sep, rest = name[len(prefix) :].partition("_")
+    if not sep or not instance_token or not rest:
+        return None
+    return instance_token, rest
+
+
+def _list_docker_containers(*, all_states: bool = False) -> list[tuple[str, list[str]]]:
+    """Running (or all) docker containers as (name, [network, ...]) pairs."""
+    command = ["docker", "ps", "--format", "{{.Names}}\t{{.Networks}}"]
+    if all_states:
+        command.insert(2, "--all")
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"docker ps failed: {(result.stderr or result.stdout).strip()}")
+    containers: list[tuple[str, list[str]]] = []
+    for line in result.stdout.splitlines():
+        name, _, networks = line.partition("\t")
+        if name:
+            containers.append((name, [net for net in networks.split(",") if net]))
+    return containers
+
+
+def _matching_com_containers(runtime: RuntimeConfig, remote_peer_name: str, *, all_states: bool = False) -> list[str]:
+    """Workspace communication containers for `remote_peer_name`, any instance."""
+    suffix = _sanitize_docker_name(f"com_to_{remote_peer_name}")
+    names = []
+    for name, _networks in _list_docker_containers(all_states=all_states):
+        parts = _split_workspace_container(name, runtime)
+        if parts is not None and parts[1] == suffix:
+            names.append(name)
+    return sorted(names)
+
+
+def _conflict_error(headline: str, containers: list[str], stop_hint: str) -> RuntimeError:
+    lines = [headline, "Active containers:"]
+    lines.extend(f"  - {name}" for name in sorted(containers))
+    lines.append(stop_hint)
+    return RuntimeError("\n".join(lines))
 
 
 def _safe_path_token(value: str) -> str:
@@ -719,7 +776,9 @@ def _write_scenario_manifest(
             {
                 "name": application.name,
                 "ros2docker_config": str(application.ros2docker_config),
-                "container_name": _scenario_container_name(runtime, resolved.name, identity, application.name),
+                "container_name": _scenario_container_name(
+                    runtime, resolved.name, identity, application.name, instance.instance_id
+                ),
                 "image_name": _scenario_application_image_name(runtime, application),
             }
             for application in applications
@@ -777,7 +836,8 @@ def _write_interactive_smoke_manifest(
         "network_subnet": network_subnet,
         "peer_address": [f"{peer}={ip}" for peer, ip in peer_ips.items()],
         "communication_containers": {
-            peer: _container_name(_remote_peer_name(target.cfg, peer), runtime) for peer in peer_ips
+            peer: _container_name(_remote_peer_name(target.cfg, peer), runtime, instance.instance_id)
+            for peer in peer_ips
         },
     }
     if target.scenario is not None and target.scenario_definition is not None:
@@ -787,7 +847,9 @@ def _write_interactive_smoke_manifest(
                 "identity": identity,
                 "name": application.name,
                 "ros2docker_config": str(application.ros2docker_config),
-                "container_name": _scenario_container_name(runtime, target.scenario.name, identity, application.name),
+                "container_name": _scenario_container_name(
+                    runtime, target.scenario.name, identity, application.name, instance.instance_id
+                ),
                 "image_name": _scenario_application_image_name(runtime, application),
             }
             for identity, applications in target.scenario_definition.applications.items()
@@ -968,16 +1030,27 @@ def _remote_peer_name(cfg: dict[str, Any], identity: str) -> str:
     return _peer_com_name(peers, str(remote_peer_key))
 
 
-def _identity_container_names(cfg: dict[str, Any], runtime: RuntimeConfig, identity: str | None = None) -> list[str]:
+def _identity_container_names(
+    cfg: dict[str, Any],
+    runtime: RuntimeConfig,
+    identity: str | None = None,
+    *,
+    all_states: bool = False,
+) -> list[str]:
+    """Discover this workspace's communication containers for the given identities.
+
+    Container names carry a per-run instance id, so they cannot be recomputed
+    here; instead they are matched against docker's live container list.
+    """
     peers = (cfg or {}).get("peers")
     if not isinstance(peers, dict):
         raise RuntimeError("session-config must define a mapping 'peers: { <peer_key>: { ... } }'.")
     identities = [identity] if identity else list(peers.keys())
-    names = []
+    names: list[str] = []
     for peer_key in identities:
         if peer_key not in peers:
             raise RuntimeError(f"--identity must be one of peers={list(peers.keys())}")
-        names.append(_container_name(_remote_peer_name(cfg, str(peer_key)), runtime))
+        names.extend(_matching_com_containers(runtime, _remote_peer_name(cfg, str(peer_key)), all_states=all_states))
     return names
 
 
@@ -1638,6 +1711,7 @@ def _ota_application_parts(
     target: InteractiveSmokeTarget,
     identity: str,
     application: ScenarioApplication,
+    instance_id: str,
 ) -> list[str]:
     return [
         "scenario",
@@ -1647,6 +1721,8 @@ def _ota_application_parts(
         identity,
         "--application",
         application.name,
+        "--instance-id",
+        instance_id,
     ]
 
 
@@ -2018,6 +2094,65 @@ def _passwordless_watchdog_command(argv: Sequence[str]) -> str:
     return f"nohup sudo -n {shlex.join(argv)} >/dev/null 2>&1 &"
 
 
+def _ota_conflict_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
+    """Fail-safe preflight: OTA runs require exclusive control of the peers.
+
+    Aborts when a peer already runs rosotacom containers or has active network
+    shaping (netem/tbf/htb) on the data interface toward another peer — both
+    signal an OTA run that is still active or was not cleaned up.
+    """
+    from .network_shaper import ota_interface_from_route
+
+    for peer in plan.peers.values():
+        result = _ota_run(
+            peer,
+            "docker ps --format '{{.Names}}'",
+            label=f"{peer.name}: scan for active rosotacom containers",
+            dry_run=dry_run,
+            batch=True,
+        )
+        active = [line.strip() for line in (result.stdout or "").splitlines() if line.strip().startswith("rosotacom_")]
+        if active:
+            raise _conflict_error(
+                f"Peer {peer.name} already runs rosotacom containers; OTA runs need exclusive hosts.",
+                active,
+                "Stop the active OTA run first (rosotacom ota-smoke <target> --stop) or pass --skip-conflict-check.",
+            )
+        for other in plan.peers.values():
+            if other.name == peer.name:
+                continue
+            route = _ota_run(
+                peer,
+                f"ip route get {shlex.quote(other.address)} 2>/dev/null | head -n 1",
+                label=f"{peer.name}: resolve data interface toward {other.name}",
+                dry_run=dry_run,
+                batch=True,
+                check=False,
+            )
+            try:
+                interface = ota_interface_from_route(route.stdout or "")
+            except ValueError:
+                continue
+            qdisc = _ota_run(
+                peer,
+                f"tc qdisc show dev {shlex.quote(interface)}",
+                label=f"{peer.name}: check for active network shaping on {interface}",
+                dry_run=dry_run,
+                batch=True,
+                check=False,
+            )
+            shaped = [
+                line.strip() for line in (qdisc.stdout or "").splitlines() if re.search(r"\b(netem|tbf|htb)\b", line)
+            ]
+            if shaped:
+                raise RuntimeError(
+                    f"Active network shaping detected on {peer.name} ({interface}); another OTA run may be active:\n"
+                    + "\n".join(f"  {line}" for line in shaped)
+                    + f"\nStop the run that applied it, clear it (sudo tc qdisc del dev {interface} root),"
+                    " or pass --skip-conflict-check."
+                )
+
+
 def _ota_preflight(
     plan: OtaSmokePlan,
     *,
@@ -2027,6 +2162,7 @@ def _ota_preflight(
     require_network_shaping_sudo: bool = False,
     sudo_mode: str = OTA_DEFAULT_SUDO_MODE,
     sudo_passwords: Mapping[str, str] | None = None,
+    check_conflicts: bool = True,
 ) -> None:
     sudo_mode = _validate_ota_sudo_mode(sudo_mode)
     sudo_passwords = sudo_passwords or {}
@@ -2096,6 +2232,9 @@ def _ota_preflight(
                     dry_run=dry_run,
                     batch=True,
                 )
+
+    if check_conflicts:
+        _ota_conflict_check(plan, dry_run=dry_run)
 
 
 _OTA_STAGE_EXCLUDES = {
@@ -2737,10 +2876,11 @@ def _ota_application_run_script(
     target: InteractiveSmokeTarget,
     peer_name: str,
     application: ScenarioApplication,
+    instance_id: str,
 ) -> str:
     communication_suffix = _sanitize_docker_name(f"_com_to_{_remote_peer_name(target.cfg, peer_name)}")
     label = f"{peer_name}:{application.name}"
-    command = _ota_rosotacom_command(plan, _ota_application_parts(target, peer_name, application))
+    command = _ota_rosotacom_command(plan, _ota_application_parts(target, peer_name, application, instance_id))
     return (
         f"{_ota_wait_for_running_container_suffix_script(communication_suffix, f'{peer_name}:communication')}; "
         f"echo '[INFO] starting native application container:' {shlex.quote(label)}; "
@@ -2875,7 +3015,9 @@ def _ota_create_tmux(
     if target.scenario_definition:
         for peer in peers:
             for application in target.scenario_definition.applications.get(peer.name, ()):
-                application_script = _ota_application_run_script(plan, target, peer.name, application)
+                application_script = _ota_application_run_script(
+                    plan, target, peer.name, application, instance.instance_id
+                )
                 created_application = subprocess.run(
                     _tmux_command(
                         runtime,
@@ -2984,13 +3126,15 @@ def _start_interactive_ota_smoke(args: argparse.Namespace) -> int:
     runtime, plan, target = _resolve_ota_smoke_context(args)
     dry_run = bool(getattr(args, "dry_run", False))
     if not getattr(args, "skip_preflight", False):
+        # Conflicts are checked after the attach shortcut below: re-attaching to
+        # this run's own containers must not count as a conflict.
         _ota_preflight(
             plan,
             require_tmux=target.target_type == "scenario",
             check_peer_reachability=bool(getattr(args, "check_peer_reachability", False)),
             dry_run=dry_run,
+            check_conflicts=False,
         )
-    _ota_prepare_hosts(args, runtime, plan)
     tmux_session = _ota_smoke_tmux_session(target.target_type, target.name)
     mode = _resolve_mode(getattr(args, "mode", "auto"))
     if _tmux_session_exists(runtime, tmux_session):
@@ -3001,6 +3145,9 @@ def _start_interactive_ota_smoke(args: argparse.Namespace) -> int:
             print(f"Attach with: rosotacom ota-smoke {shlex.quote(target.name)} --interactive")
         return 0
 
+    if not getattr(args, "skip_preflight", False) and not getattr(args, "skip_conflict_check", False):
+        _ota_conflict_check(plan, dry_run=dry_run)
+    _ota_prepare_hosts(args, runtime, plan)
     instance = _resolve_session_instance(
         runtime,
         target.session,
@@ -3049,6 +3196,7 @@ def _start_noninteractive_ota_smoke(args: argparse.Namespace) -> int:
             require_tmux=target.target_type == "scenario",
             check_peer_reachability=bool(getattr(args, "check_peer_reachability", False)),
             dry_run=dry_run,
+            check_conflicts=not getattr(args, "skip_conflict_check", False),
         )
     _ota_prepare_hosts(args, runtime, plan)
     instance = _resolve_session_instance(
@@ -3438,14 +3586,39 @@ def _scenario_container_name(
     scenario_name: str,
     identity: str,
     application_name: str,
+    instance_id: str,
 ) -> str:
     base = _sanitize_docker_name(
-        f"rosotacom_{runtime.install_id}_scenario_{scenario_name}_{identity}_{application_name}"
+        f"rosotacom_{runtime.install_id}_{_instance_name_token(instance_id)}"
+        f"_scenario_{scenario_name}_{identity}_{application_name}"
     )
     if len(base) <= 120:
         return base
     digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
     return f"{base[:109]}_{digest}"
+
+
+def _matching_scenario_containers(
+    runtime: RuntimeConfig,
+    scenario_name: str,
+    identity: str,
+    application_name: str,
+    *,
+    all_states: bool = False,
+) -> list[str]:
+    """Workspace containers for one scenario application, any instance.
+
+    Reconstructs the exact name from each candidate's instance token so the
+    long-name truncation applies identically.
+    """
+    names = []
+    for name, _networks in _list_docker_containers(all_states=all_states):
+        parts = _split_workspace_container(name, runtime)
+        if parts is None:
+            continue
+        if name == _scenario_container_name(runtime, scenario_name, identity, application_name, parts[0]):
+            names.append(name)
+    return sorted(names)
 
 
 def _scenario_application_image_name(runtime: RuntimeConfig, application: ScenarioApplication) -> str:
@@ -3542,6 +3715,7 @@ def _scenario_application_command(
     resolved: ResolvedScenario,
     identity: str,
     application: ScenarioApplication,
+    instance_id: str,
     *,
     network_name: str | None = None,
     network_ip: str | None = None,
@@ -3557,6 +3731,8 @@ def _scenario_application_command(
         identity,
         "--application",
         application.name,
+        "--instance-id",
+        instance_id,
         *_runtime_cli_args(runtime),
     ]
     if network_name:
@@ -3701,6 +3877,7 @@ def _create_scenario_tmux(
                 resolved,
                 identity,
                 application,
+                instance.instance_id,
                 network_name=application_network,
             )
         )
@@ -3889,8 +4066,22 @@ def start_session(args: argparse.Namespace) -> str:
     if not args.identity:
         print(f"Auto-selected identity: {identity}")
     remote_name = _remote_peer_name(cfg, identity)
-    container_name = _container_name(remote_name, runtime)
     instance = _resolve_session_instance(runtime, session, getattr(args, "instance_id", None))
+    container_name = _container_name(remote_name, runtime, instance.instance_id)
+    network_isolated = bool(getattr(args, "network_name", None))
+    if not network_isolated and not getattr(args, "skip_conflict_check", False):
+        conflicts = [name for name in _matching_com_containers(runtime, remote_name) if name != container_name]
+        if conflicts and args.force:
+            for conflict in conflicts:
+                _stop_container_name(conflict, runtime, quiet_missing=True)
+                print(f"Stopped conflicting session container: {conflict}")
+        elif conflicts:
+            raise _conflict_error(
+                f"An incompatible session for identity {identity!r} is already running in this workspace.",
+                conflicts,
+                f"Stop it first with: rosotacom stop {shlex.quote(args.session_dir)} --identity {shlex.quote(identity)}"
+                " (or pass --force to replace it, --skip-conflict-check to ignore it).",
+            )
     image_name = _scoped_image_name(runtime)
     extra_run_args = _base_extra_run_args(runtime, session, cfg, instance)
     run_override: dict[str, object] = {}
@@ -3991,7 +4182,12 @@ def stop_session(args: argparse.Namespace) -> None:
         )
         identity = _auto_identity(bindings)
         print(f"Auto-selected identity: {identity}")
-    for container_name in _identity_container_names(cfg, runtime, identity):
+    containers = _identity_container_names(cfg, runtime, identity, all_states=True)
+    if not containers:
+        scope = f"identity {identity!r}" if identity else "any identity"
+        print(f"No rosotacom session containers found in this workspace for {scope}.")
+        return
+    for container_name in containers:
         _stop_container_name(container_name, runtime)
 
 
@@ -4095,15 +4291,19 @@ def _stop_scenario_application(
     resolved: ResolvedScenario,
     identity: str,
     application: ScenarioApplication,
+    instance_id: str | None = None,
 ) -> bool:
-    container_name = _scenario_container_name(runtime, resolved.name, identity, application.name)
-    if not _container_exists(container_name):
-        return False
-    ros2docker_stop(
-        config_file=application.ros2docker_config,
-        override={"container_name": container_name},
-    )
-    return True
+    if instance_id:
+        containers = [_scenario_container_name(runtime, resolved.name, identity, application.name, instance_id)]
+        containers = [name for name in containers if _container_exists(name)]
+    else:
+        containers = _matching_scenario_containers(runtime, resolved.name, identity, application.name, all_states=True)
+    for container_name in containers:
+        ros2docker_stop(
+            config_file=application.ros2docker_config,
+            override={"container_name": container_name},
+        )
+    return bool(containers)
 
 
 def _kill_scenario_tmux(runtime: RuntimeConfig, session_name: str) -> bool:
@@ -4145,12 +4345,12 @@ def _stop_scenario_components(
         if stopped:
             print(f"Stopped scenario application: {application.name}")
         elif not quiet_missing:
-            print(
-                "Application container not found: "
-                + _scenario_container_name(runtime, resolved.name, identity, application.name)
-            )
-    communication_container = _container_name(_remote_peer_name(cfg, identity), runtime)
-    _stop_container_name(communication_container, runtime, quiet_missing=quiet_missing)
+            print(f"Application container not found: {resolved.name}/{identity}/{application.name}")
+    communication_containers = _matching_com_containers(runtime, _remote_peer_name(cfg, identity), all_states=True)
+    if not communication_containers and not quiet_missing:
+        print(f"Communication container not found for identity: {identity}")
+    for communication_container in communication_containers:
+        _stop_container_name(communication_container, runtime, quiet_missing=quiet_missing)
     if _kill_scenario_tmux(runtime, _scenario_tmux_session(resolved.name, identity)):
         print(f"Stopped scenario tmux session: {_scenario_tmux_session(resolved.name, identity)}")
 
@@ -4173,7 +4373,7 @@ def start_scenario(args: argparse.Namespace) -> int:
         )
 
     instance = _resolve_session_instance(runtime, session, getattr(args, "instance_id", None))
-    communication_container = _container_name(_remote_peer_name(cfg, identity), runtime)
+    communication_container = _container_name(_remote_peer_name(cfg, identity), runtime, instance.instance_id)
     _write_scenario_manifest(
         instance,
         session,
@@ -4262,7 +4462,8 @@ def run_scenario_application(args: argparse.Namespace) -> int:
     resolved = _resolve_scenario(args.scenario, runtime)
     definition = _load_scenario_definition(resolved)
     application = _scenario_application(definition, args.identity, args.application)
-    container_name = _scenario_container_name(runtime, resolved.name, args.identity, application.name)
+    instance_id = getattr(args, "instance_id", None) or _new_instance_id()
+    container_name = _scenario_container_name(runtime, resolved.name, args.identity, application.name, instance_id)
     if _container_exists(container_name):
         ros2docker_stop(
             config_file=application.ros2docker_config,
@@ -4515,6 +4716,43 @@ def doctor(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def ps_command(args: argparse.Namespace) -> int:
+    """Answer "can I start something?" by classifying active rosotacom containers."""
+    runtime = _load_runtime_config(args)
+    prefix = _workspace_container_prefix(runtime)
+    smoke_isolated: list[tuple[str, str]] = []
+    host_shared: list[str] = []
+    other_workspaces: list[str] = []
+    for name, networks in _list_docker_containers():
+        if not name.startswith("rosotacom_"):
+            continue
+        if not name.startswith(prefix):
+            other_workspaces.append(name)
+            continue
+        smoke_nets = [net for net in networks if net.startswith("rosotacom_smoke_") or net == SMOKE_NETWORK_NAME]
+        if smoke_nets:
+            smoke_isolated.append((name, smoke_nets[0]))
+        else:
+            host_shared.append(name)
+    print(f"Workspace {runtime.install_id} — active rosotacom containers:")
+    if not smoke_isolated and not host_shared:
+        print("  (none — you can start anything)")
+    if smoke_isolated:
+        print("  Smoke-isolated (parallel-safe; only a smoke run of the same target conflicts):")
+        for name, network in sorted(smoke_isolated):
+            print(f"    - {name} (network: {network})")
+    if host_shared:
+        print("  Host-shared (a new run for the same identity conflicts; stop with `rosotacom stop`):")
+        for name in sorted(host_shared):
+            print(f"    - {name}")
+    if other_workspaces:
+        print(f"Containers from other rosotacom workspaces: {len(other_workspaces)}")
+        for name in sorted(other_workspaces):
+            print(f"    - {name}")
+    print("See CONCURRENCY.md for what can run in parallel.")
+    return 0
+
+
 # `ros2 topic hz`/`delay` never exit on their own, so we sample them for a fixed
 # window via `timeout` and then SIGKILL, otherwise a slow rmw shutdown can keep
 # the probe alive. The outer docker-exec timeout must stay well above the sample
@@ -4625,10 +4863,68 @@ def _smoke_subnet_from_token(token: str) -> str:
     return f"10.137.{third_octet}.{fourth_octet}/29"
 
 
-def _interactive_smoke_network_config(runtime: RuntimeConfig, target_type: str, target_name: str) -> tuple[str, str]:
-    token = _bounded_docker_name(f"rosotacom_smoke_{runtime.install_id}_{target_type}_{target_name}")
-    subnet_octet = 1 + (int(hashlib.sha1(token.encode("utf-8")).hexdigest()[:8], 16) % 200)
-    return token, f"10.137.{subnet_octet}.0/24"
+def _interactive_smoke_network_config(
+    runtime: RuntimeConfig, target_type: str, target_name: str, instance_id: str
+) -> tuple[str, str]:
+    token = _bounded_docker_name(
+        f"rosotacom_smoke_{runtime.install_id}_{target_type}_{target_name}_{_instance_name_token(instance_id)}"
+    )
+    return token, _smoke_subnet_from_token(token)
+
+
+def _smoke_target_key(target_type: str, target_name: str) -> str:
+    return _safe_path_token(f"{target_type}_{target_name}")
+
+
+def _smoke_network_labels(runtime: RuntimeConfig, target_key: str) -> dict[str, str]:
+    return {
+        "rosotacom.kind": "smoke",
+        "rosotacom.install": runtime.install_id,
+        "rosotacom.target": target_key,
+    }
+
+
+def _matching_smoke_networks(runtime: RuntimeConfig, target_key: str) -> list[str]:
+    command = ["docker", "network", "ls", "--format", "{{.Name}}"]
+    for key, value in _smoke_network_labels(runtime, target_key).items():
+        command.extend(["--filter", f"label={key}={value}"])
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"docker network ls failed: {(result.stderr or result.stdout).strip()}")
+    return sorted(name for name in result.stdout.splitlines() if name)
+
+
+def _smoke_network_active_containers(network_name: str) -> list[str]:
+    result = subprocess.run(
+        ["docker", "ps", "--filter", f"network={network_name}", "--format", "{{.Names}}"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"docker ps failed: {(result.stderr or result.stdout).strip()}")
+    return sorted(name for name in result.stdout.splitlines() if name)
+
+
+def _abort_on_active_smoke_run(runtime: RuntimeConfig, target_key: str, target_label: str, *, skip: bool) -> None:
+    """Fail-safe preflight: refuse to start a second smoke run of the same target.
+
+    Runs before any network or workspace allocation. Different targets and
+    different workspaces stay parallel-safe; leftover networks without running
+    containers are not conflicts (they are recreated per run anyway).
+    """
+    if skip:
+        return
+    conflicts: list[str] = []
+    for network_name in _matching_smoke_networks(runtime, target_key):
+        conflicts.extend(_smoke_network_active_containers(network_name))
+    if conflicts:
+        raise _conflict_error(
+            f"A smoke run for {target_label} is already active in this workspace.",
+            conflicts,
+            f"Stop it first with: rosotacom smoke {shlex.quote(target_label)} --stop (interactive runs), wait for it"
+            " to finish, or pass --skip-conflict-check. Different targets and workspaces run in parallel.",
+        )
 
 
 def _noninteractive_smoke_network_config(
@@ -4673,16 +4969,19 @@ def _smoke_peer_address_args(peer_ips: dict[str, str] | None = None) -> list[str
     return [f"{peer}={source[peer]}" for peer in sorted(source)]
 
 
-def _ensure_smoke_network(network_name: str = SMOKE_NETWORK_NAME, subnet: str = SMOKE_NETWORK_SUBNET) -> None:
+def _ensure_smoke_network(
+    network_name: str = SMOKE_NETWORK_NAME,
+    subnet: str = SMOKE_NETWORK_SUBNET,
+    labels: dict[str, str] | None = None,
+) -> None:
     # Recreate from a clean slate so a leftover network from a crashed run cannot
     # cause a subnet-overlap failure on create.
     _remove_smoke_network(network_name)
-    result = subprocess.run(
-        ["docker", "network", "create", "--subnet", subnet, network_name],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    command = ["docker", "network", "create", "--subnet", subnet]
+    for key, value in (labels or {}).items():
+        command.extend(["--label", f"{key}={value}"])
+    command.append(network_name)
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(
             f"Failed to create smoke network {network_name} ({subnet}): {(result.stderr or result.stdout).strip()}"
@@ -5555,8 +5854,16 @@ def _resolve_running_peer(args: argparse.Namespace, identity: str) -> tuple[str,
     session = _resolve_session(getattr(args, "session_dir", None) or DEFAULT_SMOKE_SESSION, runtime)
     cfg = _effective_session_config(session.host_dir, runtime)
     containers = _identity_container_names(cfg, runtime, identity)
+    instance_id = getattr(args, "instance_id", None)
+    if instance_id:
+        instance_token = _instance_name_token(instance_id)
+        containers = [
+            name
+            for name in containers
+            if (parts := _split_workspace_container(name, runtime)) is not None and parts[0] == instance_token
+        ]
     if not containers:
-        raise RuntimeError(f"No container resolved for identity {identity!r}")
+        raise RuntimeError(f"No running container found for identity {identity!r}")
     config_container_dir = _running_instance_config_container_dir(runtime, session, getattr(args, "instance_id", None))
     ros_setup = _smoke_ros_setup(config_container_dir, cfg, identity)
     return containers[0], ros_setup, cfg
@@ -5876,6 +6183,7 @@ def _interactive_smoke_application_command(
     target: InteractiveSmokeTarget,
     identity: str,
     application: ScenarioApplication,
+    instance_id: str,
     network_name: str,
 ) -> list[str]:
     assert target.scenario is not None
@@ -5884,6 +6192,7 @@ def _interactive_smoke_application_command(
         target.scenario,
         identity,
         application,
+        instance_id,
         network_name=network_name,
     )
 
@@ -6093,11 +6402,15 @@ def _create_interactive_smoke_tmux(
 
     if target.target_type == "scenario" and target.scenario_definition is not None:
         for peer in peers:
-            communication_container = _container_name(_remote_peer_name(target.cfg, peer), runtime)
+            communication_container = _container_name(
+                _remote_peer_name(target.cfg, peer), runtime, instance.instance_id
+            )
             app_network = f"container:{communication_container}"
             for application in target.scenario_definition.applications.get(peer, ()):
                 command = shlex.join(
-                    _interactive_smoke_application_command(runtime, target, peer, application, app_network)
+                    _interactive_smoke_application_command(
+                        runtime, target, peer, application, instance.instance_id, app_network
+                    )
                 )
                 script = (
                     f"{_wait_for_peer_spec_script(instance, peer)}; "
@@ -6214,7 +6527,13 @@ def _interactive_smoke_verify(args: argparse.Namespace) -> int:
         runtime,
         getattr(args, "target_type", "auto"),
     )
-    instance = _resolve_session_instance(runtime, target.session, getattr(args, "instance_id", None))
+    instance_id = getattr(args, "instance_id", None)
+    if not instance_id:
+        # Container names are instance-scoped, so verification must join the
+        # active run instead of allocating a fresh instance.
+        active = _infer_active_interactive_smoke_run(runtime, target.name, target.target_type)
+        instance_id = active.instance_id
+    instance = _resolve_session_instance(runtime, target.session, instance_id)
     smoke_log = instance.logs_host_dir / "interactive-smoke-verification.log"
 
     def log_line(message: str) -> None:
@@ -6222,7 +6541,9 @@ def _interactive_smoke_verify(args: argparse.Namespace) -> int:
         _append_log(smoke_log, message)
 
     peers = _require_two_peer_smoke_cfg(target.cfg, target.name)
-    containers = {peer: _container_name(_remote_peer_name(target.cfg, peer), runtime) for peer in peers}
+    containers = {
+        peer: _container_name(_remote_peer_name(target.cfg, peer), runtime, instance.instance_id) for peer in peers
+    }
     log_line(f"Interactive smoke verification starting: {target.name} ({target.target_type})")
     log_line(f"Verification artifacts: {instance.host_dir}")
     for peer, container in containers.items():
@@ -6293,8 +6614,6 @@ def _start_interactive_smoke(args: argparse.Namespace) -> int:
         runtime,
         getattr(args, "target_type", "auto"),
     )
-    network_name, network_subnet = _interactive_smoke_network_config(runtime, target.target_type, target.name)
-    peer_ips = _smoke_peer_ips_for_subnet(_require_two_peer_smoke_cfg(target.cfg, target.name), network_subnet)
     tmux_session = _interactive_smoke_tmux_session(target.target_type, target.name)
     mode = _resolve_mode(getattr(args, "mode", "auto"))
     if _tmux_session_exists(runtime, tmux_session):
@@ -6305,12 +6624,18 @@ def _start_interactive_smoke(args: argparse.Namespace) -> int:
             print(f"Attach with: rosotacom smoke {shlex.quote(target.name)} --interactive")
         return 0
 
+    target_key = _smoke_target_key(target.target_type, target.name)
+    _abort_on_active_smoke_run(runtime, target_key, target.name, skip=bool(getattr(args, "skip_conflict_check", False)))
     instance = _resolve_session_instance(
         runtime,
         target.session,
         getattr(args, "instance_id", None) or _new_instance_id(),
     )
-    _ensure_smoke_network(network_name, network_subnet)
+    network_name, network_subnet = _interactive_smoke_network_config(
+        runtime, target.target_type, target.name, instance.instance_id
+    )
+    peer_ips = _smoke_peer_ips_for_subnet(_require_two_peer_smoke_cfg(target.cfg, target.name), network_subnet)
+    _ensure_smoke_network(network_name, network_subnet, labels=_smoke_network_labels(runtime, target_key))
     _write_interactive_smoke_manifest(
         instance,
         target,
@@ -6351,25 +6676,42 @@ def _stop_interactive_smoke(args: argparse.Namespace) -> int:
             raise
         active = None
         target = _resolve_interactive_smoke_target(target_arg, runtime, target_type)
-        network_name, _network_subnet = _interactive_smoke_network_config(runtime, target.target_type, target.name)
+        network_name = None
         tmux_session = _interactive_smoke_tmux_session(target.target_type, target.name)
         instance_id = getattr(args, "instance_id", None)
 
     peers = _require_two_peer_smoke_cfg(target.cfg, target.name)
-    containers = {peer: _container_name(_remote_peer_name(target.cfg, peer), runtime) for peer in peers}
+    if instance_id:
+        peer_containers = {
+            peer: [_container_name(_remote_peer_name(target.cfg, peer), runtime, instance_id)] for peer in peers
+        }
+    else:
+        # Without run metadata, fall back to discovering every instance of this
+        # workspace's communication containers for the smoke peers.
+        peer_containers = {
+            peer: _matching_com_containers(runtime, _remote_peer_name(target.cfg, peer), all_states=True)
+            for peer in peers
+        }
     if target.target_type == "session":
-        _stop_smoke_topic_publishers(containers, _smoke_publish_specs(target.cfg))
+        publisher_containers = {peer: names[0] for peer, names in peer_containers.items() if names}
+        if publisher_containers:
+            _stop_smoke_topic_publishers(publisher_containers, _smoke_publish_specs(target.cfg))
     if target.target_type == "scenario" and target.scenario is not None and target.scenario_definition is not None:
         for peer in peers:
             for application in target.scenario_definition.applications.get(peer, ()):
-                if _stop_scenario_application(runtime, target.scenario, peer, application):
+                if _stop_scenario_application(runtime, target.scenario, peer, application, instance_id):
                     print(f"Stopped scenario application: {peer}/{application.name}")
-    for peer, container in containers.items():
-        if _stop_container_name(container, runtime, quiet_missing=True):
-            print(f"Stopped communication container: {peer} ({container})")
+    for peer, names in peer_containers.items():
+        for container in names:
+            if _stop_container_name(container, runtime, quiet_missing=True):
+                print(f"Stopped communication container: {peer} ({container})")
     if _kill_scenario_tmux(runtime, tmux_session):
         print(f"Stopped interactive smoke tmux session: {tmux_session}")
-    _remove_smoke_network(network_name)
+    if network_name:
+        _remove_smoke_network(network_name)
+    else:
+        for leftover in _matching_smoke_networks(runtime, _smoke_target_key(target.target_type, target.name)):
+            _remove_smoke_network(leftover)
     instance_dir = _find_latest_interactive_smoke_instance(
         runtime,
         target.target_type,
@@ -6403,6 +6745,10 @@ def smoke(args: argparse.Namespace) -> int:
     session_dir = args.session_dir or DEFAULT_SMOKE_SESSION
     runtime = _load_runtime_config(args)
     session = _resolve_session(session_dir, runtime)
+    smoke_target_key = _smoke_target_key("session", session.host_dir.name)
+    _abort_on_active_smoke_run(
+        runtime, smoke_target_key, session.host_dir.name, skip=bool(getattr(args, "skip_conflict_check", False))
+    )
     instance_id = getattr(args, "instance_id", None) or _new_instance_id()
     smoke_instance = _resolve_session_instance(runtime, session, instance_id)
     smoke_network = _noninteractive_smoke_network_config(runtime, session, smoke_instance.instance_id)
@@ -6422,7 +6768,9 @@ def smoke(args: argparse.Namespace) -> int:
         "deployment": args.deployment,
         "session_dir": session_dir,
         "mode": "detached",
-        "force": True,
+        # Names are instance-scoped, so there is nothing to force-replace; a
+        # parallel run's containers must never be stopped from here.
+        "force": False,
         "rewrite_formatting": False,
         "peer": [],
         "peer_address": peer_address_args,
@@ -6437,7 +6785,9 @@ def smoke(args: argparse.Namespace) -> int:
     b_container = None
     smoke_publishers: list[SmokeTopicSpec] = []
     try:
-        _ensure_smoke_network(smoke_network.name, smoke_network.subnet)
+        _ensure_smoke_network(
+            smoke_network.name, smoke_network.subnet, labels=_smoke_network_labels(runtime, smoke_target_key)
+        )
         a_container = start_session(
             argparse.Namespace(**common, identity="a", auto_identity=True, network_ip=smoke_network.peer_ips["a"])
         )
@@ -6743,6 +7093,11 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     _add_peer_arg(parser)
     _add_peer_address_arg(parser)
     parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
+    parser.add_argument(
+        "--skip-conflict-check",
+        action="store_true",
+        help="Start even if another session container for this identity is running.",
+    )
     parser.add_argument("--scenario-managed", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--smoke-managed", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--network-name", help=argparse.SUPPRESS)
@@ -7029,6 +7384,7 @@ def main(argv: list[str] | None = None) -> int:
         "start",
         "stop",
         "doctor",
+        "ps",
         "smoke",
         "ota-smoke",
         "status",
@@ -7076,6 +7432,13 @@ def main(argv: list[str] | None = None) -> int:
     _add_common_config_args(doctor_parser)
     doctor_parser.set_defaults(func=doctor)
 
+    ps_parser = subparsers.add_parser(
+        "ps",
+        help="List this workspace's active rosotacom containers and whether they block new runs.",
+    )
+    _add_common_config_args(ps_parser)
+    ps_parser.set_defaults(func=ps_command)
+
     smoke_parser = subparsers.add_parser("smoke", help="Run a local smoke test.")
     _add_common_config_args(smoke_parser)
     _add_profile_arg(smoke_parser)
@@ -7104,6 +7467,11 @@ def main(argv: list[str] | None = None) -> int:
     smoke_parser.add_argument("--mode", choices=["auto", "attach", "detached"], default="auto")
     smoke_parser.add_argument("--keep-running", action="store_true", help="Leave smoke-test containers running.")
     smoke_parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
+    smoke_parser.add_argument(
+        "--skip-conflict-check",
+        action="store_true",
+        help="Start even if a smoke run for the same target is already active in this workspace.",
+    )
     _add_peer_address_arg(smoke_parser)
     smoke_parser.add_argument("--verify-only", action="store_true", help=argparse.SUPPRESS)
     smoke_parser.set_defaults(func=smoke)
@@ -7138,6 +7506,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Keep staged source and project files after cleanup.",
     )
     ota_smoke_parser.add_argument("--skip-preflight", action="store_true", help="Skip SSH/Docker readiness checks.")
+    ota_smoke_parser.add_argument(
+        "--skip-conflict-check",
+        action="store_true",
+        help="Proceed even if the peers already run rosotacom containers or active network shaping.",
+    )
     ota_smoke_parser.add_argument(
         "--check-peer-reachability",
         action="store_true",
@@ -7320,6 +7693,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_scenario_arg(scenario_run_application_parser, "scenario")
     _add_identity_arg(scenario_run_application_parser, required=True)
     scenario_run_application_parser.add_argument("--application", required=True)
+    scenario_run_application_parser.add_argument("--instance-id", help=argparse.SUPPRESS)
     scenario_run_application_parser.add_argument("--network-name", help=argparse.SUPPRESS)
     scenario_run_application_parser.add_argument("--network-ip", help=argparse.SUPPRESS)
     scenario_run_application_parser.set_defaults(func=run_scenario_application)

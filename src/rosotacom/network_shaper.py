@@ -77,17 +77,6 @@ class ProfileShaper:
     def _run(self, argv: Sequence[str]) -> None:
         self._runner(list(argv))
 
-    def _is_idempotent_cleanup(self, argv: Sequence[str]) -> bool:
-        command = list(argv)
-        return command in (teardown_command(self.interface), restore_link_command(self.interface))
-
-    def _run_tolerating_idempotent_cleanup(self, argv: Sequence[str]) -> None:
-        try:
-            self._run(argv)
-        except Exception:
-            if not self._is_idempotent_cleanup(argv):
-                raise
-
     def teardown(self) -> None:
         """Always-safe revert: clear any root qdisc and bring the link back up.
 
@@ -115,11 +104,14 @@ class ProfileShaper:
     def apply(self, commands: Iterable[Sequence[str]]) -> None:
         """Run ``commands`` as-is, without a fresh clean-slate or watchdog.
 
-        Used to step a timeline (each :func:`~rosotacom.network_profiles.expand_timeline`
-        step already begins with its own teardown); the watchdog is launched once via
-        :meth:`arm` at the start of the run, not per step."""
+        Used to step a timeline: each :func:`~rosotacom.network_profiles.expand_timeline`
+        step updates the qdisc tree **in place** (``tc qdisc replace``), so there is
+        no teardown between steps — a del+add would drop netem's queue and leave a
+        brief unshaped window at every boundary. The watchdog is launched once via
+        :meth:`arm` at the start of the run, not per step; a failing step command
+        raises (the context manager still reverts)."""
         for argv in commands:
-            self._run_tolerating_idempotent_cleanup(argv)
+            self._run(argv)
         self.armed = True
 
     def __enter__(self) -> ProfileShaper:

@@ -42,6 +42,12 @@ OUTAGE_KINDS = (OUTAGE_CATCHUP, OUTAGE_RECONNECT)
 _DEFAULT_TBF_BURST = "32kbit"
 _DEFAULT_TBF_LATENCY_MS = 100.0
 
+# The "unimpaired" tbf stage for rate-less steps of a rated timeline. Seamless
+# stepping needs the qdisc tree shape to stay constant, so the stage stays
+# present but never binds: faster than any link we emulate, with a token bucket
+# big enough (~10 ms of tokens at 10 Gbit/s) that no packet ever waits on it.
+_UNSHAPED_TBF_ARGS = ("rate", "10gbit", "burst", "12500kb", "latency", "100ms")
+
 
 # --------------------------------------------------------------------------- #
 # Value parsing (human strings → normalized numbers)
@@ -403,56 +409,50 @@ def _netem_args(shaping: DirectionShaping) -> list[str]:
     return args
 
 
+def _tbf_stage_command(interface: str, shaping: DirectionShaping | None) -> list[str]:
+    """``tc qdisc replace`` for the tbf root stage (``1:``) — in place when it
+    already exists. A step without a rate keeps the stage present but effectively
+    unlimited (:data:`_UNSHAPED_TBF_ARGS`), so the tree shape never changes."""
+    if shaping is not None and shaping.rate_bps is not None:
+        args = [
+            "rate",
+            f"{int(round(shaping.rate_bps))}bit",
+            "burst",
+            shaping.burst,
+            "latency",
+            _ms(shaping.tbf_latency_ms),
+        ]
+    else:
+        args = list(_UNSHAPED_TBF_ARGS)
+    return ["tc", "qdisc", "replace", "dev", interface, "root", "handle", "1:", "tbf", *args]
+
+
+def _netem_stage_command(interface: str, netem_args: Sequence[str], *, child_of_tbf: bool) -> list[str]:
+    """``tc qdisc replace`` for the netem stage (``10:``) — in place when it
+    already exists. Empty ``netem_args`` is a pass-through netem; a netem change
+    replaces the whole parameter set, so anything omitted is reset, not inherited."""
+    location = ["parent", "1:"] if child_of_tbf else ["root"]
+    return ["tc", "qdisc", "replace", "dev", interface, *location, "handle", "10:", "netem", *netem_args]
+
+
 def shaping_commands(interface: str, shaping: DirectionShaping) -> list[list[str]]:
     """The ordered ``tc`` argv list that arms ``shaping`` on ``interface`` egress.
 
     Layout mirrors the calibrated baseline: a ``tbf`` root for rate limiting with a
     child ``netem`` for delay/jitter/loss. When only one of the two is requested it
-    becomes the root qdisc; an empty shaping arms nothing.
+    becomes the root qdisc; an empty shaping arms nothing. Emitted as ``tc qdisc
+    replace`` (add-or-change), so re-arming over an existing tree of the same
+    shape updates it in place instead of failing.
     """
     if shaping.is_empty:
         return []
     commands: list[list[str]] = []
     if shaping.rate_bps is not None:
-        commands.append(
-            [
-                "tc",
-                "qdisc",
-                "add",
-                "dev",
-                interface,
-                "root",
-                "handle",
-                "1:",
-                "tbf",
-                "rate",
-                f"{int(round(shaping.rate_bps))}bit",
-                "burst",
-                shaping.burst,
-                "latency",
-                _ms(shaping.tbf_latency_ms),
-            ]
-        )
+        commands.append(_tbf_stage_command(interface, shaping))
         if shaping.has_netem:
-            commands.append(
-                [
-                    "tc",
-                    "qdisc",
-                    "add",
-                    "dev",
-                    interface,
-                    "parent",
-                    "1:",
-                    "handle",
-                    "10:",
-                    "netem",
-                    *_netem_args(shaping),
-                ]
-            )
+            commands.append(_netem_stage_command(interface, _netem_args(shaping), child_of_tbf=True))
     elif shaping.has_netem:
-        commands.append(
-            ["tc", "qdisc", "add", "dev", interface, "root", "handle", "10:", "netem", *_netem_args(shaping)]
-        )
+        commands.append(_netem_stage_command(interface, _netem_args(shaping), child_of_tbf=False))
     return commands
 
 
@@ -481,34 +481,6 @@ def safety_teardown_command(interface: str, max_duration_s: float) -> list[str]:
     return ["sh", "-c", f"sleep {seconds}; tc qdisc del dev {iface} root; ip link set dev {iface} up"]
 
 
-def outage_commands(interface: str, kind: str) -> list[list[str]]:
-    """Arm an outage of the given kind on ``interface``.
-
-    ``catchup`` drops every packet but keeps the interface up (DDS endpoints
-    survive → recovery is "catch up"); ``reconnect`` brings the interface down
-    (forces RMW re-discovery → the harsher reconnect). The matching restore is
-    :func:`outage_restore_commands`.
-    """
-    if kind == OUTAGE_CATCHUP:
-        return [
-            teardown_command(interface),
-            ["tc", "qdisc", "add", "dev", interface, "root", "handle", "10:", "netem", "loss", "100%"],
-        ]
-    if kind == OUTAGE_RECONNECT:
-        return [["ip", "link", "set", "dev", interface, "down"]]
-    raise ValueError(f"outage must be one of {OUTAGE_KINDS}, got {kind!r}")
-
-
-def outage_restore_commands(interface: str, kind: str) -> list[list[str]]:
-    """Undo an outage. ``catchup`` clears the 100%-loss qdisc; ``reconnect`` brings
-    the interface back up. The caller re-arms the following segment's shaping after."""
-    if kind == OUTAGE_CATCHUP:
-        return [teardown_command(interface)]
-    if kind == OUTAGE_RECONNECT:
-        return [["ip", "link", "set", "dev", interface, "up"]]
-    raise ValueError(f"outage must be one of {OUTAGE_KINDS}, got {kind!r}")
-
-
 # --------------------------------------------------------------------------- #
 # Timeline expansion (segments → a stepping schedule)
 # --------------------------------------------------------------------------- #
@@ -534,28 +506,58 @@ def expand_timeline(
 ) -> list[TimelineStep]:
     """Expand a timeline profile into absolute-clock steps for the given direction.
 
-    Each step first tears the previous shaping down (the idempotent root delete),
-    then arms its own — shaping segments arm ``shaping_commands``; outage segments
-    arm ``outage_commands``. The stepping driver runs ``commands`` at ``start_s``;
-    the recovery genre (RFC 0005) reads ``outage`` to know which restore semantics
-    a given ``end_s`` represents.
+    Steps transition **seamlessly**: every step ``tc qdisc replace``\\ s the *same*
+    qdisc tree in place instead of tearing it down and re-adding it — a del+add
+    drops everything queued inside netem and leaves a brief unshaped window, which
+    shows up as lost and under-delayed messages at every boundary (even between
+    identical segments). The tree shape is therefore fixed for the whole timeline,
+    decided up front: a tbf root (``1:``) with a netem child (``10:``) when any
+    segment rate-limits, else a netem root (``10:``). A step that does not use a
+    stage arms it as a pass-through (unlimited tbf / bare netem) rather than
+    removing it; a direction that never shapes (and no outages) arms nothing.
+
+    Outage segments fold into the same tree: ``catchup`` is an in-place
+    ``netem loss 100%`` (interface stays up — seamless entry and exit, DDS
+    endpoints survive → recovery is "catch up"); ``reconnect`` downs the link
+    (disruptive by design — forces RMW re-discovery) and the following step
+    restores it first. The stepping driver runs ``commands`` at ``start_s``; the
+    recovery genre (RFC 0005) reads ``outage`` to know which restore semantics a
+    given ``end_s`` represents.
     """
     if not profile.is_timeline:
         raise ValueError(f"profile {profile.name!r} is not a timeline profile")
     if direction not in ("uplink", "downlink"):
         raise ValueError(f"direction must be 'uplink' or 'downlink', got {direction!r}")
 
+    shapings = [segment.uplink if direction == "uplink" else segment.downlink for segment in profile.timeline]
+    rated = any(shaping is not None and shaping.rate_bps is not None for shaping in shapings)
+    shaped = (
+        rated
+        or any(shaping is not None and shaping.has_netem for shaping in shapings)
+        or any(segment.outage is not None for segment in profile.timeline)
+    )
+
     steps: list[TimelineStep] = []
     clock = 0.0
+    previous_outage: str | None = None
     for index, segment in enumerate(profile.timeline):
         start_s, end_s = clock, clock + segment.for_s
-        if segment.outage is not None:
-            commands = outage_commands(interface, segment.outage)
-        else:
-            shaping = segment.uplink if direction == "uplink" else segment.downlink
-            commands = [teardown_command(interface)]
-            if shaping is not None:
-                commands += shaping_commands(interface, shaping)
+        commands: list[list[str]] = []
+        if previous_outage == OUTAGE_RECONNECT and segment.outage != OUTAGE_RECONNECT:
+            commands.append(restore_link_command(interface))
+        if segment.outage == OUTAGE_RECONNECT:
+            commands.append(["ip", "link", "set", "dev", interface, "down"])
+        elif shaped:
+            if segment.outage == OUTAGE_CATCHUP:
+                shaping: DirectionShaping | None = None
+                netem_args: list[str] = ["loss", "100%"]
+            else:
+                shaping = shapings[index]
+                netem_args = _netem_args(shaping) if shaping is not None else []
+            if rated:
+                commands.append(_tbf_stage_command(interface, shaping))
+            commands.append(_netem_stage_command(interface, netem_args, child_of_tbf=rated))
         steps.append(TimelineStep(index=index, start_s=start_s, end_s=end_s, outage=segment.outage, commands=commands))
         clock = end_s
+        previous_outage = segment.outage
     return steps

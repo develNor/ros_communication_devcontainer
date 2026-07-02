@@ -119,6 +119,15 @@ the OTA interface, so the transport sees a realistic pipe and is unaware of it
   arm with an automatic revert on stop, on error, *and* a safety max-duration, so
   a crashed run cannot leave a `qdisc` shaping every later result. `tc qdisc del
   dev <if> root` is idempotent and always runs on teardown.
+- **Seamless timeline stepping (issue #124).** Timeline steps `tc qdisc replace`
+  the *same* qdisc tree in place — never del+add, which drops everything queued
+  inside `netem` and leaves a brief unshaped window at every boundary (observed
+  as lost plus under-delayed messages, even between identical segments). The tree
+  shape is fixed per timeline (tbf `1:` + netem `10:` when any segment
+  rate-limits, else netem `10:` root); an unused stage is armed as a pass-through
+  (effectively-unlimited tbf / bare netem) instead of being removed. `catchup`
+  outages fold in as an in-place `netem loss 100%`; `reconnect` stays link-down
+  (disruptive by design), restored by the following step.
 - **Bench-only, privileged.** `tc`/`netem` needs `CAP_NET_ADMIN` and applies on
   the controllable bench. The real fleet is never shaped — there the link *is* the
   condition and is measured. Selecting a profile on a real-deployment run is an
@@ -221,6 +230,10 @@ risk — a stuck `qdisc` silently corrupts every later result on the machine.
 - [x] Add timeline profiles (ordered segments + `outage`) — the substrate for the
   recovery genre in RFC 0005 (`network_profiles.TimelineSegment` / `expand_timeline`;
   both `outage` kinds — see Open questions).
+- [x] Make timeline stepping seamless (issue #124): steps `tc qdisc replace` one
+  constant tree in place instead of del+add, so a boundary drops no queued packets
+  and never runs unshaped (`expand_timeline`, `_tbf_stage_command` /
+  `_netem_stage_command`; outages folded into the same tree).
 - [x] Add per-profile calibration — realized as `rosotacom test --suggest --profile
   P`, which emits `P`'s conditional band nested under `per_profile`
   (`status_eval.suggest_profile_band`), reusing the RFC 0002 `--suggest` machinery.
@@ -265,6 +278,16 @@ off during implementation). Notes whether automation is feasible; privileged
 - [x] **Timeline profiles** (ordered segments + `outage`) — host unit test on the
   schedule expansion (`test_expand_timeline_*`, both outage kinds); live stepping is
   a **bench check** (and the substrate for the RFC 0005 recovery genre).
+- [x] **Seamless timeline stepping** (in-place `replace` of one constant tree — no
+  queue drop, no unshaped window at step boundaries) — host unit tests on the argv
+  (`test_expand_timeline_replaces_one_constant_tree_no_teardown`,
+  `test_timeline_catchup_is_in_place_full_loss_interface_up`,
+  `test_timeline_reconnect_downs_link_and_next_step_restores_it_first`) plus the
+  Docker e2e test proving the kernel changes the tree in place — stats/queue
+  persist across a boundary, the netem child survives a tbf-root replace, a bare
+  netem step resets stale parameters (`tests/e2e/test_timeline_stepping.py`, in the
+  fast-e2e lane). Bench confirmation: a probe run under a stepping profile shows no
+  boundary loss/under-delay.
 - [x] **Per-profile calibration** (`rosotacom test --suggest --profile P`) — host
   unit test that a reference status fixture yields `P`'s conditional band nested
   under `per_profile` (`test_suggest_profile_band_*`), reusing the RFC 0002
@@ -289,7 +312,7 @@ off during implementation). Notes whether automation is feasible; privileged
   survive → recovery is "catch up"); `outage: reconnect` is link-down (forces RMW
   re-discovery → the harsher reconnect with the multi-second backlog/simultaneous
   arrival the baseline describes). A bare `outage: true` defaults to the milder
-  `catchup`. Implemented in `network_profiles.outage_commands` / `OUTAGE_KINDS`.
+  `catchup`. Implemented in `network_profiles.expand_timeline` / `OUTAGE_KINDS`.
 - **Where the metric backbone reads the link during emulation.** The same
   `/proc/net/dev` link sampler (RFC 0003 / `link_bytes.py`) measures the shaped
   interface — confirm `tbf`/`netem` byte counts reflect post-shaping wire bytes so

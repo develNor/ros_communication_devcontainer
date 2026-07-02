@@ -74,7 +74,18 @@ def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
         "e2e-runtime-tools",
         "e2e-concurrency",
     }
+    e2e_jobs = {
+        "e2e-core",
+        "e2e-transforms",
+        "e2e-remote-assist",
+        "e2e-runtime-tools",
+        "e2e-concurrency",
+    }
     assert expected_jobs.issubset(set(needs))
+
+    for job in e2e_jobs:
+        assert jobs[job]["needs"] == "preflight-success"
+        assert jobs[job]["if"] == "always() && !cancelled() && needs.preflight-success.result == 'success'"
 
     # Check that required jobs are validated in the bash step of ci-success
     check_step = next(step for step in ci_success["steps"] if step.get("name") == "Check required jobs")

@@ -352,15 +352,7 @@ def plot_probe_raw(
     _, plt = _require_matplotlib()
     out = Path(out)
 
-    from .benchmark import (
-        SETTLED,
-        TRANSITION,
-        WARMUP,
-        _infer_nominal_period_s,
-        _section_ms,
-        _send_time,
-        classify_probe_settling,
-    )
+    from .benchmark import _infer_nominal_period_s, _section_ms, _send_time, find_probe_onset
 
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for row in records:
@@ -374,7 +366,8 @@ def plot_probe_raw(
     fig, ax = plt.subplots(figsize=(10, 6))
     cmap = plt.colormaps["tab10"].resampled(max(len(grouped), 1))
 
-    all_lost_xs: list[float] = []
+    setup_lost_xs: list[float] = []
+    real_lost_xs: list[float] = []
     reanchored = False
 
     for index, ((label, attempt), stream) in enumerate(sorted(grouped.items())):
@@ -391,107 +384,62 @@ def plot_probe_raw(
         seq0 = int(anchor["seq"])
         t0 = float(anchor.get(time_field) or 0.0)
 
-        expanded = []
+        # One seq-ordered sample per packet: (x, latency) or (x, None) for a loss.
+        first_send_s = min(_send_time(r, seq0=seq0, t0=t0, period_s=period_s, time_field=time_field) for r in stream)
+        ordered: list[tuple[float, float | None]] = []
         for record in stream:
             send_t = _send_time(record, seq0=seq0, t0=t0, period_s=period_s, time_field=time_field)
-            expanded.append((record, send_t))
-
-        if not expanded:
+            x = max(0.0, send_t - first_send_s)
+            latency = (
+                None if record.get("status") == "lost" else _section_ms(record, "ota_hop_ms", "ota_hop_uncorrected_ms")
+            )
+            ordered.append((x, latency))
+        if not ordered:
             continue
 
-        first_send_s = min(send_t for _, send_t in expanded)
+        # Onset splits start-up (excluded) from the impaired regime (included).
+        onset_index = find_probe_onset([latency for _, latency in ordered])
+        onset_x = ordered[onset_index][0] if onset_index is not None else 0.0
+        reanchored = reanchored or onset_index is not None
 
-        # Delivered samples in send-time order, so the settling detector sees the
-        # warm-up → settled step in the order it happened.
-        delivered: list[tuple[float, float]] = []
-        stream_lost_xs: list[float] = []
-        for record, send_t in expanded:
-            x = max(0.0, send_t - first_send_s)
-            if record.get("status") == "lost":
-                stream_lost_xs.append(x)
-                continue
-            latency_ms = _section_ms(record, "ota_hop_ms", "ota_hop_uncorrected_ms")
-            if latency_ms is not None:
-                delivered.append((x, latency_ms))
-        delivered.sort(key=lambda point: point[0])
-
-        settling = classify_probe_settling([lat for _, lat in delivered])
-        # Re-anchor time so t=0 is the impairment onset: the settled regime starts
-        # at 0 and the excluded setup (warm-up/transition) falls at negative time.
-        onset_x = (
-            delivered[settling.onset_index][0]
-            if settling.onset_index is not None and settling.onset_index < len(delivered)
-            else 0.0
-        )
-        reanchored = reanchored or bool(onset_x)
-
-        regimes: dict[str, tuple[list[float], list[float]]] = {
-            SETTLED: ([], []),
-            WARMUP: ([], []),
-            TRANSITION: ([], []),
-        }
-        for (x, lat), sample_label in zip(delivered, settling.labels, strict=True):
-            xs, ys = regimes[sample_label]
-            xs.append(x - onset_x)
-            ys.append(lat)
-        all_lost_xs.extend(x - onset_x for x in stream_lost_xs)
+        inc_xs: list[float] = []
+        inc_ys: list[float] = []
+        exc_xs: list[float] = []
+        exc_ys: list[float] = []
+        for i, (x, latency) in enumerate(ordered):
+            included = onset_index is None or i >= onset_index
+            shifted = x - onset_x
+            if latency is None:
+                (real_lost_xs if included else setup_lost_xs).append(shifted)
+            elif included:
+                inc_xs.append(shifted)
+                inc_ys.append(latency)
+            else:
+                exc_xs.append(shifted)
+                exc_ys.append(latency)
 
         color = cmap(index)
         stream_label = label
         if len({key[1] for key in grouped}) > 1:
             stream_label = f"{stream_label} #{attempt}"
 
-        s_xs, s_ys = regimes[SETTLED]
-        if s_xs:
-            ax.scatter(s_xs, s_ys, color=color, s=12, alpha=0.6, label=f"{stream_label} latency")
-
-        w_xs, w_ys = regimes[WARMUP]
-        if w_xs:
-            ax.scatter(
-                w_xs,
-                w_ys,
-                facecolors="none",
-                edgecolors="0.6",
-                s=14,
-                alpha=0.7,
-                label="excluded: warm-up (pre-impairment)",
-            )
-
-        t_xs, t_ys = regimes[TRANSITION]
-        if t_xs:
-            ax.scatter(
-                t_xs,
-                t_ys,
-                color="crimson",
-                marker="x",
-                s=55,
-                linewidths=1.6,
-                label="excluded: transition (partial)",
-            )
-
-        # Dashed line at the onset (t=0 once re-anchored), so the split is obvious.
-        if onset_x:
-            ax.axvline(
-                0.0,
-                color="0.5",
-                linestyle="--",
-                linewidth=1.0,
-                alpha=0.8,
-                label="impairment onset (t=0)",
-            )
+        if inc_xs:
+            ax.scatter(inc_xs, inc_ys, color=color, s=12, alpha=0.6, label=f"{stream_label} latency")
+        if exc_xs:
+            ax.scatter(exc_xs, exc_ys, facecolors="none", edgecolors="0.6", s=14, alpha=0.7, label="excluded: start-up")
+        if onset_index is not None:
+            ax.axvline(0.0, color="0.5", linestyle="--", linewidth=1.0, alpha=0.8, label="impairment onset (t=0)")
 
     ax.set_ylim(bottom=0.0)
     ymin, ymax = ax.get_ylim()
 
-    # After re-anchoring, losses at t<0 happened during setup (e.g. the packet
-    # dropped as the qdisc changed); they are excluded like the warm-up, so the
-    # settled-window summary correctly reports them as no loss.
-    setup_lost = [x for x in all_lost_xs if x < 0.0]
-    real_lost = [x for x in all_lost_xs if x >= 0.0]
-    if real_lost:
-        ax.vlines(real_lost, ymin, ymax, colors="crimson", alpha=0.3, linewidth=1.0, label="lost packet")
-    if setup_lost:
-        ax.vlines(setup_lost, ymin, ymax, colors="0.6", alpha=0.4, linewidth=1.0, label="excluded: setup loss")
+    # A loss inside the included window is real; one at t<0 was dropped during
+    # start-up (e.g. as the qdisc changed) and is excluded like the warm-up, so
+    # the summary and the plot agree on the same clean window.
+    if real_lost_xs:
+        ax.vlines(real_lost_xs, ymin, ymax, colors="crimson", alpha=0.3, linewidth=1.0, label="lost packet")
+    if setup_lost_xs:
+        ax.vlines(setup_lost_xs, ymin, ymax, colors="0.6", alpha=0.4, linewidth=1.0, label="excluded: start-up loss")
 
     ax.set_ylabel("Latency (ms)")
     ax.set_xlabel(

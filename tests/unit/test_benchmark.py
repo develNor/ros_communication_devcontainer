@@ -7,9 +7,6 @@ from pathlib import Path
 import pytest
 
 from rosotacom.benchmark import (
-    SETTLED,
-    TRANSITION,
-    WARMUP,
     BudgetEntry,
     BudgetKey,
     CapacitySlice,
@@ -20,12 +17,12 @@ from rosotacom.benchmark import (
     SweepBounds,
     capacity_binary_search,
     characterize_probe_records,
-    classify_probe_settling,
     compare_to_budget,
     exclude_probe_warmup,
     expand_size_pattern,
     find_baseline,
     find_capacity,
+    find_probe_onset,
     guard_shared_link,
     linear_ramp,
     load_budget,
@@ -270,98 +267,82 @@ def test_characterize_probe_records_bins_loss_latency_hz_and_bandwidth() -> None
 # --- fixed-probe settling / warm-up exclusion ------------------------------ #
 
 
-def test_classify_probe_settling_splits_warmup_transition_and_settled() -> None:
-    # 20 un-impaired warm-up samples, one partial packet as shaping engages,
-    # then the settled operating regime.
+def test_find_probe_onset_excludes_warmup_and_partial() -> None:
+    # 20 un-impaired warm-up samples, one partial packet as shaping engages, then
+    # the impaired plateau. Onset is the first mature packet; the partial drops.
     warmup = [5.0, 4.5, 5.5, 4.8, 5.2, 6.0, 4.9, 5.1, 5.3, 4.7] * 2
     settled = [80.0, 78.0, 84.0, 77.0, 88.0, 81.0, 79.0, 86.0, 74.0, 83.0] * 3
-    latencies = [*warmup, 21.0, *settled]
+    samples = [*warmup, 21.0, *settled]
 
-    result = classify_probe_settling(latencies)
-
-    assert result.onset_index == len(warmup) + 1
-    assert result.labels[: len(warmup)] == [WARMUP] * len(warmup)
-    assert result.labels[len(warmup)] == TRANSITION
-    assert all(label == SETTLED for label in result.labels[len(warmup) + 1 :])
-    assert result.excluded_count == len(warmup) + 1
+    assert find_probe_onset(samples) == len(warmup) + 1
 
 
-def test_classify_probe_settling_keeps_ramping_impaired_regime_whole() -> None:
-    # Bufferbloat: warm-up floor, one partial transition packet, then a latency
-    # ramp with no plateau (a shaped rate below the offered load). The whole ramp
-    # is the profile under test and must be kept — only warm-up + transition drop.
+def test_find_probe_onset_skips_a_startup_drop() -> None:
+    # The packet in flight as the qdisc changes is partial (46) and the next is
+    # dropped (None). Onset lands on the first mature packet after both, so the
+    # startup drop is excluded and never counts as loss.
     warmup = [5.0, 4.5, 5.5, 4.8, 5.2, 6.0, 4.9, 5.1, 5.3, 4.7] * 2
-    ramp = [96.0 + 6.0 * i for i in range(60)]  # 96 → ~450 ms, monotonically rising
-    latencies = [*warmup, 48.0, *ramp]
+    settled = [88.0, 86.0, 85.0, 91.0, 85.0, 90.0, 87.0, 84.0, 89.0, 86.0] * 3
+    samples = [*warmup, 46.0, None, *settled]
 
-    result = classify_probe_settling(latencies)
-
-    assert result.onset_index == len(warmup) + 1
-    assert result.labels[: len(warmup)] == [WARMUP] * len(warmup)
-    assert result.labels[len(warmup)] == TRANSITION  # the 48 ms partial packet
-    assert all(label == SETTLED for label in result.labels[len(warmup) + 1 :])
+    assert find_probe_onset(samples) == len(warmup) + 2  # past the partial and the drop
 
 
-def test_classify_probe_settling_keeps_everything_without_a_clear_step() -> None:
-    # Impairment live from the first packet: no warm-up floor, no step.
-    latencies = [80.0, 78.0, 84.0, 77.0, 88.0, 81.0, 79.0, 86.0, 74.0, 83.0] * 3
+def test_find_probe_onset_keeps_ramping_regime_whole() -> None:
+    # Bufferbloat: warm-up floor, one partial packet, then a rising ramp with no
+    # plateau. Onset is the first ramp packet; the whole ramp is kept.
+    warmup = [5.0, 4.5, 5.5, 4.8, 5.2, 6.0, 4.9, 5.1, 5.3, 4.7] * 2
+    ramp = [96.0 + 6.0 * i for i in range(60)]
+    samples = [*warmup, 48.0, *ramp]
 
-    result = classify_probe_settling(latencies)
-
-    assert result.onset_index is None
-    assert result.excluded_count == 0
-    assert set(result.labels) == {SETTLED}
-
-
-def test_classify_probe_settling_keeps_a_smooth_ramp_without_warmup() -> None:
-    # A pure ramp with no low warm-up floor has no sharp step — keep everything.
-    latencies = [96.0 + 4.0 * i for i in range(80)]  # 96 → ~412 ms, smooth
-
-    result = classify_probe_settling(latencies)
-
-    assert result.onset_index is None
-    assert set(result.labels) == {SETTLED}
+    assert find_probe_onset(samples) == len(warmup) + 1
 
 
-def test_classify_probe_settling_ignores_short_series() -> None:
-    latencies = [5.0, 5.0, 80.0, 80.0]
-
-    result = classify_probe_settling(latencies)
-
-    assert result.labels == [SETTLED] * 4
-    assert result.onset_index is None
+def test_find_probe_onset_none_without_a_clear_step() -> None:
+    # Impairment live from the first packet, and a smooth ramp with no warm-up:
+    # no sharp low→high step, so nothing is excluded.
+    assert find_probe_onset([80.0, 78.0, 84.0, 77.0, 88.0, 81.0, 79.0, 86.0, 74.0, 83.0] * 3) is None
+    assert find_probe_onset([96.0 + 4.0 * i for i in range(80)]) is None
 
 
-def _probe_stream(latencies: list[float], *, period_s: float = 0.05, t0: float = 100.0) -> list[dict]:
-    """Build joined transit records at a fixed rate — one delivered packet per latency."""
-    return [
-        {
+def test_find_probe_onset_ignores_short_series() -> None:
+    assert find_probe_onset([5.0, 5.0, 80.0, 80.0]) is None
+
+
+def _probe_stream(latencies: list[float | None], *, period_s: float = 0.05, t0: float = 100.0) -> list[dict]:
+    """Build joined transit records at a fixed rate; ``None`` latency means a lost packet."""
+    records: list[dict] = []
+    for seq, latency in enumerate(latencies):
+        record = {
             "kind": "transit",
             "source": "a",
             "target": "b",
             "topic": "/x",
             "seq": seq,
-            "status": "delivered",
             "t_wrap": t0 + seq * period_s,
-            "sections": {"ota_hop_ms": latency},
-            "size_bytes": 100,
         }
-        for seq, latency in enumerate(latencies)
-    ]
+        if latency is None:
+            record["status"] = "lost"
+        else:
+            record.update(status="delivered", sections={"ota_hop_ms": latency}, size_bytes=100)
+        records.append(record)
+    return records
 
 
-def test_exclude_probe_warmup_drops_prefix_and_reports_onset() -> None:
+def test_exclude_probe_warmup_drops_startup_incl_drop_and_reports_onset() -> None:
     warmup = [5.0] * 20
     settled = [80.0] * 40
-    records = _probe_stream([*warmup, 21.0, *settled])
+    # A partial packet (21) and a startup drop (None) sit between warm-up and the
+    # impaired plateau; both must be excluded so the kept window carries no loss.
+    records = _probe_stream([*warmup, 21.0, None, *settled])
 
     kept, onset = exclude_probe_warmup(records, nominal_period_s=0.05)
 
-    # The 20 warm-up samples and the one transition packet are dropped.
     assert len(kept) == len(settled)
     assert {record["sections"]["ota_hop_ms"] for record in kept} == {80.0}
-    # Onset is the send time of the first settled packet (seq 21).
-    assert onset == pytest.approx(100.0 + 21 * 0.05)
+    assert not any(record["status"] == "lost" for record in kept)  # startup drop excluded
+    # Onset is the send time of the first mature packet (seq 22).
+    assert onset == pytest.approx(100.0 + 22 * 0.05)
 
 
 def test_exclude_probe_warmup_keeps_all_without_a_step() -> None:
@@ -381,7 +362,7 @@ def test_characterize_probe_records_excludes_warmup_and_reanchors_to_onset() -> 
     excluded = characterize_probe_records(records, bin_s=1.0, nominal_period_s=0.05)
     included = characterize_probe_records(records, bin_s=1.0, nominal_period_s=0.05, exclude_warmup=False)
 
-    # Re-anchored: the settled regime starts at bin 0, and no bin carries the
+    # Re-anchored: the impaired regime starts at bin 0, and no bin carries the
     # warm-up latency floor.
     assert excluded[0]["bin_start_s"] == 0.0
     assert all(row["latency_p50_ms"] > 50.0 for row in excluded)

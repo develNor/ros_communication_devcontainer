@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
+
 from rosotacom.bag_ground_truth import (
     bag_ground_truth,
+    generate_whole_bag_expectations,
+    render_whole_bag_expect_fragment,
     validate_expect_against_bag,
 )
 
@@ -88,3 +92,76 @@ def test_validate_latched_static_has_no_warning(tmp_path: Path) -> None:
 def test_validate_ignores_topics_absent_from_bag(tmp_path: Path) -> None:
     gt = bag_ground_truth(_write_bag(tmp_path))
     assert validate_expect_against_bag({"/not_in_bag": {"hz": {"min": 999}}}, gt) == []
+
+
+def test_generate_whole_bag_expect_scales_counts_for_drop_and_throttle(tmp_path: Path) -> None:
+    gt = bag_ground_truth(_write_bag(tmp_path))
+    cfg = {
+        "topics": {
+            "b_to_a": [
+                {
+                    "topic": "/tf",
+                    "processing": {"drop": {"drop_count": 1, "window_size": 2}, "throttle_hz": 20},
+                },
+                {"topic": "/site"},
+                {"topic": "/tf_static"},
+                {"topic": "/not_in_bag"},
+            ]
+        }
+    }
+
+    fragment = generate_whole_bag_expectations(cfg, gt, min_ratio=0.8)
+    by_topic = {entry.topic: entry for entry in fragment.topics["b_to_a"]}
+
+    tf_expect = by_topic["/tf"].expect
+    assert tf_expect["mode"] == "stream"
+    assert tf_expect["min_count"] == 1600  # throttle caps the post-drop 53.7 Hz stream to 20 Hz over 100s.
+    assert tf_expect["completeness"] == {"min_ratio": 0.8, "vs_bag_ratio": 0.149}
+    assert "drop 1/2" in by_topic["/tf"].comment
+    assert "throttle_hz 20 caps" in by_topic["/tf"].comment
+
+    assert by_topic["/site"].expect["min_count"] == 80
+    assert by_topic["/site"].expect["completeness"] == {"min_ratio": 0.8, "vs_bag_ratio": 0.8}
+    assert by_topic["/tf_static"].expect == {"presence": "required", "mode": "latched"}
+    assert fragment.missing_session_topics == ("b_to_a:/not_in_bag",)
+    assert fragment.uncarried_bag_topics == ()
+
+
+def test_generate_whole_bag_expect_classifies_sparse_volatile_as_existence(tmp_path: Path) -> None:
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text(
+        """\
+rosbag2_bagfile_information:
+  duration: {nanoseconds: 100000000000}
+  topics_with_message_count:
+    - topic_metadata:
+        name: /oneshot
+        type: std_msgs/msg/String
+        offered_qos_profiles:
+          - {reliability: reliable, durability: volatile}
+      message_count: 1
+""",
+        encoding="utf-8",
+    )
+    gt = bag_ground_truth(bag)
+
+    fragment = generate_whole_bag_expectations({"topics": {"b_to_a": [{"topic": "/oneshot"}]}}, gt)
+    entry = fragment.topics["b_to_a"][0]
+
+    assert entry.expect == {"presence": "required", "mode": "existence"}
+    assert "at most one message" in entry.comment
+
+
+def test_render_whole_bag_expect_fragment_is_parseable_yaml_with_derivation_comments(tmp_path: Path) -> None:
+    gt = bag_ground_truth(_write_bag(tmp_path))
+    cfg = {"topics": {"b_to_a": [{"topic": "/tf"}]}}
+    fragment = generate_whole_bag_expectations(cfg, gt)
+
+    text = render_whole_bag_expect_fragment(fragment, bag=tmp_path, session="session")
+    parsed = yaml.safe_load(text)
+
+    assert parsed["topics"]["b_to_a"][0]["topic"] == "/tf"
+    assert parsed["topics"]["b_to_a"][0]["expect"]["min_count"] == 9673
+    assert "# /tf: bag_count=10748" in text
+    assert "# Bag topics not carried by this session: /site, /tf_static" in text

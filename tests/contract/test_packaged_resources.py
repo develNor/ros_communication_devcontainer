@@ -23,6 +23,7 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
         "resources/examples/ros2docker.json",
         "resources/examples/profiles.yaml",
         "resources/examples/deployment.example.yaml",
+        "resources/examples/bags/8_drop_reference/metadata.yaml",
         "resources/examples/sessions/1_heartbeat/session-definition.yaml",
         "resources/examples/sessions/1_heartbeat_status/session-definition.yaml",
         "resources/examples/sessions/14_remote_assist_anonymized/session-definition.yaml",

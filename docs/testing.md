@@ -49,6 +49,43 @@ excluding it from the synthetic local smoke publisher/probe set and from the
 local smoke self-report assertion. Use it only for redundant replay-shape topics
 when a nearby representative stream already proves that path in CI.
 
+### Whole-Bag Expect Generation
+
+For replay gates, a bag's `metadata.yaml` is a ground-truth source: it records
+which topics exist, how many messages each contains, the bag duration, and the
+offered QoS. Generate a mergeable `expect:` fragment for the topics a session
+carries with:
+
+```bash
+rosotacom expect from-bag ./native_bag --session remote_assist --out whole-bag-expect.yaml
+```
+
+The generator reads only rosbag2 metadata. It does not rewrite the session in
+place. The output is a YAML fragment under `topics:` with one commented
+derivation per generated entry, so it can be reviewed and merged into a
+session-definition manually.
+
+Stream topics receive `min_count` plus `completeness.min_ratio` and
+`completeness.vs_bag_ratio`. The count and bag-relative rate are scaled by
+intended session shaping before the threshold is emitted: `drop` applies its
+keep fraction, and `throttle_hz` caps the expected post-drop rate. That means
+planned decimation is not counted as OTA loss. The default `--min-ratio 0.9`
+leaves a safety margin for a healthy link; tune it per gate instead of
+committing a brittle 100% threshold.
+
+Transient-local or explicitly latched topics become `mode: latched`, because the
+contract is that the held value arrives, not that the topic keeps ticking.
+Sparse volatile topics become `mode: existence`; the current expect model has no
+separate finite "delivered once and may now be stale" mode, so those entries
+assert graph presence without changing evaluator semantics.
+
+Generated whole-bag contracts complement hand-curated contracts. Keep the
+hand-curated session for the operator-facing steady-state checks that humans
+understand and maintain. Use a generated whole-bag variant when the question is
+"does this replay carry every session topic from the reference recording, after
+the session's intended shaping?" Regenerate the fragment when the reference bag
+or the session pipeline changes.
+
 ## Local Check Eligibility
 
 OTA suite membership is the default. There is no `multi_machine` marker.

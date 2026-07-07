@@ -119,6 +119,21 @@ recording (message-size distribution and inter-message regularity), the
 reference point for judging how well the received stream preserves the input
 cadence.
 
+## Whole-bag expect generation
+
+The example project includes a tiny rosbag2 `metadata.yaml` fixture for
+`8_drop`. It lets you inspect the whole-bag expect generator without needing a
+large MCAP:
+
+```bash
+rosotacom expect from-bag bags/8_drop_reference --session 8_drop --out whole-bag-expect.yaml
+```
+
+The generated fragment accounts for the session's configured `drop` stage before
+emitting `min_count` and bag-relative completeness thresholds. Review the
+comments in the output, then merge the `expect:` block into a session variant
+when you want a replay gate that asserts the reference bag's carried topics.
+
 ## Two-machine runs
 
 For a real two-machine run, pass both reachable addresses on both hosts:
@@ -137,6 +152,7 @@ Use `--identity b` on the second host. Alternatively copy
 - `rosotacom.yaml`: project-local rosotacom setup
 - `ros2docker.json`: Docker runtime defaults used by the communication containers
 - `deployment.example.yaml`: optional named-host deployment example
+- `bags/`: small rosbag metadata fixtures used by documentation and host tests
 - `sessions/`: tracked static session definitions/templates
 - `scenarios/`: complete use cases that combine a session with local applications
 - `session-instances/`: ignored generated runtime configs, catmux logs, smoke logs, and rosbags

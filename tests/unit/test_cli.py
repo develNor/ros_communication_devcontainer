@@ -644,6 +644,7 @@ def test_interactive_smoke_tmux_uses_full_windows_and_metadata(
         instance,
         {"a": "10.137.42.2", "b": "10.137.42.3"},
         "smoke-net",
+        link_trace_parts=["--link-trace", "--link-trace-interval", "0.5"],
     )
 
     assert tmux_session == "smoke-scenario-demo"
@@ -665,6 +666,7 @@ def test_interactive_smoke_tmux_uses_full_windows_and_metadata(
     assert any("inner catmux: C-b C-b" in part for command in calls for part in command)
     joined = "\n".join(" ".join(command) for command in calls)
     assert "--smoke-managed" in joined
+    assert "--link-trace --link-trace-interval 0.5" in joined
     assert "--network-name smoke-net --network-ip 10.137.42.2" in joined
     assert "--peer-address a=10.137.42.2 --peer-address b=10.137.42.3" in joined
     assert "scenario _run-application demo --identity a --application local_app --instance-id interactive" in joined
@@ -1668,6 +1670,22 @@ def test_peer_binding_identity_and_command_helpers(tmp_path: Path, monkeypatch: 
         "--attach",
     ]
 
+    traced_command = rosotacom._session_command(
+        session,
+        instance,
+        "a",
+        force=False,
+        rewrite_formatting=False,
+        peer_address_overrides={},
+        attach_mode="detached",
+        link_trace=True,
+        link_trace_interval_s=0.5,
+        link_trace_modem_command="cat /tmp/modem.json",
+    )
+    assert "--link-trace" in traced_command
+    assert traced_command[traced_command.index("--link-trace-interval") + 1] == "0.5"
+    assert traced_command[traced_command.index("--link-trace-modem-command") + 1] == "cat /tmp/modem.json"
+
     with pytest.raises(RuntimeError, match="Duplicate"):
         rosotacom._parse_peer_address_overrides(["a=1.1.1.1", "a=2.2.2.2"])
 
@@ -2436,11 +2454,20 @@ def test_run_session_generates_into_instance_config_without_touching_static_sour
         force=True,
         rewrite_formatting=False,
         peer_address=["a=127.0.0.1", "b=127.0.0.2"],
+        link_trace=True,
+        link_trace_interval_s=0.5,
+        link_trace_modem_command="cat /tmp/modem.json",
     )
 
     assert Path(peer_dir) == output / "a"
     assert (output / "session-definition.yaml").is_file()
     assert (output / "a" / "plugin.yaml").is_file()
+    plugin = yaml.safe_load((output / "a" / "plugin.yaml").read_text(encoding="utf-8"))
+    assert plugin["parameters"]["status_overview"] is True
+    assert plugin["parameters"]["link_trace"] is True
+    assert plugin["parameters"]["link_trace_interval_s"] == 0.5
+    assert plugin["parameters"]["link_trace_modem_command"] == "cat /tmp/modem.json"
+    assert (output / "a" / "pipeline_spec.yaml").is_file()
     assert not (source / "a").exists()
 
 

@@ -19,6 +19,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+import yaml
 
 import rosotacom.cli as rosotacom
 
@@ -110,6 +111,43 @@ def test_pipeline_spec_absent_when_flag_off(tmp_path: Path) -> None:
     cfg["shared"]["use_status_overview"] = False
     _generate(cfg, tmp_path)
     assert not (tmp_path / "a" / "pipeline_spec.yaml").exists()
+
+
+def test_link_trace_config_generates_status_recorder_params(tmp_path: Path) -> None:
+    cfg = _heartbeat_cfg()
+    cfg["shared"]["link_trace"] = {
+        "enabled": True,
+        "interval_s": 0.5,
+        "modem_metrics_command": "cat /tmp/modem.json",
+        "modem_metrics_timeout_s": 1.5,
+    }
+    _generate(cfg, tmp_path)
+
+    plugin = yaml.safe_load((tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8"))
+    params = plugin["parameters"]
+
+    assert params["status_overview"] is True
+    assert params["status_spec_file"] == "${peer_dir}/pipeline_spec.yaml"
+    assert params["status_write_interval_s"] == 0.5
+    assert params["link_trace"] is True
+    assert params["link_trace_interval_s"] == 0.5
+    assert params["link_trace_modem_command"] == "cat /tmp/modem.json"
+    assert params["link_trace_modem_timeout_s"] == 1.5
+    assert (tmp_path / "a" / "pipeline_spec.yaml").is_file()
+
+
+def test_link_trace_requires_status_overview() -> None:
+    cfg = _heartbeat_cfg()
+    cfg["shared"]["use_status_overview"] = False
+    cfg["shared"]["link_trace"] = {"enabled": True}
+
+    with pytest.raises(RuntimeError, match="shared.link_trace.enabled requires"):
+        generator.func(
+            session_config_obj=cfg,
+            output_dir="/tmp/unused",
+            force=True,
+            peer_addresses={"a": "127.0.0.1", "b": "127.0.0.2"},
+        )
 
 
 def test_use_status_overview_must_be_bool() -> None:

@@ -394,6 +394,11 @@ The running session writes, under
   wrapped topics (delivered/lost/reordered, section latency, size, inter-arrival,
   and jitter).
 
+For fixed-interval network-condition samples alongside the same session, enable
+the [link trace recorder](docs/link-trace.md). It writes
+`link_trace.jsonl` under the same status directory with `/proc/net/dev` counter
+deltas, echo-heartbeat RTT/loss provenance, and an optional modem-metrics hook.
+
 Read it from the host with the `status` command:
 
 ```bash

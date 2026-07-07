@@ -7115,10 +7115,11 @@ def profile_from_trace_command(args: argparse.Namespace) -> int:
     from rosotacom.trace_profiles import TraceProfileConfig, parse_window, write_trace_profile
 
     window_start_s, window_end_s = parse_window(getattr(args, "window", None))
+    directions: tuple[str, ...]
     if args.directions == "both":
         directions = ("uplink", "downlink")
     else:
-        directions = (args.directions,)
+        directions = (str(args.directions),)
     mode = str(args.mode)
     config = TraceProfileConfig(
         name=args.name or ("trace_static" if mode == "static" else "trace_replay"),

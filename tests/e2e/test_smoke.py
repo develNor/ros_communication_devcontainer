@@ -532,6 +532,20 @@ def test_local_link_latency_smoke_exposes_metric_backbone(
         f"link_latency_demo missing from metrics digest for {session_name}:\n{metrics_result.stdout}"
     )
 
+    # `rosotacom report` turns the same instance into a forensics report: stream
+    # summary from the live transit rows, self-describing provenance, and the
+    # link-trace context wired through (this run recorded link_trace.jsonl).
+    report_result = _run(
+        [sys.executable, "-m", "rosotacom", "report", str(artifact_dir), "--json", "--no-figures"],
+        timeout=60,
+    )
+    report = json.loads(report_result.stdout)
+    assert any("link_latency_demo" in label for label in report["streams"]), (
+        f"link_latency_demo missing from forensics report for {session_name}:\n{report_result.stdout[:2000]}"
+    )
+    assert report["provenance"]["inputs"]["link_trace"], f"report did not discover link_trace.jsonl: {artifact_dir}"
+    assert (artifact_dir / "report" / "report.md").is_file()
+
 
 @pytest.mark.parametrize("session_name", HEARTBEAT_SMOKE_SESSIONS)
 def test_local_heartbeat_smoke_matrix_from_copied_example_project(

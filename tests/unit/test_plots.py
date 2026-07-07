@@ -19,6 +19,7 @@ pytestmark = pytest.mark.skipif(not has_matplotlib, reason="matplotlib is requir
 from rosotacom.plots import (  # noqa: E402, I001
     _require_matplotlib,
     plot_capacity_frontier,
+    plot_forensics_stream,
     plot_offered_bw,
     plot_probe_timeseries,
     plot_probe_raw,
@@ -172,6 +173,48 @@ def test_recovery_timeline_writes_figure(tmp_path: Path) -> None:
 def test_topic_heatmap_writes_figure(tmp_path: Path) -> None:
     out = tmp_path / "heatmap.png"
     result = plot_topic_heatmap(TOPIC_HEATMAP, out=out)
+    assert result == out
+    assert out.stat().st_size > 0
+
+
+FORENSICS_BINS: list[dict] = [
+    {
+        "bin_start_s": float(index),
+        "bin_end_s": float(index + 1),
+        "expected": 20,
+        "delivered": 0 if index == 2 else 20,
+        "lost": 20 if index == 2 else 0,
+        "delivered_hz": 0.0 if index == 2 else 20.0,
+        "latency_p50_ms": 10.0,
+        "latency_p95_ms": 12.0,
+        "latency_max_ms": 15.0,
+        "mean_size_bytes": 5000.0,
+        "max_size_bytes": 40000.0 if index % 2 == 0 else 6000.0,
+        "keyframes": 1 if index % 2 == 0 else 0,
+    }
+    for index in range(6)
+]
+
+FORENSICS_EVENTS: list[dict] = [
+    {"kind": "loss_burst", "start_s": 2.0, "end_s": 3.0},
+    {"kind": "latency_excursion", "start_s": 4.0, "end_s": 4.5},
+]
+
+FORENSICS_STEPS: list[dict] = [
+    {"start_s": 0.0, "end_s": 3.0, "label": "step 0"},
+    {"start_s": 3.0, "end_s": 6.0, "label": "step 1 catchup"},
+]
+
+
+def test_forensics_stream_writes_figure(tmp_path: Path) -> None:
+    out = tmp_path / "forensics.png"
+    result = plot_forensics_stream(
+        FORENSICS_BINS,
+        FORENSICS_EVENTS,
+        out=out,
+        nominal_hz=20.0,
+        timeline_steps=FORENSICS_STEPS,
+    )
     assert result == out
     assert out.stat().st_size > 0
 

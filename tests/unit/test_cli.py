@@ -2581,6 +2581,47 @@ def test_run_session_generates_into_instance_config_without_touching_static_sour
     assert not (source / "a").exists()
 
 
+def test_run_session_passes_cyclone_spdp_interval_to_plugin(tmp_path: Path) -> None:
+    from session.creation import run_session
+
+    source = tmp_path / "sessions" / "spdp"
+    output = tmp_path / "session-instances" / "2026-01-01" / "spdp_run" / "config"
+    source.mkdir(parents=True)
+    (source / "session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "peers:",
+                "  a: {}",
+                "  b: {}",
+                "shared:",
+                "  rmw:",
+                "    local: cyclone",
+                "    ota:",
+                "      cyclone:",
+                "        spdp_interval: 150s",
+                "topics:",
+                "  a_to_b:",
+                "    - topic: /x",
+                "      type: std_msgs/msg/String",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    peer_dir = run_session._resolve_peer_dir(
+        str(source),
+        str(output),
+        "a",
+        force=True,
+        rewrite_formatting=False,
+        peer_address=["a=127.0.0.1", "b=127.0.0.2"],
+    )
+
+    plugin = yaml.safe_load((Path(peer_dir) / "plugin.yaml").read_text(encoding="utf-8"))
+    assert plugin["parameters"]["ota_spdp_interval"] == "150s"
+
+
 def test_create_session_yaml_injects_catmux_logging_command(tmp_path: Path) -> None:
     from session.creation import create_session_yaml
 

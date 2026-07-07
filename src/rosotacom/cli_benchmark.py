@@ -35,6 +35,9 @@ import yaml
 
 DEFAULT_BENCHMARK_RMW = "cyclone"
 DEFAULT_BENCHMARK_DRAIN_S = 2.0
+DEFAULT_CYCLONE_SPDP_INTERVAL = "30s"
+SPDP_EFFECT_DURATION_FRACTION = 2.0 / 3.0
+SPDP_TIGHT_LINK_UTILIZATION = 0.70
 BENCHMARK_RESULT_FILE = "result.json"
 BENCHMARK_SESSIONS_BY_GENRE = {
     "probe": "bench_1_1_capacity",
@@ -229,6 +232,19 @@ def _benchmark_rmw(args: argparse.Namespace) -> str:
     return str(getattr(args, "rmw", None) or DEFAULT_BENCHMARK_RMW)
 
 
+def _benchmark_cyclone_spdp_interval(args: argparse.Namespace) -> str | None:
+    raw = getattr(args, "cyclone_spdp_interval", None)
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    from .network_profiles import parse_seconds
+
+    parse_seconds(value, "--cyclone-spdp-interval")
+    return value
+
+
 def _normalize_benchmark_profile(profile: str | None) -> str | None:
     if profile is None:
         return None
@@ -260,6 +276,114 @@ def _profile_requires_netem_seed(profile: Any) -> bool:
     return _direction_requires_netem_seed(getattr(profile, "uplink", None)) or _direction_requires_netem_seed(
         getattr(profile, "downlink", None)
     )
+
+
+def _profile_rate_limits_bps(profile: str | None, profiles_file: Path | None) -> list[float]:
+    if not profile or profiles_file is None:
+        return []
+    try:
+        from .network_profiles import load_profiles_file
+
+        profile_obj = load_profiles_file(profiles_file).get(profile)
+    except Exception:
+        return []
+    if profile_obj is None:
+        return []
+
+    def rate_of(shaping: Any) -> float | None:
+        value = getattr(shaping, "rate_bps", None) if shaping is not None else None
+        return float(value) if value is not None else None
+
+    rates: list[float] = []
+    if getattr(profile_obj, "is_timeline", False):
+        for segment in getattr(profile_obj, "timeline", ()):
+            for shaping in (getattr(segment, "uplink", None), getattr(segment, "downlink", None)):
+                rate = rate_of(shaping)
+                if rate is not None:
+                    rates.append(rate)
+    else:
+        for shaping in (getattr(profile_obj, "uplink", None), getattr(profile_obj, "downlink", None)):
+            rate = rate_of(shaping)
+            if rate is not None:
+                rates.append(rate)
+    return rates
+
+
+def _probe_spdp_diagnostics(
+    *,
+    args: argparse.Namespace,
+    profile: str | None,
+    duration_s: float,
+    load_info: dict[str, Any],
+) -> dict[str, Any] | None:
+    rmw = _benchmark_rmw(args)
+    if rmw != "cyclone":
+        return None
+
+    from .cli import _load_runtime_config
+    from .network_profiles import parse_seconds
+
+    runtime = _load_runtime_config(args)
+    profiles_file = _benchmark_profiles_file(profile, runtime.profiles_file)
+    configured_interval = _benchmark_cyclone_spdp_interval(args)
+    interval_text = configured_interval or DEFAULT_CYCLONE_SPDP_INTERVAL
+    interval_s = parse_seconds(interval_text, "CycloneDDS SPDP interval")
+    offered_bps = load_info.get("offered_bandwidth_bps")
+    rates = _profile_rate_limits_bps(profile, profiles_file)
+    min_rate = min(rates) if rates else None
+    utilization = (
+        float(offered_bps) / float(min_rate)
+        if offered_bps is not None and min_rate is not None and min_rate > 0.0
+        else None
+    )
+    duration_ratio = float(duration_s) / interval_s if interval_s > 0.0 else None
+    risk = "low"
+    warnings: list[str] = []
+    if (
+        duration_ratio is not None
+        and duration_ratio >= SPDP_EFFECT_DURATION_FRACTION
+        and utilization is not None
+        and utilization >= SPDP_TIGHT_LINK_UTILIZATION
+    ):
+        risk = "possible"
+        warnings.append(
+            "CycloneDDS SPDP discovery traffic may affect probe p99/max latency: "
+            f"SPDPInterval={interval_text}, duration={duration_s:g}s, "
+            f"offered/shaped-rate={utilization:.2f}. Keep this for end-to-end DDS behavior; "
+            "raise --cyclone-spdp-interval only for payload-only characterization."
+        )
+    return {
+        "rmw": rmw,
+        "interval": interval_text,
+        "interval_s": round(interval_s, 6),
+        "override": configured_interval is not None,
+        "duration_s": float(duration_s),
+        "duration_to_interval_ratio": round(duration_ratio, 6) if duration_ratio is not None else None,
+        "profile_rate_limits_bps": rates,
+        "minimum_profile_rate_bps": min_rate,
+        "offered_bandwidth_bps": offered_bps,
+        "offered_to_minimum_profile_rate": round(utilization, 6) if utilization is not None else None,
+        "risk": risk,
+        "warnings": warnings,
+    }
+
+
+def _attach_benchmark_diagnostics(
+    context: dict[str, Any],
+    *,
+    spdp: dict[str, Any] | None = None,
+) -> None:
+    if spdp is None:
+        return
+    diagnostics = context.setdefault("diagnostics", {})
+    diagnostics["cyclonedds_spdp"] = spdp
+    warnings = diagnostics.setdefault("warnings", [])
+    warnings.extend(spdp.get("warnings", []))
+
+
+def _print_benchmark_warnings(context: dict[str, Any]) -> None:
+    for warning in context.get("diagnostics", {}).get("warnings", []):
+        print(f"WARN: {warning}")
 
 
 def _benchmark_drain_s(args: argparse.Namespace) -> float:
@@ -333,7 +457,13 @@ def _prepare_benchmark_session_config(args: argparse.Namespace, session_name: st
     shared = cfg.setdefault("shared", {})
     if not isinstance(shared, dict):
         raise RuntimeError(f"Benchmark session config 'shared' must be a mapping: {config_path}")
-    shared["rmw"] = rmw
+    cyclone_spdp_interval = _benchmark_cyclone_spdp_interval(args)
+    if cyclone_spdp_interval is not None:
+        if rmw != "cyclone":
+            raise ValueError("--cyclone-spdp-interval can only be used with --rmw cyclone.")
+        shared["rmw"] = {"local": "cyclone", "ota": {"cyclone": {"spdp_interval": cyclone_spdp_interval}}}
+    else:
+        shared["rmw"] = rmw
     qos_options = _apply_benchmark_qos_options(
         cfg,
         reliability=getattr(args, "qos_reliability", None),
@@ -366,6 +496,7 @@ def _prepare_benchmark_session_config(args: argparse.Namespace, session_name: st
         "config_path": config_path,
         "rmw": rmw,
         "runtime_implementation": _rmw_runtime_implementation(rmw),
+        "cyclone_spdp_interval": cyclone_spdp_interval,
         "qos": qos_options,
         "streams": stream_options,
     }
@@ -4486,6 +4617,14 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
         help=f"RMW implementation or rosotacom RMW alias for benchmark sessions (default: {DEFAULT_BENCHMARK_RMW}).",
     )
     parser.add_argument(
+        "--cyclone-spdp-interval",
+        help=(
+            "Override CycloneDDS SPDPInterval for benchmark session OTA XML, e.g. 150s. "
+            f"Default remains {DEFAULT_CYCLONE_SPDP_INTERVAL}; use longer values only for quiet-discovery "
+            "payload characterization, not for normal end-to-end DDS behavior."
+        ),
+    )
+    parser.add_argument(
         "--qos-reliability",
         choices=["best_effort", "reliable"],
         help="Override benchmark session OTA pub/sub reliability for the whole run.",
@@ -5062,10 +5201,28 @@ def benchmark_probe(args: argparse.Namespace) -> int:
         run_dir=run_dir,
         session=session_context,
     )
+    probe_load = _probe_load(
+        size=getattr(args, "size", 18_000),
+        size_pattern=getattr(args, "size_pattern", None),
+        rate_hz=getattr(args, "rate_hz", 20.0),
+        streams=getattr(args, "streams", 1),
+        interval_jitter_ms=getattr(args, "interval_jitter_ms", 0.0),
+        interval_jitter_seed=getattr(args, "interval_jitter_seed", 42),
+    )
+    _attach_benchmark_diagnostics(
+        result_context,
+        spdp=_probe_spdp_diagnostics(
+            args=args,
+            profile=_normalize_benchmark_profile(args.profile),
+            duration_s=float(getattr(args, "duration", 60.0)),
+            load_info=_load_context(probe_load),
+        ),
+    )
 
     run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, "bench_1_1_capacity")
 
     with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        _print_benchmark_warnings(result_context)
         result = drive_probe(
             run_point,
             profile=args.profile,

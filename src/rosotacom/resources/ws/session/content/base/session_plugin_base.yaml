@@ -6,6 +6,7 @@ parameters:
   local_config_template: # e.g. fastdds_v1.xml, cyclonedds.xml. Empty => use RMW default config.
   local_config_file: ${peer_dir}/local_dds.xml # destination path for the resolved local DDS XML
   local_easy_mode_ip: # resolved address for #easy_mode_ip (only honored when the template uses it)
+  local_spdp_interval: # CycloneDDS SPDP interval override, e.g. 150s. Empty => template default.
   use_domain_bridge: false
   local_domain_id:   # pinned per-peer ROS_DOMAIN_ID (from peer_settings.<peer>.domain_id)
   ota_domain_id:
@@ -35,6 +36,7 @@ parameters:
   ota_config_template: # e.g. fastdds_v1.xml, cyclonedds.xml. Empty => use the RMW's default config.
   ota_config_file: ${peer_dir}/ota_dds.xml # destination path for the resolved DDS XML
   ota_easy_mode_ip: # resolved address for #easy_mode_ip (only honored when the template uses it)
+  ota_spdp_interval: # CycloneDDS SPDP interval override, e.g. 150s. Empty => template default.
   # Z2D (zenoh_ros2dds) parameters — used only when use_zenoh_ros2dds=true
   zen_mode: # e.g. router, peer or client
   zen_endpoint_role: # e.g. listen or connect
@@ -241,7 +243,7 @@ common:
   before_commands:
     - if [ '${local_domain_id}' != "None" ] && [ -n '${local_domain_id}' ]; then export ROS_DOMAIN_ID='${local_domain_id}'; fi
     - if [ '${rmw_local}' != "None" ]; then case ${rmw_local} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4};; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; *) export RMW_IMPLEMENTATION='${rmw_local}';; esac; fi
-    - if [ '${local_config_template}' != "None" ] && [ -n '${local_config_template}' ]; then local_args=(--config "${local_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${local_easy_mode_ip}' != "None" ] && [ -n '${local_easy_mode_ip}' ] && local_args+=(--easy-mode-ip "${local_easy_mode_ip}"); /ws/ota_configs/get_ota_xml.py "${local_args[@]}" > "${local_config_file}"; case ${rmw_local} in cyclone) export CYCLONEDDS_URI="file://${local_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${local_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
+    - if [ '${local_config_template}' != "None" ] && [ -n '${local_config_template}' ]; then local_args=(--config "${local_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${local_easy_mode_ip}' != "None" ] && [ -n '${local_easy_mode_ip}' ] && local_args+=(--easy-mode-ip "${local_easy_mode_ip}"); [ '${local_spdp_interval}' != "None" ] && [ -n '${local_spdp_interval}' ] && local_args+=(--spdp-interval "${local_spdp_interval}"); /ws/ota_configs/get_ota_xml.py "${local_args[@]}" > "${local_config_file}"; case ${rmw_local} in cyclone) export CYCLONEDDS_URI="file://${local_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${local_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
     - if [ '${before_command}' != "None" ]; then ${before_command}; fi
 
 windows:
@@ -275,7 +277,7 @@ windows:
     if: use_domain_bridge
     splits:
       - commands:
-        - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip}' != "None" ] && [ -n '${ota_easy_mode_ip}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
+        - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip}' != "None" ] && [ -n '${ota_easy_mode_ip}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip}"); [ '${ota_spdp_interval}' != "None" ] && [ -n '${ota_spdp_interval}' ] && ota_args+=(--spdp-interval "${ota_spdp_interval}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
         - ros2 run domain_bridge domain_bridge --wait-for-publisher false ${domain_bridge_config_file}
   - name: IN
     if: in
@@ -283,7 +285,7 @@ windows:
       - commands:
         - if [ '${ota_domain_id}' != "None" ] && [ -n '${ota_domain_id}' ]; then export ROS_DOMAIN_ID='${ota_domain_id}'; fi
         - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4};; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
-        - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip}' != "None" ] && [ -n '${ota_easy_mode_ip}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
+        - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip}' != "None" ] && [ -n '${ota_easy_mode_ip}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip}"); [ '${ota_spdp_interval}' != "None" ] && [ -n '${ota_spdp_interval}' ] && ota_args+=(--spdp-interval "${ota_spdp_interval}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
         # For zenoh_ros2dds the OTA domain is loopback-only (zenoh is the inter-host
         # transport), so confine discovery to localhost instead of statically peering
         # the remote host — otherwise the OTA-domain DDS double-delivers alongside zenoh.
@@ -308,7 +310,7 @@ windows:
       - commands:
         - if [ '${ota_domain_id}' != "None" ] && [ -n '${ota_domain_id}' ]; then export ROS_DOMAIN_ID='${ota_domain_id}'; fi
         - case ${rmw_ota} in cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp;; fastdds) export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTDDS_BUILTIN_TRANSPORTS=${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4};; zenoh) export RMW_IMPLEMENTATION=rmw_zenoh_cpp;; esac
-        - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip}' != "None" ] && [ -n '${ota_easy_mode_ip}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
+        - if [ '${ota_config_template}' != "None" ] && [ -n '${ota_config_template}' ]; then ota_args=(--config "${ota_config_template}" --host-ip "${ip_local}" --peer "${ip_remote}"); [ '${ota_easy_mode_ip}' != "None" ] && [ -n '${ota_easy_mode_ip}' ] && ota_args+=(--easy-mode-ip "${ota_easy_mode_ip}"); [ '${ota_spdp_interval}' != "None" ] && [ -n '${ota_spdp_interval}' ] && ota_args+=(--spdp-interval "${ota_spdp_interval}"); /ws/ota_configs/get_ota_xml.py "${ota_args[@]}" > "${ota_config_file}"; case ${rmw_ota} in cyclone) export CYCLONEDDS_URI="file://${ota_config_file}";; fastdds) export FASTDDS_DEFAULT_PROFILES_FILE="${ota_config_file}"; export RMW_FASTRTPS_USE_QOS_FROM_XML=1;; esac; fi
         # For zenoh_ros2dds the OTA domain is loopback-only (zenoh is the inter-host
         # transport), so confine discovery to localhost instead of statically peering
         # the remote host — otherwise the OTA-domain DDS double-delivers alongside zenoh.

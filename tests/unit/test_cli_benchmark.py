@@ -36,6 +36,8 @@ from rosotacom.cli_benchmark import (
     _parse_values,
     _peer_catmux_attach_script,
     _prepare_benchmark_session_config,
+    _probe_load,
+    _probe_spdp_diagnostics,
     _profile_requires_netem_seed,
     _requirements_jitter_loss_pct,
     _requirements_target_quality,
@@ -1522,6 +1524,7 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.bin_s == 1.0
     assert args.plot is True
     assert args.size_pattern is None
+    assert args.cyclone_spdp_interval is None
 
     args = parser.parse_args(["benchmark", "probe", "--profile", "losssless-typical", "--no-plot"])
     assert args.plot is False
@@ -1536,10 +1539,13 @@ def test_benchmark_subcommand_arg_parsing() -> None:
             "1x20KB+1x0KB",
             "--rate-hz",
             "10",
+            "--cyclone-spdp-interval",
+            "150s",
         ]
     )
     assert args.size_pattern == "1x20KB+1x0KB"
     assert args.rate_hz == 10.0
+    assert args.cyclone_spdp_interval == "150s"
 
     # Capacity.
     args = parser.parse_args(
@@ -1894,7 +1900,143 @@ def test_benchmark_session_copy_pins_requested_rmw(tmp_path: Path) -> None:
     assert copied["shared"]["qos"]["for_role"]["ota_pub"]["reliability"] == "reliable"
     assert args.session_configs_dir[0] == str(run_dir / "session-configs")
     assert context["runtime_implementation"] == "rmw_cyclonedds_cpp"
+    assert context["cyclone_spdp_interval"] is None
     assert context["qos"] == {"reliability": "reliable", "depth": 10}
+
+
+def test_benchmark_session_copy_applies_cyclone_spdp_override(tmp_path: Path) -> None:
+    import argparse
+
+    project = tmp_path / "project"
+    session_dir = project / "sessions" / "bench_1_1_capacity"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session-definition.yaml").write_text(
+        "peers:\n  a: {}\n  b: {}\nshared:\n  rmw: cyclone\n",
+        encoding="utf-8",
+    )
+    ros2docker = project / "ros2docker.json"
+    ros2docker.write_text("{}", encoding="utf-8")
+    config_file = project / "rosotacom.yaml"
+    config_file.write_text(
+        yaml.safe_dump(
+            {
+                "ros2docker_config": str(ros2docker),
+                "session_configs_dir": ["sessions"],
+                "session_instances_dir": "session-instances",
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    args = argparse.Namespace(
+        rosotacom_config=str(config_file),
+        ros2docker_config=None,
+        session_configs_dir=None,
+        scenario_configs_dir=None,
+        session_instances_dir=None,
+        deployment=None,
+        profiles_file=None,
+        artifacts_dir=None,
+        rmw="cyclone",
+        qos_reliability=None,
+        qos_depth=None,
+        cyclone_spdp_interval="150s",
+    )
+
+    context = _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
+
+    copied = yaml.safe_load(Path(context["config_path"]).read_text(encoding="utf-8"))
+    assert copied["shared"]["rmw"] == {
+        "local": "cyclone",
+        "ota": {"cyclone": {"spdp_interval": "150s"}},
+    }
+    assert context["cyclone_spdp_interval"] == "150s"
+
+
+def test_benchmark_session_copy_rejects_spdp_override_for_non_cyclone(tmp_path: Path) -> None:
+    import argparse
+
+    project = tmp_path / "project"
+    session_dir = project / "sessions" / "bench_1_1_capacity"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session-definition.yaml").write_text(
+        "peers:\n  a: {}\n  b: {}\nshared:\n  rmw: fastdds\n",
+        encoding="utf-8",
+    )
+    (project / "ros2docker.json").write_text("{}", encoding="utf-8")
+    config_file = project / "rosotacom.yaml"
+    config_file.write_text(
+        yaml.safe_dump(
+            {
+                "ros2docker_config": "ros2docker.json",
+                "session_configs_dir": ["sessions"],
+                "session_instances_dir": "session-instances",
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        rosotacom_config=str(config_file),
+        ros2docker_config=None,
+        session_configs_dir=None,
+        scenario_configs_dir=None,
+        session_instances_dir=None,
+        deployment=None,
+        profiles_file=None,
+        artifacts_dir=None,
+        rmw="fastdds",
+        cyclone_spdp_interval="150s",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    with pytest.raises(ValueError, match="--rmw cyclone"):
+        _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
+
+
+def test_probe_spdp_diagnostics_warn_on_tight_cyclone_profile(tmp_path: Path) -> None:
+    import argparse
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "ros2docker.json").write_text("{}", encoding="utf-8")
+    (project / "profiles.yaml").write_text(
+        "profiles:\n  tight:\n    uplink: { rate: 3.2mbit }\n",
+        encoding="utf-8",
+    )
+    config_file = project / "rosotacom.yaml"
+    config_file.write_text(
+        yaml.safe_dump(
+            {
+                "ros2docker_config": "ros2docker.json",
+                "profiles": "profiles.yaml",
+                "session_instances_dir": "session-instances",
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        rosotacom_config=str(config_file),
+        ros2docker_config=None,
+        session_configs_dir=None,
+        scenario_configs_dir=None,
+        session_instances_dir=None,
+        deployment=None,
+        profiles_file=None,
+        artifacts_dir=None,
+        rmw="cyclone",
+        cyclone_spdp_interval=None,
+    )
+    load_info = benchmark_cli._load_context(_probe_load(size=18_000, size_pattern=None, rate_hz=20.0, streams=1))
+
+    diagnostic = _probe_spdp_diagnostics(args=args, profile="tight", duration_s=25.0, load_info=load_info)
+
+    assert diagnostic is not None
+    assert diagnostic["interval"] == "30s"
+    assert diagnostic["risk"] == "possible"
+    assert diagnostic["offered_to_minimum_profile_rate"] == pytest.approx(0.9)
+    assert "SPDPInterval=30s" in diagnostic["warnings"][0]
 
 
 def test_benchmark_session_copy_expands_capacity_stream_topics(tmp_path: Path) -> None:

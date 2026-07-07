@@ -132,7 +132,7 @@ class YamlBlockScalar:
 #   - a string: cyclone | fastdds | zenoh_connect_endpoints | zenoh_ros2dds | <raw rmw string>
 #     (zenoh_ros2dds is allowed for ota only; raw rmw strings are for local only)
 #   - a tagged-union mapping with exactly one key (the RMW name):
-#       {cyclone: {config?: <fname.xml>, easy_mode_ip?: <address>}}
+#       {cyclone: {config?: <fname.xml>, easy_mode_ip?: <address>, spdp_interval?: <duration>}}
 #       {fastdds: {config?: <fname.xml>, easy_mode_ip?: <address>}}
 #       {zenoh_connect_endpoints: {main_peer?: <peer_key>, main_port?: 7447}}
 #       {zenoh_ros2dds: {transport?: udp|tcp, main_peer?: <peer_key>, main_port?: 7447}}
@@ -145,7 +145,7 @@ _OTA_SHORTS = {"cyclone", "fastdds", *_NATIVE_ZENOH_OTA_SHORTS, "zenoh_ros2dds"}
 _LOCAL_SHORTS = {"cyclone", "fastdds", "zenoh"}
 _SHORTCUT_ALLOWED = {"cyclone", "fastdds", "zenoh"}
 
-_DDS_CFG_KEYS = {"config", "easy_mode_ip"}
+_DDS_CFG_KEYS = {"config", "easy_mode_ip", "spdp_interval"}
 _ZEN_OTA_CFG_KEYS = {"main_peer", "main_port"}
 _ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
 
@@ -159,6 +159,16 @@ _DDS_OTA_DEFAULT_CONFIG = {
     "cyclone": "cyclonedds_tuned.xml",
     "fastdds": "fastdds_unicast.xml",
 }
+
+
+def _validate_positive_seconds(value: str, ctx: str) -> None:
+    text = value.strip().lower()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(ms|s)?", text)
+    if not match:
+        raise RuntimeError(f"{ctx}: expected e.g. '30s' or '500ms', got {value!r}.")
+    seconds = float(match.group(1)) / 1000.0 if match.group(2) == "ms" else float(match.group(1))
+    if seconds <= 0.0:
+        raise RuntimeError(f"{ctx} must be > 0, got {value!r}.")
 
 
 def _is_native_zenoh_ota(impl: Optional[str]) -> bool:
@@ -180,6 +190,7 @@ class RmwSideSpec:
     # DDS-specific (cyclone, fastdds)
     dds_config: Optional[str] = None
     dds_easy_mode_ip: Optional[str] = None
+    dds_spdp_interval: Optional[str] = None
     # zenoh / zenoh_ros2dds
     zen_main_peer: Optional[str] = None
     # zenoh_ros2dds only
@@ -239,6 +250,13 @@ def _parse_rmw_side(value: Any, ctx: str, *, is_local: bool) -> RmwSideSpec:
             if not isinstance(cfg["easy_mode_ip"], str) or not cfg["easy_mode_ip"].strip():
                 raise RuntimeError(f"{ctx}.{impl}.easy_mode_ip must be a non-empty string if provided.")
             spec.dds_easy_mode_ip = cfg["easy_mode_ip"].strip()
+        if cfg.get("spdp_interval") is not None:
+            if impl != "cyclone":
+                raise RuntimeError(f"{ctx}.{impl}.spdp_interval is only supported for CycloneDDS.")
+            if not isinstance(cfg["spdp_interval"], str) or not cfg["spdp_interval"].strip():
+                raise RuntimeError(f"{ctx}.{impl}.spdp_interval must be a non-empty duration if provided.")
+            _validate_positive_seconds(cfg["spdp_interval"], f"{ctx}.{impl}.spdp_interval")
+            spec.dds_spdp_interval = cfg["spdp_interval"].strip()
     elif _is_native_zenoh_ota(impl):
         extra = set(cfg.keys()) - _ZEN_OTA_CFG_KEYS
         if extra:
@@ -1980,6 +1998,8 @@ def func(
                         side.dds_easy_mode_ip or peer_ip[peer_keys[0]],
                     )
                 )
+            if side.impl == "cyclone" and side.dds_spdp_interval:
+                items.append(("local_spdp_interval", side.dds_spdp_interval))
         return items
 
     def _build_ota_rmw_items() -> List[Tuple[str, Any]]:
@@ -2005,6 +2025,8 @@ def func(
                         ota.dds_easy_mode_ip or peer_ip[peer_keys[0]],
                     )
                 )
+            if ota.impl == "cyclone" and ota.dds_spdp_interval:
+                items.append(("ota_spdp_interval", ota.dds_spdp_interval))
         return items
 
     def _build_zenoh_block(

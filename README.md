@@ -519,6 +519,18 @@ shaping context, thresholds, verdict, and per-topic loss/latency/jitter metrics.
 For live benchmark probes, `--duration` is the shaped publish window; after that
 rosotacom stops synthetic publishers and waits `--drain-s` seconds before
 tearing down shaping, so delayed in-flight messages are not miscounted as loss.
+Cyclone DDS benchmark sessions keep the default tuned OTA
+`SPDPInterval=30s`. On tight rate-limited profiles, this periodic discovery
+metatraffic can share the shaped link with payload traffic and appear as regular
+p99/max latency spikes. rosotacom records a `cyclonedds_spdp` diagnostic in
+`result.json` and prints a warning when the probe duration and offered/shaped
+bandwidth make that effect plausible. Keep the default for end-to-end DDS
+behavior. For payload-only characterization where discovery bursts would mask the
+question under test, pass `--cyclone-spdp-interval 150s` or another longer
+positive `ms`/`s` duration. Making SPDP too frequent improves stale-peer and
+reconnect detection cadence but contaminates tight-link latency more often;
+making it too lax quiets short probes but hides discovery/liveliness overhead and
+delays detection of changed peer state.
 Use `benchmark probe` when you want a fixed payload/rate under one profile
 instead of a breakpoint search. It writes the normal `result.json` plus
 `time-bins.jsonl` with per-second loss, delivered Hz, payload bandwidth, and
@@ -528,6 +540,7 @@ when the optional plotting dependency is installed:
 ```bash
 rosotacom benchmark probe --profile cellular-4g-typical --size 18000 --rate-hz 20 --duration 20 --repeats 1
 rosotacom benchmark probe --profile cellular-4g-typical --size-pattern 1x20KB+1x0KB --rate-hz 10 --duration 20 --repeats 1
+rosotacom benchmark probe --profile cellular-4g-typical --size 18000 --rate-hz 20 --duration 20 --cyclone-spdp-interval 150s
 rosotacom benchmark plot time-bins.jsonl --type probe
 ```
 

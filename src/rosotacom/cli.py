@@ -40,6 +40,14 @@ import yaml
 from argcomplete.completers import DirectoriesCompleter
 
 from . import __version__
+from .bundle_check import (
+    BundleCheckConfig,
+    ExpectedPath,
+    check_bundle,
+    format_bundle_report,
+    load_bundle_manifest,
+    merge_bundle_configs,
+)
 from .deployment import (
     DeploymentConfig,
     PeerBinding,
@@ -7380,6 +7388,22 @@ def anonymize_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def bundle_check_command(args: argparse.Namespace) -> int:
+    configs: list[BundleCheckConfig] = []
+    if args.manifest:
+        configs.append(load_bundle_manifest(args.manifest))
+
+    files = tuple(ExpectedPath(path=path, required=True) for path in args.required_file or ())
+    files += tuple(ExpectedPath(path=path, required=False) for path in args.optional_file or ())
+    bags = tuple(ExpectedPath(path=path, required=True) for path in args.required_bag or ())
+    bags += tuple(ExpectedPath(path=path, required=False) for path in args.optional_bag or ())
+    configs.append(BundleCheckConfig(peers=tuple(args.peer or ()), files=files, bags=bags))
+
+    report = check_bundle(args.directory, merge_bundle_configs(*configs))
+    print(format_bundle_report(report))
+    return 0 if report.complete else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     commands = {
@@ -7402,6 +7426,7 @@ def main(argv: list[str] | None = None) -> int:
         "scenario",
         "examples",
         "config",
+        "bundle",
         "completion",
         "benchmark",
         "ota-benchmark",
@@ -7751,6 +7776,51 @@ def main(argv: list[str] | None = None) -> int:
         help="Clear the machine-wide default (the only persisted scope).",
     )
     config_unset_parser.set_defaults(func=config_command)
+
+    bundle_parser = subparsers.add_parser("bundle", help="Inspect session-instance artifact bundles.")
+    bundle_subparsers = bundle_parser.add_subparsers(dest="bundle_command", required=True)
+    bundle_check_parser = bundle_subparsers.add_parser(
+        "check",
+        help="Validate a session-instance artifact bundle.",
+    )
+    bundle_check_parser.add_argument("directory", help="Session-instance directory to validate.")
+    bundle_check_parser.add_argument(
+        "--manifest",
+        help="YAML manifest listing expected peers, files, and bags relative to the session instance.",
+    )
+    bundle_check_parser.add_argument(
+        "--peer",
+        action="append",
+        default=[],
+        help="Expected peer key with logs/<peer>/status/status.json and events.jsonl. Repeat as needed.",
+    )
+    bundle_check_parser.add_argument(
+        "--file",
+        dest="required_file",
+        action="append",
+        default=[],
+        help="Required non-empty file relative to the session instance. Repeat as needed.",
+    )
+    bundle_check_parser.add_argument(
+        "--optional-file",
+        action="append",
+        default=[],
+        help="Optional file to validate when present. Repeat as needed.",
+    )
+    bundle_check_parser.add_argument(
+        "--bag",
+        dest="required_bag",
+        action="append",
+        default=[],
+        help="Required rosbag2 bag directory or metadata.yaml path. Repeat as needed.",
+    )
+    bundle_check_parser.add_argument(
+        "--optional-bag",
+        action="append",
+        default=[],
+        help="Optional rosbag2 bag directory or metadata.yaml path to validate when present. Repeat as needed.",
+    )
+    bundle_check_parser.set_defaults(func=bundle_check_command)
 
     from .cli_benchmark import register_benchmark_parser
 

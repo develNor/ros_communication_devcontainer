@@ -427,6 +427,33 @@ shared:
 The MCAP is written under `logs/<peer>/metrics/`. Analyze an ordered pipeline
 with `ros2 run com_py stage_latency BAG TOPIC...`.
 
+After a recording run, validate that a session instance still contains the
+artifacts needed for later analysis:
+
+```bash
+rosotacom bundle check session-instances/.../drive_run --peer a --peer b \
+  --file config/resolved-session.yaml \
+  --bag rosbags/a/native
+```
+
+`bundle check` validates each expected peer's `status.json` and `events.jsonl`,
+requires transit rows in the event streams, and validates expected rosbag2 bags
+from their `metadata.yaml` message counts. Extra expected artifacts can be passed
+as repeated `--file`, `--optional-file`, `--bag`, and `--optional-bag` flags, or
+via a generic YAML manifest:
+
+```yaml
+schema_version: 1
+peers: [a, b]
+required_files:
+  - config/resolved-session.yaml
+required_bags:
+  - path: rosbags/a/native
+    label: native bag
+optional_files:
+  - traces/link.jsonl
+```
+
 Phase 1 samples local-domain stages directly. OTA stages are graph-only and
 their activity is inferred from adjacent local flow, so the status overview
 never creates an additional OTA payload subscription. Combine both peers' files

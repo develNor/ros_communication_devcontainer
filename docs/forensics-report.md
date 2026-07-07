@@ -112,6 +112,36 @@ when the flagged share looks like a real GOP structure (2–40 %), so uniform or
 rare-spike streams are not mislabeled. The provenance string in the report says
 which case applied.
 
+## Example: a real capacity-probe instance
+
+A two-host `bench_1_1_capacity` probe (20 Hz, 18 KB payloads) recorded under a
+`delay 30ms jitter 25ms` profile whose shaping armed a few seconds after the
+publisher started:
+
+```bash
+rosotacom report session-instances/2026-06-29/bench_1_1_capacity_2026-06-29_13-18-33_7c87ccea \
+  --profile probe-30ms-jitter25-unconstrained --profiles-file profiles.yaml
+```
+
+```text
+## Streams
+- `a->b:/bench_capacity` — 20.0Hz nominal, 503/508 delivered (0.984% lost),
+  ota p50 72.0ms p95 100.0ms, 1 event(s)
+
+## Incidents (1)
+### 1. t=+5.2s..+25.3s (13:19:22-13:19:42) — 1 event(s)
+- **latency excursion** on `a->b:/bench_capacity` — 387 messages (seq 203-605),
+  peak 121.7ms vs baseline 3.5ms (threshold 53.5ms), t=+5.2s..+25.3s
+- context — profile `probe-30ms-jitter25-unconstrained`: static (constant for the whole run)
+```
+
+The excursion boundary is the shaping onset: baseline 3.5 ms on the unshaped
+link, one sustained excursion from t=+5.2 s that never returns to baseline, and
+the scattered losses stay below the burst threshold. The per-stream figure
+shades the event across latency, delivery rate, and sizes:
+
+![Forensics timeline of the capacity probe](../media/forensics-report-example.png)
+
 ## Wall-clock joins
 
 Transit records are placed on the publish timeline (sender clock, epoch

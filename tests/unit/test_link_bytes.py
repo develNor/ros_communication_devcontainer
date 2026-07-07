@@ -39,7 +39,12 @@ Inter-|   Receive                |  Transmit
 
 def test_parse_proc_net_dev_extracts_rx_tx() -> None:
     stats = lb.parse_proc_net_dev(PROC_NET_DEV)
-    assert stats["tun1"] == {"rx_bytes": 1000000, "tx_bytes": 2000000}
+    assert stats["tun1"] == {
+        "rx_bytes": 1000000,
+        "rx_packets": 5000,
+        "tx_bytes": 2000000,
+        "tx_packets": 6000,
+    }
     assert stats["lo"]["rx_bytes"] == 123456
 
 
@@ -60,8 +65,7 @@ def _sampler_over(frames: list[str], times: list[float]):
 
     def fake_read(iface, proc_path):  # noqa: ARG001
         stats = lb.parse_proc_net_dev(frames[state["i"]])
-        row = stats.get(iface)
-        return None if row is None else (row["rx_bytes"], row["tx_bytes"])
+        return stats.get(iface)
 
     clock = {"i": 0}
 
@@ -71,8 +75,8 @@ def _sampler_over(frames: list[str], times: list[float]):
 
     s = lb.LinkByteSampler("tun1", clock=fake_clock)
     # Patch the module-level reader the sampler uses.
-    orig = lb.read_iface_counters
-    lb.read_iface_counters = fake_read
+    orig = lb.read_iface_counter_row
+    lb.read_iface_counter_row = fake_read
     try:
         results = []
         for _ in frames:
@@ -80,7 +84,7 @@ def _sampler_over(frames: list[str], times: list[float]):
             state["i"] += 1
             clock["i"] += 1
     finally:
-        lb.read_iface_counters = orig
+        lb.read_iface_counter_row = orig
     return results
 
 
@@ -92,6 +96,8 @@ def test_sampler_first_call_primes_then_reports_rate() -> None:
     assert results[0] is None  # primed
     assert results[1]["rx_kbps"] == lb.kbps(1024, 1.0)
     assert results[1]["tx_kbps"] == lb.kbps(2048, 1.0)
+    assert results[1]["rx_packets_delta"] == 1
+    assert results[1]["tx_packets_delta"] == 1
     assert results[1]["interface"] == "tun1"
 
 

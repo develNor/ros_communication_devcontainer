@@ -399,6 +399,26 @@ the [link trace recorder](docs/link-trace.md). It writes
 `link_trace.jsonl` under the same status directory with `/proc/net/dev` counter
 deltas, echo-heartbeat RTT/loss provenance, and an optional modem-metrics hook.
 
+Convert a recorded link trace into a profiles-file entry when you want to replay
+the same drive conditions in a repeatable benchmark:
+
+```bash
+rosotacom profile from-trace session-instances/.../logs/a/status/link_trace.jsonl \
+  --mode timeline --name drive_replay --out generated-profiles.yaml
+rosotacom benchmark recovery --profiles-file generated-profiles.yaml --profile drive_replay
+```
+
+Timeline mode emits piecewise-constant RFC 0004 segments, turns long sample gaps
+into `outage: reconnect`, and turns sustained 100% probe loss into
+`outage: catchup`. Static mode distills one profile with median valid rate, p90
+one-way delay, delay-spread jitter, and mean loss; constrain it with
+`--window START:END` when only part of a drive should calibrate the profile. RTT
+is mapped to symmetric one-way delay. Passive `/proc/net/dev` throughput is only
+a lower-bound observation, so `rate` is emitted only when a sample is marked as
+saturated/probed/capacity-like; otherwise the converter omits rate instead of
+fabricating capacity. The generated YAML carries a provenance comment with the
+source path, SHA-256, parameters, and these caveats.
+
 Read it from the host with the `status` command:
 
 ```bash

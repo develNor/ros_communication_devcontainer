@@ -465,6 +465,41 @@ shared:
 The MCAP is written under `logs/<peer>/metrics/`. Analyze an ordered pipeline
 with `ros2 run com_py stage_latency BAG TOPIC...`.
 
+For decoded camera stages, compute offline image quality with PSNR/SSIM:
+
+```bash
+rosotacom videoquality \
+  session-instances/.../logs/b/metrics/stages_... \
+  session-instances/.../logs/a/metrics/stages_... \
+  --ref-topic /camera/image \
+  --degraded-topic /camera/image/ffmpeg/raw \
+  --out videoquality.json \
+  --plot videoquality.png \
+  --min-mean-psnr 30 \
+  --min-mean-ssim 0.90 \
+  --max-loss-pct 0
+```
+
+Use the outbound pre-transport image topic as the reference (`native` when no
+preprocessing runs; otherwise the generated topic immediately before
+`transport`, such as a restamped/drop output) and the receiver-side decoded
+`native_in` stage as the degraded stream. The reference topic may be decoded
+`sensor_msgs/msg/Image` or JPEG/PNG `sensor_msgs/msg/CompressedImage`; the
+receiver-side ffmpeg comparison topic should be the decoded `/raw` reverse
+transport output. Lost frames are reported as delivery loss and are never
+averaged into PSNR/SSIM. Encoded `ffmpeg_image_transport_msgs/msg/FFMPEGPacket`
+topics carry packet bytes, not pixels, so select the decoded `/raw` topic when
+computing image quality. The same command also accepts JSON frame manifests for
+host-only checks:
+
+```bash
+rosotacom videoquality --make-synthetic /tmp/rosotacom-quality
+rosotacom videoquality \
+  /tmp/rosotacom-quality/reference-frames.json \
+  /tmp/rosotacom-quality/degraded-frames.json \
+  --min-mean-psnr 20 --max-loss-pct 0
+```
+
 After a recording run, validate that a session instance still contains the
 artifacts needed for later analysis:
 
@@ -539,6 +574,9 @@ The `sessions/` directory contains curated built-in session definitions:
 - `16_remote_assist_anonymized_camera`: single-stream cut of example 14 —
   only `/topic9`, the anonymized ffmpeg camera stream; run it with
   `rosotacom smoke 16_remote_assist_anonymized_camera`
+- `17_synthetic_camera_quality`: synthetic raw camera stream encoded through
+  ffmpeg and reverse-republished as decoded `/raw` frames for offline
+  `rosotacom videoquality` checks
 
 Transport-combination coverage lives under `tests/sessions/rmw_matrix` and is
 generated from `tests/sessions/generate_rmw_matrix.py`.

@@ -2337,6 +2337,7 @@ def test_restamp_example_uses_stale_stamped_header_source() -> None:
         "tf2_msgs/msg/TFMessage",
         "visualization_msgs/msg/MarkerArray",
         "sensor_msgs/msg/CameraInfo",
+        "sensor_msgs/msg/Image",
         "sensor_msgs/msg/CompressedImage",
         "sensor_msgs/msg/NavSatFix",
         "gps_msgs/msg/GPSFix",
@@ -2386,6 +2387,65 @@ def test_named_stage_latency_is_left_to_status_oracle() -> None:
     assert len(specs) == 1
     assert specs[0].hz_min == 2.0
     assert specs[0].max_delay_s is None
+
+
+def test_videoquality_cli_generates_synthetic_report_and_enforces_thresholds(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    synthetic_dir = tmp_path / "frames"
+
+    rc = rosotacom.main(
+        [
+            "videoquality",
+            "--make-synthetic",
+            str(synthetic_dir),
+            "--synthetic-frames",
+            "4",
+            "--synthetic-width",
+            "4",
+            "--synthetic-height",
+            "4",
+            "--synthetic-quantization-step",
+            "4",
+        ]
+    )
+
+    assert rc == 0
+    assert "Synthetic reference manifest" in capsys.readouterr().out
+    report_path = tmp_path / "quality.json"
+    rc = rosotacom.main(
+        [
+            "videoquality",
+            str(synthetic_dir / "reference-frames.json"),
+            str(synthetic_dir / "degraded-frames.json"),
+            "--out",
+            str(report_path),
+            "--min-mean-psnr",
+            "20",
+            "--max-loss-pct",
+            "0",
+        ]
+    )
+
+    assert rc == 0
+    assert "VIDEOQUALITY OK" in capsys.readouterr().out
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["delivery"]["compared_frames"] == 4
+    assert report["delivery"]["lost_frames"] == 0
+
+    rc = rosotacom.main(
+        [
+            "videoquality",
+            str(synthetic_dir / "reference-frames.json"),
+            str(synthetic_dir / "degraded-frames.json"),
+            "--min-mean-psnr",
+            "80",
+        ]
+    )
+
+    assert rc == 1
+    assert "VIDEOQUALITY FAIL" in capsys.readouterr().err
 
 
 def test_trickle_example_asserts_the_trickle_output_stage() -> None:

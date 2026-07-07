@@ -23,6 +23,13 @@ def test_console_scripts_target_package_cli() -> None:
     assert 'stop_rosotacom = "rosotacom.cli:stop_compat_main"' in pyproject
 
 
+def test_videoquality_reader_dependencies_are_packaged() -> None:
+    pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert '"mcap>=1.4,<2"' in pyproject
+    assert '"Pillow>=10,<13"' in pyproject
+
+
 def test_checkout_installer_enables_completion_during_venv_activation() -> None:
     installer = (PACKAGE_ROOT / "install.sh").read_text(encoding="utf-8")
 

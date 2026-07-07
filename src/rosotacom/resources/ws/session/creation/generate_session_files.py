@@ -63,6 +63,7 @@ RMW_ALIASES = {
 HEARTBEAT_MSG_TYPE = "com_msgs/msg/EchoHeartbeat"
 COMPRESSED_MSG_TYPE = "com_msgs/msg/CompressedData"
 OTA_STAMPED_MSG_TYPE = "com_msgs/msg/OtaStamped"
+SENSOR_IMAGE_MSG_TYPE = "sensor_msgs/msg/Image"
 TRANSPORT_OUTPUT_TYPES = {
     "compressed": "sensor_msgs/msg/CompressedImage",
     "ffmpeg": "ffmpeg_image_transport_msgs/msg/FFMPEGPacket",
@@ -1358,6 +1359,12 @@ def _build_status_pipeline_spec(
             # (globalframe) topic, and the framebridge transforms it down to the
             # local base topic -- that base is the post-framebridge native_in.
             return str(pipe["fb_g2l_base"])
+        transport = pipe.get("transport")
+        if isinstance(transport, TransportSpec) and transport.local_republish:
+            # image_transport reverse republish decodes `<final>` into
+            # `<final>/raw`; PSNR/SSIM and application-level checks need that
+            # decoded sensor_msgs/Image stage, not the encoded packet.
+            return final + "/raw"
         return final
 
     def _relay_in_local_topic(topic: str) -> str:
@@ -1507,11 +1514,15 @@ def _build_status_pipeline_spec(
                 },
             ]
             if postprocessed != final:
+                native_in_type = base_type
+                transport = p.get("transport")
+                if isinstance(transport, TransportSpec) and transport.local_republish:
+                    native_in_type = SENSOR_IMAGE_MSG_TYPE
                 stages.append(
                     {
                         "stage": "native_in",
                         "topic": _relay_in_local_topic(postprocessed),
-                        "type": base_type,
+                        "type": native_in_type,
                         "domain": "local",
                         "produced_by": "postprocessing",
                     }
@@ -2885,6 +2896,16 @@ def func(
                         for stage in topic.get("stages", [])
                         if stage.get("domain", "local") == "local"
                     ]
+                    + [
+                        str(p["it_in"])
+                        for p in out_pipes
+                        if p.get("it_in")
+                    ]
+                    + [
+                        f'{p["irt_in"]}/raw'
+                        for p in out_pipes
+                        if p.get("irt_in")
+                    ]
                 )
                 blocks.append(
                     PluginBlock(
@@ -3081,18 +3102,19 @@ def func(
             blocks.append(PluginBlock("it", items2))
 
         # Merge reverse-transport config for (a) local reconstruction and (b) inbound remote topics (if requested).
-        irt_all: List[Tuple[str, str]] = []
+        irt_all: List[Tuple[str, str, str]] = []
         for t, tspec in irt_items_local:
             assert tspec is not None
-            irt_all.append((t, tspec.type))
-        irt_all.extend(irt_items_remote)
+            irt_all.append((t, tspec.type, "raw"))
+        irt_all.extend((topic, ttype, "raw") for topic, ttype in irt_items_remote)
         _assert_max("irt", irt_all, 4)
         if irt_all:
             items2 = [("irt", True)]
-            for i, (topic, ttype) in enumerate(irt_all, 1):
+            for i, (topic, _ttype, _out_transport) in enumerate(irt_all, 1):
                 items2.append((f"irt_{i}_topic", topic))
-            for i, (topic, ttype) in enumerate(irt_all, 1):
+            for i, (_topic, ttype, out_transport) in enumerate(irt_all, 1):
                 items2.append((f"irt_{i}_transport", ttype))
+                items2.append((f"irt_{i}_out_transport", out_transport))
             blocks.append(PluginBlock("irt", items2))
 
         if nor_items:

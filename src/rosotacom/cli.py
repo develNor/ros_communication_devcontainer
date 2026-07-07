@@ -1669,6 +1669,7 @@ def _ota_start_parts(
     *,
     mode: str,
     force: bool = True,
+    link_trace_parts: list[str] | None = None,
 ) -> list[str]:
     if target.target_type == "scenario":
         parts = ["scenario", "start", target.name, "--identity", identity, "--mode", mode, "--instance-id", instance_id]
@@ -1684,6 +1685,7 @@ def _ota_start_parts(
             instance_id,
         ]
     parts.append("--force" if force else "--no-force")
+    parts.extend(link_trace_parts or [])
     for override in peer_args:
         parts.extend(["--peer-address", override])
     return parts
@@ -1697,6 +1699,7 @@ def _ota_communication_start_parts(
     *,
     mode: str,
     force: bool = True,
+    link_trace_parts: list[str] | None = None,
 ) -> list[str]:
     parts = [
         "start",
@@ -1710,8 +1713,20 @@ def _ota_communication_start_parts(
         "--smoke-managed",
     ]
     parts.append("--force" if force else "--no-force")
+    parts.extend(link_trace_parts or [])
     for override in peer_args:
         parts.extend(["--peer-address", override])
+    return parts
+
+
+def _link_trace_parts_from_args(args: argparse.Namespace) -> list[str]:
+    parts: list[str] = []
+    if getattr(args, "link_trace", None):
+        parts.append("--link-trace")
+    if getattr(args, "link_trace_interval_s", None) is not None:
+        parts.extend(["--link-trace-interval", str(args.link_trace_interval_s)])
+    if getattr(args, "link_trace_modem_command", None):
+        parts.extend(["--link-trace-modem-command", args.link_trace_modem_command])
     return parts
 
 
@@ -2619,13 +2634,14 @@ def _ota_start_peers(
     *,
     dry_run: bool,
     mode: str = "detached",
+    link_trace_parts: list[str] | None = None,
 ) -> None:
     peer_args = _ota_peer_address_args(plan)
     for peer_name in sorted(plan.peers):
         peer = plan.peers[peer_name]
         command = _ota_rosotacom_command(
             plan,
-            _ota_start_parts(target, peer_name, instance_id, peer_args, mode=mode),
+            _ota_start_parts(target, peer_name, instance_id, peer_args, mode=mode, link_trace_parts=link_trace_parts),
         )
         _ota_run(peer, command, label=f"{peer_name}: start {target.name}", dry_run=dry_run)
 
@@ -2904,6 +2920,7 @@ def _ota_create_tmux(
     target: InteractiveSmokeTarget,
     plan: OtaSmokePlan,
     instance: SessionInstance,
+    link_trace_parts: list[str] | None = None,
 ) -> str:
     _require_tmux()
     session_name = _ota_smoke_tmux_session(target.target_type, target.name)
@@ -2912,7 +2929,14 @@ def _ota_create_tmux(
     first_peer = peers[0]
     first_start = _ota_rosotacom_command(
         plan,
-        _ota_communication_start_parts(target, first_peer.name, instance.instance_id, peer_args, mode="attach"),
+        _ota_communication_start_parts(
+            target,
+            first_peer.name,
+            instance.instance_id,
+            peer_args,
+            mode="attach",
+            link_trace_parts=link_trace_parts,
+        ),
     )
     first_script = (
         "set -e; "
@@ -2984,7 +3008,14 @@ def _ota_create_tmux(
     for peer in peers[1:]:
         start = _ota_rosotacom_command(
             plan,
-            _ota_communication_start_parts(target, peer.name, instance.instance_id, peer_args, mode="attach"),
+            _ota_communication_start_parts(
+                target,
+                peer.name,
+                instance.instance_id,
+                peer_args,
+                mode="attach",
+                link_trace_parts=link_trace_parts,
+            ),
         )
         script = (
             "set -e; "
@@ -3178,7 +3209,7 @@ def _start_interactive_ota_smoke(args: argparse.Namespace) -> int:
         print(f"Would create OTA smoke tmux session: {tmux_session}")
         print(f"OTA smoke artifacts: {instance.host_dir}")
         return 0
-    created = _ota_create_tmux(runtime, target, plan, instance)
+    created = _ota_create_tmux(runtime, target, plan, instance, link_trace_parts=_link_trace_parts_from_args(args))
     print(f"rosotacom OTA smoke instance: {instance.host_dir}")
     print(f"rosotacom OTA smoke started: {target.name} ({target.target_type})")
     print("Local control tmux prefix: Ctrl-b. Send the peer tmux/catmux prefix with Ctrl-b Ctrl-b.")
@@ -3232,7 +3263,13 @@ def _start_noninteractive_ota_smoke(args: argparse.Namespace) -> int:
     try:
         if profile is not None:
             shapers = _ota_arm_profile(plan, profile, directions, dry_run=dry_run)
-        _ota_start_peers(target, plan, instance.instance_id, dry_run=dry_run)
+        _ota_start_peers(
+            target,
+            plan,
+            instance.instance_id,
+            dry_run=dry_run,
+            link_trace_parts=_link_trace_parts_from_args(args),
+        )
         if not dry_run:
             time.sleep(12)
         _ota_start_session_publishers(target, plan, dry_run=dry_run)
@@ -3705,6 +3742,12 @@ def _scenario_communication_command(
     command.append("--force" if getattr(args, "force", True) else "--no-force")
     if getattr(args, "rewrite_formatting", False):
         command.append("--rewrite-formatting")
+    if getattr(args, "link_trace", None):
+        command.append("--link-trace")
+    if getattr(args, "link_trace_interval_s", None) is not None:
+        command.extend(["--link-trace-interval", str(args.link_trace_interval_s)])
+    if getattr(args, "link_trace_modem_command", None):
+        command.extend(["--link-trace-modem-command", args.link_trace_modem_command])
     for assignment in getattr(args, "peer", []) or []:
         command.extend(["--peer", assignment])
     for override in getattr(args, "peer_address", []) or []:
@@ -3981,6 +4024,9 @@ def _session_command(
     rewrite_formatting: bool,
     peer_address_overrides: dict[str, str],
     attach_mode: str,
+    link_trace: bool | None = None,
+    link_trace_interval_s: float | None = None,
+    link_trace_modem_command: str | None = None,
 ) -> list[str]:
     parts = [
         RUN_SESSION_CONTAINER_PATH,
@@ -4001,6 +4047,12 @@ def _session_command(
         parts.append("--force")
     if rewrite_formatting:
         parts.append("--rewrite-formatting")
+    if link_trace:
+        parts.append("--link-trace")
+    if link_trace_interval_s is not None:
+        parts.extend(["--link-trace-interval", str(link_trace_interval_s)])
+    if link_trace_modem_command:
+        parts.extend(["--link-trace-modem-command", link_trace_modem_command])
     for peer_key, address_value in peer_address_overrides.items():
         parts.extend(["--peer-address", f"{peer_key}={address_value}"])
     if attach_mode == "attach":
@@ -4110,6 +4162,9 @@ def start_session(args: argparse.Namespace) -> str:
         rewrite_formatting=args.rewrite_formatting,
         peer_address_overrides=_binding_addresses(bindings),
         attach_mode=mode,
+        link_trace=getattr(args, "link_trace", None),
+        link_trace_interval_s=getattr(args, "link_trace_interval_s", None),
+        link_trace_modem_command=getattr(args, "link_trace_modem_command", None),
     )
 
     print("Command which will be run in container: " + shlex.join(command))
@@ -6160,6 +6215,7 @@ def _interactive_smoke_communication_command(
     network_name: str,
     *,
     force: bool,
+    link_trace_parts: list[str] | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -6181,6 +6237,7 @@ def _interactive_smoke_communication_command(
         *_runtime_cli_args(runtime),
     ]
     command.append("--force" if force else "--no-force")
+    command.extend(link_trace_parts or [])
     for override in _interactive_smoke_peer_address_args(peer_ips):
         command.extend(["--peer-address", override])
     return command
@@ -6292,6 +6349,7 @@ def _create_interactive_smoke_tmux(
     instance: SessionInstance,
     peer_ips: dict[str, str],
     network_name: str,
+    link_trace_parts: list[str] | None = None,
 ) -> str:
     session_name = _interactive_smoke_tmux_session(target.target_type, target.name)
     peers = sorted(peer_ips)
@@ -6305,6 +6363,7 @@ def _create_interactive_smoke_tmux(
             peer_ips,
             network_name,
             force=True,
+            link_trace_parts=link_trace_parts,
         )
     )
     created = subprocess.run(
@@ -6383,6 +6442,7 @@ def _create_interactive_smoke_tmux(
                 peer_ips,
                 network_name,
                 force=False,
+                link_trace_parts=link_trace_parts,
             )
         )
         script = f"{_wait_for_peer_spec_script(instance, peer)}; exec {command}"
@@ -6653,7 +6713,14 @@ def _start_interactive_smoke(args: argparse.Namespace) -> int:
         network_subnet=network_subnet,
         tmux_session=tmux_session,
     )
-    created_session = _create_interactive_smoke_tmux(runtime, target, instance, peer_ips, network_name)
+    created_session = _create_interactive_smoke_tmux(
+        runtime,
+        target,
+        instance,
+        peer_ips,
+        network_name,
+        link_trace_parts=_link_trace_parts_from_args(args),
+    )
     print(f"rosotacom interactive smoke instance: {instance.host_dir}")
     print(f"rosotacom interactive smoke started: {target.name} ({target.target_type})")
     print(f"Smoke peers isolated on docker network {network_name} ({network_subnet})")
@@ -6784,6 +6851,9 @@ def smoke(args: argparse.Namespace) -> int:
         "peer_address": peer_address_args,
         "instance_id": smoke_instance.instance_id,
         "network_name": smoke_network.name,
+        "link_trace": getattr(args, "link_trace", None),
+        "link_trace_interval_s": getattr(args, "link_trace_interval_s", None),
+        "link_trace_modem_command": getattr(args, "link_trace_modem_command", None),
     }
 
     log_line(f"Starting local smoke test with PEER_ADDRESSES={', '.join(peer_address_args)}")
@@ -7031,6 +7101,26 @@ def _add_profile_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_link_trace_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--link-trace",
+        action="store_true",
+        default=None,
+        help="Record logs/<peer>/status/link_trace.jsonl for this run.",
+    )
+    parser.add_argument(
+        "--link-trace-interval",
+        dest="link_trace_interval_s",
+        type=float,
+        help="Link trace sample interval in seconds; enables link tracing.",
+    )
+    parser.add_argument(
+        "--link-trace-modem-command",
+        dest="link_trace_modem_command",
+        help="Shell command returning a JSON object to merge under each link trace sample.",
+    )
+
+
 def _add_session_arg(parser: argparse.ArgumentParser, *args: str, **kwargs: Any) -> argparse.Action:
     action = parser.add_argument(*args, **kwargs)
     cast(Any, action).completer = _session_name_completer
@@ -7090,6 +7180,7 @@ def _add_scenario_identity_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_start_args(parser: argparse.ArgumentParser) -> None:
     _add_common_config_args(parser)
+    _add_link_trace_args(parser)
     _add_session_arg(parser, "session_dir_positional", nargs="?")
     _add_session_arg(parser, "-s", "--session-dir", dest="session_dir")
     _add_identity_arg(parser)
@@ -7469,6 +7560,7 @@ def main(argv: list[str] | None = None) -> int:
     smoke_parser = subparsers.add_parser("smoke", help="Run a local smoke test.")
     _add_common_config_args(smoke_parser)
     _add_profile_arg(smoke_parser)
+    _add_link_trace_args(smoke_parser)
     smoke_target = smoke_parser.add_argument("session_dir", nargs="?")
     cast(Any, smoke_target).completer = _smoke_target_completer
     smoke_parser.add_argument("--local", action="store_true", default=True)
@@ -7506,6 +7598,7 @@ def main(argv: list[str] | None = None) -> int:
     ota_smoke_parser = subparsers.add_parser("ota-smoke", help="Run a generic multi-machine OTA smoke test.")
     _add_common_config_args(ota_smoke_parser)
     _add_profile_arg(ota_smoke_parser)
+    _add_link_trace_args(ota_smoke_parser)
     ota_target = ota_smoke_parser.add_argument("target", nargs="?")
     cast(Any, ota_target).completer = _smoke_target_completer
     _add_peer_arg(ota_smoke_parser)
@@ -7678,6 +7771,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Start a scenario in an isolated outer tmux session.",
     )
     _add_common_config_args(scenario_start_parser)
+    _add_link_trace_args(scenario_start_parser)
     _add_scenario_arg(scenario_start_parser, "scenario")
     _add_scenario_identity_args(scenario_start_parser)
     scenario_start_parser.add_argument("--mode", choices=["auto", "attach", "detached"], default="auto")

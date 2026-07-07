@@ -68,6 +68,7 @@ from rclpy.serialization import serialize_message
 from rosidl_runtime_py.utilities import get_message
 
 from com_py.link_bytes import LinkByteSampler, find_interface_for_ip
+from com_py.link_trace import LinkTraceRecorder
 from com_py.status_overview_core import (
     ClockOffsetEstimator,
     StageObservation,
@@ -302,6 +303,10 @@ class StatusOverview(Node):
         # (the snapshot's `link` block is null).
         self.declare_parameter("ota_interface", "")
         self.declare_parameter("ota_local_ip", "")
+        self.declare_parameter("link_trace", False)
+        self.declare_parameter("link_trace_interval_s", 1.0)
+        self.declare_parameter("link_trace_modem_command", "")
+        self.declare_parameter("link_trace_modem_timeout_s", 2.0)
 
         spec_file = str(self.get_parameter("status_spec_file").value or "").strip()
         output_dir = str(self.get_parameter("output_dir").value or "").strip()
@@ -393,6 +398,19 @@ class StatusOverview(Node):
                 + (f" (resolved from {ota_local_ip})" if ota_local_ip else "")
             )
 
+        link_trace_recorder = None
+        if bool(self.get_parameter("link_trace").value):
+            link_trace_path = os.path.join(output_dir, "link_trace.jsonl")
+            link_trace_recorder = LinkTraceRecorder(
+                link_trace_path,
+                interval_s=float(self.get_parameter("link_trace_interval_s").value),
+                modem_metrics_command=str(self.get_parameter("link_trace_modem_command").value or ""),
+                modem_metrics_timeout_s=float(self.get_parameter("link_trace_modem_timeout_s").value),
+            )
+            self.get_logger().info(
+                f"status_overview: link trace enabled; writing {link_trace_path}"
+            )
+
         self.aggregator = StatusAggregator(
             self.get_logger(),
             self.spec,
@@ -404,6 +422,7 @@ class StatusOverview(Node):
             delay_bad_ms=float(self.get_parameter("delay_bad_ms").value),
             link_sampler=link_sampler,
             clock_estimator=clock_estimator,
+            link_trace_recorder=link_trace_recorder,
         )
 
         self.create_timer(self.write_interval_s, self._on_write)

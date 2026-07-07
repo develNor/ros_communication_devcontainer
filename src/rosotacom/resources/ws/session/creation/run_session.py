@@ -38,6 +38,7 @@
 # ---------------------------------------------------------------------
 
 import argparse
+import copy
 import os
 import re
 import subprocess
@@ -156,6 +157,32 @@ def _load_session_config_input(session_config_yaml: str) -> Dict:
     return cfg
 
 
+def _apply_link_trace_overrides(
+    cfg: Dict,
+    *,
+    link_trace: Optional[bool] = None,
+    link_trace_interval_s: Optional[float] = None,
+    link_trace_modem_command: Optional[str] = None,
+) -> Dict:
+    if link_trace is None and link_trace_interval_s is None and link_trace_modem_command is None:
+        return cfg
+    updated = copy.deepcopy(cfg)
+    shared = updated.setdefault("shared", {})
+    if not isinstance(shared, dict):
+        raise RuntimeError("shared must be a mapping before applying link trace overrides.")
+    trace_cfg = shared.setdefault("link_trace", {})
+    if not isinstance(trace_cfg, dict):
+        raise RuntimeError("shared.link_trace must be a mapping before applying link trace overrides.")
+    shared["use_status_overview"] = True
+    trace_cfg["enabled"] = True if link_trace is None else bool(link_trace)
+    if link_trace_interval_s is not None:
+        trace_cfg["interval_s"] = float(link_trace_interval_s)
+    if link_trace_modem_command is not None:
+        trace_cfg["modem_metrics_command"] = link_trace_modem_command
+    session_gen._validate_session_template_cfg(updated)
+    return updated
+
+
 def _resolve_peer_dir(
     session_dir: str,
     output_dir: Optional[str],
@@ -163,6 +190,9 @@ def _resolve_peer_dir(
     force: bool,
     rewrite_formatting: bool,
     peer_address=None,
+    link_trace: Optional[bool] = None,
+    link_trace_interval_s: Optional[float] = None,
+    link_trace_modem_command: Optional[str] = None,
 ) -> str:
     """
     Resolve a runnable session directory (the directory containing session_specification.yaml).
@@ -215,7 +245,12 @@ def _resolve_peer_dir(
             f"{candidates}. Got dir: {p}"
         )
 
-    cfg_for_generation = _load_session_config_input(param_yaml)
+    cfg_for_generation = _apply_link_trace_overrides(
+        _load_session_config_input(param_yaml),
+        link_trace=link_trace,
+        link_trace_interval_s=link_trace_interval_s,
+        link_trace_modem_command=link_trace_modem_command,
+    )
     peer_addresses = _parse_peer_address_overrides(peer_address)
     known_peers = set((cfg_for_generation.get("peers") or {}).keys())
     unknown = sorted(set(peer_addresses) - known_peers)
@@ -255,6 +290,9 @@ def main(
     force: bool = False,
     rewrite_formatting: bool = False,
     peer_address=None,
+    link_trace: Optional[bool] = None,
+    link_trace_interval_s: Optional[float] = None,
+    link_trace_modem_command: Optional[str] = None,
     attach: Optional[bool] = None,
 ):
 
@@ -265,6 +303,9 @@ def main(
         force,
         rewrite_formatting,
         peer_address=peer_address,
+        link_trace=link_trace,
+        link_trace_interval_s=link_trace_interval_s,
+        link_trace_modem_command=link_trace_modem_command,
     )
 
     # Ensure merged .session_readonly.yaml exists for catmux
@@ -368,6 +409,23 @@ if __name__ == "__main__":
         default=[],
         metavar="PEER=ADDRESS",
         help="Resolved peer address. Pass once for every logical peer.",
+    )
+    parser.add_argument(
+        "--link-trace",
+        action="store_true",
+        default=None,
+        help="Enable link_trace.jsonl recording for this generated session instance.",
+    )
+    parser.add_argument(
+        "--link-trace-interval",
+        dest="link_trace_interval_s",
+        type=float,
+        help="Link trace sample interval in seconds; enables link tracing.",
+    )
+    parser.add_argument(
+        "--link-trace-modem-command",
+        dest="link_trace_modem_command",
+        help="Shell command returning a JSON object to merge under each trace row's modem block.",
     )
     attach_group = parser.add_mutually_exclusive_group()
     attach_group.add_argument(

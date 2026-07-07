@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import subprocess
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 PROC_NET_DEV = "/proc/net/dev"
 
@@ -28,7 +28,9 @@ PROC_NET_DEV = "/proc/net/dev"
 # Receive: bytes packets errs drop fifo frame compressed multicast
 # Transmit: bytes packets errs drop fifo colls carrier compressed
 _RX_BYTES_IDX = 0
+_RX_PACKETS_IDX = 1
 _TX_BYTES_IDX = 8
+_TX_PACKETS_IDX = 9
 
 
 def parse_proc_net_dev(text: str) -> Dict[str, Dict[str, int]]:
@@ -45,7 +47,9 @@ def parse_proc_net_dev(text: str) -> Dict[str, Dict[str, int]]:
         try:
             out[iface] = {
                 "rx_bytes": int(fields[_RX_BYTES_IDX]),
+                "rx_packets": int(fields[_RX_PACKETS_IDX]),
                 "tx_bytes": int(fields[_TX_BYTES_IDX]),
+                "tx_packets": int(fields[_TX_PACKETS_IDX]),
             }
         except ValueError:
             continue
@@ -89,15 +93,20 @@ def find_interface_for_ip(ip: str) -> Optional[str]:
 
 def read_iface_counters(iface: str, proc_path: str = PROC_NET_DEV) -> Optional[Tuple[int, int]]:
     """Return (rx_bytes, tx_bytes) for ``iface`` now, or None if unavailable."""
+    row = read_iface_counter_row(iface, proc_path)
+    if row is None:
+        return None
+    return row["rx_bytes"], row["tx_bytes"]
+
+
+def read_iface_counter_row(iface: str, proc_path: str = PROC_NET_DEV) -> Optional[Dict[str, int]]:
+    """Return parsed /proc/net/dev counters for ``iface``, or None if unavailable."""
     try:
         with open(proc_path, encoding="utf-8") as fp:
             stats = parse_proc_net_dev(fp.read())
     except OSError:
         return None
-    row = stats.get(iface)
-    if row is None:
-        return None
-    return row["rx_bytes"], row["tx_bytes"]
+    return stats.get(iface)
 
 
 def kbps(delta_bytes: int, elapsed_s: float) -> float:
@@ -122,24 +131,47 @@ class LinkByteSampler:
         self._last_t: Optional[float] = None
         self._last_rx: Optional[int] = None
         self._last_tx: Optional[int] = None
+        self._last_rx_packets: Optional[int] = None
+        self._last_tx_packets: Optional[int] = None
 
-    def sample(self) -> Optional[Dict[str, float]]:
-        counters = read_iface_counters(self.iface, self._proc_path)
+    def sample(self) -> Optional[Dict[str, Any]]:
+        counters = read_iface_counter_row(self.iface, self._proc_path)
         if counters is None:
             return None
-        rx, tx = counters
+        rx = counters["rx_bytes"]
+        tx = counters["tx_bytes"]
+        rx_packets = counters.get("rx_packets")
+        tx_packets = counters.get("tx_packets")
         now = self._clock()
-        prev_t, prev_rx, prev_tx = self._last_t, self._last_rx, self._last_tx
-        self._last_t, self._last_rx, self._last_tx = now, rx, tx
+        prev_t = self._last_t
+        prev_rx = self._last_rx
+        prev_tx = self._last_tx
+        prev_rx_packets = self._last_rx_packets
+        prev_tx_packets = self._last_tx_packets
+        self._last_t = now
+        self._last_rx = rx
+        self._last_tx = tx
+        self._last_rx_packets = rx_packets
+        self._last_tx_packets = tx_packets
         if prev_t is None or prev_rx is None or prev_tx is None:
             return None
         elapsed = now - prev_t
         d_rx, d_tx = rx - prev_rx, tx - prev_tx
         if d_rx < 0 or d_tx < 0 or elapsed <= 0:
             return None  # counter reset/wrap -- skip this window
+        d_rx_packets = rx_packets - prev_rx_packets if rx_packets is not None and prev_rx_packets is not None else None
+        d_tx_packets = tx_packets - prev_tx_packets if tx_packets is not None and prev_tx_packets is not None else None
+        if d_rx_packets is not None and d_rx_packets < 0:
+            d_rx_packets = None
+        if d_tx_packets is not None and d_tx_packets < 0:
+            d_tx_packets = None
         return {
             "interface": self.iface,
             "rx_kbps": kbps(d_rx, elapsed),
             "tx_kbps": kbps(d_tx, elapsed),
+            "rx_bytes_delta": d_rx,
+            "tx_bytes_delta": d_tx,
+            "rx_packets_delta": d_rx_packets,
+            "tx_packets_delta": d_tx_packets,
             "window_s": elapsed,
         }

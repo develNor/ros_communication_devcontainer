@@ -50,7 +50,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Hashable, List, Optional, Tuple
 
-
 # --- State vocabulary shared with heartbeat health ---
 ABSENT = "ABSENT"        # no publisher and never received a message
 IDLE = "IDLE"            # publisher present but no message observed yet
@@ -437,7 +436,8 @@ class StatusAggregator:
                  observers_by_domain: Dict[str, Any],
                  *, liveness_window_s: float = 3.0, stale_after_s: float = 3.0,
                  delay_good_ms: float = 100.0, delay_bad_ms: float = 200.0,
-                 link_sampler: Any = None, clock_estimator: Any = None):
+                 link_sampler: Any = None, clock_estimator: Any = None,
+                 link_trace_recorder: Any = None):
         self._log = logger
         self._spec = spec
         self._output_dir = output_dir
@@ -451,6 +451,7 @@ class StatusAggregator:
         # stays free of any I/O and is unit-testable.
         self._link_sampler = link_sampler
         self._clock_estimator = clock_estimator
+        self._link_trace_recorder = link_trace_recorder
         self._prev_states: Dict[str, Dict[str, Any]] = {}
         os.makedirs(self._output_dir, exist_ok=True)
         self._json_path = os.path.join(self._output_dir, "status.json")
@@ -933,6 +934,12 @@ class StatusAggregator:
                 if self._log is not None:
                     self._log.warning(f"status_overview: link sampling failed: {exc}")
         snapshot = self.build_snapshot(now_mono, link_sample=link_sample)
+        if self._link_trace_recorder is not None:
+            try:
+                self._link_trace_recorder.maybe_write(snapshot, link_sample)
+            except Exception as exc:  # pragma: no cover - defensive
+                if self._log is not None:
+                    self._log.warning(f"status_overview: failed to write link trace: {exc}")
         events = self.detect_transitions(snapshot)
         transit_records = self.collect_transit_records()
         try:

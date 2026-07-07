@@ -949,6 +949,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "use_heartbeat",
                 "heartbeat",
                 "metric_backbone",
+                "link_trace",
                 "use_in",
                 "use_out",
                 "rmw",
@@ -997,6 +998,29 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
             _assert_allowed_keys("shared.heartbeat", hb, {"expect"})
             if "expect" in hb and hb["expect"] is not None and not isinstance(hb["expect"], dict):
                 raise RuntimeError("shared.heartbeat.expect must be a mapping.")
+        if "link_trace" in shared and shared["link_trace"] is not None:
+            link_trace = _assert_mapping(shared.get("link_trace"), "shared.link_trace")
+            _assert_allowed_keys(
+                "shared.link_trace",
+                link_trace,
+                {"enabled", "interval_s", "modem_metrics_command", "modem_metrics_timeout_s"},
+            )
+            if "enabled" in link_trace and not isinstance(link_trace["enabled"], bool):
+                raise RuntimeError("shared.link_trace.enabled must be boolean if provided.")
+            if "interval_s" in link_trace and link_trace["interval_s"] is not None:
+                if not isinstance(link_trace["interval_s"], (int, float)) or float(link_trace["interval_s"]) <= 0:
+                    raise RuntimeError("shared.link_trace.interval_s must be a positive number if provided.")
+            if "modem_metrics_command" in link_trace and link_trace["modem_metrics_command"] is not None:
+                if not isinstance(link_trace["modem_metrics_command"], str):
+                    raise RuntimeError("shared.link_trace.modem_metrics_command must be a string if provided.")
+            if "modem_metrics_timeout_s" in link_trace and link_trace["modem_metrics_timeout_s"] is not None:
+                if (
+                    not isinstance(link_trace["modem_metrics_timeout_s"], (int, float))
+                    or float(link_trace["modem_metrics_timeout_s"]) <= 0
+                ):
+                    raise RuntimeError(
+                        "shared.link_trace.modem_metrics_timeout_s must be a positive number if provided."
+                    )
 
     # peer_settings is optional
     if "peer_settings" in cfg and cfg["peer_settings"] is not None:
@@ -1841,6 +1865,15 @@ def func(
             "shared.metric_backbone.record_stages requires shared.use_status_overview=true "
             "so the generated pipeline defines the stage topics."
         )
+    link_trace = shared.get("link_trace", {}) or {}
+    if not isinstance(link_trace, dict):
+        raise RuntimeError("shared.link_trace must be a mapping if provided.")
+    link_trace_enabled = bool(link_trace.get("enabled", False))
+    link_trace_interval_s = float(link_trace.get("interval_s", 1.0))
+    link_trace_modem_command = str(link_trace.get("modem_metrics_command") or "")
+    link_trace_modem_timeout_s = float(link_trace.get("modem_metrics_timeout_s", 2.0))
+    if link_trace_enabled and not use_status_overview:
+        raise RuntimeError("shared.link_trace.enabled requires shared.use_status_overview=true.")
     shared_use_in = shared.get("use_in", None)
     shared_use_out = shared.get("use_out", None)
 
@@ -2135,6 +2168,54 @@ def func(
                             ("heartbeat_remote_topic", hb_topic[remote]),
                             *_heartbeat_monitor_overrides((shared.get("heartbeat") or {}).get("expect")),
                         ],
+                    )
+                )
+            if use_status_overview:
+                generated.append(
+                    (
+                        os.path.join(param_dir, local, "pipeline_spec.yaml"),
+                        _build_status_pipeline_spec(
+                            local=local,
+                            remote=remote,
+                            peer_name=peer_name,
+                            out_entries=[],
+                            out_pipes=[],
+                            in_entries=[],
+                            in_pipes=[],
+                            use_target_prefix=False,
+                            remote_uses_target_prefix=False,
+                            native_have_source_prefix=False,
+                            inbound_keep_source_prefix=False,
+                            local_domain_id=peer_local_domain_id[local],
+                            ota_domain_id=ota_domain_id,
+                            uses_domain_bridge=_use_domain_bridge(local),
+                            hb_topic=hb_topic,
+                            use_heartbeat=use_heartbeat,
+                            heartbeat_expect=(shared.get("heartbeat") or {}).get("expect"),
+                            out_enabled=False,
+                            in_enabled=False,
+                            final_topic_type=_final_topic_type,
+                        ),
+                    )
+                )
+                blocks.append(
+                    PluginBlock(
+                        "status_overview",
+                        [
+                            ("status_overview", True),
+                            ("status_spec_file", "${peer_dir}/pipeline_spec.yaml"),
+                        ]
+                        + (
+                            [
+                                ("status_write_interval_s", link_trace_interval_s),
+                                ("link_trace", True),
+                                ("link_trace_interval_s", link_trace_interval_s),
+                                ("link_trace_modem_command", link_trace_modem_command),
+                                ("link_trace_modem_timeout_s", link_trace_modem_timeout_s),
+                            ]
+                            if link_trace_enabled
+                            else []
+                        ),
                     )
                 )
             generated.append((os.path.join(param_dir, local, "plugin.yaml"), _render_plugin_yaml(blocks)))
@@ -2759,7 +2840,18 @@ def func(
                     [
                         ("status_overview", True),
                         ("status_spec_file", "${peer_dir}/pipeline_spec.yaml"),
-                    ],
+                    ]
+                    + (
+                        [
+                            ("status_write_interval_s", link_trace_interval_s),
+                            ("link_trace", True),
+                            ("link_trace_interval_s", link_trace_interval_s),
+                            ("link_trace_modem_command", link_trace_modem_command),
+                            ("link_trace_modem_timeout_s", link_trace_modem_timeout_s),
+                        ]
+                        if link_trace_enabled
+                        else []
+                    ),
                 )
             )
             if record_metric_stages:

@@ -459,6 +459,12 @@ def _read_transit_records(artifact_dir: Path, peer: str) -> list[dict[str, objec
     return rows
 
 
+def _read_link_trace_rows(artifact_dir: Path, peer: str) -> list[dict[str, object]]:
+    path = artifact_dir / "logs" / peer / "status" / "link_trace.jsonl"
+    assert path.is_file(), f"no link_trace.jsonl for peer {peer} under {artifact_dir}"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 @pytest.mark.parametrize("session_name", LINK_LATENCY_SMOKE_SESSIONS)
 def test_local_link_latency_smoke_exposes_metric_backbone(
     copied_example_project: Path,
@@ -500,6 +506,19 @@ def test_local_link_latency_smoke_exposes_metric_backbone(
     assert any(row.get("status") == "delivered" for row in transit_rows), (
         f"no delivered transit record for {session_name}: {transit_rows[:3]}"
     )
+
+    link_trace_rows = _read_link_trace_rows(artifact_dir, "a")
+    assert link_trace_rows, f"no link trace rows for {session_name}"
+    assert any(
+        row.get("kind") == "link_trace"
+        and row.get("schema_version") == 1
+        and isinstance(row.get("passive_counter_delta"), dict)
+        and row["passive_counter_delta"].get("provenance") == "proc_net_dev_counter_delta"
+        and row["passive_counter_delta"].get("observed_not_available_bandwidth") is True
+        and isinstance(row.get("peer_probe"), dict)
+        and row["peer_probe"].get("provenance") == "echo_heartbeat_status_snapshot"
+        for row in link_trace_rows
+    ), f"link_trace.jsonl rows do not expose expected provenance for {session_name}: {link_trace_rows[:3]}"
 
     # The `rosotacom metrics` digest joins those rows into a non-empty summary.
     events_path = artifact_dir / "logs" / "a" / "status" / "events.jsonl"

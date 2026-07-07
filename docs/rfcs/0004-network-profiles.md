@@ -3,7 +3,9 @@
 **Status:** Implemented (pure half) — the schema, `tc`/`netem` command generation,
 fail-safe arm/teardown controller, timeline expansion, both outage kinds,
 `--profile` selection and the `expect.per_profile` invariant/conditional split are
-in `rosotacom.network_profiles` / `network_shaper` / `status_eval`, host-tested. The
+in `rosotacom.network_profiles` / `network_shaper` / `status_eval`, host-tested.
+The link-trace converter lives in `rosotacom.trace_profiles` and emits the same
+profiles-file schema. The
 **privileged per-direction live arming** (wiring the controller into the ota-smoke
 SSH path) and the **manual bench checks** (crash teardown, post-shaping link bytes,
 real two-shaped-interface application) remain. · **Scope:** the
@@ -237,6 +239,11 @@ risk — a stuck `qdisc` silently corrupts every later result on the machine.
 - [x] Add per-profile calibration — realized as `rosotacom test --suggest --profile
   P`, which emits `P`'s conditional band nested under `per_profile`
   (`status_eval.suggest_profile_band`), reusing the RFC 0002 `--suggest` machinery.
+- [x] Convert recorded `link_trace.jsonl` files into profile YAML via
+  `rosotacom profile from-trace`: timeline replay with change-point segmentation
+  and outage steps, plus static distillation from a full trace or window
+  (`trace_profiles.convert_trace_to_profile_yaml`). Passive throughput is omitted
+  as `rate` unless the sample is marked saturated/probed/capacity-like.
 - [ ] Confirm the `/proc/net/dev` link sampler (RFC 0003 / `link_bytes.py`) reports
   post-shaping wire bytes so link-overhead stays meaningful under a profile. *(Bench
   check.)*
@@ -292,6 +299,12 @@ off during implementation). Notes whether automation is feasible; privileged
   unit test that a reference status fixture yields `P`'s conditional band nested
   under `per_profile` (`test_suggest_profile_band_*`), reusing the RFC 0002
   `--suggest` machinery. Done.
+- [x] **Trace-to-profile conversion** (`rosotacom profile from-trace`) — host unit
+  tests on synthetic traces recover known timeline segments, detect sample-gap
+  reconnect outages, compute static percentiles exactly, omit passive-only rates,
+  load generated YAML through `load_profiles_file`, and feed the resulting
+  timeline into dry-run `ProfileShaper` command generation
+  (`tests/unit/test_trace_profiles.py`). Done.
 - [ ] **Emulated-profile gate (rung 2)** — an example session run under one
   canonical profile in the per-promotion CI smoke, asserting a conditional bound
   that differs from the unshaped run. Automatable in the smoke matrix.

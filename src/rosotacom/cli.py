@@ -7111,6 +7111,36 @@ def metrics_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def profile_from_trace_command(args: argparse.Namespace) -> int:
+    from rosotacom.trace_profiles import TraceProfileConfig, parse_window, write_trace_profile
+
+    window_start_s, window_end_s = parse_window(getattr(args, "window", None))
+    if args.directions == "both":
+        directions = ("uplink", "downlink")
+    else:
+        directions = (args.directions,)
+    mode = str(args.mode)
+    config = TraceProfileConfig(
+        name=args.name or ("trace_static" if mode == "static" else "trace_replay"),
+        directions=directions,
+        min_segment_s=float(args.min_segment_s),
+        change_sensitivity=float(args.change_sensitivity),
+        gap_outage_after_s=args.gap_outage_after_s,
+        loss_outage_min_s=args.loss_outage_min_s,
+        window_start_s=window_start_s,
+        window_end_s=window_end_s,
+        rate_percentile=float(args.rate_percentile),
+        delay_percentile=float(args.delay_percentile),
+        jitter_spread_percentile=float(args.jitter_spread_percentile),
+    )
+    text = write_trace_profile(args.trace, args.out, mode=mode, config=config)
+    if args.out:
+        print(f"Wrote trace-derived profile {config.name!r} to {args.out}")
+    else:
+        print(text, end="")
+    return 0
+
+
 def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--rosotacom-config",
@@ -7568,6 +7598,7 @@ def main(argv: list[str] | None = None) -> int:
         "examples",
         "config",
         "bundle",
+        "profile",
         "completion",
         "benchmark",
         "ota-benchmark",
@@ -7718,6 +7749,76 @@ def main(argv: list[str] | None = None) -> int:
         "--records", action="store_true", help="Emit joined per-(topic, seq) records instead of a summary."
     )
     metrics_parser.set_defaults(func=metrics_command)
+
+    profile_parser = subparsers.add_parser("profile", help="Generate and inspect network profiles.")
+    profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)
+    profile_from_trace_parser = profile_subparsers.add_parser(
+        "from-trace",
+        help="Convert link_trace.jsonl into an RFC 0004 profiles YAML entry.",
+    )
+    profile_from_trace_parser.add_argument("trace", help="Path to link_trace.jsonl.")
+    profile_from_trace_parser.add_argument("--out", help="Write generated YAML to this path instead of stdout.")
+    profile_from_trace_parser.add_argument("--name", help="Profile name to emit.")
+    profile_from_trace_parser.add_argument(
+        "--mode",
+        choices=["timeline", "static"],
+        default="timeline",
+        help="Emit a piecewise timeline profile or one distilled static profile.",
+    )
+    profile_from_trace_parser.add_argument(
+        "--directions",
+        choices=["both", "uplink", "downlink"],
+        default="both",
+        help="Profile directions to populate from the trace peer's tx/rx counters.",
+    )
+    profile_from_trace_parser.add_argument(
+        "--window",
+        metavar="START:END",
+        help="Only use samples in this relative seconds window; either side may be omitted.",
+    )
+    profile_from_trace_parser.add_argument(
+        "--min-segment-s",
+        type=float,
+        default=5.0,
+        help="Minimum normal timeline segment duration before a change point may split it.",
+    )
+    profile_from_trace_parser.add_argument(
+        "--change-sensitivity",
+        type=float,
+        default=0.25,
+        help="Relative sensitivity for timeline change points; lower values split more readily.",
+    )
+    profile_from_trace_parser.add_argument(
+        "--gap-outage-after",
+        dest="gap_outage_after_s",
+        type=float,
+        help="Sample gap duration that becomes a reconnect outage; default is 3x the trace interval.",
+    )
+    profile_from_trace_parser.add_argument(
+        "--loss-outage-min",
+        dest="loss_outage_min_s",
+        type=float,
+        help="Minimum sustained 100%% probe-loss duration emitted as a catchup outage.",
+    )
+    profile_from_trace_parser.add_argument(
+        "--rate-percentile",
+        type=float,
+        default=50.0,
+        help="Percentile for valid saturated/probed rate samples (default: median).",
+    )
+    profile_from_trace_parser.add_argument(
+        "--delay-percentile",
+        type=float,
+        default=90.0,
+        help="Static-profile delay percentile; timeline segments use median delay.",
+    )
+    profile_from_trace_parser.add_argument(
+        "--jitter-spread-percentile",
+        type=float,
+        default=90.0,
+        help="Jitter is this delay percentile minus median delay.",
+    )
+    profile_from_trace_parser.set_defaults(func=profile_from_trace_command)
 
     test_parser = subparsers.add_parser(
         "test", help="Assert a running/recent session meets its status + per-topic expect contract."

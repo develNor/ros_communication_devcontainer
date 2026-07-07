@@ -17,7 +17,7 @@
             </Peers>
             <EnableTopicDiscoveryEndpoints>false</EnableTopicDiscoveryEndpoints>
             <LeaseDuration>60s</LeaseDuration>
-            <SPDPInterval>30s</SPDPInterval>
+            <SPDPInterval>#spdp_interval</SPDPInterval>
         </Discovery>
 
         <Internal>

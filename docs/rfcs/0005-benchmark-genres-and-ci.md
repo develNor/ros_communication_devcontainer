@@ -144,6 +144,12 @@ harness, not in this public repo.
 - **Averages hide the failure mode.** Head-of-line blocking and reconnect bursts
   are only visible per-message (RFC 0003) and under irregular load (the a/b
   pattern) — a benchmark on averages would miss exactly what matters.
+- **Discovery traffic is real load.** Cyclone DDS SPDP discovery uses the same
+  OTA link as payload data. Keeping the default `SPDPInterval=30s` is honest for
+  end-to-end DDS behavior, but tight shaped probes can show regular p99/max
+  latency spikes from SPDP bursts. A longer benchmark-only SPDP interval is useful
+  for payload characterization, but it makes the run less representative and
+  delays stale-peer/reconnect detection.
 
 ## Implementation checklist
 
@@ -168,6 +174,11 @@ slice and reuses RFC 0003 + 0004.
   packaged benchmark sessions to Cyclone DDS, while keeping `--rmw fastdds` and
   other supported session RMW values available for explicit comparisons
   (`cli_benchmark --rmw`, artifact-backed session copy).
+- [x] Keep Cyclone DDS `SPDPInterval=30s` as the tuned default, add an explicit
+  benchmark/session override for quiet-discovery probes, and annotate fixed
+  probes when SPDP traffic can plausibly distort tight-link tail latency
+  (`--cyclone-spdp-interval`, `shared.rmw.ota.cyclone.spdp_interval`,
+  `result.json.context.diagnostics.cyclonedds_spdp`).
 - [x] Persist a self-contained per-run `result.json` with selected RMW, local/OTA
   mode, configured load, offered bandwidth, profile shaping context, thresholds,
   verdict, and per-topic loss/latency/jitter metrics; keep `budgets.jsonl` as the
@@ -225,6 +236,13 @@ reviewed rather than asserted in a blocking test.
   *(`test_benchmark_subcommand_arg_parsing`,
   `test_benchmark_session_copy_pins_requested_rmw`,
   `test_benchmark_capacity_*`.)*
+- [x] **Cyclone DDS SPDP benchmark awareness** (default 30s retained, optional
+  override, fixed-probe diagnostic warning for tight links) — host unit tests for
+  XML rendering, session copy, generated plugin parameters, and diagnostic
+  classification. Automatable. *(`test_ota_xml_renders_default_and_overridden_spdp_interval`,
+  `test_benchmark_session_copy_applies_cyclone_spdp_override`,
+  `test_run_session_passes_cyclone_spdp_interval_to_plugin`,
+  `test_probe_spdp_diagnostics_warn_on_tight_cyclone_profile`.)*
 - [x] **Self-contained benchmark result artifact** (`result.json` with context,
   metrics, verdict, and artifact references) — host unit tests assert the capacity,
   ramp, and sweep result files and the CI-readable metric output. Automatable.

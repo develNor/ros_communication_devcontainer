@@ -2,8 +2,8 @@
 """Unified OTA DDS XML generator.
 
 Loads an XML template from /ws/ota_configs/<config>(.template), detects which
-placeholders it uses (#host_ip, #peer, #easy_mode_ip), substitutes already
-resolved addresses, and prints the resulting XML to stdout.
+placeholders it uses (#host_ip, #peer, #easy_mode_ip, #spdp_interval),
+substitutes already resolved addresses, and prints the resulting XML to stdout.
 
 Replaces the old per-template scripts (get_fastdds_xml.py,
 get_fastdds_easy_mode_xml.py, get_cyclonedds_xml.py).
@@ -14,8 +14,9 @@ import os
 import re
 
 
-KNOWN_PLACEHOLDERS = {"#host_ip", "#peer", "#easy_mode_ip"}
+KNOWN_PLACEHOLDERS = {"#host_ip", "#peer", "#easy_mode_ip", "#spdp_interval"}
 PLACEHOLDER_PATTERN = re.compile(r"#[A-Za-z_][A-Za-z0-9_]*")
+DEFAULT_SPDP_INTERVAL = "30s"
 
 
 def _template_path(name: str) -> str:
@@ -43,6 +44,19 @@ def _resolved_address(value: str, label: str) -> str:
     if not address:
         raise ValueError(f"{label} must be a non-empty resolved address.")
     return address
+
+
+def _resolved_spdp_interval(value: str) -> str:
+    interval = value.strip().lower()
+    if not interval:
+        raise ValueError("SPDP interval must be a non-empty duration.")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(ms|s)?", interval)
+    if not match:
+        raise ValueError("SPDP interval must use seconds or milliseconds, e.g. '30s' or '500ms'.")
+    number = float(match.group(1))
+    if number <= 0.0:
+        raise ValueError("SPDP interval must be > 0.")
+    return interval
 
 
 def _resolve_peer_ips(value: str) -> list:
@@ -124,6 +138,7 @@ def main(
     host_ip: str = None,
     peer: str = None,
     easy_mode_ip: str = None,
+    spdp_interval: str = DEFAULT_SPDP_INTERVAL,
 ) -> str:
     path = _template_path(config)
     if not os.path.exists(path):
@@ -156,6 +171,9 @@ def main(
             "#easy_mode_ip", _resolved_address(easy_mode_ip, "Easy Mode IP")
         )
 
+    if "#spdp_interval" in found:
+        content = content.replace("#spdp_interval", _resolved_spdp_interval(spdp_interval))
+
     if "#peer" in found:
         if not peer:
             raise RuntimeError(
@@ -185,6 +203,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "-e", "--easy-mode-ip", dest="easy_mode_ip",
         help="Resolved Fast DDS Easy Mode address (#easy_mode_ip).",
+    )
+    parser.add_argument(
+        "--spdp-interval",
+        dest="spdp_interval",
+        default=DEFAULT_SPDP_INTERVAL,
+        help=f"CycloneDDS SPDP interval duration (#spdp_interval, default: {DEFAULT_SPDP_INTERVAL}).",
     )
     args = parser.parse_args()
     print(main(**{k: v for k, v in vars(args).items() if v is not None}))

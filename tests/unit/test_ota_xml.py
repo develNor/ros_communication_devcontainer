@@ -40,6 +40,16 @@ def test_ota_xml_uses_resolved_literal_addresses(tmp_path: Path, monkeypatch: py
     assert rendered == "<host>10.0.0.10</host><peer>10.0.0.11</peer><easy>10.0.0.10</easy>\n"
 
 
+def test_ota_xml_renders_default_and_overridden_spdp_interval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module()
+    template = tmp_path / "test.xml.template"
+    template.write_text("<SPDPInterval>#spdp_interval</SPDPInterval>\n", encoding="utf-8")
+    monkeypatch.setattr(module, "_template_path", lambda _name: str(template))
+
+    assert module.main(config="test.xml") == "<SPDPInterval>30s</SPDPInterval>\n"
+    assert module.main(config="test.xml", spdp_interval="150s") == "<SPDPInterval>150s</SPDPInterval>\n"
+
+
 def test_ota_xml_rejects_empty_resolved_address(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = _module()
     template = tmp_path / "test.xml.template"
@@ -48,3 +58,13 @@ def test_ota_xml_rejects_empty_resolved_address(tmp_path: Path, monkeypatch: pyt
 
     with pytest.raises(ValueError, match="non-empty resolved address"):
         module.main(config="test.xml", host_ip=" ")
+
+
+def test_ota_xml_rejects_invalid_spdp_interval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module()
+    template = tmp_path / "test.xml.template"
+    template.write_text("<SPDPInterval>#spdp_interval</SPDPInterval>\n", encoding="utf-8")
+    monkeypatch.setattr(module, "_template_path", lambda _name: str(template))
+
+    with pytest.raises(ValueError, match="seconds or milliseconds"):
+        module.main(config="test.xml", spdp_interval="2min")

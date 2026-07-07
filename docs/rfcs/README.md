@@ -11,6 +11,7 @@ self-contained; later ones extend earlier ones.
 | [0004](0004-network-profiles.md) | Network profiles & the fidelity ladder (per-direction netem, profile-bound expectations) | Draft |
 | [0005](0005-benchmark-genres-and-ci.md) | Benchmark genres & CI distribution (sweep/capacity + recovery, budgets, gate vs monitor) | Draft |
 | [0006](0006-dynamic-qos.md) | Dynamic QoS (mirror correctness durability, shape bandwidth reliability/depth) | Draft |
+| [0007](0007-regression-gate.md) | Performance regression gate (two-sided budgets, ratchet, blocking lanes, boundary must-fail rows) | Draft |
 
 Add a new RFC as `NNNN-title.md` and list it here, so it stays reachable from the
 README (see the documentation-traceability rule in `AGENTS.md`).

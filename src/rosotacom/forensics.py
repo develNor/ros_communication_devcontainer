@@ -985,8 +985,8 @@ def _event_line(event: dict[str, Any]) -> str:
             f"{window}"
         )
     return (
-        f"**rate collapse** on `{event['stream']}` — {event['count']} bins at "
-        f">={details.get('min_delivered_hz')}Hz min vs nominal {details.get('nominal_hz')}Hz, {window}"
+        f"**rate collapse** on `{event['stream']}` — {event['count']} bins, delivered rate down to "
+        f"{details.get('min_delivered_hz')}Hz vs nominal {details.get('nominal_hz')}Hz, {window}"
     )
 
 

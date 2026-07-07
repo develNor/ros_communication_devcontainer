@@ -440,6 +440,19 @@ summary. Wrapped-topic corrected latency requires `shared.use_heartbeat: true`;
 sample age, and symmetric-path assumption. Uncorrected OTA delay remains a
 separate field.
 
+Turn a whole recorded instance into an explanation of *where* and *how*
+delivery degraded — loss bursts, latency excursions, and rate collapses with
+exact boundaries, joined with link-trace/profile/keyframe context:
+
+```bash
+rosotacom report session-instances/<day>/<instance>
+```
+
+It writes `report/report.json`, `report/report.md`, and per-stream figures with
+the events marked (needs the `[plots]` extra). See
+[docs/forensics-report.md](docs/forensics-report.md) for the detection
+semantics and the correlation-not-causation caveat.
+
 For opt-in local per-step latency, record generated local stage topics:
 
 ```yaml

@@ -456,3 +456,109 @@ def plot_probe_raw(
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Degradation forensics — per-stream timeline with events marked
+# --------------------------------------------------------------------------- #
+
+_FORENSICS_EVENT_STYLE = {
+    "loss_burst": ("crimson", "loss burst"),
+    "latency_excursion": ("darkorange", "latency excursion"),
+    "rate_collapse": ("purple", "rate collapse"),
+}
+
+
+def plot_forensics_stream(
+    bins: Sequence[dict[str, Any]],
+    events: Sequence[dict[str, Any]],
+    *,
+    out: str | Path,
+    title: str = "Forensics timeline",
+    nominal_hz: float | None = None,
+    timeline_steps: Sequence[dict[str, Any]] | None = None,
+) -> Path:
+    """One stream's forensics timeline: latency, delivery rate/loss, and sizes.
+
+    ``bins`` are the report's per-stream time bins (relative ``bin_start_s``);
+    ``events`` are the report's event dicts for this stream (relative
+    ``start_s``/``end_s`` plus ``kind``); ``timeline_steps`` optionally marks
+    RFC 0004 profile segments (``start_s``/``end_s``/``label`` on the same
+    relative axis). Event windows are shaded across all axes — this is "the
+    plot that shows the degradation moment".
+    """
+    _, plt = _require_matplotlib()
+    out = Path(out)
+
+    rows = sorted(bins, key=lambda row: float(row["bin_start_s"]))
+    xs = [float(row["bin_start_s"]) for row in rows]
+    fig, (ax_latency, ax_rate, ax_size) = plt.subplots(3, 1, sharex=True, figsize=(11, 7.5))
+
+    ax_latency.plot(xs, [row.get("latency_p50_ms") for row in rows], "-", color="tab:blue", label="latency p50")
+    ax_latency.plot(xs, [row.get("latency_p95_ms") for row in rows], "--", color="tab:cyan", label="latency p95")
+    ax_latency.plot(
+        xs, [row.get("latency_max_ms") for row in rows], ":", color="tab:gray", alpha=0.7, label="latency max"
+    )
+    ax_latency.set_ylabel("OTA hop (ms)")
+    ax_latency.set_title(title)
+
+    ax_rate.plot(
+        xs, [float(row.get("delivered_hz") or 0.0) for row in rows], "-", color="tab:green", label="delivered Hz"
+    )
+    if nominal_hz:
+        ax_rate.axhline(nominal_hz, linestyle="--", color="0.5", linewidth=1.0, label="nominal Hz")
+    ax_lost = ax_rate.twinx()
+    width = (xs[1] - xs[0]) if len(xs) > 1 else 1.0
+    ax_lost.bar(
+        xs,
+        [int(row.get("lost") or 0) for row in rows],
+        width=width * 0.9,
+        align="edge",
+        color="crimson",
+        alpha=0.35,
+        label="lost / bin",
+    )
+    ax_lost.set_ylabel("Lost / bin")
+    ax_rate.set_ylabel("Delivered Hz")
+
+    ax_size.plot(xs, [row.get("mean_size_bytes") for row in rows], "-", color="tab:brown", label="mean size")
+    ax_size.plot(xs, [row.get("max_size_bytes") for row in rows], ":", color="tab:brown", alpha=0.6, label="max size")
+    keyframe_xs = [x for x, row in zip(xs, rows, strict=True) if int(row.get("keyframes") or 0) > 0]
+    keyframe_ys = [row.get("max_size_bytes") for row in rows if int(row.get("keyframes") or 0) > 0]
+    if keyframe_xs:
+        ax_size.scatter(keyframe_xs, keyframe_ys, marker="^", color="tab:red", s=24, zorder=3, label="keyframe bin")
+    ax_size.set_ylabel("Size (bytes)")
+    ax_size.set_xlabel("Time since first publish (s)")
+
+    for event in events:
+        color, label = _FORENSICS_EVENT_STYLE.get(str(event.get("kind")), ("0.4", str(event.get("kind"))))
+        for axis in (ax_latency, ax_rate, ax_size):
+            axis.axvspan(float(event["start_s"]), float(event["end_s"]), color=color, alpha=0.18, label=label)
+
+    for step in timeline_steps or ():
+        ax_latency.axvline(float(step["start_s"]), color="0.6", linestyle=":", linewidth=1.0)
+        ax_latency.annotate(
+            str(step.get("label") or ""),
+            xy=(float(step["start_s"]), 1.01),
+            xycoords=("data", "axes fraction"),
+            fontsize=7,
+            color="0.4",
+            ha="left",
+        )
+
+    handles: list[Any] = []
+    labels: list[str] = []
+    for axis in (ax_latency, ax_rate, ax_lost, ax_size):
+        axis_handles, axis_labels = axis.get_legend_handles_labels()
+        handles.extend(axis_handles)
+        labels.extend(axis_labels)
+    by_label = dict(zip(labels, handles, strict=False))
+    if by_label:
+        fig.legend(by_label.values(), by_label.keys(), loc="upper center", ncol=4, fontsize="x-small")
+        fig.tight_layout(rect=(0, 0, 1, 0.93))
+    else:
+        fig.tight_layout()
+
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out

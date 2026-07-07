@@ -353,7 +353,7 @@ windows:
             -p ota_local_ip:=${ip_local}
             -p link_trace:=${link_trace}
             -p link_trace_interval_s:=${link_trace_interval_s}
-            -p link_trace_modem_command:='${link_trace_modem_command}'
+            -p "link_trace_modem_command:='${link_trace_modem_command}'"
             -p link_trace_modem_timeout_s:=${link_trace_modem_timeout_s}
       - commands:
         - status_out_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/status"

@@ -35,7 +35,7 @@ def _parse_pattern(pattern: str) -> list[str]:
     tokens: list[str] = []
     for raw_token in pattern.split(","):
         token = raw_token.strip().lower()
-        match = re.fullmatch(r"([ab])(?:[*x](\d+))?", token)
+        match = re.fullmatch(r"([a-z])(?:[*x](\d+))?", token)
         if not match:
             raise ValueError(
                 f"Invalid pattern token '{raw_token}'. Use tokens like 'a', 'b', 'ax4', or 'b*2'."
@@ -64,6 +64,9 @@ class SizedPublisher(Node):
         self.declare_parameter("pattern", "")
         self.declare_parameter("rate", 10.0)
         self.declare_parameter("streams", 1)
+        self.declare_parameter("sizes", [])
+        self.declare_parameter("interval_jitter_ms", 0.0)
+        self.declare_parameter("interval_jitter_seed", 42)
 
         topic = self.get_parameter("topic").value
         default_size = int(self.get_parameter("size").value)
@@ -72,27 +75,54 @@ class SizedPublisher(Node):
         pattern_param = str(self.get_parameter("pattern").value)
         rate = self.get_parameter("rate").value
         streams = max(1, int(self.get_parameter("streams").value))
+        sizes_param = self.get_parameter("sizes").value
+        self.interval_jitter_ms = float(self.get_parameter("interval_jitter_ms").value)
+        self.interval_jitter_seed = int(self.get_parameter("interval_jitter_seed").value)
 
-        self.size_a = size_a_param if size_a_param >= 0 else default_size
-        self.size_b = size_b_param
-        self.uses_pattern = bool(pattern_param.strip()) or self.size_b >= 0
-        if pattern_param.strip():
-            self.pattern = _parse_pattern(pattern_param)
-        elif self.size_b >= 0:
-            self.pattern = ["a", "b"]
+        # Initialize sizes sequence
+        if sizes_param:
+            self.cycle_sizes = [int(s) for s in sizes_param]
+            self.uses_pattern = True
+            self.pattern = None
         else:
-            self.pattern = ["a"]
+            self.size_a = size_a_param if size_a_param >= 0 else default_size
+            self.size_b = size_b_param
+            self.uses_pattern = bool(pattern_param.strip()) or self.size_b >= 0
+            if pattern_param.strip():
+                self.pattern = _parse_pattern(pattern_param)
+            elif self.size_b >= 0:
+                self.pattern = ["a", "b"]
+            else:
+                self.pattern = ["a"]
 
-        if any(token == "b" for token in self.pattern) and self.size_b < 0:
-            raise ValueError(
-                "Pattern references size 'b', but parameter 'size_b' is not set. "
-                "Provide e.g. -p size_b:=70."
-            )
+            self.token_sizes = {}
+            unique_tokens = set(self.pattern)
+            for token in unique_tokens:
+                if token == "a":
+                    self.token_sizes["a"] = self.size_a
+                elif token == "b":
+                    if self.size_b < 0:
+                        raise ValueError(
+                            "Pattern references size 'b', but parameter 'size_b' is not set. "
+                            "Provide e.g. -p size_b:=70."
+                        )
+                    self.token_sizes["b"] = self.size_b
+                else:
+                    param_name = f"size_{token}"
+                    self.declare_parameter(param_name, -1)
+                    val = int(self.get_parameter(param_name).value)
+                    if val < 0:
+                        raise ValueError(
+                            f"Pattern references size '{token}', but parameter '{param_name}' is not set."
+                        )
+                    self.token_sizes[token] = val
 
-        if self.size_a < 0:
-            raise ValueError("size_a must be >= 0.")
-        if self.size_b < -1:
-            raise ValueError("size_b must be >= 0 when set.")
+            self.cycle_sizes = [self.token_sizes[t] for t in self.pattern]
+
+            if self.size_a < 0:
+                raise ValueError("size_a must be >= 0.")
+            if self.size_b < -1:
+                raise ValueError("size_b must be >= 0 when set.")
 
         self.streams_state: list[dict] = []
         for i in range(streams):
@@ -100,11 +130,21 @@ class SizedPublisher(Node):
             pub = self.create_publisher(SizedPayload, stream_topic, 10)
             self.streams_state.append({"publisher": pub, "seq": 0, "topic": stream_topic})
 
-        period = 1.0 / rate
-        self.timer = self.create_timer(period, self._publish)
+        # Initialize scheduling & timer
+        self.nominal_period = 1.0 / rate
+        self.interval_jitter_s = self.interval_jitter_ms / 1000.0
 
-        cycle_sizes = [self._size_for_token(token) for token in self.pattern]
-        avg_size = sum(cycle_sizes) / len(cycle_sizes)
+        import random
+        self.rng = random.Random(self.interval_jitter_seed)
+
+        first_period = self.nominal_period
+        if self.interval_jitter_s > 0.0:
+            noise = self.rng.gauss(0.0, self.interval_jitter_s)
+            first_period = max(0.001, self.nominal_period + noise)
+
+        self.timer = self.create_timer(first_period, self._publish)
+
+        avg_size = sum(self.cycle_sizes) / len(self.cycle_sizes)
         bandwidth_bits = avg_size * 8 * rate
         bandwidth_bytes = avg_size * rate
 
@@ -112,17 +152,22 @@ class SizedPublisher(Node):
         topics_desc = ", ".join(s["topic"] for s in self.streams_state)
 
         if self.uses_pattern:
-            cycle_desc = ", ".join(f"{token}:{self._size_for_token(token)} B" for token in self.pattern)
+            if self.pattern:
+                cycle_desc = ", ".join(f"{token}:{self.token_sizes[token]} B" for token in self.pattern)
+                pattern_str = self._pattern_as_string()
+            else:
+                cycle_desc = ", ".join(f"{s} B" for s in self.cycle_sizes)
+                pattern_str = "explicit"
             self.get_logger().info(
                 f"Publishing [{topics_desc}]{stream_suffix} at {rate} Hz, "
-                f"pattern '{self._pattern_as_string()}' -> [{cycle_desc}]. "
+                f"pattern '{pattern_str}' -> [{cycle_desc}]. "
                 f"Average payload {_human_bytes(avg_size)}. "
                 f"Average bandwidth per stream: {_human_bits(bandwidth_bits)}/s, {_human_bytes(bandwidth_bytes)}/s"
             )
         else:
             self.get_logger().info(
                 f"Publishing [{topics_desc}]{stream_suffix} at {rate} Hz, "
-                f"payload {_human_bytes(self.size_a)}. "
+                f"payload {_human_bytes(self.cycle_sizes[0])}. "
                 f"Bandwidth per stream: {_human_bits(bandwidth_bits)}/s, {_human_bytes(bandwidth_bytes)}/s"
             )
 
@@ -131,9 +176,13 @@ class SizedPublisher(Node):
             return self.size_a
         if token == "b":
             return self.size_b
+        if hasattr(self, "token_sizes") and token in self.token_sizes:
+            return self.token_sizes[token]
         raise ValueError(f"Unsupported pattern token '{token}'.")
 
     def _pattern_as_string(self) -> str:
+        if not self.pattern:
+            return "explicit"
         compressed: list[str] = []
         current = self.pattern[0]
         count = 1
@@ -151,7 +200,7 @@ class SizedPublisher(Node):
 
     def _publish(self):
         for stream in self.streams_state:
-            size = self._size_for_token(self.pattern[stream["seq"] % len(self.pattern)])
+            size = self.cycle_sizes[stream["seq"] % len(self.cycle_sizes)]
             msg = SizedPayload()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.seq = stream["seq"]
@@ -159,6 +208,12 @@ class SizedPublisher(Node):
             msg.payload = list(b"\x42" * size)
             stream["publisher"].publish(msg)
             stream["seq"] += 1
+
+        if self.interval_jitter_s > 0.0:
+            noise = self.rng.gauss(0.0, self.interval_jitter_s)
+            next_period = max(0.001, self.nominal_period + noise)
+            self.timer.timer_period_ns = int(next_period * 1e9)
+            self.timer.reset()
 
         total_seq = sum(s["seq"] for s in self.streams_state)
         if total_seq % 100 == 0 and total_seq > 0:

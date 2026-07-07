@@ -159,3 +159,23 @@ targets also get native application-container windows. Stop it with
 
 External runners should use `ota_suite_sessions()` to discover the scenario set
 from examples and generated test-configs instead of hardcoding transport names.
+
+## Idealized Camera Load (GOP + Jitter)
+
+To study packet burst and jitter effects in isolation without relying on heavy bag replays, you can configure a synthetic "idealized camera" load using the `--size-pattern` and publish-interval jitter parameters.
+
+### Translating Measured Stream Stats to Parameters
+
+Suppose you analyze a real camera stream (similar to the processed handoff trace in [docs/ffmpeg-keyframes.md](ffmpeg-keyframes.md)) and measure the following:
+* **Frame Rate**: Nominal rate is 10 Hz (nominal period of 100 ms).
+* **GOP (Group of Pictures)**: GOP size is 5.
+* **Frame Sizes**: Keyframe (I-frame) average is ~43 KiB. The 4 delta frames (P-frames) average is ~4 KiB.
+* **Interval Jitter**: Standard deviation of frame intervals is measured at ~20 ms.
+
+You can translate these metrics directly into the following CLI arguments for the `benchmark` tool:
+
+1. **Nominal Rate**: `--rate-hz 10.0`
+2. **GOP-Shaped Sizes**: `--size-pattern 1x43KiB+4x4KiB` (which repeats cyclically: `43 KiB, 4 KiB, 4 KiB, 4 KiB, 4 KiB`).
+3. **Interval Jitter**: `--interval-jitter-ms 20.0 --interval-jitter-seed 42` (specifies a 20 ms standard deviation Gaussian noise around the 100 ms nominal period, seeded with a deterministic seed of 42 to ensure the publish schedule is identical across runs).
+
+This maps the measured network footprint of the camera stream to a clean, reproducible synthetic load.

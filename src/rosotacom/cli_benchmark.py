@@ -488,6 +488,11 @@ def _benchmark_result_context(
 
 
 def _mean_payload_bytes(load: dict[str, Any]) -> float | None:
+    if "sizes" in load:
+        sizes = load["sizes"]
+        if not sizes:
+            return 0.0
+        return float(sum(sizes) / len(sizes))
     size_a_raw = load.get("size_a", load.get("size"))
     if size_a_raw is None:
         return None
@@ -531,6 +536,8 @@ def _probe_load(
     size_pattern: str | None,
     rate_hz: float,
     streams: int,
+    interval_jitter_ms: float = 0.0,
+    interval_jitter_seed: int = 42,
 ) -> dict[str, Any]:
     if size_pattern is not None:
         from .benchmark import parse_size_pattern_load
@@ -544,6 +551,9 @@ def _probe_load(
     load["rate"] = rate_hz
     if streams != 1:
         load["streams"] = streams
+    if interval_jitter_ms > 0.0:
+        load["interval_jitter_ms"] = interval_jitter_ms
+        load["interval_jitter_seed"] = interval_jitter_seed
     return load
 
 
@@ -606,6 +616,17 @@ def _sized_publisher_param_args(
         "-p",
         f"streams:={publisher_streams}",
     ]
+
+    if "interval_jitter_ms" in load:
+        params.extend(["-p", f"interval_jitter_ms:={load['interval_jitter_ms']}"])
+    if "interval_jitter_seed" in load:
+        params.extend(["-p", f"interval_jitter_seed:={load['interval_jitter_seed']}"])
+
+    sizes = load.get("sizes")
+    if sizes is not None and len(set(sizes)) >= 3:
+        sizes_str = "[" + ",".join(str(s) for s in sizes) + "]"
+        params.extend(["-p", f"sizes:={sizes_str}"])
+        return params
 
     pattern = load.get("pattern")
     if pattern:
@@ -1264,6 +1285,8 @@ def drive_probe(
     render_plot: bool = True,
     out_dir: Path,
     result_context: dict[str, Any] | None = None,
+    interval_jitter_ms: float = 0.0,
+    interval_jitter_seed: int = 42,
 ) -> dict[str, Any]:
     """Run a fixed probe and characterize time-dependent latency/loss behavior."""
     if repeats < 1:
@@ -1275,7 +1298,14 @@ def drive_probe(
 
     profile = _normalize_benchmark_profile(profile)
     profile_label = _benchmark_profile_label(profile)
-    load = _probe_load(size=size, size_pattern=size_pattern, rate_hz=rate_hz, streams=streams)
+    load = _probe_load(
+        size=size,
+        size_pattern=size_pattern,
+        rate_hz=rate_hz,
+        streams=streams,
+        interval_jitter_ms=interval_jitter_ms,
+        interval_jitter_seed=interval_jitter_seed,
+    )
     load_info = _load_context(load)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -5050,6 +5080,8 @@ def benchmark_probe(args: argparse.Namespace) -> int:
             render_plot=getattr(args, "plot", True),
             out_dir=run_dir,
             result_context=result_context,
+            interval_jitter_ms=getattr(args, "interval_jitter_ms", 0.0),
+            interval_jitter_seed=getattr(args, "interval_jitter_seed", 42),
         )
 
     out_file_name = getattr(args, "out", "time-bins.jsonl")
@@ -5856,6 +5888,18 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
     probe_parser.add_argument("--rate-hz", type=float, default=20.0, help="Publish rate (Hz).")
     probe_parser.add_argument("--streams", type=int, default=1, help="Parallel stream count.")
     probe_parser.add_argument("--topic", default="", help="Topic to characterize (default: all).")
+    probe_parser.add_argument(
+        "--interval-jitter-ms",
+        type=float,
+        default=0.0,
+        help="Standard deviation of interval jitter in ms.",
+    )
+    probe_parser.add_argument(
+        "--interval-jitter-seed",
+        type=int,
+        default=42,
+        help="Random seed for interval jitter.",
+    )
     probe_parser.add_argument("--duration", type=float, default=60.0, help="Seconds per probe attempt.")
     probe_parser.add_argument("--repeats", type=int, default=1, help="Repeat the same fixed probe this many times.")
     probe_parser.add_argument("--bin-s", type=float, default=1.0, help="Time-bin width in seconds.")

@@ -5197,6 +5197,9 @@ def _smoke_postprocessed_topic(entry: Any, pipe: dict[str, Any]) -> str:
         return str(pipe["ota_in"])
     if pipe.get("framebridge") == "global_to_local":
         return str(pipe["fb_g2l_base"])
+    transport = pipe.get("transport")
+    if transport is not None and bool(getattr(transport, "local_republish", False)):
+        return str(pipe["final"]) + "/raw"
     return str(pipe["final"])
 
 
@@ -5566,6 +5569,8 @@ def _smoke_publish_message(msg_type: str) -> str:
         )
     if normalized in {"sensor_msgs/msg/CameraInfo", "sensor_msgs/CameraInfo"}:
         return "{header: {frame_id: camera}, height: 1, width: 1}"
+    if normalized in {"sensor_msgs/msg/Image", "sensor_msgs/Image"}:
+        return _smoke_sensor_image_message()
     if normalized in {"sensor_msgs/msg/CompressedImage", "sensor_msgs/CompressedImage"}:
         return (
             "{header: {frame_id: camera}, format: png, data: ["
@@ -5633,6 +5638,21 @@ def _content_integrity_specs(cfg: dict[str, Any], receiver_peer_key: str) -> lis
         if expected is not None:
             out.append((spec.topic, spec.publish_type, "data", expected))
     return out
+
+
+def _smoke_sensor_image_message() -> str:
+    width = 32
+    height = 32
+    data: list[str] = []
+    for y in range(height):
+        for x in range(width):
+            base = (x * 7 + y * 13) % 256
+            data.extend((str(base), str((base + 53) % 256), str((base + 101) % 256)))
+    return (
+        "{header: {frame_id: camera}, "
+        f"height: {height}, width: {width}, encoding: rgb8, is_bigendian: false, step: {width * 3}, "
+        "data: [" + ", ".join(data) + "]}"
+    )
 
 
 def _smoke_topic_pub_qos_args(qos: dict[str, Any] | None) -> str:
@@ -7575,6 +7595,80 @@ def bundle_check_command(args: argparse.Namespace) -> int:
     return 0 if report.complete else 1
 
 
+def _videoquality_summary_line(report: dict[str, Any]) -> str:
+    delivery = report.get("delivery") or {}
+    summary = report.get("summary") or {}
+    psnr = (summary.get("psnr_db") or {}).get("mean")
+    quality = (summary.get("ssim") or {}).get("mean")
+    return (
+        "VIDEOQUALITY "
+        f"compared={delivery.get('compared_frames', 0)}/{delivery.get('reference_frames', 0)} "
+        f"lost={delivery.get('lost_frames', 0)} loss={delivery.get('loss_pct', 0)}% "
+        f"mean_psnr_db={psnr} mean_ssim={quality}"
+    )
+
+
+def videoquality_command(args: argparse.Namespace) -> int:
+    from . import video_quality
+
+    if args.synthetic_out:
+        if args.reference or args.degraded:
+            raise RuntimeError("--make-synthetic cannot be combined with REF DEGRADED inputs.")
+        ref_path, degraded_path = video_quality.write_synthetic_pair(
+            args.synthetic_out,
+            frames=args.synthetic_frames,
+            width=args.synthetic_width,
+            height=args.synthetic_height,
+            channels=args.synthetic_channels,
+            seed=args.synthetic_seed,
+            quantization_step=args.synthetic_quantization_step,
+            drop_every=args.synthetic_drop_every,
+        )
+        print(f"Synthetic reference manifest: {ref_path}")
+        print(f"Synthetic degraded manifest: {degraded_path}")
+        return 0
+
+    if not args.reference or not args.degraded:
+        raise RuntimeError("videoquality requires REF and DEGRADED inputs unless --make-synthetic is used.")
+
+    report = video_quality.compare_inputs(
+        args.reference,
+        args.degraded,
+        topic=args.topic,
+        reference_topic=args.ref_topic,
+        degraded_topic=args.degraded_topic,
+        align=args.align,
+    )
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"Video quality report saved to {out_path}")
+        print(_videoquality_summary_line(report))
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
+
+    if args.plot:
+        from .plots import plot_video_quality
+
+        plot_path = plot_video_quality(report, out=args.plot)
+        print(f"Video quality plot saved to {plot_path}")
+
+    failures = video_quality.threshold_failures(
+        report,
+        min_mean_psnr=args.min_mean_psnr,
+        min_mean_ssim=args.min_mean_ssim,
+        max_loss_pct=args.max_loss_pct,
+    )
+    if failures:
+        for failure in failures:
+            print(f"VIDEOQUALITY FAIL: {failure}", file=sys.stderr)
+        return 1
+    if args.out or args.plot or args.min_mean_psnr is not None or args.min_mean_ssim is not None:
+        print("VIDEOQUALITY OK")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     commands = {
@@ -7586,6 +7680,7 @@ def main(argv: list[str] | None = None) -> int:
         "ota-smoke",
         "status",
         "metrics",
+        "videoquality",
         "test",
         "expect",
         "calibrate",
@@ -7820,6 +7915,55 @@ def main(argv: list[str] | None = None) -> int:
         help="Jitter is this delay percentile minus median delay.",
     )
     profile_from_trace_parser.set_defaults(func=profile_from_trace_command)
+
+    videoquality_parser = subparsers.add_parser(
+        "videoquality",
+        help="Compute offline PSNR/SSIM for decoded camera frames.",
+    )
+    videoquality_parser.add_argument(
+        "reference",
+        nargs="?",
+        help="Reference rosbag2 bag/metadata.yaml or frame manifest.",
+    )
+    videoquality_parser.add_argument(
+        "degraded",
+        nargs="?",
+        help="Degraded rosbag2 bag/metadata.yaml or frame manifest.",
+    )
+    videoquality_parser.add_argument(
+        "--topic",
+        help="sensor_msgs/msg/Image topic to read from rosbag2 inputs; manifests carry their own frames.",
+    )
+    videoquality_parser.add_argument("--ref-topic", help="Reference bag topic; overrides --topic for REF.")
+    videoquality_parser.add_argument("--degraded-topic", help="Degraded bag topic; overrides --topic for DEGRADED.")
+    videoquality_parser.add_argument(
+        "--align",
+        choices=["auto", "pts", "index"],
+        default="auto",
+        help="Frame alignment mode: pts when available, otherwise index (default: auto).",
+    )
+    videoquality_parser.add_argument("--out", help="Write the JSON report to this path instead of stdout-only output.")
+    videoquality_parser.add_argument("--plot", help="Write a PNG plot using the optional rosotacom[plots] extra.")
+    videoquality_parser.add_argument("--min-mean-psnr", type=float, help="Fail if mean PSNR is below this dB floor.")
+    videoquality_parser.add_argument("--min-mean-ssim", type=float, help="Fail if mean SSIM is below this floor.")
+    videoquality_parser.add_argument(
+        "--max-loss-pct",
+        type=float,
+        help="Fail if reference-frame loss exceeds this percent.",
+    )
+    videoquality_parser.add_argument(
+        "--make-synthetic",
+        dest="synthetic_out",
+        help="Write deterministic reference/degraded frame manifests to this directory.",
+    )
+    videoquality_parser.add_argument("--synthetic-frames", type=int, default=12)
+    videoquality_parser.add_argument("--synthetic-width", type=int, default=32)
+    videoquality_parser.add_argument("--synthetic-height", type=int, default=24)
+    videoquality_parser.add_argument("--synthetic-channels", type=int, choices=[1, 3], default=1)
+    videoquality_parser.add_argument("--synthetic-seed", type=int, default=0)
+    videoquality_parser.add_argument("--synthetic-quantization-step", type=int, default=8)
+    videoquality_parser.add_argument("--synthetic-drop-every", type=int)
+    videoquality_parser.set_defaults(func=videoquality_command)
 
     test_parser = subparsers.add_parser(
         "test", help="Assert a running/recent session meets its status + per-topic expect contract."

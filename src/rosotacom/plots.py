@@ -93,6 +93,51 @@ def plot_probe_timeseries(
     return out
 
 
+def plot_video_quality(
+    report: dict[str, Any],
+    *,
+    out: str | Path,
+    title: str = "Video quality",
+) -> Path:
+    """Render per-frame PSNR and SSIM from a ``rosotacom videoquality`` report."""
+    _, plt = _require_matplotlib()
+    out = Path(out)
+
+    compared = [row for row in report.get("frames", []) if row.get("status") == "compared"]
+    lost = [row for row in report.get("frames", []) if row.get("status") == "lost"]
+    xs = [int(row["ref_index"]) for row in compared]
+    psnr = [None if row.get("psnr_db") == "inf" else row.get("psnr_db") for row in compared]
+    quality = [row.get("ssim") for row in compared]
+
+    fig, ax_psnr = plt.subplots(figsize=(10, 5))
+    ax_ssim = ax_psnr.twinx()
+    if xs:
+        ax_psnr.plot(xs, psnr, "o-", color="tab:blue", label="PSNR dB")
+        ax_ssim.plot(xs, quality, "s-", color="tab:green", label="SSIM")
+    if lost:
+        lost_xs = [int(row["ref_index"]) for row in lost]
+        ax_psnr.scatter(lost_xs, [0.0] * len(lost_xs), marker="x", color="tab:red", label="lost frame")
+
+    ax_psnr.set_xlabel("Reference frame index")
+    ax_psnr.set_ylabel("PSNR (dB)", color="tab:blue")
+    ax_ssim.set_ylabel("SSIM", color="tab:green")
+    ax_psnr.set_title(title)
+    handles: list[Any] = []
+    labels: list[str] = []
+    for axis in (ax_psnr, ax_ssim):
+        axis_handles, axis_labels = axis.get_legend_handles_labels()
+        handles.extend(axis_handles)
+        labels.extend(axis_labels)
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=3, fontsize="small")
+        fig.tight_layout(rect=(0, 0, 1, 0.90))
+    else:
+        fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # 1.1 / 2.1 — capacity frontier
 # --------------------------------------------------------------------------- #

@@ -14,6 +14,10 @@ FULL_E2E_PATH = PACKAGE_ROOT / ".github" / "workflows" / "nightly-e2e.yml"
 RELEASE_PATH = PACKAGE_ROOT / ".github" / "workflows" / "release.yml"
 
 
+def _rmw_smoke_id(session_name: str) -> str:
+    return session_name.removeprefix("1_heartbeat_").replace("_", "-")
+
+
 def test_dependabot_groups_weekly_actions_and_python_updates() -> None:
     dependabot = DEPENDABOT_PATH.read_text(encoding="utf-8")
 
@@ -177,6 +181,20 @@ def test_full_e2e_workflow_runs_nightly_and_supports_manual_dispatch() -> None:
     assert "name: smoke-e2e" in full_e2e
     assert "rmw-matrix:" in full_e2e
     assert "just test-e2e-rmw" in full_e2e
+
+
+def test_nightly_rmw_matrix_matches_local_checkable_smoke_params() -> None:
+    from rosotacom.cli import local_check_sessions, session_local_checks
+
+    rmw_matrix_dir = PACKAGE_ROOT / "tests" / "sessions" / "rmw_matrix"
+    workflow = yaml.safe_load(FULL_E2E_PATH.read_text(encoding="utf-8"))
+
+    actual_sessions = workflow["jobs"]["rmw-matrix"]["strategy"]["matrix"]["session"]
+    expected_sessions = [_rmw_smoke_id(name) for name in local_check_sessions(rmw_matrix_dir)]
+
+    assert actual_sessions == expected_sessions
+    assert session_local_checks(rmw_matrix_dir)["1_heartbeat_cyclone-ota-tuned"] is False
+    assert "cyclone-ota-tuned" not in actual_sessions
 
 
 def test_release_publishes_only_for_a_version_tag_via_repository_configuration() -> None:

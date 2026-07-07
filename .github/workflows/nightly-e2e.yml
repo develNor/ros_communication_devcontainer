@@ -68,7 +68,6 @@ jobs:
         session:
           - cyclone-local-zenoh-ros2dds-ota
           - cyclone-ota
-          - cyclone-ota-tuned
           - fastdds
           - zen-endpoints
     steps:

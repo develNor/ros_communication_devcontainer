@@ -492,7 +492,7 @@ def _mean_payload_bytes(load: dict[str, Any]) -> float | None:
         sizes = load["sizes"]
         if not sizes:
             return 0.0
-        return sum(sizes) / len(sizes)
+        return float(sum(sizes) / len(sizes))
     size_a_raw = load.get("size_a", load.get("size"))
     if size_a_raw is None:
         return None

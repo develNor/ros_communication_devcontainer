@@ -61,7 +61,7 @@ test-e2e-node nodeid:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q "{{nodeid}}"
 
 test-e2e-rmw session:
-	ROSOTACOM_RUN_E2E=1 ROSOTACOM_RUN_FULL_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "test_full_rmw_heartbeat_smoke_matrix and {{session}}"
+	ROSOTACOM_RUN_E2E=1 ROSOTACOM_RUN_FULL_E2E=1 {{python}} -m pytest -q "tests/e2e/test_smoke.py::test_full_rmw_heartbeat_smoke_matrix[{{session}}]"
 
 
 docs:

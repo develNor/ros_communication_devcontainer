@@ -6112,6 +6112,55 @@ def calibrate_command(args: argparse.Namespace) -> int:
     return 1 if warnings else 0
 
 
+def expect_from_bag_command(args: argparse.Namespace) -> int:
+    """Generate a mergeable whole-bag ``expect`` fragment from bag metadata."""
+    from . import bag_ground_truth
+
+    runtime = _load_runtime_config(args)
+    session = _resolve_session(args.session_dir, runtime)
+    cfg = _effective_session_config(session.host_dir, runtime)
+    gt = bag_ground_truth.bag_ground_truth(args.bag)
+    if not gt:
+        print(f"No topics found in bag metadata: {args.bag}", file=sys.stderr)
+        return 1
+
+    fragment = bag_ground_truth.generate_whole_bag_expectations(
+        cfg,
+        gt,
+        min_ratio=float(args.min_ratio),
+        stream_min_hz=float(args.stream_min_hz),
+    )
+    generated_count = sum(len(entries) for entries in fragment.topics.values())
+    if generated_count == 0:
+        print(
+            f"No session-carried topics from {session.host_dir} were found in bag metadata: {args.bag}",
+            file=sys.stderr,
+        )
+        return 1
+
+    text = bag_ground_truth.render_whole_bag_expect_fragment(fragment, bag=args.bag, session=session.host_dir)
+    out = getattr(args, "out", None)
+    if out:
+        out_path = Path(out).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text + "\n", encoding="utf-8")
+        print(f"Wrote {generated_count} generated expect block(s) to {out_path}")
+    else:
+        print(text)
+
+    if fragment.missing_session_topics:
+        print(
+            "Warning: skipped session topics absent from the bag: " + ", ".join(fragment.missing_session_topics),
+            file=sys.stderr,
+        )
+    if fragment.uncarried_bag_topics:
+        print(
+            "Warning: bag topics not carried by this session: " + ", ".join(fragment.uncarried_bag_topics),
+            file=sys.stderr,
+        )
+    return 0
+
+
 def test_command(args: argparse.Namespace) -> int:
     """Assert a running/recent session meets its status + per-topic `expect` contract.
 
@@ -7507,6 +7556,7 @@ def main(argv: list[str] | None = None) -> int:
         "status",
         "metrics",
         "test",
+        "expect",
         "calibrate",
         "verify",  # retired; keep guarded so it is not rewritten as `start verify`.
         "probe-publish",
@@ -7688,6 +7738,36 @@ def main(argv: list[str] | None = None) -> int:
         help="Print a suggested `expect` block per topic from the current run instead of asserting.",
     )
     test_parser.set_defaults(func=test_command)
+
+    expect_parser = subparsers.add_parser("expect", help="Generate or inspect per-topic expect contracts.")
+    expect_subparsers = expect_parser.add_subparsers(dest="expect_command", required=True)
+    expect_from_bag_parser = expect_subparsers.add_parser(
+        "from-bag",
+        help="Generate a whole-bag expect YAML fragment from rosbag2 metadata.",
+    )
+    _add_common_config_args(expect_from_bag_parser)
+    expect_from_bag_parser.add_argument("bag", help="Path to a rosbag2 bag directory or its metadata.yaml.")
+    _add_session_arg(
+        expect_from_bag_parser,
+        "--session",
+        dest="session_dir",
+        required=True,
+        help="Session name or directory whose carried topics should receive generated expect blocks.",
+    )
+    expect_from_bag_parser.add_argument("--out", help="Write the YAML fragment to this path instead of stdout.")
+    expect_from_bag_parser.add_argument(
+        "--min-ratio",
+        type=float,
+        default=0.9,
+        help="Safety margin for generated min_count/completeness thresholds (default: 0.9).",
+    )
+    expect_from_bag_parser.add_argument(
+        "--stream-min-hz",
+        type=float,
+        default=0.1,
+        help="Minimum native rate classified as stream instead of existence (default: 0.1).",
+    )
+    expect_from_bag_parser.set_defaults(func=expect_from_bag_command)
 
     calibrate_parser = subparsers.add_parser(
         "calibrate",

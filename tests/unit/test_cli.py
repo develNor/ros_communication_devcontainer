@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import json
 import os
 import re
 import struct
@@ -1531,6 +1532,115 @@ def test_probe_verbs_dispatch_not_wrapped_in_start(monkeypatch: pytest.MonkeyPat
     ]
     assert all(args.session_dir == "1_heartbeat" for _, args in seen)
     assert seen[1][1].expect == "absent"
+
+
+def test_expect_from_bag_fragment_passes_rosotacom_test(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = tmp_path / "project"
+    session_dir = project / "sessions" / "whole_bag"
+    bag_dir = project / "bags" / "fixture_bag"
+    instance_dir = project / "session-instances" / "2026-01-01" / "whole_bag_2026-01-01_00-00-00_run1"
+    session_dir.mkdir(parents=True)
+    bag_dir.mkdir(parents=True)
+    (project / "ros2docker.json").write_text('{"image_name": "unit"}\n', encoding="utf-8")
+    (project / "rosotacom.yaml").write_text(
+        "ros2docker_config: ros2docker.json\n"
+        "session_configs_dir:\n"
+        "  - sessions\n"
+        "session_instances_dir: session-instances\n",
+        encoding="utf-8",
+    )
+    (bag_dir / "metadata.yaml").write_text(
+        """\
+rosbag2_bagfile_information:
+  duration: {nanoseconds: 10000000000}
+  topics_with_message_count:
+    - topic_metadata:
+        name: /stream
+        type: std_msgs/msg/String
+        offered_qos_profiles:
+          - {reliability: reliable, durability: volatile}
+      message_count: 101
+""",
+        encoding="utf-8",
+    )
+    session_cfg = {
+        "peers": {"a": {}, "b": {}},
+        "shared": {"use_status_overview": True},
+        "topics": {
+            "b_to_a": [
+                {
+                    "topic": "/stream",
+                    "type": "std_msgs/msg/String",
+                    "processing": {"drop": {"drop_count": 1, "window_size": 2}},
+                }
+            ]
+        },
+    }
+    session_path = session_dir / "session-definition.yaml"
+    session_path.write_text(yaml.safe_dump(session_cfg, sort_keys=False), encoding="utf-8")
+
+    generated_path = tmp_path / "whole-bag-expect.yaml"
+    rc = rosotacom.main(
+        [
+            "expect",
+            "from-bag",
+            str(bag_dir),
+            "--session",
+            "whole_bag",
+            "--project",
+            str(project / "rosotacom.yaml"),
+            "--out",
+            str(generated_path),
+            "--min-ratio",
+            "0.8",
+        ]
+    )
+
+    assert rc == 0
+    assert "Wrote 1 generated expect block" in capsys.readouterr().out
+    generated = yaml.safe_load(generated_path.read_text(encoding="utf-8"))
+    session_cfg["topics"]["b_to_a"][0]["expect"] = generated["topics"]["b_to_a"][0]["expect"]
+    session_path.write_text(yaml.safe_dump(session_cfg, sort_keys=False), encoding="utf-8")
+
+    status_dir = instance_dir / "logs" / "a" / "status"
+    status_dir.mkdir(parents=True)
+    status = {
+        "peer": "a",
+        "topics": [
+            {
+                "base": "/stream",
+                "direction": "inbound",
+                "overall": "OK",
+                "stages": [
+                    {"stage": "com_in", "state": "FLOWING", "hz": 5.0, "messages_total": 50, "publishers": 1},
+                    {"stage": "app_in", "state": "FLOWING", "hz": 5.0, "messages_total": 45, "publishers": 1},
+                ],
+            }
+        ],
+    }
+    (status_dir / "status.json").write_text(json.dumps(status), encoding="utf-8")
+
+    assert (
+        rosotacom.main(
+            [
+                "test",
+                "whole_bag",
+                "--project",
+                str(project / "rosotacom.yaml"),
+                "--instance-id",
+                "run1",
+                "--bag",
+                str(bag_dir),
+                "--timeout",
+                "0",
+            ]
+        )
+        == 0
+    )
+    assert "TEST OK" in capsys.readouterr().out
 
 
 def test_start_and_stop_compat_entrypoints_prefix_commands(monkeypatch: pytest.MonkeyPatch) -> None:

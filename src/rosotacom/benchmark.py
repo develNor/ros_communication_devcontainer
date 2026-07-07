@@ -42,7 +42,7 @@ def parse_size_pattern(pattern: str) -> list[str]:
     tokens: list[str] = []
     for raw_token in pattern.split(","):
         token = raw_token.strip().lower()
-        match = re.fullmatch(r"([ab])(?:[*x](\d+))?", token)
+        match = re.fullmatch(r"([a-z])(?:[*x](\d+))?", token)
         if not match:
             raise ValueError(f"Invalid pattern token '{raw_token}'. Use tokens like 'a', 'b', 'ax4', or 'b*2'.")
         count = int(match.group(2) or "1")
@@ -101,12 +101,11 @@ def _compress_size_pattern(tokens: Sequence[str]) -> str:
 
 
 def parse_size_pattern_load(pattern: str) -> dict[str, Any]:
-    """Parse ``1x20KB+1x0KB`` into ``sized_publisher`` a/b load parameters.
+    """Parse ``1x20KB+1x0KB`` into ``sized_publisher`` load parameters.
 
     Pattern terms are ``COUNTxSIZE`` or just ``SIZE``, separated by ``+`` or
     ``,``. Decimal units (KB/MB/GB) use powers of 1000; binary units
-    (KiB/MiB/GiB) use powers of 1024. The current ROS publisher supports up to
-    two distinct payload sizes, mapped to ``size_a`` and ``size_b``.
+    (KiB/MiB/GiB) use powers of 1024.
     """
     if not pattern.strip():
         raise ValueError("size pattern must not be empty.")
@@ -128,37 +127,40 @@ def parse_size_pattern_load(pattern: str) -> dict[str, Any]:
         size = parse_payload_size_bytes(match.group(2))
         label = label_by_size.get(size)
         if label is None:
-            if len(label_by_size) >= 2:
-                raise ValueError("size pattern supports at most two distinct payload sizes.")
-            label = "a" if not label_by_size else "b"
+            label = chr(ord("a") + len(label_by_size))
             label_by_size[size] = label
             size_by_label[label] = size
         tokens.extend([label] * count)
 
+    sizes_list = [size_by_label[t] for t in tokens]
+
     load: dict[str, Any] = {
-        "size_a": size_by_label["a"],
+        "sizes": sizes_list,
         "pattern": _compress_size_pattern(tokens),
         "size_pattern": pattern,
     }
-    if "b" in size_by_label:
-        load["size_b"] = size_by_label["b"]
+    for label, size in size_by_label.items():
+        load[f"size_{label}"] = size
+
     return load
 
 
-def expand_size_pattern(pattern: str, size_a: int, size_b: int | None = None) -> list[int]:
+def expand_size_pattern(pattern: str, size_a: int, size_b: int | None = None, **kwargs: Any) -> list[int]:
     """Expand a pattern into the concrete cyclic byte-size sequence it publishes."""
     if size_a < 0:
         raise ValueError("size_a must be >= 0.")
     tokens = parse_size_pattern(pattern)
-    if any(token == "b" for token in tokens) and size_b is None:
-        raise ValueError("Pattern references size 'b' but size_b was not provided.")
     sizes = {"a": size_a, "b": size_b}
+    sizes.update(kwargs)
+    for token in tokens:
+        if token not in sizes or sizes[token] is None:
+            raise ValueError(f"Pattern references size {token!r} but it was not provided.")
     return [int(sizes[token]) for token in tokens]  # type: ignore[arg-type]
 
 
-def pattern_mean_bytes(pattern: str, size_a: int, size_b: int | None = None) -> float:
+def pattern_mean_bytes(pattern: str, size_a: int, size_b: int | None = None, **kwargs: Any) -> float:
     """Mean payload of one pattern cycle — the basis for the offered-bandwidth bound."""
-    sizes = expand_size_pattern(pattern, size_a, size_b)
+    sizes = expand_size_pattern(pattern, size_a, size_b, **kwargs)
     return sum(sizes) / len(sizes)
 
 

@@ -232,6 +232,7 @@ def test_probe_driver_accepts_size_pattern_load(tmp_path: Path) -> None:
             "pattern": "a*1,b*1",
             "size_pattern": "1x20KB+1x0KB",
             "rate": 10.0,
+            "sizes": [20_000, 0],
         }
     ]
     assert result["load"]["mean_payload_bytes"] == 10_000.0
@@ -281,6 +282,52 @@ def test_sized_publisher_args_include_size_pattern_and_zero_payload() -> None:
         "streams:=1",
         "-p",
         "size:=9000",
+    ]
+
+
+def test_sized_publisher_args_include_interval_jitter() -> None:
+    assert benchmark_cli._sized_publisher_param_args(
+        "/bench_capacity",
+        {
+            "size_a": 20_000,
+            "rate": 10.0,
+            "streams": 1,
+            "interval_jitter_ms": 20.0,
+            "interval_jitter_seed": 42,
+        },
+    ) == [
+        "-p",
+        "topic:=/bench_capacity",
+        "-p",
+        "rate:=10.0",
+        "-p",
+        "streams:=1",
+        "-p",
+        "interval_jitter_ms:=20.0",
+        "-p",
+        "interval_jitter_seed:=42",
+        "-p",
+        "size:=20000",
+    ]
+
+
+def test_sized_publisher_args_include_dynamic_sizes() -> None:
+    assert benchmark_cli._sized_publisher_param_args(
+        "/bench_capacity",
+        {
+            "sizes": [43000, 3000, 4000, 4000, 4000],
+            "rate": 10.0,
+            "streams": 1,
+        },
+    ) == [
+        "-p",
+        "topic:=/bench_capacity",
+        "-p",
+        "rate:=10.0",
+        "-p",
+        "streams:=1",
+        "-p",
+        "sizes:=[43000,3000,4000,4000,4000]",
     ]
 
 

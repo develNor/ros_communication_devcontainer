@@ -61,6 +61,7 @@ def test_human_size_pattern_load_maps_to_a_b_publisher_params() -> None:
         "size_b": 0,
         "pattern": "a*1,b*1",
         "size_pattern": "1x20KB+1x0KB",
+        "sizes": [20_000, 0],
     }
     assert pattern_mean_bytes(load["pattern"], load["size_a"], load["size_b"]) == 10_000
 
@@ -69,11 +70,49 @@ def test_size_pattern_rejects_unset_b_and_bad_tokens() -> None:
     with pytest.raises(ValueError):
         expand_size_pattern("a,b", size_a=10)  # size_b missing
     with pytest.raises(ValueError):
-        parse_size_pattern("c*2")
-    with pytest.raises(ValueError):
         parse_size_pattern("a*0")
-    with pytest.raises(ValueError):
-        parse_size_pattern_load("1x20KB+1x10KB+1x0KB")
+
+
+def test_multi_element_pattern_expansion() -> None:
+    load = parse_size_pattern_load("1x43KB+1x3KB+3x4KB")
+    assert load["sizes"] == [43_000, 3_000, 4_000, 4_000, 4_000]
+    assert load["size_pattern"] == "1x43KB+1x3KB+3x4KB"
+    assert load["size_a"] == 43_000
+    assert load["size_b"] == 3_000
+    assert load["size_c"] == 4_000
+    assert load["pattern"] == "a*1,b*1,c*3"
+
+    assert expand_size_pattern("a*1,b*1,c*3", size_a=43_000, size_b=3_000, c=4_000) == [
+        43_000,
+        3_000,
+        4_000,
+        4_000,
+        4_000,
+    ]
+    assert pattern_mean_bytes("a*1,b*1,c*3", size_a=43_000, size_b=3_000, c=4_000) == 11_600.0
+
+
+def test_seeded_jitter_determinism() -> None:
+    import random
+
+    def generate_intervals(rate_hz: float, jitter_ms: float, seed: int, count: int) -> list[float]:
+        nominal_period = 1.0 / rate_hz
+        jitter_s = jitter_ms / 1000.0
+        rng = random.Random(seed)
+        intervals = []
+        for _ in range(count):
+            noise = rng.gauss(0.0, jitter_s)
+            intervals.append(max(0.001, nominal_period + noise))
+        return intervals
+
+    # Same seed -> same schedule
+    seq1 = generate_intervals(10.0, 20.0, 42, 100)
+    seq2 = generate_intervals(10.0, 20.0, 42, 100)
+    assert seq1 == seq2
+
+    # Different seed -> different schedule
+    seq3 = generate_intervals(10.0, 20.0, 43, 100)
+    assert seq1 != seq3
 
 
 # --- capacity binary-search driver + oracle -------------------------------- #

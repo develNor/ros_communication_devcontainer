@@ -171,3 +171,40 @@ def test_benchmark_capacity_bad_case(copied_example_project: Path) -> None:
     ]
     result = _run(cmd, timeout=BENCHMARK_TIMEOUT_S)
     _assert_capacity_result(result.stdout, expected_capacity=None, expected_probe_value=18000, expected_passed=False)
+
+
+def test_benchmark_probe_camera_load(copied_example_project: Path) -> None:
+    """✅ Probe with camera load: GOP sequence + seeded interval jitter"""
+    cmd = [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "benchmark",
+        "probe",
+        "--rosotacom-config",
+        str(copied_example_project / "rosotacom.yaml"),
+        "--profile",
+        CAPACITY_PROFILE,
+        "--size-pattern",
+        "1x43KB+1x3KB+3x4KB",
+        "--interval-jitter-ms",
+        "20.0",
+        "--interval-jitter-seed",
+        "42",
+        "--duration",
+        "5",
+        "--repeats",
+        "1",
+        "--rmw",
+        "cyclone",
+    ]
+    result = _run(cmd, timeout=BENCHMARK_TIMEOUT_S)
+    result_path = _benchmark_result_path(result.stdout)
+    assert result_path.is_file()
+    doc = json.loads(result_path.read_text(encoding="utf-8"))
+
+    # Assert load configuration is correctly propagated
+    load_params = doc["configuration"]["load"]["parameters"]
+    assert load_params["sizes"] == [43000, 3000, 4000, 4000, 4000]
+    assert load_params["interval_jitter_ms"] == 20.0
+    assert load_params["interval_jitter_seed"] == 42

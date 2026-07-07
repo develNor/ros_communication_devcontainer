@@ -7142,6 +7142,44 @@ def profile_from_trace_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def report_command(args: argparse.Namespace) -> int:
+    from rosotacom.forensics import DetectionConfig, build_report, parse_timeline_anchor, render_markdown, write_report
+
+    instance_dir = Path(args.instance_dir).expanduser().resolve()
+    config = DetectionConfig(
+        bin_s=args.bin_s,
+        loss_burst_min=args.loss_burst_min,
+        latency_baseline_window=args.latency_baseline_window,
+        latency_baseline_min=args.latency_baseline_min,
+        latency_ratio=args.latency_ratio,
+        latency_min_delta_ms=args.latency_min_delta_ms,
+        latency_min_run=args.latency_min_run,
+        rate_collapse_fraction=args.rate_collapse_fraction,
+        rate_collapse_min_bins=args.rate_collapse_min_bins,
+    )
+    report = build_report(
+        instance_dir,
+        config=config,
+        peers=tuple(args.peer or ()),
+        profile=args.profile,
+        profiles_file=args.profiles_file,
+        timeline_anchor=parse_timeline_anchor(args.timeline_anchor),
+    )
+    out_dir = Path(args.out).expanduser().resolve() if args.out else instance_dir / "report"
+    written = write_report(report, out_dir, figures=not args.no_figures)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(render_markdown(report))
+    print(f"report: {written['json']}", file=sys.stderr)
+    print(f"summary: {written['markdown']}", file=sys.stderr)
+    for figure in written["figures"]:
+        print(f"figure: {figure}", file=sys.stderr)
+    if written["figures_note"]:
+        print(written["figures_note"], file=sys.stderr)
+    return 0
+
+
 def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--rosotacom-config",
@@ -7586,6 +7624,7 @@ def main(argv: list[str] | None = None) -> int:
         "ota-smoke",
         "status",
         "metrics",
+        "report",
         "test",
         "expect",
         "calibrate",
@@ -7820,6 +7859,81 @@ def main(argv: list[str] | None = None) -> int:
         help="Jitter is this delay percentile minus median delay.",
     )
     profile_from_trace_parser.set_defaults(func=profile_from_trace_command)
+
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Degradation forensics for a recorded session instance: localize and explain loss/latency events.",
+    )
+    report_parser.add_argument("instance_dir", help="Session-instance directory (contains logs/<peer>/status/).")
+    report_parser.add_argument(
+        "--peer", action="append", help="Analyze only this peer's artifacts. Repeat to add more (default: all found)."
+    )
+    report_parser.add_argument("--bin-s", type=float, default=1.0, help="Timeline bin width in seconds (default: 1).")
+    report_parser.add_argument(
+        "--loss-burst-min",
+        type=int,
+        default=3,
+        help="Minimum consecutive lost sequence numbers to flag a loss burst (default: 3).",
+    )
+    report_parser.add_argument(
+        "--latency-baseline-window",
+        type=int,
+        default=30,
+        help="Rolling baseline size in delivered samples (default: 30).",
+    )
+    report_parser.add_argument(
+        "--latency-baseline-min",
+        type=int,
+        default=10,
+        help="Samples required before excursion detection starts (default: 10).",
+    )
+    report_parser.add_argument(
+        "--latency-ratio",
+        type=float,
+        default=2.0,
+        help="Excursion threshold as a multiple of the rolling baseline median (default: 2.0).",
+    )
+    report_parser.add_argument(
+        "--latency-min-delta-ms",
+        type=float,
+        default=50.0,
+        help="Excursion must also exceed baseline by this many ms (default: 50).",
+    )
+    report_parser.add_argument(
+        "--latency-min-run",
+        type=int,
+        default=3,
+        help="Consecutive excursive samples required to flag an event (default: 3).",
+    )
+    report_parser.add_argument(
+        "--rate-collapse-fraction",
+        type=float,
+        default=0.5,
+        help="Delivered rate below this fraction of nominal counts as collapsed (default: 0.5).",
+    )
+    report_parser.add_argument(
+        "--rate-collapse-min-bins",
+        type=int,
+        default=2,
+        help="Consecutive collapsed bins required to flag an event (default: 2).",
+    )
+    report_parser.add_argument(
+        "--profile",
+        metavar="NAME",
+        help="Profile the run was recorded under (environment context only; RFC 0004 name).",
+    )
+    report_parser.add_argument("--profiles-file", help="profiles.yaml that defines --profile.")
+    report_parser.add_argument(
+        "--timeline-anchor",
+        metavar="EPOCH_OR_ISO",
+        help="Wall-clock start of a timeline profile (default: first observed publish, approximate).",
+    )
+    report_parser.add_argument("--out", help="Output directory (default: <instance-dir>/report).")
+    report_parser.add_argument("--no-figures", action="store_true", help="Skip figure rendering.")
+    report_parser.add_argument(
+        "--json", action="store_true", help="Print report.json to stdout instead of the markdown summary."
+    )
+    report_parser.set_defaults(func=report_command)
 
     test_parser = subparsers.add_parser(
         "test", help="Assert a running/recent session meets its status + per-topic expect contract."

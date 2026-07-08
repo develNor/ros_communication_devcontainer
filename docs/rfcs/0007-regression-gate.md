@@ -1,7 +1,8 @@
 # RFC 0007 — Performance regression gate: two-sided budgets, ratchet & blocking lanes
 
-**Status:** Draft (design accepted; implementation staged as follow-up issues in
-the operator harness roadmap) · **Scope:** turning the *deterministic* slice of
+**Status:** Draft (design accepted; core machinery §1–§3 implemented — band
+schema v2, two-sided `compare`, `ratchet` — remaining items staged as follow-up
+issues in the operator harness roadmap) · **Scope:** turning the *deterministic* slice of
 the benchmark suite into a gate — committed two-sided performance bands, the
 ratchet workflow, noise calibration, lane placement, boundary must-fail rows,
 and the living-findings hook · extends
@@ -195,15 +196,24 @@ becomes a finding with a row, instead of living only in RFC prose.
 Ordered; each item lands with its validation. The operator harness roadmap
 slices these into issues.
 
-- [ ] **Band schema v2** in `budgets.jsonl`: two-sided `[lo, hi]`,
+- [x] **Band schema v2** in `budgets.jsonl`: two-sided `[lo, hi]`,
   better-direction, runner-class fingerprint, window length, repeats, σ/floor
   provenance; clean rewrite of existing entries (repo rule: no backward
-  compatibility).
-- [ ] **Two-sided `benchmark compare`**: verdicts `REGRESSED` / `IMPROVED` /
+  compatibility). *(`benchmark.Band`/`BandProvenance`/`save_bands`/`load_bands`;
+  every `result.json` now carries `sha` + `runner.fingerprint`; the packaged
+  `budgets.jsonl` is rewritten with fingerprint `uncalibrated`, so it refuses to
+  gate until the calibration step mints measured bands. Workflow doc:
+  [docs/performance-bands.md](../performance-bands.md).)*
+- [x] **Two-sided `benchmark compare`**: verdicts `REGRESSED` / `IMPROVED` /
   `WITHIN`, CI exit codes, improvement failure prints the exact ratchet
-  command; refuses fingerprint mismatches.
-- [ ] **`benchmark ratchet`**: rewrite bands from `result.json` run(s);
+  command; refuses fingerprint mismatches. *(`cli_benchmark.benchmark_compare`;
+  exit 0 WITHIN / 1 REGRESSED-or-refusal / 2 IMPROVED, `--monitor` reports
+  without blocking.)*
+- [x] **`benchmark ratchet`**: rewrite bands from `result.json` run(s);
   `--recalibrate` from K repeats; refuses to *widen* without `--recalibrate`.
+  *(`benchmark.ratchet_band` + `cli_benchmark.benchmark_ratchet`; a plain
+  ratchet also refuses runs from another runner class and preserves the
+  calibrated width/provenance.)*
 - [ ] **Calibration**: measure run-to-run σ per metric on the CI runner class
   (K repeats of the canonical rows); commit the initial bands with provenance.
 - [ ] **Benched-set registry**: curated row list (config/RMW × profile × load ×
@@ -223,13 +233,22 @@ slices these into issues.
 
 ## Validation checklist
 
-- [ ] **Two-sided compare** — unit tests for `REGRESSED` / `IMPROVED` /
+- [x] **Two-sided compare** — unit tests for `REGRESSED` / `IMPROVED` /
   `WITHIN` in both better-directions; the improvement message contains the
   ratchet command.
-- [ ] **Ratchet** — unit roundtrip: run → ratchet → compare is `WITHIN`;
+  *(`test_benchmark.test_band_verdicts_are_two_sided_for_both_better_directions`,
+  `test_cli_benchmark.test_compare_gates_both_sides_and_banks_improvements` —
+  the latter also executes the printed ratchet command and re-compares.)*
+- [x] **Ratchet** — unit roundtrip: run → ratchet → compare is `WITHIN`;
   refuses widening without `--recalibrate`; preserves provenance.
-- [ ] **Fingerprint** — unit test: compare across runner classes fails with
+  *(`test_cli_benchmark.test_capacity_run_ratchet_compare_is_within`,
+  `test_benchmark.test_ratchet_recenters_within_calibrated_width_and_preserves_provenance`,
+  `test_benchmark.test_ratchet_refuses_moving_toward_worse_without_recalibrate`,
+  `test_benchmark.test_recalibrate_mints_width_from_repeats_with_floor_guard`.)*
+- [x] **Fingerprint** — unit test: compare across runner classes fails with
   the recalibration instruction.
+  *(`test_benchmark.test_compare_refuses_cross_runner_fingerprints_with_recalibration_instruction`,
+  `test_cli_benchmark.test_compare_refuses_bands_from_another_runner_class`.)*
 - [ ] **Boundary rows** — unit test: a bad side meeting the good oracle yields
   the happy-red verdict with finding/profile pointers.
 - [ ] **Registry** — contract test: every row names an existing profile, load
@@ -247,7 +266,9 @@ slices these into issues.
 ## Open questions
 
 - **Width formula** — `k·σ` with which k; σ vs robust quantiles; per-metric
-  floors. Settle empirically in the calibration step.
+  floors. Settle empirically in the calibration step. *(The core ships
+  overridable defaults per ratchet invocation: `--k 3`, `--floor-frac 0.02`,
+  `--floor 0`; the center is the median of the runs, σ is the sample stdev.)*
 - **K** — how many calibration repeats per row class (cost vs confidence).
 - **Latency on shared runners** — wide band vs monitor-only; decide from the
   calibration numbers.

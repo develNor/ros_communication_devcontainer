@@ -1,31 +1,38 @@
-"""RFC 0005 validation checklist — host tests for the benchmark genre logic."""
+"""RFC 0005 + RFC 0007 validation — host tests for the benchmark genre and band logic."""
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
 
 from rosotacom.benchmark import (
-    BudgetEntry,
-    BudgetKey,
+    Band,
+    BandError,
+    BandProvenance,
+    Better,
     CapacitySlice,
-    Direction,
-    MetricSpec,
+    FingerprintMismatch,
     OracleThresholds,
     OutageWindow,
     SweepBounds,
+    Verdict,
+    WideningRefused,
+    band_verdict,
     capacity_binary_search,
     characterize_probe_records,
-    compare_to_budget,
+    compare_to_band,
+    default_better,
     exclude_probe_warmup,
     expand_size_pattern,
-    find_baseline,
+    find_band,
     find_capacity,
     find_probe_onset,
     guard_shared_link,
     linear_ramp,
-    load_budget,
+    load_bands,
+    metrics_from_result,
     offered_bandwidth_bps,
     oracle_passes,
     oracle_passes_topic,
@@ -33,8 +40,11 @@ from rosotacom.benchmark import (
     parse_size_pattern,
     parse_size_pattern_load,
     pattern_mean_bytes,
+    ratchet_band,
     recovery_metrics,
-    save_budget,
+    result_row_id,
+    runner_fingerprint,
+    save_bands,
     size_ceiling,
     within_shared_link_budget,
 )
@@ -411,49 +421,325 @@ def test_characterize_probe_records_excludes_warmup_and_reanchors_to_onset() -> 
     assert included[0]["latency_p50_ms"] < 10.0
 
 
-# --- budget store + regression compare ------------------------------------- #
+# --- committed bands: two-sided verdicts + the ratchet (RFC 0007) ----------- #
+
+CI_RUNNER = "github-hosted-linux-x86_64"
 
 
-def test_budget_compare_flags_regression_per_metric_direction() -> None:
-    key = BudgetKey(sha="abc123", profile="cellular-emulated", genre="capacity")
-    specs = [
-        MetricSpec("capacity_bytes", Direction.HIGHER_IS_BETTER, rel_tolerance=0.05),
-        MetricSpec("p95_latency_ms", Direction.LOWER_IS_BETTER, abs_tolerance=10.0),
-    ]
-    baseline = {"capacity_bytes": 10_000.0, "p95_latency_ms": 150.0}
-    # Capacity dropped 20% (regression); latency only +5 ms, within the 10 ms band (ok).
-    current = {"capacity_bytes": 8_000.0, "p95_latency_ms": 155.0}
-    comparison = compare_to_budget(key, specs, baseline, current)
-    flagged = {c.name: c.regressed for c in comparison.comparisons}
-    assert flagged == {"capacity_bytes": True, "p95_latency_ms": False}
-    assert comparison.regressed
+def _provenance(**overrides: object) -> BandProvenance:
+    base: dict[str, object] = {
+        "fingerprint": CI_RUNNER,
+        "window_s": 60.0,
+        "repeats": 5,
+        "sigma": 100.0,
+        "floor": 50.0,
+        "k": 3.0,
+        "source_sha": "abc123",
+        "ratcheted_at": "2026-07-08T12:00:00",
+        "note": "initial calibration",
+    }
+    base.update(overrides)
+    return BandProvenance(**base)  # type: ignore[arg-type]
 
 
-def test_budget_compare_tolerates_within_band_and_improvements() -> None:
-    key = BudgetKey(sha="abc123", profile="lan", genre="capacity")
-    specs = [
-        MetricSpec("capacity_bytes", Direction.HIGHER_IS_BETTER, rel_tolerance=0.05),
-        MetricSpec("p95_latency_ms", Direction.LOWER_IS_BETTER, abs_tolerance=10.0),
-    ]
-    baseline = {"capacity_bytes": 10_000.0, "p95_latency_ms": 150.0}
-    current = {"capacity_bytes": 12_000.0, "p95_latency_ms": 90.0}  # both better
-    comparison = compare_to_budget(key, specs, baseline, current)
-    assert not comparison.regressed
+def _band(
+    lo: float = 4_700.0,
+    hi: float = 5_300.0,
+    better: Better = Better.HIGHER,
+    metric: str = "capacity_size",
+    **prov_overrides: object,
+) -> Band:
+    return Band(
+        row="capacity-size",
+        profile="rate-limited-capacity-ci",
+        metric=metric,
+        lo=lo,
+        hi=hi,
+        better=better,
+        provenance=_provenance(**prov_overrides),
+    )
 
 
-def test_budget_store_roundtrip_and_baseline_lookup(tmp_path: Path) -> None:
+def test_band_verdicts_are_two_sided_for_both_better_directions() -> None:
+    higher = _band()  # capacity: higher is better, band [4700, 5300]
+    assert band_verdict(higher, 5_000.0) is Verdict.WITHIN
+    assert band_verdict(higher, 4_700.0) is Verdict.WITHIN  # closed interval
+    assert band_verdict(higher, 5_300.0) is Verdict.WITHIN
+    assert band_verdict(higher, 4_600.0) is Verdict.REGRESSED
+    assert band_verdict(higher, 5_400.0) is Verdict.IMPROVED
+
+    lower = _band(lo=1.0, hi=2.0, better=Better.LOWER, metric="t_recover_s")
+    assert band_verdict(lower, 1.5) is Verdict.WITHIN
+    assert band_verdict(lower, 2.5) is Verdict.REGRESSED  # slower recovery = worse
+    assert band_verdict(lower, 0.5) is Verdict.IMPROVED
+
+
+def test_compare_refuses_cross_runner_fingerprints_with_recalibration_instruction() -> None:
+    band = _band()
+    with pytest.raises(FingerprintMismatch, match="--recalibrate"):
+        compare_to_band(band, 5_000.0, fingerprint="host-laptop-linux-x86_64")
+    comparison = compare_to_band(band, 5_000.0, fingerprint=CI_RUNNER)
+    assert comparison.verdict is Verdict.WITHIN
+
+
+def test_band_store_roundtrip_preserves_provenance_and_rejects_v1(tmp_path: Path) -> None:
     path = tmp_path / "budgets.jsonl"
-    entries = [
-        BudgetEntry(BudgetKey("sha1", "lan", "capacity"), {"capacity_bytes": 9_000.0}),
-        BudgetEntry(BudgetKey("sha2", "lan", "capacity"), {"capacity_bytes": 10_000.0}),
-        BudgetEntry(BudgetKey("sha2", "cellular", "recovery"), {"t_recover_s": 1.2}),
+    bands = [
+        _band(),
+        _band(lo=1.0, hi=2.0, better=Better.LOWER, metric="t_recover_s", note="recovery calibration"),
     ]
-    save_budget(path, entries)
-    loaded = load_budget(path)
-    assert loaded == entries
-    baseline = find_baseline(loaded, profile="lan", genre="capacity")
-    assert baseline is not None and baseline.metrics["capacity_bytes"] == 10_000.0  # most recent
-    assert find_baseline(loaded, profile="wifi", genre="capacity") is None
+    save_bands(path, bands)
+    loaded = load_bands(path)
+    assert loaded == sorted(bands, key=lambda band: band.key)
+    assert find_band(loaded, row="capacity-size", profile="rate-limited-capacity-ci", metric="t_recover_s")
+
+    # A leftover v1 budget entry is refused outright — no migration shim.
+    path.write_text('{"genre": "capacity", "metrics": {"capacity_size": 1.0}, "profile": "p", "sha": "x"}\n')
+    with pytest.raises(BandError, match="--recalibrate"):
+        load_bands(path)
+
+
+def test_band_store_refuses_duplicate_keys(tmp_path: Path) -> None:
+    path = tmp_path / "budgets.jsonl"
+    with pytest.raises(BandError, match="duplicate"):
+        save_bands(path, [_band(), _band(lo=1.0, hi=2.0)])
+
+
+def test_ratchet_recenters_within_calibrated_width_and_preserves_provenance() -> None:
+    existing = _band()  # center 5000, half-width 300
+    moved = ratchet_band(
+        existing,
+        [5_600.0, 5_700.0, 5_500.0],
+        row=existing.row,
+        profile=existing.profile,
+        metric=existing.metric,
+        better=existing.better,
+        fingerprint=CI_RUNNER,
+        window_s=60.0,
+        source_sha="def456",
+        ratcheted_at="2026-07-09T09:00:00",
+        note="gop default changed",
+    )
+    assert moved.center == 5_600.0  # median of the runs
+    assert moved.half_width == existing.half_width  # width comes from calibration, not this run
+    # Calibration provenance is preserved; move provenance is updated.
+    assert moved.provenance.sigma == existing.provenance.sigma
+    assert moved.provenance.floor == existing.provenance.floor
+    assert moved.provenance.k == existing.provenance.k
+    assert moved.provenance.repeats == existing.provenance.repeats
+    assert moved.provenance.window_s == existing.provenance.window_s
+    assert moved.provenance.fingerprint == CI_RUNNER
+    assert moved.provenance.source_sha == "def456"
+    assert moved.provenance.note == "gop default changed"
+
+
+def test_ratchet_refuses_moving_toward_worse_without_recalibrate() -> None:
+    higher = _band()  # [4700, 5300], higher is better
+    with pytest.raises(WideningRefused, match="--recalibrate"):
+        ratchet_band(
+            higher,
+            [4_800.0],
+            row=higher.row,
+            profile=higher.profile,
+            metric=higher.metric,
+            better=higher.better,
+            fingerprint=CI_RUNNER,
+            window_s=60.0,
+            source_sha="bad",
+            ratcheted_at="now",
+        )
+    lower = _band(lo=1.0, hi=2.0, better=Better.LOWER, metric="t_recover_s")
+    with pytest.raises(WideningRefused, match="--recalibrate"):
+        ratchet_band(
+            lower,
+            [2.4],
+            row=lower.row,
+            profile=lower.profile,
+            metric=lower.metric,
+            better=lower.better,
+            fingerprint=CI_RUNNER,
+            window_s=60.0,
+            source_sha="bad",
+            ratcheted_at="now",
+        )
+
+
+def test_ratchet_requires_an_existing_band_unless_recalibrating() -> None:
+    with pytest.raises(BandError, match="--recalibrate"):
+        ratchet_band(
+            None,
+            [5_000.0],
+            row="capacity-size",
+            profile="p",
+            metric="capacity_size",
+            better=Better.HIGHER,
+            fingerprint=CI_RUNNER,
+            window_s=60.0,
+            source_sha="abc",
+            ratcheted_at="now",
+        )
+
+
+def test_ratchet_refuses_runs_from_another_runner_class() -> None:
+    existing = _band()
+    with pytest.raises(FingerprintMismatch, match="--recalibrate"):
+        ratchet_band(
+            existing,
+            [5_600.0],
+            row=existing.row,
+            profile=existing.profile,
+            metric=existing.metric,
+            better=existing.better,
+            fingerprint="host-bench-pair-linux-x86_64",
+            window_s=60.0,
+            source_sha="abc",
+            ratcheted_at="now",
+        )
+
+
+def test_recalibrate_mints_width_from_repeats_with_floor_guard() -> None:
+    fresh = ratchet_band(
+        None,
+        [5_000.0, 5_060.0, 4_940.0],  # median 5000, sample stdev 60
+        row="capacity-size",
+        profile="p",
+        metric="capacity_size",
+        better=Better.HIGHER,
+        fingerprint=CI_RUNNER,
+        window_s=60.0,
+        source_sha="abc",
+        ratcheted_at="now",
+        note="calibration",
+        recalibrate=True,
+        k=3.0,
+        floor=0.0,
+        floor_frac=0.0,
+    )
+    assert fresh.center == 5_000.0
+    assert fresh.half_width == pytest.approx(180.0)  # 3σ
+    assert fresh.provenance.sigma == pytest.approx(60.0)
+    assert fresh.provenance.repeats == 3
+
+    # One lucky run (σ = 0): the floor keeps the band from becoming a hair-trigger.
+    floored = ratchet_band(
+        None,
+        [5_000.0],
+        row="capacity-size",
+        profile="p",
+        metric="capacity_size",
+        better=Better.HIGHER,
+        fingerprint=CI_RUNNER,
+        window_s=60.0,
+        source_sha="abc",
+        ratcheted_at="now",
+        recalibrate=True,
+        floor_frac=0.02,
+    )
+    assert floored.half_width == pytest.approx(100.0)
+    assert floored.provenance.floor == pytest.approx(100.0)
+
+    # A recalibration is the deliberate path: it may move a band toward worse.
+    existing = _band()
+    worse = ratchet_band(
+        existing,
+        [4_000.0, 4_020.0],
+        row=existing.row,
+        profile=existing.profile,
+        metric=existing.metric,
+        better=existing.better,
+        fingerprint=CI_RUNNER,
+        window_s=60.0,
+        source_sha="abc",
+        ratcheted_at="now",
+        note="accepted trade-off",
+        recalibrate=True,
+    )
+    assert worse.center == 4_010.0
+
+    with pytest.raises(BandError, match="--floor"):
+        ratchet_band(
+            None,
+            [0.0],
+            row="r",
+            profile="p",
+            metric="capacity_size",
+            better=Better.HIGHER,
+            fingerprint=CI_RUNNER,
+            window_s=60.0,
+            source_sha="abc",
+            ratcheted_at="now",
+            recalibrate=True,
+            floor=0.0,
+            floor_frac=0.02,
+        )
+
+
+def test_metrics_and_row_derive_from_capacity_and_recovery_results() -> None:
+    capacity_doc = {
+        "genre": "capacity",
+        "configuration": {"knob": "size", "profile": "p", "duration_s": 30.0},
+        "result": {"capacity": 5_000},
+    }
+    assert metrics_from_result(capacity_doc) == {"capacity_size": 5_000.0}
+    assert result_row_id(capacity_doc) == "capacity-size"
+
+    recovery_doc = {
+        "genre": "recovery",
+        "result": {
+            "t_recover": 1.5,
+            "t_steady": 3.0,
+            "recovery_burst": 12,
+            "lost_during_outage": {"/a": 3, "/b": 2},
+        },
+    }
+    assert metrics_from_result(recovery_doc) == {
+        "t_recover_s": 1.5,
+        "t_steady_s": 3.0,
+        "recovery_burst": 12.0,
+        "lost_during_outage_total": 5.0,
+    }
+    assert result_row_id(recovery_doc) == "recovery"
+
+    with pytest.raises(BandError, match="no value to band"):
+        metrics_from_result({"genre": "capacity", "configuration": {"knob": "size"}, "result": {"capacity": None}})
+    with pytest.raises(BandError, match="registry"):
+        metrics_from_result({"genre": "ramp"})
+
+
+def test_runner_fingerprint_distinguishes_runner_classes() -> None:
+    assert runner_fingerprint({"ROSOTACOM_RUNNER_CLASS": "bench-pair"}) == "bench-pair"
+    hosted = runner_fingerprint({"RUNNER_ENVIRONMENT": "github-hosted"})
+    assert hosted.startswith("github-hosted-")
+    local = runner_fingerprint({})
+    assert local.startswith("host-")
+    assert hosted != local
+
+
+def test_default_better_directions_cover_banded_metrics() -> None:
+    assert default_better("capacity_size") is Better.HIGHER
+    assert default_better("capacity_rate") is Better.HIGHER
+    assert default_better("t_recover_s") is Better.LOWER
+    assert default_better("lost_during_outage_total") is Better.LOWER
+    with pytest.raises(BandError, match="--better"):
+        default_better("mystery_metric")
+
+
+def test_band_json_lines_are_stable_and_reviewable(tmp_path: Path) -> None:
+    """A ratchet shows up as a minimal diff: stable ordering, stable key order."""
+    path = tmp_path / "budgets.jsonl"
+    bands = [
+        _band(lo=1.0, hi=2.0, better=Better.LOWER, metric="t_recover_s"),
+        _band(),
+    ]
+    save_bands(path, bands)
+    first = path.read_text(encoding="utf-8")
+    save_bands(path, list(reversed(load_bands(path))))
+    assert path.read_text(encoding="utf-8") == first
+    moved = dataclasses.replace(bands[1], lo=bands[1].lo + 100.0, hi=bands[1].hi + 100.0)
+    save_bands(path, [bands[0], moved])
+    second = path.read_text(encoding="utf-8")
+    changed = [(a, b) for a, b in zip(first.splitlines(), second.splitlines(), strict=True) if a != b]
+    assert len(changed) == 1  # exactly the ratcheted band's line moved
 
 
 # --- recovery driver + metric set ------------------------------------------ #

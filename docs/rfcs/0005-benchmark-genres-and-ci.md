@@ -168,8 +168,10 @@ slice and reuses RFC 0003 + 0004.
   the sweep's focus is the emulated degraded profiles, not a pristine link's
   ceiling (`benchmark.SweepBounds`, `size_ceiling`, `guard_shared_link`).
 - [x] Add the budget store (per `(SHA, profile, genre)`) and the regression compare
-  against a recorded baseline ± tolerance (`benchmark.BudgetEntry`/`save_budget`/
-  `load_budget`/`find_baseline`, `compare_to_budget`).
+  against a recorded baseline ± tolerance. *(Superseded by RFC 0007: the v1 store
+  was rewritten without migration into two-sided bands per
+  `(row, profile, metric)` — `benchmark.Band`/`save_bands`/`load_bands`,
+  `compare_to_band`, `ratchet_band`.)*
 - [x] Make live benchmark sessions RMW-selectable per invocation and default the
   packaged benchmark sessions to Cyclone DDS, while keeping `--rmw fastdds` and
   other supported session RMW values available for explicit comparisons
@@ -181,8 +183,11 @@ slice and reuses RFC 0003 + 0004.
   `result.json.context.diagnostics.cyclonedds_spdp`).
 - [x] Persist a self-contained per-run `result.json` with selected RMW, local/OTA
   mode, configured load, offered bandwidth, profile shaping context, thresholds,
-  verdict, and per-topic loss/latency/jitter metrics; keep `budgets.jsonl` as the
-  budget/baseline feed (`cli_benchmark._write_benchmark_result`).
+  verdict, and per-topic loss/latency/jitter metrics
+  (`cli_benchmark._write_benchmark_result`). *(RFC 0007 update: runs no longer
+  append to `budgets.jsonl`; the committed bands change only via
+  `benchmark ratchet`, and `result.json` now carries `sha` +
+  `runner.fingerprint` for band provenance.)*
 - [x] Make OTA benchmark runs default to the selected genre's benchmark session
   instead of a hard-coded project target, while allowing `--target` /
   `--target-type` for project-specific sessions or scenarios
@@ -229,7 +234,9 @@ reviewed rather than asserted in a blocking test.
   `test_find_capacity_never_searches_past_the_shared_link_budget`.)*
 - [x] **Budget store + regression compare** (per `(SHA, profile, genre)`, ±
   tolerance) — host unit test on the compare against a recorded baseline fixture.
-  Automatable. *(`test_budget_compare_*`, `test_budget_store_roundtrip_*`.)*
+  Automatable. *(Superseded by RFC 0007's two-sided bands; the coverage moved to
+  `test_band_*`, `test_ratchet_*`, and `test_compare_*` in `test_benchmark.py` /
+  `test_cli_benchmark.py`.)*
 - [x] **Benchmark RMW selection** (Cyclone default, explicit per-run override) —
   host unit test for parser defaults and artifact-backed session override; the
   Docker-backed capacity E2E pins `--rmw cyclone`. Automatable.

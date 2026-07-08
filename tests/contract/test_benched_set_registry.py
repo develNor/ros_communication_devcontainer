@@ -141,7 +141,8 @@ def test_gate_workflows_exist_and_consume_the_registry(rows: list[GateRow]) -> N
 
 def test_merge_gate_lane_actually_selects_the_benchmark_e2e() -> None:
     """Regression contract for the silent deselection this work found: the
-    runtime-tools recipe must run tests/e2e/test_benchmark_capacity.py in a
+    runtime-tools recipe must run both benchmark E2E files
+    (tests/e2e/test_benchmark_capacity.py and tests/e2e/test_benchmark_ab.py) in a
     pytest invocation that carries no `-k` filter (a `-k` from another file's
     selection would deselect every benchmark test without failing)."""
     recipe = re.search(
@@ -150,7 +151,8 @@ def test_merge_gate_lane_actually_selects_the_benchmark_e2e() -> None:
         re.MULTILINE,
     )
     assert recipe, "justfile recipe test-e2e-runtime-tools is missing"
-    benchmark_lines = [line for line in recipe.group(1).splitlines() if "test_benchmark_capacity.py" in line]
-    assert benchmark_lines, "test-e2e-runtime-tools no longer runs tests/e2e/test_benchmark_capacity.py"
-    poisoned = [line for line in benchmark_lines if re.search(r"\s-k\s", line)]
-    assert not poisoned, f"a -k filter would silently deselect the benchmark E2E: {poisoned}"
+    for e2e_file in ("test_benchmark_capacity.py", "test_benchmark_ab.py"):
+        benchmark_lines = [line for line in recipe.group(1).splitlines() if e2e_file in line]
+        assert benchmark_lines, f"test-e2e-runtime-tools no longer runs tests/e2e/{e2e_file}"
+        poisoned = [line for line in benchmark_lines if re.search(r"\s-k\s", line)]
+        assert not poisoned, f"a -k filter would silently deselect the benchmark E2E {e2e_file}: {poisoned}"

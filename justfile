@@ -55,7 +55,7 @@ test-e2e-remote-assist:
 # every test in the other files (contract-tested in test_benched_set_registry).
 test-e2e-runtime-tools:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "link_latency"
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py tests/e2e/test_benchmark_ab.py
 
 test-e2e-concurrency:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_parallel_smoke.py

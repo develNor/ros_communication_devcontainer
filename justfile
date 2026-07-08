@@ -65,7 +65,7 @@ test-e2e-rmw session:
 
 
 docs:
-	{{python}} -m pytest -q tests/contract/test_markdown_links.py tests/contract/test_readme_examples.py tests/contract/test_pytest_policy.py
+	{{python}} -m pytest -q tests/contract/test_markdown_links.py tests/contract/test_readme_examples.py tests/contract/test_pytest_policy.py tests/contract/test_findings.py
 
 package: _package-build _package-smoke
 

@@ -217,7 +217,7 @@ slices these into issues.
 - [ ] **Boundary must-fail rows**: oracle inversion (assert the failure
   signature) + happy-red messaging; seed with the documented 18 KB @ 20 Hz
   pairs.
-- [ ] **Findings ledger here** with the `Verification:` field and a schema
+- [x] **Findings ledger here** with the `Verification:` field and a schema
   check; migrate the emulated-reproducible findings from the operator harness;
   seed the SPDP-30 s quirk finding.
 
@@ -238,7 +238,7 @@ slices these into issues.
   benchmark-capacity E2E), runtime bounded by the workflow timeout.
 - [ ] **Nightly matrix** — one deliberately injected regression (canary
   branch) turns the lane red end-to-end; documented one-off exercise.
-- [ ] **Findings checker** — contract test: a finding without `Verification:`
+- [x] **Findings checker** — contract test: a finding without `Verification:`
   fails the ledger check.
 - [ ] **Manual (explicit):** the first calibration is reviewed by the operator
   — band widths sane against the known noise findings (short-run

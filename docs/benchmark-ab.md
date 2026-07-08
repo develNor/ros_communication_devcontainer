@@ -15,7 +15,7 @@ verdict on the ephemeral `[baseline ± tolerance]` envelope.
 
 | Held constant across every run | Varied between configs |
 |---|---|
-| the load — the synthetic `sized_publisher` stream on `a_to_b` (`--size`/`--size-pattern`, `--rate-hz`, `--streams`) | the **session config**: the OTA pipeline knobs (`throttle_hz`, `drop`, QoS reliability/depth/lifespan, compression, ffmpeg settings, …) |
+| the load — the synthetic `sized_publisher` stream on `a_to_b` (`--size`/`--size-pattern`, `--rate-hz`, `--streams`) | the **session config**: the OTA pipeline knobs (QoS reliability/depth/lifespan, compression, ffmpeg gop/bitrate/crf, …) |
 | the network profile and its seed policy (`--profile`) | |
 | the RMW and any run-wide QoS override (`--rmw`, `--qos-*`) | |
 
@@ -26,6 +26,15 @@ differ *only* in the pipeline knob under test. The run records the YAML diff of
 each candidate against the baseline (`configs/<label>.diff`) so what actually
 changed is explicit and reviewable — and so the "same load" assumption is
 auditable rather than assumed.
+
+**Compare knobs that keep the topic name.** The verdict matches topics by name,
+so the clean A/B knobs are the ones that leave the delivered topic identical
+across configs: QoS (reliability/depth/lifespan), compression, ffmpeg settings.
+`throttle_hz` and `drop` are implemented as a `topic_tools` republish to a
+rate-suffixed topic (`/topic/max20hz`), so two throttle values produce two
+*different* topic names — not a like-for-like comparison. To compare rate caps,
+give both configs the same fixed suffix and vary elsewhere, or measure the rate
+knob with `benchmark sensitivity`/`capacity` instead.
 
 ## Running it
 
@@ -125,31 +134,37 @@ Under the run directory:
 
 ## Owner smoke
 
-Two configs that differ only in `throttle_hz`, on the packaged example project,
-under a tight uplink where the heavier-throttle candidate offers ~5× the load
-into the same pipe and must therefore regress:
+Two configs that differ only in OTA QoS **reliability**, on the packaged example
+project, under an emulated 20% packet loss (QoS keeps the delivered topic name
+identical across configs, which throttle/drop do not — they republish to a
+Hz/N-renamed topic — so QoS is the clean knob for a like-for-like A/B):
 
 ```bash
 rosotacom examples create /tmp/ab-demo && cd /tmp/ab-demo
-printf 'profiles:\n  ab-ci:\n    uplink: { rate: 1mbit }\n    downlink: { rate: 10mbit }\n' > profiles.yaml
-for hz in 4 20; do d="cfg_$hz"; mkdir -p "$d"; cat > "$d/session-definition.yaml" <<YAML
+printf 'profiles:\n  ab-loss:\n    uplink: { rate: 8mbit, loss: 20%% }\n    downlink: { rate: 8mbit }\n' > profiles.yaml
+for rel in best_effort reliable; do d="cfg_$rel"; mkdir -p "$d"; cat > "$d/session-definition.yaml" <<YAML
 peers: { a: {}, b: {} }
 peer_settings: { a: { domain_id: 50 }, b: { domain_id: 51 } }
-shared: { use_status_overview: true, ota_domain_id: 52, rmw: cyclone }
+shared:
+  use_status_overview: true
+  ota_domain_id: 52
+  rmw: cyclone
+  qos: { for_role: { ota_pub: { depth: 1, reliability: $rel }, ota_sub: { depth: 1, reliability: $rel } } }
 topics:
   a_to_b:
     - topic: "/bench_capacity"
       type: "com_msgs/msg/SizedPayload"
-      processing: { use_ota_wrapper: true, throttle_hz: $hz }
+      processing: { use_ota_wrapper: true }
 YAML
 done
-rosotacom benchmark ab --profile ab-ci --baseline cfg_4 --candidate unthrottled=cfg_20 \
+rosotacom benchmark ab --profile ab-loss --baseline cfg_best_effort --candidate reliable=cfg_reliable \
   --size 18000 --rate-hz 20 --duration 15 --repeats 1
 ```
 
-Expected: overall verdict **FAIL** — `unthrottled` regresses on `loss_pct` /
-`completeness_pct` (it congests the 1 Mbit/s uplink while the throttled baseline
-stays clean); the printed `ab.md` table shows the two REGRESSED cells.
+Expected: both configs are measured on `/bench_capacity`, and the printed `ab.md`
+table classifies the `reliable` candidate's `completeness_pct` as **IMPROVED** (it
+recovers the dropped samples best_effort loses) or **WITHIN** — never REGRESSED.
+The verdict JSON is written to `result.json`.
 
 See also: [RFC 0005](rfcs/0005-benchmark-genres-and-ci.md) (benchmark genres),
 [RFC 0007](rfcs/0007-regression-gate.md) (the two-sided band / verdict language),

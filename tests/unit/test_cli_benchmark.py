@@ -1689,6 +1689,38 @@ def test_gate_summary_aggregates_rows_and_reds_on_missing_or_regressed(tmp_path:
     assert doc["red_rows"] == [rows[0].id], "IMPROVED blocks: bank the ratchet, don't revert"
 
 
+def test_row_accepts_a_relative_artifacts_dir(
+    monkeypatch: pytest.MonkeyPatch, examples_project: Path, tmp_path: Path
+) -> None:
+    """The CI lanes pass cwd-relative --artifacts-dir; the run dir must resolve
+    absolute before it becomes a session-configs source, or session resolution
+    later re-anchors it under the project config's directory (the first
+    calibration run failed exactly this way)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        benchmark_cli, "_make_live_run_point", lambda args, session_name: _make_stub_probe(loss_pct=48.0)
+    )
+    rc = cli.main(
+        [
+            "benchmark",
+            "row",
+            "probe-loss-tight-cyclone",
+            "--rosotacom-config",
+            str(examples_project / "rosotacom.yaml"),
+            "--artifacts-dir",
+            "rel-artifacts",
+            "--no-compare",
+            "--verdict-file",
+            "rel-verdicts/row.json",
+        ]
+    )
+    assert rc == 0
+    verdict = json.loads((tmp_path / "rel-verdicts" / "row.json").read_text(encoding="utf-8"))
+    assert verdict["verdict"] == "RAN"
+    assert Path(verdict["result"]).is_absolute()
+    assert Path(verdict["result"]).is_file()
+
+
 def test_probe_point_dirnames_are_artifact_safe() -> None:
     """Pattern loads carry `a*1,b*1` and bracketed size lists; the copied probe
     directory name must stay shell- and upload-artifact-safe (no `*?"<>|[] `)."""

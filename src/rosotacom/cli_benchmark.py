@@ -4467,7 +4467,10 @@ def _setup_benchmark_run_dir(args: argparse.Namespace, genre: str, profile: str 
 
     now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     profile_part = f"_{profile}" if profile else ""
-    run_dir = artifacts_dir / f"{genre}{profile_part}_{now_str}"
+    # Absolute: the run dir becomes a session-configs source, and relative
+    # entries there would later be re-resolved against the project config's
+    # directory instead of the invocation cwd.
+    run_dir = (Path.cwd() / artifacts_dir / f"{genre}{profile_part}_{now_str}").resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Write command.txt

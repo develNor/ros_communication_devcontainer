@@ -1724,6 +1724,48 @@ def test_row_accepts_a_relative_artifacts_dir(
     assert Path(verdict["result"]).is_file()
 
 
+def test_ota_row_with_explicit_target_skips_benchmark_session_copy(
+    monkeypatch: pytest.MonkeyPatch, examples_project: Path, tmp_path: Path
+) -> None:
+    def fail_prepare(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("explicit OTA target rows must not prepare the benchmark session")
+
+    monkeypatch.setattr(benchmark_cli, "_prepare_benchmark_session_config", fail_prepare)
+    monkeypatch.setattr(
+        benchmark_cli, "_make_live_run_point", lambda args, session_name: _make_stub_probe(loss_pct=0.0)
+    )
+
+    verdict_path = tmp_path / "verdict.json"
+    rc = cli.main(
+        [
+            "ota-benchmark",
+            "row",
+            "probe-loss-tight-cyclone",
+            "--rosotacom-config",
+            str(examples_project / "rosotacom.yaml"),
+            "--target",
+            "remote_assist",
+            "--target-type",
+            "scenario",
+            "--artifacts-dir",
+            str(tmp_path / "runs"),
+            "--no-compare",
+            "--verdict-file",
+            str(verdict_path),
+        ]
+    )
+
+    assert rc == 0
+    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+    assert verdict["verdict"] == "RAN"
+    result = json.loads(Path(verdict["result"]).read_text(encoding="utf-8"))
+    assert result["context"]["session"]["prepared"] is False
+    assert result["context"]["session"]["target_override"] == {
+        "target": "remote_assist",
+        "target_type": "scenario",
+    }
+
+
 def test_probe_point_dirnames_are_artifact_safe() -> None:
     """Pattern loads carry `a*1,b*1` and bracketed size lists; the copied probe
     directory name must stay shell- and upload-artifact-safe (no `*?"<>|[] `)."""
@@ -2191,6 +2233,32 @@ def test_benchmark_subcommand_arg_parsing() -> None:
     assert args.target_type is None
     assert args.peer == ["a=seat_tks", "b=majestic_tks"]
     assert args.sudo_mode == "askpass"
+    assert _is_ota_benchmark(args) is True
+
+    args = parser.parse_args(
+        [
+            "ota-benchmark",
+            "row",
+            "private-s3-full-tight-cyclone",
+            "--registry",
+            "fzi_projects/remote_assist/benchmark-rows.yaml",
+            "--budgets",
+            "fzi_projects/remote_assist/budgets.jsonl",
+            "--monitor",
+            "--peer",
+            "a=seat_tks",
+            "--peer",
+            "b=majestic_tks",
+        ]
+    )
+    assert args.command == "ota-benchmark"
+    assert args.benchmark_command == "row"
+    assert args.row_id == "private-s3-full-tight-cyclone"
+    assert args.ota_benchmark is True
+    assert args.registry == "fzi_projects/remote_assist/benchmark-rows.yaml"
+    assert args.budgets == "fzi_projects/remote_assist/budgets.jsonl"
+    assert args.monitor is True
+    assert args.peer == ["a=seat_tks", "b=majestic_tks"]
     assert _is_ota_benchmark(args) is True
 
 

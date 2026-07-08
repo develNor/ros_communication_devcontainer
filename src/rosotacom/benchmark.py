@@ -646,9 +646,11 @@ _DEFAULT_BETTER: dict[str, Better] = {
     "t_steady_s": Better.LOWER,
     "recovery_burst": Better.LOWER,
     "lost_during_outage_total": Better.LOWER,
+    "completeness_pct": Better.HIGHER,
     "loss_pct": Better.LOWER,
     "latency_p50_ms": Better.LOWER,
     "latency_p95_ms": Better.LOWER,
+    "payload_bandwidth_bps": Better.HIGHER,
 }
 
 
@@ -674,6 +676,7 @@ def _probe_metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
     lost = 0
     p50s: list[float] = []
     p95s: list[float] = []
+    bandwidth_by_bin: dict[tuple[int, float, float], float] = {}
     for attempt in attempts:
         for topic_row in attempt.get("topics") or []:
             if topic_row.get("expected") is None:
@@ -685,13 +688,29 @@ def _probe_metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
                 p50s.append(float(latency["p50"]))
             if latency.get("p95") is not None:
                 p95s.append(float(latency["p95"]))
+    for bin_row in (doc.get("measurements") or {}).get("time_bins") or []:
+        bandwidth = bin_row.get("payload_bandwidth_bps")
+        if bandwidth is None:
+            continue
+        key = (
+            int(bin_row.get("attempt") or 0),
+            float(bin_row.get("bin_start_s") or 0.0),
+            float(bin_row.get("bin_end_s") or 0.0),
+        )
+        bandwidth_by_bin[key] = bandwidth_by_bin.get(key, 0.0) + float(bandwidth)
     if expected <= 0:
         raise BandError("probe run carries no per-topic expected/lost counts — there is nothing to band")
-    metrics = {"loss_pct": 100.0 * lost / expected}
+    delivered = expected - lost
+    metrics = {
+        "completeness_pct": 100.0 * delivered / expected,
+        "loss_pct": 100.0 * lost / expected,
+    }
     if p50s:
         metrics["latency_p50_ms"] = _median(p50s)
     if p95s:
         metrics["latency_p95_ms"] = _median(p95s)
+    if bandwidth_by_bin:
+        metrics["payload_bandwidth_bps"] = _median(list(bandwidth_by_bin.values()))
     return metrics
 
 

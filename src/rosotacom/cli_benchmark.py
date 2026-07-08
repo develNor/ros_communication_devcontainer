@@ -806,6 +806,10 @@ def _benchmark_ota_target(args: argparse.Namespace, session_name: str) -> tuple[
     return session_name, "session"
 
 
+def _uses_explicit_ota_target(args: argparse.Namespace) -> bool:
+    return _is_ota_benchmark(args) and bool(getattr(args, "target", None))
+
+
 def _is_ota_benchmark(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "ota_benchmark", False) or getattr(args, "deployment", None))
 
@@ -5732,7 +5736,17 @@ def benchmark_rows(args: argparse.Namespace) -> int:
 def _drive_gate_row(args: argparse.Namespace, row: Any, run_dir: Path) -> None:
     """Run one registry row's genre driver with the row's committed parameters."""
     session_name = BENCHMARK_SESSIONS_BY_GENRE[row.genre]
-    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    if _uses_explicit_ota_target(args):
+        session_context = {
+            "name": session_name,
+            "prepared": False,
+            "target_override": {
+                "target": str(args.target),
+                "target_type": str(getattr(args, "target_type", None) or "auto"),
+            },
+        }
+    else:
+        session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
     result_context = _benchmark_result_context(
         args, genre=row.genre, profile=row.profile, run_dir=run_dir, session=session_context
     )
@@ -7562,7 +7576,7 @@ def _register_benchmark_band_parsers(benchmark_subparsers: Any) -> None:
     ratchet_parser.set_defaults(func=benchmark_ratchet)
 
 
-def _register_benchmark_gate_parsers(benchmark_subparsers: Any) -> None:
+def _register_benchmark_gate_parsers(benchmark_subparsers: Any, *, ota_benchmark: bool) -> None:
     """Register the benched-set commands (RFC 0007 §4): rows/row/calibrate/gate-summary."""
     from .benched_set import LANES
     from .benchmark import DEFAULT_FLOOR_FRAC, DEFAULT_WIDTH_K
@@ -7585,7 +7599,7 @@ def _register_benchmark_gate_parsers(benchmark_subparsers: Any) -> None:
         "row",
         help="Run one benched row end-to-end and gate it against the committed bands.",
     )
-    _add_benchmark_common_args(row_parser, ota_benchmark=False)
+    _add_benchmark_common_args(row_parser, ota_benchmark=ota_benchmark)
     row_parser.add_argument("row_id", help="Registry row id (see 'benchmark rows'); pins rmw/profile/load/duration.")
     row_parser.add_argument("--registry", default=None, help="Registry file (default: the packaged benched set).")
     row_parser.add_argument("--budgets", default="budgets.jsonl", help="Committed band store (JSONL).")
@@ -7653,7 +7667,7 @@ def register_benchmark_parser(subparsers: Any) -> None:
     benchmark_subparsers = benchmark_parser.add_subparsers(dest="benchmark_command", required=True)
     _register_benchmark_driver_parsers(benchmark_subparsers, ota_benchmark=False)
     _register_benchmark_band_parsers(benchmark_subparsers)
-    _register_benchmark_gate_parsers(benchmark_subparsers)
+    _register_benchmark_gate_parsers(benchmark_subparsers, ota_benchmark=False)
     _register_benchmark_plot_parser(benchmark_subparsers)
 
     ota_parser = subparsers.add_parser(
@@ -7662,3 +7676,4 @@ def register_benchmark_parser(subparsers: Any) -> None:
     )
     ota_subparsers = ota_parser.add_subparsers(dest="benchmark_command", required=True)
     _register_benchmark_driver_parsers(ota_subparsers, ota_benchmark=True)
+    _register_benchmark_gate_parsers(ota_subparsers, ota_benchmark=True)

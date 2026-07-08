@@ -715,6 +715,44 @@ def test_metrics_and_row_derive_from_capacity_and_recovery_results() -> None:
         metrics_from_result({"genre": "ramp"})
 
 
+def test_probe_metrics_include_completeness_and_payload_bandwidth() -> None:
+    doc = {
+        "genre": "probe",
+        "measurements": {
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "topics": [
+                        {
+                            "expected": 100,
+                            "lost": 3,
+                            "latency_ms": {"p50": 10.0, "p95": 20.0},
+                        },
+                        {
+                            "expected": 50,
+                            "lost": 0,
+                            "latency_ms": {"p50": 12.0, "p95": 18.0},
+                        },
+                    ],
+                }
+            ],
+            "time_bins": [
+                {"attempt": 1, "bin_start_s": 0.0, "bin_end_s": 1.0, "payload_bandwidth_bps": 1000.0},
+                {"attempt": 1, "bin_start_s": 0.0, "bin_end_s": 1.0, "payload_bandwidth_bps": 500.0},
+                {"attempt": 1, "bin_start_s": 1.0, "bin_end_s": 2.0, "payload_bandwidth_bps": 900.0},
+            ],
+        },
+    }
+
+    assert metrics_from_result(doc) == {
+        "completeness_pct": 98.0,
+        "latency_p50_ms": 11.0,
+        "latency_p95_ms": 19.0,
+        "loss_pct": 2.0,
+        "payload_bandwidth_bps": 1200.0,
+    }
+
+
 def test_runner_fingerprint_distinguishes_runner_classes() -> None:
     assert runner_fingerprint({"ROSOTACOM_RUNNER_CLASS": "bench-pair"}) == "bench-pair"
     hosted = runner_fingerprint({"RUNNER_ENVIRONMENT": "github-hosted"})
@@ -727,7 +765,10 @@ def test_runner_fingerprint_distinguishes_runner_classes() -> None:
 def test_default_better_directions_cover_banded_metrics() -> None:
     assert default_better("capacity_size") is Better.HIGHER
     assert default_better("capacity_rate") is Better.HIGHER
+    assert default_better("completeness_pct") is Better.HIGHER
+    assert default_better("payload_bandwidth_bps") is Better.HIGHER
     assert default_better("t_recover_s") is Better.LOWER
+    assert default_better("loss_pct") is Better.LOWER
     assert default_better("lost_during_outage_total") is Better.LOWER
     with pytest.raises(BandError, match="--better"):
         default_better("mystery_metric")

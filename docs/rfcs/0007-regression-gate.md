@@ -253,8 +253,9 @@ slices these into issues.
   `benchmark rows --format ids`, per-row `result.json` + `verdict.json`
   artifacts, aggregated `benchmark-gate-summary` artifact via
   `benchmark gate-summary`; setup failure, `REGRESSED`, and unbanked
-  `IMPROVED` are all red. Anonymized-replay rows land with the replay issue —
-  the registry is the extension point.)*
+  `IMPROVED` are all red. S2 anonymized costmap/camera replay rows now cover
+  nominal and tight profiles, carrying whole-bag expect fragments and GOP-aware
+  metadata next to their committed bands.)*
 - [ ] **Boundary must-fail rows**: oracle inversion (assert the failure
   signature) + happy-red messaging; seed with the documented 18 KB @ 20 Hz
   pairs.
@@ -309,6 +310,13 @@ slices these into issues.
   the netem `seed`, so a seeded-loss injection instead failed setup and turned
   the lane red via the MISSING-verdict path — itself a demonstration that a row
   which cannot run is red, not silently green.)*
+- [x] **S2 anonymized replay rows** — contract and unit tests pin the public
+  costmap/camera rows in the nightly lane, their whole-bag expect fragments, GOP
+  metadata, calibrated bands, and the probe metrics that turn replay loss into a
+  canary failure.
+  *(`tests/contract/test_benched_set_registry.py::test_public_s2_replay_rows_carry_whole_bag_expect_metadata`,
+  `tests/contract/test_benched_set_registry.py::test_every_gated_metric_has_a_calibrated_band`,
+  `tests/unit/test_benchmark.py::test_probe_metrics_include_completeness_and_payload_bandwidth`.)*
 - [x] **Findings checker** — contract test: a finding without `Verification:`
   fails the ledger check.
 - [x] **Manual (explicit):** the first calibration is reviewed — band widths

@@ -32,7 +32,7 @@ GENRES = ("probe", "capacity")
 # latency percentiles on shared runners are monitor-only unless calibration
 # proves otherwise.
 GENRE_METRICS: dict[str, tuple[str, ...]] = {
-    "probe": ("loss_pct", "latency_p50_ms", "latency_p95_ms"),
+    "probe": ("completeness_pct", "loss_pct", "latency_p50_ms", "latency_p95_ms", "payload_bandwidth_bps"),
     "capacity": ("capacity_size", "capacity_rate", "capacity_bandwidth"),
 }
 
@@ -68,6 +68,7 @@ class GateRow:
     load: dict[str, Any] = field(default_factory=dict)  # probe load parameters
     search: dict[str, Any] = field(default_factory=dict)  # capacity binary-search bounds
     oracle: dict[str, Any] = field(default_factory=dict)  # capacity pass/fail thresholds
+    replay: dict[str, Any] = field(default_factory=dict)  # replay provenance/expect fragment for replay-derived rows
     floors: dict[str, float] = field(default_factory=dict)  # committed minimum half-widths per gated metric
     repeats: int = 1  # in-run repeats (median vote / attempts)
     window_note: str = ""  # why a sub-60 s window is still a valid gate
@@ -106,6 +107,7 @@ _ROW_KEYS = frozenset(
         "load",
         "search",
         "oracle",
+        "replay",
         "floors",
         "repeats",
         "window_note",
@@ -155,8 +157,15 @@ def _parse_row(raw: Any) -> GateRow:
     load = raw.get("load") or {}
     search = raw.get("search") or {}
     oracle = raw.get("oracle") or {}
+    replay = raw.get("replay") or {}
     floors = raw.get("floors") or {}
-    for name, value in (("load", load), ("search", search), ("oracle", oracle), ("floors", floors)):
+    for name, value in (
+        ("load", load),
+        ("search", search),
+        ("oracle", oracle),
+        ("replay", replay),
+        ("floors", floors),
+    ):
         if not isinstance(value, dict):
             raise RegistryError(f"row {row_id!r}: {name!r} must be a mapping")
     for metric, floor in floors.items():
@@ -189,6 +198,7 @@ def _parse_row(raw: Any) -> GateRow:
         load=dict(load),
         search=dict(search),
         oracle=dict(oracle),
+        replay=dict(replay),
         floors={str(metric): float(floor) for metric, floor in floors.items()},
         repeats=repeats_raw,
         window_note=window_note,
@@ -213,9 +223,12 @@ def _validate_genre_parameters(row: GateRow) -> None:
             raise RegistryError(
                 f"row {row.id!r}: interval jitter without 'interval_jitter_seed' — gated rows commit their seeds"
             )
+        _validate_replay_metadata(row)
         return
 
     # capacity
+    if row.replay:
+        raise RegistryError(f"row {row.id!r}: replay metadata belongs to probe rows")
     if row.load:
         raise RegistryError(f"row {row.id!r}: capacity rows configure 'search'/'oracle', not 'load'")
     knob = str(row.search.get("knob") or "")
@@ -234,6 +247,36 @@ def _validate_genre_parameters(row: GateRow) -> None:
         raise RegistryError(
             f"row {row.id!r}: a capacity row bands exactly [{expected_metric!r}] (the breakpoint of its knob)"
         )
+
+
+def _validate_replay_metadata(row: GateRow) -> None:
+    if not row.replay:
+        return
+    required = {
+        "source",
+        "public_example",
+        "bag_topic",
+        "native_count",
+        "native_duration_s",
+        "native_hz",
+        "size_basis",
+        "expect",
+    }
+    missing = sorted(required - set(row.replay))
+    if missing:
+        raise RegistryError(f"row {row.id!r}: replay metadata missing {missing}")
+    expect = row.replay.get("expect")
+    if not isinstance(expect, dict):
+        raise RegistryError(f"row {row.id!r}: replay.expect must be a mapping")
+    for key in ("min_count", "completeness_min_ratio", "vs_bag_ratio"):
+        if key not in expect:
+            raise RegistryError(f"row {row.id!r}: replay.expect missing {key!r}")
+    if int(expect["min_count"]) < 1:
+        raise RegistryError(f"row {row.id!r}: replay.expect.min_count must be positive")
+    for key in ("completeness_min_ratio", "vs_bag_ratio"):
+        value = float(expect[key])
+        if not 0.0 < value <= 1.0:
+            raise RegistryError(f"row {row.id!r}: replay.expect.{key} must be in (0, 1]")
 
 
 def load_registry(path: Path | None = None) -> list[GateRow]:

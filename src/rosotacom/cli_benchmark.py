@@ -55,6 +55,11 @@ BENCHMARK_SESSIONS_BY_GENRE = {
     "loss-boundaries": "bench_1_1_capacity",
 }
 
+# A/B experiments (#22) install every config under one internal session name and
+# switch which one resolves by swapping ``session_configs_dir`` per run, so the
+# same synthetic load (the a_to_b sized_publisher stream) drives each config.
+AB_SESSION_NAME = "ab_experiment"
+
 
 class TeeStream:
     def __init__(self, original_stream: Any, file_path: Path):
@@ -2639,6 +2644,127 @@ def drive_sensitivity(
     )
     print(f"Sensitivity rows saved to {sensitivity_path}")
     return rows
+
+
+def drive_ab(
+    run_point: RunPointFn,
+    *,
+    configs: Sequence[dict[str, Any]],
+    baseline_label: str,
+    profile: str | None,
+    load: dict[str, Any],
+    duration_s: float,
+    repeats: int,
+    metrics: Sequence[str],
+    tolerances: dict[str, Any],
+    topic: str,
+    out_dir: Path,
+    result_context: dict[str, Any] | None = None,
+    config_diffs: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run baseline + candidates interleaved and classify each candidate.
+
+    ``configs`` are ``{"label", "is_baseline", "source", "configs_root"}`` dicts;
+    ``run_point`` receives a ``config`` kwarg naming the active one so the CLI
+    wrapper can point ``session_configs_dir`` at it (a stub in tests reads it to
+    return config-specific summaries). The load and profile are held identical
+    across every run — only the config changes.
+    """
+    from .benchmark import AbRun, ab_schedule, ab_verdict, render_ab_markdown
+
+    labels = [str(config["label"]) for config in configs]
+    config_by_label = {str(config["label"]): config for config in configs}
+    schedule = ab_schedule(labels, repeats)
+
+    profile = _normalize_benchmark_profile(profile)
+    profile_label = _benchmark_profile_label(profile)
+    load_info = _load_context(load)
+
+    runs: list[AbRun] = []
+    run_rows: list[dict[str, Any]] = []
+    for order, (label, repeat) in enumerate(schedule, start=1):
+        config = config_by_label[label]
+        run_dir = out_dir / "runs" / f"{order:03d}_{_safe_case_token(label)}_r{repeat}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        summary = run_point(profile=profile, load=load, duration_s=duration_s, out_dir=run_dir, config=config)
+        runs.append(AbRun(config=label, repeat=repeat, summary=summary))
+        rows = _topic_rows(summary, topic)
+        run_rows.append(
+            {
+                "order": order,
+                "config": label,
+                "repeat": repeat,
+                "is_baseline": bool(config.get("is_baseline")),
+                "profile": profile_label,
+                "artifact_dir": str(run_dir.relative_to(out_dir)),
+                "topics": rows,
+            }
+        )
+        print(
+            f"  ab[{order}/{len(schedule)}] config={label} repeat={repeat}: "
+            f"offered_bw={_format_bps(load_info.get('offered_bandwidth_bps'))} {_format_topic_rows(rows)}"
+        )
+
+    report = ab_verdict(runs, baseline=baseline_label, metrics=metrics, tolerances=tolerances, topic=topic)
+    report_doc = cast(dict[str, Any], _jsonable(report))
+
+    ab_rows_path = out_dir / "ab.jsonl"
+    ab_rows_path.write_text(
+        "\n".join(json.dumps(row, sort_keys=True) for row in run_rows) + "\n",
+        encoding="utf-8",
+    )
+    markdown = render_ab_markdown(report)
+    ab_md_path = out_dir / "ab.md"
+    ab_md_path.write_text(markdown + "\n", encoding="utf-8")
+
+    _write_benchmark_result(
+        out_dir,
+        genre="ab",
+        context=result_context,
+        configuration={
+            "baseline": baseline_label,
+            "configs": [
+                {
+                    "label": config["label"],
+                    "is_baseline": bool(config.get("is_baseline")),
+                    "source": str(config["source"]),
+                }
+                for config in configs
+            ],
+            "profile": profile_label,
+            "load": load_info,
+            "duration_s": duration_s,
+            "repeats": repeats,
+            "metrics": list(metrics),
+            "tolerances": {metric: {"rel": tol.rel, "abs": tol.abs} for metric, tol in tolerances.items()},
+            "topic": topic or None,
+            "schedule": [{"order": i, "config": lbl, "repeat": rp} for i, (lbl, rp) in enumerate(schedule, start=1)],
+        },
+        result=report_doc,
+        measurements={"runs": run_rows},
+        verdict={
+            "passed": report.passed,
+            "status": "no_regression" if report.passed else "candidate_regressed",
+            "regressed": {
+                candidate.config: candidate.regressed
+                for candidate in report.candidates
+                if candidate.regressed or candidate.dropped_topics
+            },
+            "improved": {candidate.config: candidate.improved for candidate in report.candidates if candidate.improved},
+        },
+        artifacts={
+            "ab_rows": ab_rows_path.name,
+            "ab_markdown": ab_md_path.name,
+            "configs_dir": "configs",
+            "config_diffs": dict(config_diffs or {}),
+            "stdout": "stdout.txt",
+        },
+    )
+    print()
+    print(markdown)
+    print()
+    print(f"A/B verdict: {'PASS' if report.passed else 'FAIL'} — rows saved to {ab_rows_path}")
+    return report_doc
 
 
 def drive_matrix(
@@ -6009,6 +6135,239 @@ def benchmark_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_ab_candidates(raw: Sequence[str]) -> list[tuple[str, str]]:
+    """Parse ``--candidate label=path`` values into ``(label, path)`` pairs."""
+    parsed: list[tuple[str, str]] = []
+    for item in raw:
+        if "=" not in item:
+            raise ValueError(f"--candidate must be label=config, got {item!r}.")
+        label, path = item.split("=", 1)
+        label = label.strip()
+        if not label or not path.strip():
+            raise ValueError(f"--candidate must be label=config, got {item!r}.")
+        parsed.append((label, path.strip()))
+    return parsed
+
+
+def _resolve_ab_config_path(raw: str) -> Path:
+    """A config is a session directory or a session-definition.yaml; return the YAML."""
+    path = Path(raw).expanduser()
+    if path.is_dir():
+        candidate = path / "session-definition.yaml"
+        if not candidate.is_file():
+            raise FileNotFoundError(f"A/B config directory {path} has no session-definition.yaml.")
+        return candidate
+    if path.is_file():
+        return path
+    raise FileNotFoundError(f"A/B config {raw!r} is neither a session directory nor a session YAML.")
+
+
+def _prepare_ab_config(
+    args: argparse.Namespace,
+    *,
+    label: str,
+    source_yaml: Path,
+    is_baseline: bool,
+    run_dir: Path,
+) -> dict[str, Any]:
+    """Materialize one A/B config as an ``AB_SESSION_NAME`` session under ``run_dir``.
+
+    Every config is a whole session-definition.yaml (no patch format). The
+    run-wide knobs (``shared.rmw`` and any ``--qos-*`` overrides) are pinned
+    identically on all configs so the only thing that varies between runs is what
+    the user actually changed in the file.
+    """
+    cfg = yaml.safe_load(source_yaml.read_text(encoding="utf-8")) or {}
+    if not isinstance(cfg, dict):
+        raise RuntimeError(f"A/B config {source_yaml} must be a YAML mapping.")
+    topics = cfg.get("topics")
+    a_to_b = topics.get("a_to_b") if isinstance(topics, dict) else None
+    if not a_to_b:
+        raise ValueError(
+            f"A/B config {source_yaml} defines no topics.a_to_b stream. The synthetic load "
+            "publishes on a_to_b, so every config must carry the same a_to_b load topic(s) and "
+            "differ only in the pipeline knobs under test (throttle_hz, drop, QoS, compression, ...)."
+        )
+    shared = cfg.setdefault("shared", {})
+    if not isinstance(shared, dict):
+        raise RuntimeError(f"A/B config {source_yaml} 'shared' must be a mapping.")
+    rmw = _benchmark_rmw(args)
+    cyclone_spdp_interval = _benchmark_cyclone_spdp_interval(args)
+    if cyclone_spdp_interval is not None:
+        if rmw != "cyclone":
+            raise ValueError("--cyclone-spdp-interval can only be used with --rmw cyclone.")
+        shared["rmw"] = {"local": "cyclone", "ota": {"cyclone": {"spdp_interval": cyclone_spdp_interval}}}
+    else:
+        shared["rmw"] = rmw
+    _apply_benchmark_qos_options(
+        cfg,
+        reliability=getattr(args, "qos_reliability", None),
+        depth=getattr(args, "qos_depth", None),
+    )
+
+    configs_root = run_dir / "configs" / _safe_case_token(label)
+    session_dir = configs_root / AB_SESSION_NAME
+    session_dir.mkdir(parents=True, exist_ok=True)
+    config_path = session_dir / "session-definition.yaml"
+    config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    return {
+        "label": label,
+        "is_baseline": is_baseline,
+        "source": source_yaml,
+        "configs_root": configs_root,
+        "config_path": config_path,
+        "cfg": cfg,
+    }
+
+
+def _write_ab_config_diffs(configs: Sequence[dict[str, Any]], run_dir: Path) -> dict[str, str]:
+    """Unified diff of each candidate config against the baseline (self-describing)."""
+    import difflib
+
+    baseline = next(config for config in configs if config["is_baseline"])
+    baseline_text = yaml.safe_dump(baseline["cfg"], sort_keys=True).splitlines(keepends=True)
+    diffs: dict[str, str] = {}
+    for config in configs:
+        if config["is_baseline"]:
+            continue
+        candidate_text = yaml.safe_dump(config["cfg"], sort_keys=True).splitlines(keepends=True)
+        diff = "".join(
+            difflib.unified_diff(
+                baseline_text,
+                candidate_text,
+                fromfile=f"{baseline['label']}/session-definition.yaml",
+                tofile=f"{config['label']}/session-definition.yaml",
+            )
+        )
+        diff_name = f"{_safe_case_token(str(config['label']))}.diff"
+        (run_dir / "configs" / diff_name).write_text(diff, encoding="utf-8")
+        diffs[str(config["label"])] = f"configs/{diff_name}"
+    return diffs
+
+
+def benchmark_ab(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark ab`` — candidate configs vs a baseline."""
+    from .benchmark import AB_METRICS, DEFAULT_AB_METRICS, AbTolerance, default_ab_tolerance
+    from .cli import _load_runtime_config
+
+    runtime = _load_runtime_config(args)
+    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
+    profile = str(args.profile)
+    repeats = int(getattr(args, "repeats", 3))
+    if repeats < 1:
+        raise ValueError("--repeats must be >= 1.")
+
+    baseline_label = "baseline"
+    candidate_specs = _parse_ab_candidates(getattr(args, "candidate", None) or [])
+    if not candidate_specs:
+        raise ValueError("benchmark ab needs at least one --candidate label=config.")
+    labels = [baseline_label, *(label for label, _ in candidate_specs)]
+    if len(set(labels)) != len(labels):
+        raise ValueError("A/B config labels must be unique and none may be 'baseline'.")
+
+    metrics_arg = getattr(args, "metrics", None)
+    metrics = [m.strip() for m in metrics_arg.split(",") if m.strip()] if metrics_arg else list(DEFAULT_AB_METRICS)
+    unknown = [metric for metric in metrics if metric not in AB_METRICS]
+    if unknown:
+        raise ValueError(f"unknown A/B metric(s) {unknown}; known: {sorted(AB_METRICS)}.")
+    rel = getattr(args, "rel_tolerance", None)
+    abs_override = getattr(args, "abs_tolerance", None)
+    tolerances: dict[str, AbTolerance] = {}
+    for metric in metrics:
+        base = default_ab_tolerance(metric) if rel is None else default_ab_tolerance(metric, rel=rel)
+        tolerances[metric] = base if abs_override is None else AbTolerance(rel=base.rel, abs=float(abs_override))
+
+    run_dir = _setup_benchmark_run_dir(args, "ab", profile)
+    configs: list[dict[str, Any]] = [
+        _prepare_ab_config(
+            args,
+            label=baseline_label,
+            source_yaml=_resolve_ab_config_path(args.baseline),
+            is_baseline=True,
+            run_dir=run_dir,
+        )
+    ]
+    for label, raw in candidate_specs:
+        configs.append(
+            _prepare_ab_config(
+                args,
+                label=label,
+                source_yaml=_resolve_ab_config_path(raw),
+                is_baseline=False,
+                run_dir=run_dir,
+            )
+        )
+    config_diffs = _write_ab_config_diffs(configs, run_dir)
+
+    result_context = _benchmark_result_context(args, genre="ab", profile=profile, run_dir=run_dir, session=None)
+    result_context["ab"] = {
+        "baseline": baseline_label,
+        "configs": [{"label": config["label"], "source": str(config["source"])} for config in configs],
+    }
+
+    load = _probe_load(
+        size=int(getattr(args, "size", 18_000)),
+        size_pattern=getattr(args, "size_pattern", None),
+        rate_hz=float(getattr(args, "rate_hz", 20.0)),
+        streams=int(getattr(args, "streams", 1)),
+        interval_jitter_ms=float(getattr(args, "interval_jitter_ms", 0.0)),
+        interval_jitter_seed=int(getattr(args, "interval_jitter_seed", 42)),
+    )
+
+    raw_run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, AB_SESSION_NAME)
+
+    def run_point_with_config(
+        *,
+        profile: str | None,
+        load: dict[str, Any],
+        duration_s: float,
+        out_dir: Path,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        previous = getattr(args, "session_configs_dir", None)
+        if previous is None:
+            existing: list[Any] = []
+        elif isinstance(previous, list | tuple):
+            existing = list(previous)
+        else:
+            existing = [previous]
+        args.session_configs_dir = [str(config["configs_root"]), *[str(path) for path in existing]]
+        try:
+            return raw_run_point(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
+        finally:
+            args.session_configs_dir = previous
+
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        drive_ab(
+            run_point_with_config,
+            configs=configs,
+            baseline_label=baseline_label,
+            profile=profile,
+            load=load,
+            duration_s=float(getattr(args, "duration", 20.0)),
+            repeats=repeats,
+            metrics=metrics,
+            tolerances=tolerances,
+            topic=getattr(args, "topic", ""),
+            out_dir=run_dir,
+            result_context=result_context,
+            config_diffs=config_diffs,
+        )
+
+    out_file_name = getattr(args, "out", "ab.jsonl")
+    out_path = artifacts_dir / Path(out_file_name).name if artifacts_dir else Path(out_file_name)
+    run_ab_file = run_dir / "ab.jsonl"
+    if run_ab_file.is_file():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(run_ab_file, out_path)
+        print(f"A/B rows copied to {out_path}")
+
+    passed = json.loads((run_dir / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8")).get("verdict", {}).get("passed")
+    if not passed and getattr(args, "fail_on_regression", False):
+        return 1
+    return 0
+
+
 def benchmark_sensitivity(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark sensitivity``."""
     from .cli import _load_runtime_config
@@ -6708,6 +7067,62 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
     )
     sensitivity_parser.add_argument("--out", default="sensitivity.jsonl", help="Output sensitivity JSONL file.")
     sensitivity_parser.set_defaults(func=benchmark_sensitivity)
+
+    # --- ab ---
+    ab_parser = benchmark_subparsers.add_parser(
+        "ab",
+        help="A/B tuning: compare candidate session configs against a baseline on the same load and profile.",
+    )
+    _add_benchmark_common_args(ab_parser, ota_benchmark=ota_benchmark)
+    ab_parser.add_argument("--profile", required=True, help="Network profile, held identical across every config.")
+    ab_parser.add_argument(
+        "--baseline",
+        required=True,
+        help="Baseline session config: a session directory or a session-definition.yaml.",
+    )
+    ab_parser.add_argument(
+        "--candidate",
+        action="append",
+        metavar="LABEL=CONFIG",
+        help="Candidate config as label=path (session dir or session-definition.yaml). Repeatable.",
+    )
+    ab_parser.add_argument("--repeats", type=int, default=3, help="Repeats per config (spread + median vote).")
+    ab_parser.add_argument("--size", type=int, default=18_000, help="Synthetic load payload size (bytes).")
+    ab_parser.add_argument(
+        "--size-pattern",
+        default=None,
+        help="Cyclic payload sizes such as 1x20KB+1x0KB; overrides --size when set.",
+    )
+    ab_parser.add_argument("--rate-hz", type=float, default=20.0, help="Synthetic load publish rate (Hz).")
+    ab_parser.add_argument("--streams", type=int, default=1, help="Parallel stream count.")
+    ab_parser.add_argument("--interval-jitter-ms", type=float, default=0.0, help="Std dev of interval jitter (ms).")
+    ab_parser.add_argument("--interval-jitter-seed", type=int, default=42, help="Seed for interval jitter.")
+    ab_parser.add_argument("--duration", type=float, default=20.0, help="Seconds per run.")
+    ab_parser.add_argument("--topic", default="", help="Restrict the verdict to one topic (default: all).")
+    ab_parser.add_argument(
+        "--metrics",
+        default=None,
+        help="Comma list of watched metrics (default: completeness_pct,loss_pct,latency_p95_ms,jitter_p95_ms).",
+    )
+    ab_parser.add_argument(
+        "--rel-tolerance",
+        type=float,
+        default=None,
+        help="Relative half-width of the unchanged band around the baseline median (default: 0.10).",
+    )
+    ab_parser.add_argument(
+        "--abs-tolerance",
+        type=float,
+        default=None,
+        help="Override the absolute half-width floor (metric units) for every watched metric.",
+    )
+    ab_parser.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        help="Exit non-zero when any candidate regressed (default: verdict in result.json, exit 0).",
+    )
+    ab_parser.add_argument("--out", default="ab.jsonl", help="Output per-run JSONL file.")
+    ab_parser.set_defaults(func=benchmark_ab)
 
     # --- matrix ---
     matrix_parser = benchmark_subparsers.add_parser(

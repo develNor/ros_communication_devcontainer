@@ -701,6 +701,25 @@ rosotacom benchmark loss-boundaries --rate-hz 20 --size 18000 --qos-reliability 
 rosotacom benchmark loss-boundaries --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-latency-ms 250 --latency-base-ms 30 --downlink-mode lan --bandwidth-low 2.8mbit --bandwidth-high 4mbit --bandwidth-step 0.1mbit --jitter-low-ms 0 --jitter-high-ms 40 --jitter-step-ms 1 --min-duration 20 --min-messages 100 --probe-repeats 1 --netem-seeds 101,102,103,104,105,106,107,108,109,110
 ```
 
+Use `benchmark ab` when the question is a **tuning** one: "does candidate config
+B beat baseline config A on the same load and profile?" Each `--baseline` and
+`--candidate label=…` is a whole session config (a directory or a
+`session-definition.yaml`) that shares the synthetic `a_to_b` load and differs
+only in the pipeline knobs under test (`throttle_hz`, `drop`, QoS, compression,
+…). The driver runs them interleaved with a rotating start over `--repeats`,
+then classifies every candidate against the baseline per topic and metric as
+**IMPROVED / WITHIN / REGRESSED** — the same verdict language the regression gate
+uses — with a two-sided tolerance band (`--rel-tolerance`, `--abs-tolerance`).
+The overall verdict fails if any watched metric regressed; the repeat spread
+(min/median/max) travels with every cell so small-N effects are read honestly.
+It writes `result.json`, a markdown table (`ab.md`), the per-config YAML diffs,
+and `ab.jsonl`. See [docs/benchmark-ab.md](docs/benchmark-ab.md) for the config
+model, interleaving, and the statistical-power note:
+
+```bash
+rosotacom benchmark ab --profile cellular-4g-degraded --baseline configs/gop30 --candidate gop15=configs/gop15 --size 18000 --rate-hz 20 --duration 20 --repeats 3
+```
+
 Use `rosotacom ota-benchmark` for the same probes over deployment peers, without
 having to name a target:
 

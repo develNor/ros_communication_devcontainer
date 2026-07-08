@@ -29,23 +29,32 @@ rows:
   # ------------------------------------------------------------------ #
   # merge-gate: one minutes-scale row on every PR (RFC 0007 §4)
   # ------------------------------------------------------------------ #
-  - id: probe-loss-tight-cyclone
+  - id: probe-loss-gop-tight-cyclone
     lane: merge-gate
     reason: >-
-      Per-PR regression row: steady load at ~2x the emulated uplink capacity
-      pins loss to the bottleneck, not host timing — a minutes-scale band
-      assert on the default RMW.
+      Per-PR regression row: camera-shaped burst load (GOP keyframe/delta size
+      pattern, seeded interval jitter) at ~0.8x the rate-limited uplink. The
+      keyframe bursts must be absorbed losslessly when the mean rate fits, so a
+      change that breaks clean delivery on a constrained link (QoS, buffering,
+      fragmentation) turns 0% loss into a regression — a sharp, non-flaky
+      signal (calibration: sigma 0.045pp, floor-limited band). Chosen over the
+      steady overload row for the per-PR lane precisely because its band does
+      not depend on the noisy exact overload-loss fraction.
     rmw: cyclone
     genre: probe
     profile: gate-tight
     duration_s: 60
-    load: { size: 12000, rate_hz: 20.0 }
+    load:
+      size_pattern: 1x12KB+1x2KB+3x3KB
+      rate_hz: 20.0
+      interval_jitter_ms: 20.0
+      interval_jitter_seed: 42
     metrics: [loss_pct]
     floors: { loss_pct: 0.5 }
     monitor: [latency_p50_ms, latency_p95_ms]
 
   # ------------------------------------------------------------------ #
-  # nightly: default RMW deep (nominal + tight × steady + GOP + breakpoint)
+  # nightly: default RMW deep (nominal + tight steady + breakpoint)
   # ------------------------------------------------------------------ #
   - id: probe-loss-nominal-cyclone
     lane: nightly
@@ -61,26 +70,19 @@ rows:
     floors: { loss_pct: 0.5 }
     monitor: [latency_p50_ms, latency_p95_ms]
 
-  - id: probe-loss-gop-tight-cyclone
+  - id: probe-loss-tight-cyclone
     lane: nightly
     reason: >-
-      Camera-shaped burst load (GOP keyframe/delta size pattern with seeded
-      interval jitter) at ~0.8x the tight uplink: keyframe bursts must be
-      absorbed losslessly when the mean rate fits — the realistic-load
-      headroom coverage a steady row cannot give (RFC 0007 motivation #4).
-      Deliberately not overloaded: on the emulated bottleneck, burst loads sit
-      on a knife-edge (sub-capacity absorbs, sustained overload drops a
-      fragment of every large message — a blackout, unbandable); the graded
-      overload regime belongs to the steady rows.
+      Steady load at ~2x the emulated uplink capacity: the graceful-shedding
+      gate on the default RMW. Loss stays pinned by the bottleneck (calibration:
+      median ~72%, sigma 6.1pp -> wide but real band); a change that turns
+      graceful shedding into a blackout or a stall leaves the band. Nightly-only
+      because the exact overload-loss fraction is too noisy for a per-PR gate.
     rmw: cyclone
     genre: probe
     profile: gate-tight
     duration_s: 60
-    load:
-      size_pattern: 1x12KB+1x2KB+3x3KB
-      rate_hz: 20.0
-      interval_jitter_ms: 20.0
-      interval_jitter_seed: 42
+    load: { size: 12000, rate_hz: 20.0 }
     metrics: [loss_pct]
     floors: { loss_pct: 0.5 }
     monitor: [latency_p50_ms, latency_p95_ms]

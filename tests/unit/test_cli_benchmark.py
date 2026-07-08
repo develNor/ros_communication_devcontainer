@@ -1740,7 +1740,7 @@ def test_rows_ids_format_is_a_workflow_matrix(capsys: pytest.CaptureFixture[str]
     assert cli.main(["benchmark", "rows", "--lane", "merge-gate", "--format", "ids"]) == 0
     ids = json.loads(capsys.readouterr().out)
     assert isinstance(ids, list) and ids
-    assert "probe-loss-tight-cyclone" in ids
+    assert "probe-loss-gop-tight-cyclone" in ids
 
 
 # --------------------------------------------------------------------------- #

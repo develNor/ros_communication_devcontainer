@@ -7200,6 +7200,27 @@ def report_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def stream_stats_command(args: argparse.Namespace) -> int:
+    from rosotacom.stream_stats import build_report, load_sources, render_markdown, write_report
+
+    sources = load_sources(
+        bag_specs=tuple(args.bag or ()),
+        events_specs=tuple(args.events or ()),
+        storage_id=args.storage_id,
+    )
+    report = build_report(sources, argv=["rosotacom", "stream-stats", *sys.argv[2:]])
+    written: dict[str, Path] = {}
+    if args.out:
+        written = write_report(report, Path(args.out).expanduser().resolve())
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(render_markdown(report), end="")
+    for kind, path in written.items():
+        print(f"{kind}: {path}", file=sys.stderr)
+    return 0
+
+
 def _add_common_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--rosotacom-config",
@@ -7720,6 +7741,7 @@ def main(argv: list[str] | None = None) -> int:
         "metrics",
         "videoquality",
         "report",
+        "stream-stats",
         "test",
         "expect",
         "calibrate",
@@ -8078,6 +8100,36 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true", help="Print report.json to stdout instead of the markdown summary."
     )
     report_parser.set_defaults(func=report_command)
+
+    stream_stats_parser = subparsers.add_parser(
+        "stream-stats",
+        help="Compare stream sizes, rate, interval regularity, and FFMPEG GOP shape across recorded stages.",
+    )
+    stream_stats_parser.add_argument(
+        "--bag",
+        action="append",
+        metavar="LABEL=PATH:/topic",
+        help=(
+            "Analyze one rosbag2/stage-bag topic. Requires rosbag2_py in the active environment. "
+            "Repeat to compare stages."
+        ),
+    )
+    stream_stats_parser.add_argument(
+        "--events",
+        action="append",
+        metavar="LABEL=PATH:/topic",
+        help="Analyze one RFC 0003 events.jsonl transit topic. Repeat to compare stages.",
+    )
+    stream_stats_parser.add_argument(
+        "--storage-id",
+        default="mcap",
+        help="rosbag2 storage id for --bag sources (default: mcap).",
+    )
+    stream_stats_parser.add_argument("--out", help="Output directory for stream-stats.json and stream-stats.md.")
+    stream_stats_parser.add_argument(
+        "--json", action="store_true", help="Print stream-stats.json to stdout instead of the markdown summary."
+    )
+    stream_stats_parser.set_defaults(func=stream_stats_command)
 
     test_parser = subparsers.add_parser(
         "test", help="Assert a running/recent session meets its status + per-topic expect contract."

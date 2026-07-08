@@ -45,6 +45,50 @@ Grouping a stream into GOPs is then just splitting at keyframes. Note the
 encoder may emit keyframes *early* (scene cuts), so GOPs can be shorter than
 `gop_size` — assert spacing `<= gop_size`, not `== gop_size`.
 
+## Automated stream-stage stats
+
+`rosotacom stream-stats` applies the same packet parser and GOP grouping to
+recorded stage bags, then lines the aggregate results up beside post-OTA
+`events.jsonl` transit rows. This is the repeatable version of the manual
+remote-assist camera analysis:
+
+```bash
+rosotacom stream-stats \
+  --bag pre=logs/b/metrics/stages_20260702_172900:/sensors/camera/front_medium/resized/image_rect_color \
+  --bag handoff=logs/b/metrics/stages_20260702_172900:/sensors/camera/front_medium/resized/image_rect_color/compressed/restamped/drop1of2/ffmpeg \
+  --events post=logs/b/status/events.jsonl:/sensors/camera/front_medium/resized/image_rect_color \
+  --out stream-stats
+```
+
+Inputs are explicit and repeatable:
+
+- `--bag LABEL=PATH:/topic` reads one rosbag2 topic, using message timestamps and
+  serialized sizes. When the bag metadata declares `FFMPEGPacket`, the command
+  parses the CDR payload and reports encoded-frame payload sizes plus keyframes
+  from `flags & 1`. Bag reading uses `rosbag2_py`, so run it in a ROS
+  environment for MCAP sources.
+- `--events LABEL=PATH:/topic` reads delivered RFC 0003 transit rows from
+  `events.jsonl`, using receiver-side `t_com_in` timestamps and `size_bytes`.
+  Transit rows do not carry raw CDR flags, so GOP annotation uses the documented
+  size-bimodality fallback when the keyframe share looks like a real GOP.
+
+The Markdown output starts with the comparison table:
+
+```text
+| stage | kind | topic | msgs | hz | mean B | p90 B | gap std ms | gaps within +/-10% | GOP spacing |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `pre` | bag | `/.../image_rect_color` | ... | 20 | ... | ... | ... | ... | - |
+| `handoff` | bag | `/.../ffmpeg` | ... | 10 | ... | ... | ... | ... | 5 |
+| `post` | events | `/.../image_rect_color` | ... | ... | ... | ... | ... | ... | 5 |
+```
+
+The JSON output (`stream-stats/stream-stats.json`) carries the same rows plus
+the full size and interval distributions, per-GOP-position size table, keyframe
+spacing distribution, and the most extreme GOP by keyframe-to-delta mean ratio.
+The comparison is intentionally aggregate-only: it does not join individual
+messages across decimating stages such as drop or throttle, matching the
+index-join caveat in [RFC 0003](rfcs/0003-metric-backbone.md).
+
 ## Fallback: size bimodality
 
 If `flags` is unavailable (foreign recordings, or bags anonymized before
@@ -61,6 +105,9 @@ scene at a very low bitrate) — prefer `flags` whenever present.
 - `tests/unit/test_ffmpeg_packet.py` — CDR parsing (alignment across
   odd-length strings), flag semantics, and the size fallback on a synthetic
   GOP pattern.
+- `tests/unit/test_stream_stats.py` — exact stream statistics, per-GOP-position
+  tables from hand-built CDR packets, events-row source loading, comparison
+  table shape, and CLI output writing.
 - `tests/unit/test_anonymize.py::test_anonymize_msg_preserves_ffmpeg_keyframe_structure`
   — anonymization keeps `flags`/`pts` while zeroing payloads.
 - `tests/e2e/test_anonymize_e2e.py` — headless end-to-end: a trace bag written

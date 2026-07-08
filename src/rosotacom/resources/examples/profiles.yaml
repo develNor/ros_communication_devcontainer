@@ -24,6 +24,19 @@ profiles:
       - { for: 5s,  outage: catchup }
       - { for: 40s, uplink: { rate: 2.5mbit, delay: 90ms,  loss: 1%   } }
 
+  # RFC 0007 gate profiles — the canonical public conditions of the regression
+  # gate (see resources/benched-set.yaml). Deliberately plain committed netem
+  # numbers with no random elements, so gated metrics are pinned by the emulated
+  # bottleneck and need no netem seed; a profile that adds `loss`/`jitter` to a
+  # gated row must also commit a `seed` (contract-tested seed policy).
+  gate-nominal:
+    uplink:   { rate: 20mbit, delay: 20ms }
+    downlink: { rate: 20mbit, delay: 20ms }
+
+  gate-tight:
+    uplink:   { rate: 1mbit, delay: 40ms }
+    downlink: { rate: 10mbit }
+
   # Public finding fixtures. These are small, deterministic emulation points used
   # by docs/findings; they intentionally carry no private host or calibration data.
   finding-3.2mbit:

@@ -1,0 +1,176 @@
+# Runner-class calibration of the benched set (RFC 0007 §3).
+#
+# K independent repeats of every registry row on this runner class — one job per
+# (row, repeat) so the measured sigma includes cross-instance variance, which is
+# the variance the gate will actually see. The mint job then rewrites
+# budgets.jsonl through `rosotacom benchmark calibrate` (bands are never
+# hand-edited) and uploads the bands plus the per-row calibration reports as the
+# `calibrated-bands` artifact for review and commit.
+name: Benchmark Calibrate
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: "Calibration repeats per row (K)"
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rows:
+    name: rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      rows: ${{ steps.list.outputs.rows }}
+      repeats: ${{ steps.list.outputs.repeats }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: List benched rows and repeat indices
+        id: list
+        run: |
+          k="${{ github.event.inputs.repeats || '5' }}"
+          if ! [[ "$k" =~ ^[0-9]+$ ]] || [ "$k" -lt 2 ] || [ "$k" -gt 10 ]; then
+            echo "repeats must be an integer in [2, 10], got: $k" >&2
+            exit 1
+          fi
+          rows="$(.venv/bin/rosotacom benchmark rows --format ids)"
+          repeats="$(seq 1 "$k" | jq -cs '.')"
+          echo "rows=$rows" >> "$GITHUB_OUTPUT"
+          echo "repeats=$repeats" >> "$GITHUB_OUTPUT"
+          echo "calibrating rows $rows with K=$k repeats"
+
+  run:
+    name: run-${{ matrix.row }}-r${{ matrix.repeat }}
+    needs: rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        row: ${{ fromJSON(needs.rows.outputs.rows) }}
+        repeat: ${{ fromJSON(needs.rows.outputs.repeats) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just and tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just tmux
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Show Docker environment
+        run: docker info
+
+      - name: Run one ungated calibration repeat
+        run: |
+          .venv/bin/rosotacom examples create "$RUNNER_TEMP/examples"
+          .venv/bin/rosotacom benchmark row "${{ matrix.row }}" \
+            --rosotacom-config "$RUNNER_TEMP/examples/rosotacom.yaml" \
+            --no-compare \
+            --artifacts-dir "calib/${{ matrix.row }}/r${{ matrix.repeat }}"
+
+      - name: Upload calibration run
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-calibration-${{ matrix.row }}-r${{ matrix.repeat }}
+          path: calib/
+          if-no-files-found: error
+
+  mint:
+    name: mint
+    needs: [rows, run]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Download calibration runs
+        uses: actions/download-artifact@v7
+        with:
+          pattern: benchmark-calibration-*
+          path: calib
+          merge-multiple: true
+
+      - name: Mint bands from the repeats
+        run: |
+          k="${{ github.event.inputs.repeats || '5' }}"
+          # A runner-class calibration mints the complete public band store;
+          # no pre-existing entry survives it (repo rule: no legacy paths).
+          rm -f budgets.jsonl
+          mkdir -p calibration
+          while read -r row; do
+            mapfile -t runs < <(find calib -path "*/${row}/*" -name result.json)
+            if [ "${#runs[@]}" -ne "$k" ]; then
+              echo "row ${row}: expected ${k} calibration runs, found ${#runs[@]}" >&2
+              exit 1
+            fi
+            .venv/bin/rosotacom benchmark calibrate "$row" "${runs[@]}" \
+              --budgets budgets.jsonl \
+              --report "calibration/${row}.json" \
+              --note "runner-class calibration, K=${k} independent GitHub-hosted runs"
+          done < <(.venv/bin/rosotacom benchmark rows --format ids | jq -r '.[]')
+          git --no-pager diff --no-index /dev/null budgets.jsonl || true
+
+      - name: Upload calibrated bands
+        uses: actions/upload-artifact@v7
+        with:
+          name: calibrated-bands
+          path: |
+            budgets.jsonl
+            calibration/
+          if-no-files-found: error

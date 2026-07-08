@@ -68,16 +68,63 @@ rosotacom benchmark ratchet <run1> <run2> <run3> --budgets budgets.jsonl \
   Anything else — first bands, widening, accepting a worse level as a
   trade-off, a new runner class — is `--recalibrate`, which recomputes the
   half-width as `max(k·σ, floor)` from the given runs (`--k`, `--floor`,
-  `--floor-frac`; defaults k=3, floor 2 % of the center — starting points
-  until the runner-class calibration settles them per metric).
+  `--floor-frac`; defaults k=3, floor 2 % of the center).
 - Every move takes a one-line `--note`; a band diff without an explanation is
   a review red flag.
 
-Banded metrics today come from `capacity` runs (`capacity_<knob>`) and
-`recovery` runs (`t_recover_s`, `t_steady_s`, `recovery_burst`,
-`lost_during_outage_total`); the benched-set registry (RFC 0007 checklist)
-extends this to probe/replay rows.
+Banded metrics today come from `probe` runs (`loss_pct`, plus
+`latency_p50_ms`/`latency_p95_ms` — monitor-only on shared runners),
+`capacity` runs (`capacity_<knob>`) and `recovery` runs (`t_recover_s`,
+`t_steady_s`, `recovery_burst`, `lost_during_outage_total`).
 
-The packaged `budgets.jsonl` currently carries the v1 entries rewritten to
-schema v2 with the fingerprint `uncalibrated` — they refuse to gate until the
-runner-class calibration mints measured bands, by design.
+## The benched set: which rows gate
+
+The curated registry
+[`src/rosotacom/resources/benched-set.yaml`](../src/rosotacom/resources/benched-set.yaml)
+is the whitelist of gated rows — one deliberate (RMW × profile × load × metric
+set) each, with an operator-visible reason, committed seeds, and per-metric
+width floors. The CI lanes *read* it; adding a row is a registry edit plus a
+calibration, never a workflow edit (contract-tested in
+`tests/contract/test_benched_set_registry.py`).
+
+```bash
+rosotacom benchmark rows                      # list the benched set
+rosotacom benchmark row <id> \
+  --rosotacom-config <project>/rosotacom.yaml # run + band-assert one row
+```
+
+`benchmark row` runs the row's genre with its committed parameters, gates the
+result against `budgets.jsonl`, and writes a machine-readable
+`verdict.json` (`WITHIN` / `REGRESSED` / `IMPROVED` / `REFUSED`, metrics,
+bands, sha, runner fingerprint) for downstream tooling. `--monitor` reports
+without blocking; `--no-compare` is for calibration repeats.
+
+Lanes (RFC 0007 §4):
+
+- **merge gate** — the `merge-gate` rows run inside the benchmark-capacity E2E
+  (`tests/e2e/test_benchmark_capacity.py::test_merge_gate_row_is_band_asserted`,
+  lane `just test-e2e-runtime-tools`): minutes-scale, default RMW, one
+  rate-limited profile.
+- **nightly** — `.github/workflows/benchmark-gate.yml` runs every `nightly`
+  row on schedule (and on dispatch), uploads per-row verdicts plus the
+  aggregated `benchmark-gate-summary` artifact (`benchmark gate-summary`), and
+  is red on any setup failure, `REGRESSED`, or unbanked `IMPROVED`.
+
+## Calibration: how bands are minted
+
+Bands are calibrated on the runner class that executes them, via
+`.github/workflows/benchmark-calibrate.yml` (manual dispatch): K independent
+repeats per row — one job per (row, repeat), so σ includes cross-instance
+variance — then
+
+```bash
+rosotacom benchmark calibrate <row-id> <K run dirs...> --budgets budgets.jsonl \
+  --report calibration/<row-id>.json
+```
+
+mints the bands for exactly the row's gated metrics (each with its committed
+registry floor) and writes the spread evidence — monitor metrics included, so
+the tighten-or-monitor decision is made from numbers, not taste. The workflow
+uploads `budgets.jsonl` + reports as the `calibrated-bands` artifact; review
+the widths and commit both. The committed calibration evidence lives in
+[`calibration/`](../calibration/README.md).

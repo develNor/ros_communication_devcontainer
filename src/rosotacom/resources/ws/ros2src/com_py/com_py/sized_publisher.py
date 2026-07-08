@@ -3,7 +3,9 @@
 import re
 
 import rclpy
+from rclpy.exceptions import ParameterUninitializedException
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from com_msgs.msg import SizedPayload
 
 
@@ -64,7 +66,10 @@ class SizedPublisher(Node):
         self.declare_parameter("pattern", "")
         self.declare_parameter("rate", 10.0)
         self.declare_parameter("streams", 1)
-        self.declare_parameter("sizes", [])
+        # Typed declaration without a default: an empty-list default would be
+        # inferred as BYTE_ARRAY and reject the integer size lists the
+        # benchmark CLI passes for >=3-size patterns.
+        self.declare_parameter("sizes", Parameter.Type.INTEGER_ARRAY)
         self.declare_parameter("interval_jitter_ms", 0.0)
         self.declare_parameter("interval_jitter_seed", 42)
 
@@ -75,7 +80,10 @@ class SizedPublisher(Node):
         pattern_param = str(self.get_parameter("pattern").value)
         rate = self.get_parameter("rate").value
         streams = max(1, int(self.get_parameter("streams").value))
-        sizes_param = self.get_parameter("sizes").value
+        try:
+            sizes_param = list(self.get_parameter("sizes").value)
+        except ParameterUninitializedException:
+            sizes_param = []
         self.interval_jitter_ms = float(self.get_parameter("interval_jitter_ms").value)
         self.interval_jitter_seed = int(self.get_parameter("interval_jitter_seed").value)
 

@@ -1355,11 +1355,12 @@ def test_compare_gates_both_sides_and_banks_improvements(tmp_path: Path, capsys:
     assert benchmark_cli.benchmark_compare(_band_args([improved_result], budgets)) == 0
 
 
-def test_compare_refuses_bands_from_another_runner_class(tmp_path: Path) -> None:
-    """Uncalibrated or foreign-runner bands refuse to gate, naming the fix."""
+def test_compare_refuses_bands_from_another_runner_class(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Uncalibrated or foreign-runner bands refuse to gate (exit 1), naming the fix;
+    --monitor reports the refusal without blocking."""
     import dataclasses
 
-    from rosotacom.benchmark import UNCALIBRATED_FINGERPRINT, FingerprintMismatch, load_bands, save_bands
+    from rosotacom.benchmark import UNCALIBRATED_FINGERPRINT, load_bands, save_bands
 
     run = _capacity_run(tmp_path, "run", breakpoint_size=5000)
     budgets = tmp_path / "budgets.jsonl"
@@ -1369,8 +1370,345 @@ def test_compare_refuses_bands_from_another_runner_class(tmp_path: Path) -> None
         for band in load_bands(budgets)
     ]
     save_bands(budgets, doctored)
-    with pytest.raises(FingerprintMismatch, match="--recalibrate"):
-        benchmark_cli.benchmark_compare(_band_args([run], budgets))
+    capsys.readouterr()
+
+    assert benchmark_cli.benchmark_compare(_band_args([run], budgets)) == 1
+    out = capsys.readouterr().out
+    assert "REFUSED" in out
+    assert "--recalibrate" in out
+
+    assert benchmark_cli.benchmark_compare(_band_args([run], budgets, monitor=True)) == 0
+    out = capsys.readouterr().out
+    assert "REFUSED" in out
+
+
+# --------------------------------------------------------------------------- #
+# Benched set: row / calibrate / gate-summary (RFC 0007 §4)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture()
+def examples_project(tmp_path: Path) -> Path:
+    project = tmp_path / "examples"
+    assert cli.main(["examples", "create", str(project)]) == 0
+    return project
+
+
+def _run_row(
+    monkeypatch: pytest.MonkeyPatch,
+    project: Path,
+    out_root: Path,
+    row_id: str,
+    *,
+    stub: Any,
+    budgets: Path,
+    verdict: Path,
+    extra: list[str] | None = None,
+) -> int:
+    monkeypatch.setattr(benchmark_cli, "_make_live_run_point", lambda args, session_name: stub)
+    return cli.main(
+        [
+            "benchmark",
+            "row",
+            row_id,
+            "--rosotacom-config",
+            str(project / "rosotacom.yaml"),
+            "--artifacts-dir",
+            str(out_root),
+            "--budgets",
+            str(budgets),
+            "--verdict-file",
+            str(verdict),
+            *(extra or []),
+        ]
+    )
+
+
+def test_row_lifecycle_calibrate_gate_regress_improve(
+    monkeypatch: pytest.MonkeyPatch, examples_project: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The full RFC 0007 row lifecycle against the packaged registry: an ungated
+    calibration run, `calibrate` minting the banded metrics with the committed
+    floor, then WITHIN / REGRESSED / IMPROVED / monitor verdicts end-to-end."""
+    from rosotacom.benchmark import load_bands
+
+    budgets = tmp_path / "budgets.jsonl"
+    row_id = "probe-loss-tight-cyclone"
+
+    # Calibration repeats run ungated and record a RAN verdict.
+    verdict_path = tmp_path / "calib-verdict.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "calib",
+        row_id,
+        stub=_make_stub_probe(loss_pct=48.0),
+        budgets=budgets,
+        verdict=verdict_path,
+        extra=["--no-compare"],
+    )
+    assert rc == 0
+    calib_verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+    assert calib_verdict["verdict"] == "RAN"
+    assert calib_verdict["gate"] is False
+    calib_run = Path(calib_verdict["result"]).parent
+
+    # calibrate mints bands only for the gated metrics, with the committed floor.
+    report = tmp_path / "report.json"
+    rc = cli.main(
+        [
+            "benchmark",
+            "calibrate",
+            row_id,
+            str(calib_run),
+            "--budgets",
+            str(budgets),
+            "--report",
+            str(report),
+        ]
+    )
+    assert rc == 0
+    bands = load_bands(budgets)
+    assert [band.metric for band in bands] == ["loss_pct"]
+    assert bands[0].row == row_id
+    assert bands[0].profile == "gate-tight"
+    # One repeat means sigma 0: the width is pure floor — the larger of the
+    # registry's committed floor and the default floor_frac of the center.
+    assert bands[0].half_width == pytest.approx(max(0.5, 0.02 * 48.0))
+    assert bands[0].provenance.floor >= 0.5, "the registry's committed floor is respected"
+    report_doc = json.loads(report.read_text(encoding="utf-8"))
+    assert report_doc["metrics"]["loss_pct"]["banded"] is True
+    assert report_doc["metrics"]["latency_p95_ms"]["banded"] is False, "monitor metrics keep their spread evidence"
+
+    # WITHIN gates green and the verdict is machine-readable.
+    within_verdict = tmp_path / "within.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "within",
+        row_id,
+        stub=_make_stub_probe(loss_pct=48.0),
+        budgets=budgets,
+        verdict=within_verdict,
+    )
+    assert rc == 0
+    within_doc = json.loads(within_verdict.read_text(encoding="utf-8"))
+    assert within_doc["verdict"] == "WITHIN"
+    assert within_doc["metrics"] == {"loss_pct": 48.0}
+    assert within_doc["monitor_metrics"]["latency_p95_ms"] == 50.0
+    assert within_doc["bands"]["loss_pct"]["better"] == "lower"
+
+    # REGRESSED is red (exit 1).
+    regressed_verdict = tmp_path / "regressed.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "regressed",
+        row_id,
+        stub=_make_stub_probe(loss_pct=60.0),
+        budgets=budgets,
+        verdict=regressed_verdict,
+    )
+    assert rc == 1
+    assert json.loads(regressed_verdict.read_text(encoding="utf-8"))["verdict"] == "REGRESSED"
+
+    # IMPROVED is red too (exit 2) and the verdict carries the exact ratchet command.
+    improved_verdict = tmp_path / "improved.json"
+    capsys.readouterr()
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "improved",
+        row_id,
+        stub=_make_stub_probe(loss_pct=40.0),
+        budgets=budgets,
+        verdict=improved_verdict,
+    )
+    assert rc == 2
+    improved_doc = json.loads(improved_verdict.read_text(encoding="utf-8"))
+    assert improved_doc["verdict"] == "IMPROVED"
+    assert "rosotacom benchmark ratchet" in improved_doc["ratchet_command"]
+    assert "IMPROVED" in capsys.readouterr().out
+
+    # --monitor reports the same verdict without blocking.
+    monitor_verdict = tmp_path / "monitor.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "monitor",
+        row_id,
+        stub=_make_stub_probe(loss_pct=60.0),
+        budgets=budgets,
+        verdict=monitor_verdict,
+        extra=["--monitor"],
+    )
+    assert rc == 0
+    monitor_doc = json.loads(monitor_verdict.read_text(encoding="utf-8"))
+    assert monitor_doc["verdict"] == "REGRESSED"
+    assert monitor_doc["gate"] is False
+
+
+def test_row_refuses_without_bands_and_when_a_gated_band_is_missing(
+    monkeypatch: pytest.MonkeyPatch, examples_project: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    row_id = "probe-loss-tight-cyclone"
+    budgets = tmp_path / "budgets.jsonl"
+    budgets.write_text("", encoding="utf-8")
+
+    verdict_path = tmp_path / "verdict.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "runs",
+        row_id,
+        stub=_make_stub_probe(loss_pct=48.0),
+        budgets=budgets,
+        verdict=verdict_path,
+    )
+    assert rc == 1
+    doc = json.loads(verdict_path.read_text(encoding="utf-8"))
+    assert doc["verdict"] == "REFUSED"
+    assert "calibrate" in doc["refusal"]
+    run_dir = Path(doc["result"]).parent
+
+    # A band store that lost the gated metric refuses instead of silently not gating.
+    ratchet_args = _band_args(
+        [run_dir], budgets, row=row_id, profile="gate-tight", recalibrate=True, metric=["latency_p95_ms"]
+    )
+    assert benchmark_cli.benchmark_ratchet(ratchet_args) == 0
+    capsys.readouterr()
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "runs2",
+        row_id,
+        stub=_make_stub_probe(loss_pct=48.0),
+        budgets=budgets,
+        verdict=verdict_path,
+    )
+    assert rc == 1
+    assert "loss_pct" in json.loads(verdict_path.read_text(encoding="utf-8"))["refusal"]
+
+
+def test_capacity_row_gates_the_breakpoint(
+    monkeypatch: pytest.MonkeyPatch, examples_project: Path, tmp_path: Path
+) -> None:
+    row_id = "capacity-size-tight-cyclone"
+    budgets = tmp_path / "budgets.jsonl"
+
+    verdict_path = tmp_path / "calib.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "calib",
+        row_id,
+        stub=_make_stub_probe(breakpoint_size=5000),
+        budgets=budgets,
+        verdict=verdict_path,
+        extra=["--no-compare"],
+    )
+    assert rc == 0
+    calib_run = Path(json.loads(verdict_path.read_text(encoding="utf-8"))["result"]).parent
+    assert cli.main(["benchmark", "calibrate", row_id, str(calib_run), "--budgets", str(budgets)]) == 0
+
+    gate_verdict = tmp_path / "gate.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "gate",
+        row_id,
+        stub=_make_stub_probe(breakpoint_size=5000),
+        budgets=budgets,
+        verdict=gate_verdict,
+    )
+    assert rc == 0
+    doc = json.loads(gate_verdict.read_text(encoding="utf-8"))
+    assert doc["verdict"] == "WITHIN"
+    assert doc["metrics"] == {"capacity_size": 5000.0}
+
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "worse",
+        row_id,
+        stub=_make_stub_probe(breakpoint_size=4000),
+        budgets=budgets,
+        verdict=gate_verdict,
+    )
+    assert rc == 1
+    assert json.loads(gate_verdict.read_text(encoding="utf-8"))["verdict"] == "REGRESSED"
+
+
+def test_gate_summary_aggregates_rows_and_reds_on_missing_or_regressed(tmp_path: Path) -> None:
+    from rosotacom.benched_set import find_row, load_registry, rows_for_lane, verdict_document, write_verdict
+
+    rows = rows_for_lane(load_registry(), "nightly")
+    verdicts_dir = tmp_path / "verdicts"
+
+    def summary(out_name: str) -> tuple[int, dict[str, Any]]:
+        out = tmp_path / out_name
+        rc = cli.main(
+            ["benchmark", "gate-summary", "--verdicts", str(verdicts_dir), "--lane", "nightly", "--out", str(out)]
+        )
+        return rc, json.loads(out.read_text(encoding="utf-8"))
+
+    verdicts_dir.mkdir()
+    rc, doc = summary("empty.json")
+    assert rc == 1
+    assert doc["overall"] == "red"
+    assert doc["red_rows"] == [row.id for row in rows]
+
+    def write(row_id: str, verdict: str, exit_code: int) -> None:
+        row = find_row(rows, row_id)
+        write_verdict(
+            verdicts_dir / f"{row_id}.json",
+            verdict_document(
+                row,
+                verdict=verdict,
+                exit_code=exit_code,
+                gate=True,
+                sha="abc1234",
+                fingerprint="github-hosted-linux-x86_64",
+                created_at="2026-07-08T12:00:00",
+                metrics={},
+                monitor_metrics={},
+                bands={},
+                result_path="run/result.json",
+            ),
+        )
+
+    for row in rows:
+        write(row.id, "WITHIN", 0)
+    rc, doc = summary("green.json")
+    assert rc == 0
+    assert doc["overall"] == "green"
+
+    write(rows[0].id, "IMPROVED", 2)
+    rc, doc = summary("improved.json")
+    assert rc == 1
+    assert doc["red_rows"] == [rows[0].id], "IMPROVED blocks: bank the ratchet, don't revert"
+
+
+def test_probe_point_dirnames_are_artifact_safe() -> None:
+    """Pattern loads carry `a*1,b*1` and bracketed size lists; the copied probe
+    directory name must stay shell- and upload-artifact-safe (no `*?"<>|[] `)."""
+    from rosotacom.benchmark import parse_size_pattern_load
+    from rosotacom.cli_benchmark import _probe_point_dirname
+
+    load = parse_size_pattern_load("1x12KB+1x2KB+3x3KB")
+    load["rate"] = 20.0
+    load["interval_jitter_ms"] = 20.0
+    name = _probe_point_dirname("deadbeef", load)
+
+    assert not set(name) & set('*?"<>|[] ,:'), name
+    assert name.startswith("probe_deadbeef")
+
+
+def test_rows_ids_format_is_a_workflow_matrix(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["benchmark", "rows", "--lane", "merge-gate", "--format", "ids"]) == 0
+    ids = json.loads(capsys.readouterr().out)
+    assert isinstance(ids, list) and ids
+    assert "probe-loss-tight-cyclone" in ids
 
 
 # --------------------------------------------------------------------------- #

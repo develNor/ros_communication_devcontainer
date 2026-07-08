@@ -70,6 +70,24 @@ config, catmux pane logs, Docker logs when available, and the smoke verification
 log under `session-instances/`; collect that directory as the first debugging
 artifact when an E2E job fails.
 
+## Performance Regression Gate
+
+The deterministic benchmark rows gate against committed two-sided bands
+([performance-bands.md](performance-bands.md), RFC 0007):
+
+- the `merge-gate` rows of the benched-set registry run inside the
+  `e2e-runtime-tools` lane (band-asserted benchmark-capacity E2E);
+- `.github/workflows/benchmark-gate.yml` runs the `nightly` rows on schedule
+  and on manual dispatch. Its matrix comes from
+  `rosotacom benchmark rows --format ids`; each row uploads `result.json` plus
+  a machine-readable `verdict.json`, and the `verdict` job aggregates them into
+  the `benchmark-gate-summary` artifact. A red gate — setup failure,
+  `REGRESSED`, or an unbanked `IMPROVED` — is fix-first, like a red merge gate;
+- `.github/workflows/benchmark-calibrate.yml` (manual dispatch) reruns the
+  runner-class calibration: K repeats per row, then `benchmark calibrate`
+  mints `budgets.jsonl` and the [calibration reports](../calibration/README.md)
+  as the `calibrated-bands` artifact to review and commit.
+
 ## Nightly And Maintenance Checks
 
 `.github/workflows/nightly-e2e.yml` runs the local smoke slice plus the generated

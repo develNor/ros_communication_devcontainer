@@ -11,7 +11,8 @@ import pytest
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_TIMEOUT_S = 900
 SMOKE_NETWORK_NAME = "rosotacom-smoke"
-CAPACITY_PROFILE = "rate-limited-capacity-ci"
+# The committed public gate profile (RFC 0007): a 1 Mbit/s uplink bottleneck.
+CAPACITY_PROFILE = "gate-tight"
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.skipif(
@@ -93,17 +94,11 @@ def _assert_capacity_result(
 
 @pytest.fixture(scope="session")
 def copied_example_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The examples project as shipped — the gate profiles are committed, not
+    synthesized here, so these tests exercise exactly what the gate lanes run."""
     project = tmp_path_factory.mktemp("rosotacom") / "examples"
 
     _run([sys.executable, "-m", "rosotacom", "examples", "create", str(project)], timeout=60)
-
-    # Keep the smoke deterministic: these cases validate capacity against the
-    # rate limit, not delay/jitter/loss side effects.
-    profiles_yaml = project / "profiles.yaml"
-    profiles_yaml.write_text(
-        f"profiles:\n  {CAPACITY_PROFILE}:\n    uplink:   {{ rate: 1mbit }}\n    downlink: {{ rate: 10mbit }}\n",
-        encoding="utf-8",
-    )
     return project
 
 
@@ -208,3 +203,60 @@ def test_benchmark_probe_camera_load(copied_example_project: Path) -> None:
     assert load_params["sizes"] == [43000, 3000, 4000, 4000, 4000]
     assert load_params["interval_jitter_ms"] == 20.0
     assert load_params["interval_jitter_seed"] == 42
+
+
+def _merge_gate_row_ids() -> list[str]:
+    from rosotacom.benched_set import load_registry, rows_for_lane
+
+    return [row.id for row in rows_for_lane(load_registry(), "merge-gate")]
+
+
+@pytest.mark.parametrize("row_id", _merge_gate_row_ids())
+def test_merge_gate_row_is_band_asserted(row_id: str, copied_example_project: Path, tmp_path: Path) -> None:
+    """The RFC 0007 merge-gate row: run the benched row end-to-end and assert
+    the committed two-sided band. REGRESSED and IMPROVED both fail — the
+    IMPROVED failure text carries the exact ratchet command to bank it in this
+    same change. On a host that is not the calibrated runner class the compare
+    refuses by design; that principled refusal is a skip here (the gate lanes
+    always run on the calibrated class)."""
+    verdict_path = tmp_path / f"verdict-{row_id}.json"
+    cmd = [
+        sys.executable,
+        "-m",
+        "rosotacom",
+        "benchmark",
+        "row",
+        row_id,
+        "--rosotacom-config",
+        str(copied_example_project / "rosotacom.yaml"),
+        "--budgets",
+        str(PACKAGE_ROOT / "budgets.jsonl"),
+        "--artifacts-dir",
+        str(tmp_path / "gate-artifacts"),
+        "--verdict-file",
+        str(verdict_path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, cwd=PACKAGE_ROOT, text=True, capture_output=True, timeout=BENCHMARK_TIMEOUT_S, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        _cleanup_smoke_network()
+        raise AssertionError(f"Benched row {row_id} timed out after {BENCHMARK_TIMEOUT_S}s") from exc
+
+    output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    if result.returncode == 1 and "REFUSED" in result.stdout and "runner class" in result.stdout:
+        if os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
+            pytest.skip(f"bands are calibrated for another runner class; refusal is by design:\n{result.stdout}")
+        raise AssertionError(f"gate refused on its own runner class — recalibrate the bands.\n{output}")
+    if result.returncode == 2:
+        raise AssertionError(
+            f"benched row {row_id} IMPROVED beyond its band — bank it with the printed ratchet "
+            f"command and commit budgets.jsonl in this same change.\n{output}"
+        )
+    assert result.returncode == 0, f"benched row {row_id} failed its band assert.\n{output}"
+
+    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+    assert verdict["verdict"] == "WITHIN"
+    assert verdict["row"] == row_id
+    assert verdict["metrics"], "a gated row must record its banded metrics"

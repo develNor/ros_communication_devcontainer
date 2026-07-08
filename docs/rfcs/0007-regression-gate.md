@@ -216,14 +216,30 @@ slices these into issues.
   calibrated width/provenance.)*
 - [ ] **Calibration**: measure run-to-run σ per metric on the CI runner class
   (K repeats of the canonical rows); commit the initial bands with provenance.
-- [ ] **Benched-set registry**: curated row list (config/RMW × profile × load ×
+- [x] **Benched-set registry**: curated row list (config/RMW × profile × load ×
   metrics) discoverable by workflows and the `benchmark` CLI.
-- [ ] **Merge-gate row**: upgrade the existing benchmark-capacity E2E to
+  *(`resources/benched-set.yaml` + `benched_set.py`; CLI `benchmark rows` /
+  `row` / `calibrate` / `gate-summary`; committed per-row seeds, per-metric
+  width floors, and the ≥60 s window rule are schema-enforced. Probe rows band
+  `loss_pct`; latency percentiles ride along as monitor metrics per §3.)*
+- [x] **Merge-gate row**: upgrade the existing benchmark-capacity E2E to
   band-asserting; keep it minutes-scale.
-- [ ] **Nightly regression matrix**: blocking workflow over the registry (RMW
+  *(`tests/e2e/test_benchmark_capacity.py::test_merge_gate_row_is_band_asserted`
+  runs every `merge-gate` registry row via `benchmark row`. Reality check: the
+  lane's previous single pytest invocation applied `-k link_latency` to all
+  files, silently deselecting the entire benchmark E2E — the "existing
+  merge-gate benchmark" had not run in the merge gate at all. The justfile now
+  uses two invocations, and a contract test pins the selection.)*
+- [x] **Nightly regression matrix**: blocking workflow over the registry (RMW
   variants × nominal + tight profiles × loads incl. single-stream anonymized
   replay), artifacts plus a machine-readable verdict the promotion gate can
   consume.
+  *(`.github/workflows/benchmark-gate.yml`: schedule + dispatch, matrix from
+  `benchmark rows --format ids`, per-row `result.json` + `verdict.json`
+  artifacts, aggregated `benchmark-gate-summary` artifact via
+  `benchmark gate-summary`; setup failure, `REGRESSED`, and unbanked
+  `IMPROVED` are all red. Anonymized-replay rows land with the replay issue —
+  the registry is the extension point.)*
 - [ ] **Boundary must-fail rows**: oracle inversion (assert the failure
   signature) + happy-red messaging; seed with the documented 18 KB @ 20 Hz
   pairs.
@@ -251,10 +267,18 @@ slices these into issues.
   `test_cli_benchmark.test_compare_refuses_bands_from_another_runner_class`.)*
 - [ ] **Boundary rows** — unit test: a bad side meeting the good oracle yields
   the happy-red verdict with finding/profile pointers.
-- [ ] **Registry** — contract test: every row names an existing profile, load
+- [x] **Registry** — contract test: every row names an existing profile, load
   and metric set; workflows consume the registry (no hardcoded row lists).
-- [ ] **Merge-gate row** — exercised by the merge gate itself (band-asserted
+  *(`tests/unit/test_benched_set.py` for the schema;
+  `tests/contract/test_benched_set_registry.py` for the cross-file contracts:
+  profiles exist, random netem is seeded, every gated metric has a calibrated
+  band, no orphan bands, workflows consume the registry and hardcode no row
+  id, and the merge-gate lane cannot silently deselect the benchmark E2E.)*
+- [x] **Merge-gate row** — exercised by the merge gate itself (band-asserted
   benchmark-capacity E2E), runtime bounded by the workflow timeout.
+  *(`test_benchmark_capacity.py::test_merge_gate_row_is_band_asserted` in the
+  `e2e-runtime-tools` lane of `pr-merge-gate.yml`; a 60 s probe window plus
+  session setup keeps it minutes-scale.)*
 - [ ] **Nightly matrix** — one deliberately injected regression (canary
   branch) turns the lane red end-to-end; documented one-off exercise.
 - [x] **Findings checker** — contract test: a finding without `Verification:`

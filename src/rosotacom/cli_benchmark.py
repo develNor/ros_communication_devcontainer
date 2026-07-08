@@ -21,6 +21,7 @@ import contextlib
 import copy
 import json
 import math
+import os
 import re
 import shlex
 import shutil
@@ -777,6 +778,17 @@ def _sized_publisher_param_args(
         size = 66000
     params.extend(["-p", f"size:={size}"])
     return params
+
+
+def _probe_point_dirname(instance_id: str, load: dict[str, Any]) -> str:
+    """Filesystem- and CI-artifact-safe name for one probe point's copied logs.
+
+    Load values can carry pattern syntax (``a*1,b*1``, bracketed size lists)
+    whose characters are hostile to shells and invalid in upload-artifact paths.
+    """
+    parts = ["probe", instance_id]
+    parts += [_safe_case_token(f"{key}_{value}") for key, value in sorted(load.items())]
+    return "_".join(parts)
 
 
 def _benchmark_ota_target(args: argparse.Namespace, session_name: str) -> tuple[str, str]:
@@ -4886,11 +4898,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     }
                 }
             if not dry_run:
-                probe_parts = ["probe", instance.instance_id]
-                for k, v in sorted(load.items()):
-                    probe_parts.append(f"{k}_{v}")
-                probe_name = "_".join(probe_parts)
-                dest = out_dir / "probes" / probe_name
+                dest = out_dir / "probes" / _probe_point_dirname(instance.instance_id, load)
                 shutil.copytree(instance.host_dir, dest, dirs_exist_ok=True)
             return collect_transit_summary(instance.host_dir)
 
@@ -5179,11 +5187,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                         _stop_container_name(cleanup_container, runtime)
                 _remove_smoke_network(smoke_network.name)
 
-            probe_parts = ["probe", smoke_instance.instance_id]
-            for k, v in sorted(load.items()):
-                probe_parts.append(f"{k}_{v}")
-            probe_name = "_".join(probe_parts)
-            dest = out_dir / "probes" / probe_name
+            dest = out_dir / "probes" / _probe_point_dirname(smoke_instance.instance_id, load)
             shutil.copytree(smoke_instance.host_dir, dest, dirs_exist_ok=True)
 
             return collect_transit_summary(smoke_instance.host_dir, publish_window=measurement_window)
@@ -5327,12 +5331,17 @@ def _load_result_docs(paths: Sequence[str]) -> list[dict[str, Any]]:
     return docs
 
 
-def _resolve_run_identity(docs: Sequence[dict[str, Any]], args: argparse.Namespace) -> tuple[str, str, str]:
+def _resolve_run_identity(
+    docs: Sequence[dict[str, Any]],
+    *,
+    row: str | None = None,
+    profile: str | None = None,
+) -> tuple[str, str, str]:
     """One (row, profile, fingerprint) for the given runs — repeats, not a mixture."""
     from .benchmark import BandError, result_fingerprint, result_profile, result_row_id
 
-    rows = {getattr(args, "row", None) or result_row_id(doc) for doc in docs}
-    profiles = {getattr(args, "profile", None) or result_profile(doc) for doc in docs}
+    rows = {row or result_row_id(doc) for doc in docs}
+    profiles = {profile or result_profile(doc) for doc in docs}
     fingerprints = {result_fingerprint(doc) for doc in docs}
     if len(rows) > 1 or len(profiles) > 1:
         raise BandError(
@@ -5360,34 +5369,51 @@ def _median_run_metrics(docs: Sequence[dict[str, Any]]) -> dict[str, float]:
     return {name: statistics.median([metrics[name] for metrics in per_run]) for name in sorted(shared)}
 
 
-def _ratchet_command(args: argparse.Namespace) -> str:
+def _ratchet_command(
+    results: Sequence[Any],
+    budgets: Any,
+    *,
+    row: str | None = None,
+    profile: str | None = None,
+) -> str:
     """The exact ratchet invocation for the runs/bands `compare` was called with."""
-    parts = ["rosotacom", "benchmark", "ratchet", *[str(p) for p in args.results], "--budgets", str(args.budgets)]
-    if getattr(args, "row", None):
-        parts += ["--row", str(args.row)]
-    if getattr(args, "profile", None):
-        parts += ["--profile", str(args.profile)]
+    parts = ["rosotacom", "benchmark", "ratchet", *[str(p) for p in results], "--budgets", str(budgets)]
+    if row:
+        parts += ["--row", str(row)]
+    if profile:
+        parts += ["--profile", str(profile)]
     return " ".join(shlex.quote(part) for part in parts)
 
 
-def benchmark_compare(args: argparse.Namespace) -> int:
-    """Handler for ``rosotacom benchmark compare`` — the two-sided gate verdict.
+def _compare_docs_to_bands(
+    docs: Sequence[dict[str, Any]],
+    budgets_path: Path,
+    *,
+    row: str | None = None,
+    profile: str | None = None,
+    required_metrics: Sequence[str] = (),
+    ratchet_hint: str,
+) -> list[Any]:
+    """Per-metric band comparisons for repeats of one row, or a ``BandError`` refusal.
 
-    Exit codes: 0 all WITHIN (or ``--monitor``), 1 REGRESSED or any refusal
-    (fingerprint mismatch, missing band/metric), 2 IMPROVED beyond the band —
-    red too, but the fix is the printed ratchet command, not a revert.
+    ``required_metrics`` closes the silent-no-op hole for registry rows: a gated
+    metric whose band vanished from the store refuses instead of not gating.
     """
-    from .benchmark import BandError, Verdict, bands_for, compare_to_band, load_bands
+    from .benchmark import BandError, bands_for, compare_to_band, load_bands
 
-    docs = _load_result_docs(args.results)
-    budgets_path = Path(args.budgets)
     bands = load_bands(budgets_path)
-    row, profile, fingerprint = _resolve_run_identity(docs, args)
-    selected = bands_for(bands, row=row, profile=profile)
+    row_id, profile_name, fingerprint = _resolve_run_identity(docs, row=row, profile=profile)
+    selected = bands_for(bands, row=row_id, profile=profile_name)
     if not selected:
         raise BandError(
-            f"no committed bands for ({row}, {profile}) in {budgets_path} — calibrate them first: "
-            f"{_ratchet_command(args)} --recalibrate"
+            f"no committed bands for ({row_id}, {profile_name}) in {budgets_path} — calibrate them first: "
+            f"{ratchet_hint} --recalibrate"
+        )
+    missing_bands = sorted(set(required_metrics) - {band.metric for band in selected})
+    if missing_bands:
+        raise BandError(
+            f"({row_id}, {profile_name}) gates {missing_bands} but {budgets_path} has no band for them — "
+            f"calibrate them first: {ratchet_hint} --recalibrate"
         )
     run_metrics = _median_run_metrics(docs)
 
@@ -5395,11 +5421,14 @@ def benchmark_compare(args: argparse.Namespace) -> int:
     for band in selected:
         if band.metric not in run_metrics:
             raise BandError(
-                f"the run(s) carry no {band.metric!r}, but ({row}, {profile}) bands it — "
+                f"the run(s) carry no {band.metric!r}, but ({row_id}, {profile_name}) bands it — "
                 "the gate cannot assert a missing metric"
             )
         comparisons.append(compare_to_band(band, run_metrics[band.metric], fingerprint=fingerprint))
+    return comparisons
 
+
+def _print_band_comparisons(comparisons: Sequence[Any]) -> None:
     for comparison in comparisons:
         band = comparison.band
         print(
@@ -5407,22 +5436,51 @@ def benchmark_compare(args: argparse.Namespace) -> int:
             f"(better={band.better.value}, runner={band.provenance.fingerprint})"
         )
 
+
+def _gate_exit_code(comparisons: Sequence[Any], *, budgets: Any, ratchet_hint: str) -> int:
+    """Print the two-sided gate verdict and map it to the CI exit code."""
+    from .benchmark import Verdict
+
     regressed = [c for c in comparisons if c.verdict is Verdict.REGRESSED]
     improved = [c for c in comparisons if c.verdict is Verdict.IMPROVED]
     if regressed:
         names = ", ".join(c.band.metric for c in regressed)
         print(f"REGRESSED: {names} left the band on the worse side — fix the regression;")
         print("a deliberate trade-off is a recalibration with a cause note:")
-        print(f"  {_ratchet_command(args)} --recalibrate --note '<why this level is accepted>'")
-        return 0 if args.monitor else 1
+        print(f"  {ratchet_hint} --recalibrate --note '<why this level is accepted>'")
+        return 1
     if improved:
         names = ", ".join(c.band.metric for c in improved)
         print(f"IMPROVED: {names} left the band on the better side — nice. Bank it in this same change:")
-        print(f"  {_ratchet_command(args)} --note '<one-line cause>'")
-        print(f"then commit the tightened {budgets_path} (the band diff is part of the review).")
-        return 0 if args.monitor else 2
+        print(f"  {ratchet_hint} --note '<one-line cause>'")
+        print(f"then commit the tightened {budgets} (the band diff is part of the review).")
+        return 2
     print(f"WITHIN: all {len(comparisons)} banded metric(s) inside their bands.")
     return 0
+
+
+def benchmark_compare(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark compare`` — the two-sided gate verdict.
+
+    Exit codes: 0 all WITHIN, 1 REGRESSED or any refusal (fingerprint mismatch,
+    missing band/metric), 2 IMPROVED beyond the band — red too, but the fix is
+    the printed ratchet command, not a revert. ``--monitor`` reports the same
+    verdicts (refusals included) and always exits 0.
+    """
+    from .benchmark import BandError
+
+    docs = _load_result_docs(args.results)
+    ratchet_hint = _ratchet_command(args.results, args.budgets, row=args.row, profile=args.profile)
+    try:
+        comparisons = _compare_docs_to_bands(
+            docs, Path(args.budgets), row=args.row, profile=args.profile, ratchet_hint=ratchet_hint
+        )
+    except BandError as exc:
+        print(f"REFUSED: {exc}")
+        return 0 if args.monitor else 1
+    _print_band_comparisons(comparisons)
+    exit_code = _gate_exit_code(comparisons, budgets=args.budgets, ratchet_hint=ratchet_hint)
+    return 0 if args.monitor else exit_code
 
 
 def benchmark_ratchet(args: argparse.Namespace) -> int:
@@ -5443,7 +5501,7 @@ def benchmark_ratchet(args: argparse.Namespace) -> int:
     docs = _load_result_docs(args.results)
     budgets_path = Path(args.budgets)
     bands = load_bands(budgets_path) if budgets_path.is_file() else []
-    row, profile, fingerprint = _resolve_run_identity(docs, args)
+    row, profile, fingerprint = _resolve_run_identity(docs, row=args.row, profile=args.profile)
     run_metrics = _median_run_metrics(docs)
     per_run = [metrics_from_result(doc) for doc in docs]
 
@@ -5511,6 +5569,282 @@ def benchmark_ratchet(args: argparse.Namespace) -> int:
     kept = [band for band in bands if band.key not in updated]
     save_bands(budgets_path, kept + list(updated.values()))
     print(f"{len(updated)} band(s) written to {budgets_path}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Benched set: rows / row / calibrate / gate-summary (RFC 0007 §4)
+# --------------------------------------------------------------------------- #
+
+
+def _load_gate_registry(args: argparse.Namespace) -> list[Any]:
+    from .benched_set import load_registry
+
+    registry_raw = getattr(args, "registry", None)
+    return load_registry(Path(registry_raw) if registry_raw else None)
+
+
+def benchmark_rows(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark rows`` — list the benched set."""
+    from .benched_set import rows_for_lane
+
+    rows = rows_for_lane(_load_gate_registry(args), args.lane)
+    if args.format == "ids":
+        print(json.dumps([row.id for row in rows]))
+    elif args.format == "json":
+        print(json.dumps([asdict(row) for row in rows], indent=2, sort_keys=True))
+    else:
+        for row in rows:
+            print(f"{row.id:32s} {row.lane:10s} {row.rmw:8s} {row.genre:9s} {row.profile}")
+            print(f"{'':32s} {row.reason}")
+    return 0
+
+
+def _drive_gate_row(args: argparse.Namespace, row: Any, run_dir: Path) -> None:
+    """Run one registry row's genre driver with the row's committed parameters."""
+    session_name = BENCHMARK_SESSIONS_BY_GENRE[row.genre]
+    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    result_context = _benchmark_result_context(
+        args, genre=row.genre, profile=row.profile, run_dir=run_dir, session=session_context
+    )
+    result_context["gate_row"] = {"id": row.id, "lane": row.lane, "reason": row.reason}
+    run_point = getattr(args, "_test_run_point", None) or _make_live_run_point(args, session_name)
+
+    with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
+        _print_benchmark_warnings(result_context)
+        if row.genre == "probe":
+            drive_probe(
+                run_point,
+                profile=row.profile,
+                size=int(row.load.get("size") or 0),
+                size_pattern=row.load.get("size_pattern"),
+                rate_hz=float(row.load["rate_hz"]),
+                streams=int(row.load.get("streams") or 1),
+                repeats=row.repeats,
+                duration_s=row.duration_s,
+                bin_s=1.0,
+                render_plot=False,
+                out_dir=run_dir,
+                result_context=result_context,
+                interval_jitter_ms=float(row.load.get("interval_jitter_ms") or 0.0),
+                interval_jitter_seed=int(row.load.get("interval_jitter_seed") or 42),
+            )
+        else:
+            drive_capacity(
+                run_point,
+                profile=row.profile,
+                knob=str(row.search["knob"]),
+                low=int(row.search["low"]),
+                high=int(row.search["high"]),
+                max_loss_pct=float(row.oracle["max_loss_pct"]),
+                max_latency_ms=float(row.oracle["max_latency_ms"]),
+                rate_hz=float(row.search["rate_hz"]),
+                repeats=row.repeats,
+                duration_s=row.duration_s,
+                out_dir=run_dir,
+                result_context=result_context,
+            )
+
+
+def benchmark_row(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark row`` — run one benched row and gate it.
+
+    Failure semantics (RFC 0007 §4): a run/setup failure raises and is red;
+    ``REGRESSED`` exits 1; ``IMPROVED`` exits 2 with the exact ratchet command
+    (bank it, don't revert); a refusal (uncalibrated or foreign-runner bands,
+    missing band) exits 1. ``--monitor`` reports the same verdict but exits 0;
+    ``--no-compare`` skips gating entirely (calibration runs). The verdict is
+    also written as machine-readable JSON for downstream gates.
+    """
+    from .benched_set import find_row, verdict_document, write_verdict
+    from .benchmark import BandError, Verdict, metrics_from_result, result_fingerprint, result_sha
+
+    row = find_row(_load_gate_registry(args), args.row_id)
+    args.rmw = row.rmw
+    args.profile = row.profile
+
+    run_dir = _setup_benchmark_run_dir(args, f"row-{row.id}", row.profile)
+    _drive_gate_row(args, row, run_dir)
+
+    doc = json.loads((run_dir / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    sha = result_sha(doc)
+    fingerprint = result_fingerprint(doc)
+
+    refusal: str | None = None
+    ratchet_hint = _ratchet_command([run_dir], args.budgets, row=row.id, profile=row.profile)
+    try:
+        run_metrics = metrics_from_result(doc)
+    except BandError as exc:
+        run_metrics = {}
+        refusal = str(exc)
+
+    comparisons: list[Any] = []
+    exit_code = 0
+    verdict = "RAN"
+    gate = not (args.no_compare or args.monitor)
+    if not args.no_compare and refusal is None:
+        try:
+            comparisons = _compare_docs_to_bands(
+                [doc],
+                Path(args.budgets),
+                row=row.id,
+                profile=row.profile,
+                required_metrics=row.metrics,
+                ratchet_hint=ratchet_hint,
+            )
+        except BandError as exc:
+            refusal = str(exc)
+
+    if refusal is not None:
+        print(f"REFUSED: {refusal}")
+        verdict = "REFUSED"
+        exit_code = 1
+    elif not args.no_compare:
+        _print_band_comparisons(comparisons)
+        exit_code = _gate_exit_code(comparisons, budgets=args.budgets, ratchet_hint=ratchet_hint)
+        verdicts = {c.verdict for c in comparisons}
+        if Verdict.REGRESSED in verdicts:
+            verdict = Verdict.REGRESSED.value
+        elif Verdict.IMPROVED in verdicts:
+            verdict = Verdict.IMPROVED.value
+        else:
+            verdict = Verdict.WITHIN.value
+
+    verdict_doc = verdict_document(
+        row,
+        verdict=verdict,
+        exit_code=exit_code,
+        gate=gate,
+        sha=sha,
+        fingerprint=fingerprint,
+        created_at=datetime.now().isoformat(timespec="seconds"),
+        metrics={name: run_metrics[name] for name in row.metrics if name in run_metrics},
+        monitor_metrics={name: run_metrics[name] for name in row.monitor if name in run_metrics},
+        bands={c.band.metric: {"lo": c.band.lo, "hi": c.band.hi, "better": c.band.better.value} for c in comparisons},
+        result_path=str(run_dir / BENCHMARK_RESULT_FILE),
+        refusal=refusal,
+        ratchet_command=ratchet_hint if verdict == Verdict.IMPROVED.value else None,
+    )
+    verdict_path = Path(args.verdict_file) if args.verdict_file else run_dir / "verdict.json"
+    write_verdict(verdict_path, verdict_doc)
+    print(f"Gate verdict {verdict} ({row.id}) written to {verdict_path}")
+    return 0 if args.monitor else exit_code
+
+
+def benchmark_calibrate(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark calibrate`` — mint one row's bands.
+
+    A row-aware ``ratchet --recalibrate``: bands only for the row's *gated*
+    metrics, keyed by the row id, plus a calibration report carrying the
+    measured per-metric spread — monitor metrics included, so the tighten-or-
+    monitor decision (RFC 0007 §3) is made from committed evidence.
+    """
+    from .benched_set import find_row
+    from .benchmark import _sample_stdev, metrics_from_result, result_fingerprint, result_window_s
+
+    row = find_row(_load_gate_registry(args), args.row_id)
+    note = args.note or f"runner-class calibration of benched row {row.id}"
+    # One ratchet per gated metric so each takes its committed floor (the
+    # registry's `floors` are the reviewed per-metric width parameters).
+    for metric in row.metrics:
+        ratchet_args = argparse.Namespace(
+            results=list(args.results),
+            budgets=args.budgets,
+            row=row.id,
+            profile=row.profile,
+            metric=[metric],
+            note=note,
+            recalibrate=True,
+            better=None,
+            k=args.k,
+            floor=row.floors.get(metric, args.floor),
+            floor_frac=args.floor_frac,
+        )
+        exit_code = benchmark_ratchet(ratchet_args)
+        if exit_code != 0:
+            return exit_code
+
+    docs = _load_result_docs(args.results)
+    per_run = [metrics_from_result(doc) for doc in docs]
+    shared = sorted(set.intersection(*[set(metrics) for metrics in per_run]))
+    spread = {}
+    for metric in shared:
+        values = [metrics[metric] for metrics in per_run]
+        spread[metric] = {
+            "values": values,
+            "median": statistics.median(values),
+            "sigma": _sample_stdev(values),
+            "banded": metric in row.metrics,
+        }
+    report = {
+        "schema": 1,
+        "kind": "benchmark-calibration-report",
+        "row": row.id,
+        "profile": row.profile,
+        "rmw": row.rmw,
+        "fingerprint": result_fingerprint(docs[0]),
+        "window_s": result_window_s(docs[0]),
+        "repeats": len(docs),
+        "k": args.k,
+        "floor": args.floor,
+        "floor_frac": args.floor_frac,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "metrics": spread,
+    }
+    if args.report:
+        report_path = Path(args.report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"Calibration report written to {report_path}")
+    for metric, stats in spread.items():
+        role = "banded" if stats["banded"] else "monitor"
+        print(f"  {metric}: median={stats['median']:g} sigma={stats['sigma']:g} ({role}, {len(docs)} repeats)")
+    return 0
+
+
+def benchmark_gate_summary(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark gate-summary`` — aggregate row verdicts.
+
+    Reads every per-row verdict JSON in ``--verdicts``, checks it against the
+    registry's rows for the lane, and writes the one summary document the
+    operator harness promotion gate consumes. A missing or non-``WITHIN`` gated
+    row makes the summary red and the exit code 1.
+    """
+    from .benched_set import rows_for_lane, summarize_verdicts
+    from .benchmark import runner_fingerprint
+
+    rows = rows_for_lane(_load_gate_registry(args), args.lane)
+    verdicts: dict[str, dict[str, Any]] = {}
+    verdicts_dir = Path(args.verdicts)
+    for path in sorted(verdicts_dir.rglob("*.json")):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(doc, dict) and doc.get("kind") == "benchmark-gate-verdict":
+            verdicts[str(doc.get("row"))] = doc
+
+    summary = summarize_verdicts(
+        rows,
+        verdicts,
+        run={
+            "sha": os.environ.get("GITHUB_SHA") or _current_sha(),
+            "run_id": os.environ.get("GITHUB_RUN_ID"),
+            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "fingerprint": runner_fingerprint(),
+        },
+    )
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    for row_doc in summary["rows"]:
+        print(f"  {row_doc.get('row')}: {row_doc.get('verdict')}")
+    print(f"Gate summary ({summary['overall']}) written to {out_path}")
+    if summary["overall"] != "green":
+        red = ", ".join(summary["red_rows"])
+        print(f"RED: {red} — a red nightly gate outranks feature work (RFC 0007 §4)")
+        return 1
     return 0
 
 
@@ -6810,6 +7144,88 @@ def _register_benchmark_band_parsers(benchmark_subparsers: Any) -> None:
     ratchet_parser.set_defaults(func=benchmark_ratchet)
 
 
+def _register_benchmark_gate_parsers(benchmark_subparsers: Any) -> None:
+    """Register the benched-set commands (RFC 0007 §4): rows/row/calibrate/gate-summary."""
+    from .benched_set import LANES
+    from .benchmark import DEFAULT_FLOOR_FRAC, DEFAULT_WIDTH_K
+
+    rows_parser = benchmark_subparsers.add_parser(
+        "rows",
+        help="List the benched-set registry — the curated rows the gate lanes run.",
+    )
+    rows_parser.add_argument("--registry", default=None, help="Registry file (default: the packaged benched set).")
+    rows_parser.add_argument("--lane", choices=list(LANES), default=None, help="Only rows of this lane.")
+    rows_parser.add_argument(
+        "--format",
+        choices=["text", "ids", "json"],
+        default="text",
+        help="Output format; 'ids' is a JSON array for a workflow matrix.",
+    )
+    rows_parser.set_defaults(func=benchmark_rows)
+
+    row_parser = benchmark_subparsers.add_parser(
+        "row",
+        help="Run one benched row end-to-end and gate it against the committed bands.",
+    )
+    _add_benchmark_common_args(row_parser, ota_benchmark=False)
+    row_parser.add_argument("row_id", help="Registry row id (see 'benchmark rows'); pins rmw/profile/load/duration.")
+    row_parser.add_argument("--registry", default=None, help="Registry file (default: the packaged benched set).")
+    row_parser.add_argument("--budgets", default="budgets.jsonl", help="Committed band store (JSONL).")
+    row_parser.add_argument(
+        "--verdict-file",
+        default=None,
+        help="Where to write the machine-readable verdict JSON (default: <run-dir>/verdict.json).",
+    )
+    row_gate_mode = row_parser.add_mutually_exclusive_group()
+    row_gate_mode.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Report the verdict (refusals included) without blocking: always exit 0.",
+    )
+    row_gate_mode.add_argument(
+        "--no-compare",
+        action="store_true",
+        help="Run the row without gating it — calibration repeats use this.",
+    )
+    row_parser.set_defaults(func=benchmark_row)
+
+    calibrate_parser = benchmark_subparsers.add_parser(
+        "calibrate",
+        help="Mint one benched row's bands from K fresh repeats on this runner class.",
+    )
+    calibrate_parser.add_argument("row_id", help="Registry row id whose gated metrics get bands.")
+    calibrate_parser.add_argument("results", nargs="+", help="The K result.json file(s) or run director(y/ies).")
+    calibrate_parser.add_argument("--registry", default=None, help="Registry file (default: the packaged benched set).")
+    calibrate_parser.add_argument("--budgets", default="budgets.jsonl", help="Committed band store (JSONL).")
+    calibrate_parser.add_argument(
+        "--report",
+        default=None,
+        help="Also write a calibration report (per-metric values/median/sigma, monitor metrics included).",
+    )
+    calibrate_parser.add_argument("--note", default="", help="One-line cause note recorded in the bands.")
+    calibrate_parser.add_argument(
+        "--k", type=float, default=DEFAULT_WIDTH_K, help="Width multiplier: half-width = max(k*sigma, floor)."
+    )
+    calibrate_parser.add_argument("--floor", type=float, default=0.0, help="Absolute minimum half-width.")
+    calibrate_parser.add_argument(
+        "--floor-frac",
+        type=float,
+        default=DEFAULT_FLOOR_FRAC,
+        help="Minimum half-width as a fraction of the band center.",
+    )
+    calibrate_parser.set_defaults(func=benchmark_calibrate)
+
+    summary_parser = benchmark_subparsers.add_parser(
+        "gate-summary",
+        help="Aggregate per-row verdict JSONs into the one summary a promotion gate reads.",
+    )
+    summary_parser.add_argument("--verdicts", required=True, help="Directory holding the per-row verdict JSON files.")
+    summary_parser.add_argument("--registry", default=None, help="Registry file (default: the packaged benched set).")
+    summary_parser.add_argument("--lane", choices=list(LANES), default="nightly", help="Lane the summary covers.")
+    summary_parser.add_argument("--out", required=True, help="Summary JSON output path.")
+    summary_parser.set_defaults(func=benchmark_gate_summary)
+
+
 def register_benchmark_parser(subparsers: Any) -> None:
     """Register the ``benchmark`` and ``ota-benchmark`` commands."""
     benchmark_parser = subparsers.add_parser(
@@ -6819,6 +7235,7 @@ def register_benchmark_parser(subparsers: Any) -> None:
     benchmark_subparsers = benchmark_parser.add_subparsers(dest="benchmark_command", required=True)
     _register_benchmark_driver_parsers(benchmark_subparsers, ota_benchmark=False)
     _register_benchmark_band_parsers(benchmark_subparsers)
+    _register_benchmark_gate_parsers(benchmark_subparsers)
     _register_benchmark_plot_parser(benchmark_subparsers)
 
     ota_parser = subparsers.add_parser(

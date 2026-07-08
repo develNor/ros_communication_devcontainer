@@ -453,7 +453,8 @@ rosotacom stream-stats \
 
 The command emits a side-by-side Markdown table plus `stream-stats.json`, with
 per-stage size distributions, observed rate, interval regularity, and FFMPEG
-GOP/keyframe shape when available. Bag sources require `rosbag2_py`; `events`
+GOP/keyframe shape when available. MCAP bag sources use the Python `mcap`
+reader; other rosbag2 storage backends require `rosbag2_py`. `events`
 sources work from the recorded RFC 0003 transit rows. See
 [docs/ffmpeg-keyframes.md](docs/ffmpeg-keyframes.md) for the GOP methodology
 and example camera interpretation.

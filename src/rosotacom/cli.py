@@ -8110,8 +8110,8 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="LABEL=PATH:/topic",
         help=(
-            "Analyze one rosbag2/stage-bag topic. Requires rosbag2_py in the active environment. "
-            "Repeat to compare stages."
+            "Analyze one rosbag2/stage-bag topic. MCAP uses the Python mcap reader; other storage "
+            "backends require rosbag2_py. Repeat to compare stages."
         ),
     )
     stream_stats_parser.add_argument(

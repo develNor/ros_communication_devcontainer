@@ -11,6 +11,8 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+import yaml
+
 from . import __version__
 from .ffmpeg_packet import FFMPEGPacketInfo, keyframes_by_size, parse_ffmpeg_packet
 from .transit import join_transit_records, load_transit_records
@@ -18,6 +20,10 @@ from .transit import join_transit_records, load_transit_records
 FFMPEG_TYPE = "ffmpeg_image_transport_msgs/msg/FFMPEGPacket"
 KEYFRAME_SHARE_MIN = 0.02
 KEYFRAME_SHARE_MAX = 0.40
+
+
+class McapUnavailableError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -172,13 +178,140 @@ def samples_from_cdr_records(
     return tuple(samples)
 
 
+def _metadata_path(path: Path) -> Path | None:
+    if path.is_dir() and (path / "metadata.yaml").is_file():
+        return path / "metadata.yaml"
+    if path.is_file() and path.name == "metadata.yaml":
+        return path
+    return None
+
+
+def _load_bag_metadata(path: Path) -> dict[str, Any] | None:
+    metadata = _metadata_path(path)
+    if metadata is None:
+        return None
+    loaded = yaml.safe_load(metadata.read_text(encoding="utf-8")) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"bag metadata must be a mapping: {metadata}")
+    info = loaded.get("rosbag2_bagfile_information") or {}
+    if not isinstance(info, dict):
+        raise ValueError(f"bag metadata missing rosbag2_bagfile_information: {metadata}")
+    return loaded
+
+
+def _bag_info(metadata: dict[str, Any]) -> dict[str, Any]:
+    info = metadata.get("rosbag2_bagfile_information") or {}
+    if not isinstance(info, dict):
+        raise ValueError("bag metadata missing rosbag2_bagfile_information")
+    return info
+
+
+def _bag_base_dir(path: Path) -> Path:
+    metadata = _metadata_path(path)
+    if metadata is None:
+        raise ValueError(f"not a rosbag2 directory or metadata.yaml: {path}")
+    return metadata.parent
+
+
+def _bag_file_paths(path: Path, metadata: dict[str, Any], suffix: str) -> list[Path]:
+    base = _bag_base_dir(path)
+    info = _bag_info(metadata)
+    raw_paths = info.get("relative_file_paths") or []
+    if isinstance(raw_paths, list) and raw_paths:
+        files = [base / str(raw) for raw in raw_paths]
+    else:
+        files = sorted(base.glob(f"*{suffix}"))
+    if not files:
+        raise ValueError(f"bag has no {suffix} storage files: {base}")
+    return files
+
+
+def _topic_types_from_metadata(metadata: dict[str, Any]) -> dict[str, str]:
+    topics = _bag_info(metadata).get("topics_with_message_count") or []
+    result: dict[str, str] = {}
+    if not isinstance(topics, list):
+        return result
+    for entry in topics:
+        if not isinstance(entry, dict):
+            continue
+        topic_metadata = entry.get("topic_metadata") or {}
+        if not isinstance(topic_metadata, dict):
+            continue
+        name = topic_metadata.get("name")
+        msg_type = topic_metadata.get("type")
+        if name is not None and msg_type is not None:
+            result[str(name)] = str(msg_type)
+    return result
+
+
+def _mcap_paths(path: Path, metadata: dict[str, Any] | None) -> list[Path]:
+    if metadata is not None:
+        return _bag_file_paths(path, metadata, ".mcap")
+    if path.is_file() and path.suffix == ".mcap":
+        return [path]
+    raise ValueError(f"not an mcap rosbag2 directory, metadata.yaml, or .mcap file: {path}")
+
+
+def _load_mcap_bag_source(spec: SourceSpec) -> StreamSource:
+    try:
+        from mcap.reader import make_reader
+    except ImportError as exc:
+        raise McapUnavailableError(
+            "mcap bag sources require the Python package `mcap`; reinstall rosotacom or install mcap"
+        ) from exc
+
+    metadata = _load_bag_metadata(spec.path)
+    message_type = None
+    if metadata is not None:
+        topic_types = _topic_types_from_metadata(metadata)
+        if spec.topic not in topic_types:
+            available = ", ".join(sorted(topic_types)) or "none"
+            raise RuntimeError(f"{spec.path}: topic {spec.topic!r} not found; available topics: {available}")
+        message_type = topic_types[spec.topic]
+
+    records: list[tuple[int, bytes]] = []
+    for mcap_path in _mcap_paths(spec.path, metadata):
+        with mcap_path.open("rb") as fp:
+            reader = make_reader(fp)
+            for schema, channel, message in reader.iter_messages(topics=[spec.topic]):
+                if channel.topic != spec.topic:
+                    continue
+                if message_type is None and schema is not None:
+                    schema_name = getattr(schema, "name", None)
+                    message_type = str(schema_name) if schema_name is not None else None
+                records.append((int(message.log_time), bytes(message.data)))
+    if not records:
+        raise RuntimeError(f"{spec.path}: no messages found for topic {spec.topic!r}")
+    records.sort(key=lambda row: row[0])
+    samples = samples_from_cdr_records(records, message_type=message_type)
+    size_basis = (
+        "ffmpeg_payload_bytes" if message_type and "FFMPEGPacket" in message_type else "serialized_message_bytes"
+    )
+    return StreamSource(
+        label=spec.label,
+        kind="bag",
+        path=spec.path,
+        topic=spec.topic,
+        samples=samples,
+        message_type=message_type,
+        size_basis=size_basis,
+    )
+
+
 def load_bag_source(spec: SourceSpec, *, storage_id: str = "mcap") -> StreamSource:
-    """Load one topic from a rosbag2 bag using optional ``rosbag2_py``."""
+    """Load one topic from a rosbag2 bag."""
+    if storage_id == "mcap":
+        try:
+            return _load_mcap_bag_source(spec)
+        except McapUnavailableError:
+            pass
+
     try:
         import rosbag2_py  # type: ignore[import-not-found]
     except ImportError as exc:
         raise RuntimeError(
-            "bag sources require rosbag2_py. Run inside a ROS environment, or use --events for events.jsonl sources."
+            "bag sources require the Python package `mcap` for MCAP bags or rosbag2_py in a ROS environment. "
+            "Use --events for events.jsonl sources."
         ) from exc
 
     reader = rosbag2_py.SequentialReader()

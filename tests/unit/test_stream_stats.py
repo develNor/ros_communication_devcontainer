@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import struct
+import sys
+import types
 from pathlib import Path
 
 import rosotacom.cli as rosotacom
@@ -11,6 +13,7 @@ from rosotacom.stream_stats import (
     StreamSample,
     StreamSource,
     build_report,
+    load_bag_source,
     load_events_source,
     parse_source_spec,
     render_markdown,
@@ -149,6 +152,47 @@ def test_events_source_filters_topic_and_detects_gop_by_size(tmp_path: Path) -> 
     assert stats["rate_hz"] == 10.0
     assert stats["gop"]["method"].startswith("size_bimodality")
     assert stats["gop"]["keyframes"] == 2
+
+
+def test_mcap_bag_source_reads_metadata_without_rosbag2(tmp_path: Path, monkeypatch) -> None:
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "stage_0.mcap").write_bytes(b"not a real mcap; fake reader supplies rows")
+    (bag / "metadata.yaml").write_text(
+        """
+rosbag2_bagfile_information:
+  storage_identifier: mcap
+  relative_file_paths:
+    - stage_0.mcap
+  topics_with_message_count:
+    - topic_metadata:
+        name: /numbers
+        type: std_msgs/msg/UInt8MultiArray
+      message_count: 2
+""",
+        encoding="utf-8",
+    )
+
+    class FakeReader:
+        def iter_messages(self, *, topics):
+            assert topics == ["/numbers"]
+            schema = types.SimpleNamespace(name="std_msgs/msg/UInt8MultiArray")
+            channel = types.SimpleNamespace(topic="/numbers")
+            yield schema, channel, types.SimpleNamespace(log_time=100, data=b"abcd")
+            yield schema, channel, types.SimpleNamespace(log_time=200, data=b"abcdef")
+
+    reader_module = types.ModuleType("mcap.reader")
+    reader_module.make_reader = lambda _fp: FakeReader()
+    monkeypatch.setitem(sys.modules, "mcap", types.ModuleType("mcap"))
+    monkeypatch.setitem(sys.modules, "mcap.reader", reader_module)
+
+    source = load_bag_source(parse_source_spec("bag", f"handoff={bag}:/numbers"))
+    stats = summarize_source(source)
+
+    assert source.message_type == "std_msgs/msg/UInt8MultiArray"
+    assert source.size_basis == "serialized_message_bytes"
+    assert stats["count"] == 2
+    assert stats["size_bytes"]["mean"] == 5.0
 
 
 def test_comparison_markdown_has_one_row_per_stage() -> None:

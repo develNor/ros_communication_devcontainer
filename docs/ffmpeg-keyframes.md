@@ -65,8 +65,8 @@ Inputs are explicit and repeatable:
 - `--bag LABEL=PATH:/topic` reads one rosbag2 topic, using message timestamps and
   serialized sizes. When the bag metadata declares `FFMPEGPacket`, the command
   parses the CDR payload and reports encoded-frame payload sizes plus keyframes
-  from `flags & 1`. Bag reading uses `rosbag2_py`, so run it in a ROS
-  environment for MCAP sources.
+  from `flags & 1`. MCAP bags are read through the Python `mcap` package; other
+  rosbag2 storage backends fall back to `rosbag2_py` in a ROS environment.
 - `--events LABEL=PATH:/topic` reads delivered RFC 0003 transit rows from
   `events.jsonl`, using receiver-side `t_com_in` timestamps and `size_bytes`.
   Transit rows do not carry raw CDR flags, so GOP annotation uses the documented
@@ -88,6 +88,20 @@ spacing distribution, and the most extreme GOP by keyframe-to-delta mean ratio.
 The comparison is intentionally aggregate-only: it does not join individual
 messages across decimating stages such as drop or throttle, matching the
 index-join caveat in [RFC 0003](rfcs/0003-metric-backbone.md).
+
+The July 2 remote-assist handoff traces used by examples 15/16 produce this
+handoff-only comparison:
+
+```text
+| stage | kind | topic | msgs | hz | mean B | p90 B | gap std ms | gaps within +/-10% | GOP spacing |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `costmap` | bag | `/costmap/costmap/restamped/globalframe/bz2` | 1396 | 10.001 | 8332.97 | 10208 | 12.701 | 68.817% | - |
+| `camera` | bag | `/sensors/camera/front_medium/resized/image_rect_color/compressed/restamped/drop1of2/ffmpeg` | 1396 | 9.999 | 12398.8 | 42300 | 19.691 | 48.459% | 5 |
+```
+
+The camera GOP-position table is the expected bimodal GOP-5 shape: position 0
+averages 43,723 B, while positions 1-4 average 3,738 B, 4,512 B, 4,834 B, and
+4,335 B respectively.
 
 ## Fallback: size bimodality
 

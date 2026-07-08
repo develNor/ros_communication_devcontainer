@@ -17,6 +17,7 @@ from rosotacom.benched_set import (
     find_row,
     load_registry,
     packaged_registry_path,
+    rows_for_calibration,
     rows_for_lane,
     summarize_verdicts,
     verdict_document,
@@ -24,6 +25,7 @@ from rosotacom.benched_set import (
 
 MINIMAL_PROBE_ROW = """
   - id: probe-x
+    kind: performance
     lane: nightly
     reason: because
     rmw: cyclone
@@ -38,7 +40,7 @@ MINIMAL_PROBE_ROW = """
 
 def _write_registry(tmp_path: Path, rows_yaml: str) -> Path:
     path = tmp_path / "benched-set.yaml"
-    path.write_text(f"version: 1\nrows:\n{rows_yaml}", encoding="utf-8")
+    path.write_text(f"version: 2\nrows:\n{rows_yaml}", encoding="utf-8")
     return path
 
 
@@ -55,6 +57,8 @@ def test_packaged_registry_loads_and_covers_both_lanes() -> None:
     assert {"cyclone", "fastdds", "zenoh"} <= rmws, "the matrix covers the supported RMW variants"
     profiles = {row.profile for row in rows if row.rmw == "cyclone"}
     assert len(profiles) >= 2, "the default RMW runs deep: nominal and tight profiles"
+    assert any(row.kind == "boundary" for row in rows_for_lane(rows, "nightly")), "nightly carries boundary rows"
+    assert all(row.kind == "performance" for row in rows_for_calibration(rows)), "only performance rows calibrate bands"
 
 
 def test_find_row_names_known_rows_in_the_refusal() -> None:
@@ -73,6 +77,12 @@ def test_registry_refuses_unknown_keys(tmp_path: Path) -> None:
     path = _write_registry(tmp_path, _probe_row_yaml(extra="    surprise: 1\n"))
     with pytest.raises(RegistryError, match="whitelist"):
         load_registry(path)
+
+
+def test_registry_requires_explicit_row_kind(tmp_path: Path) -> None:
+    row = _probe_row_yaml().replace("    kind: performance\n", "")
+    with pytest.raises(RegistryError, match="kind"):
+        load_registry(_write_registry(tmp_path, row))
 
 
 def test_registry_refuses_short_window_without_note(tmp_path: Path) -> None:
@@ -111,6 +121,7 @@ def test_registry_refuses_floors_for_unbanded_metrics(tmp_path: Path) -> None:
 def test_capacity_rows_band_exactly_their_knob_breakpoint(tmp_path: Path) -> None:
     row = """
   - id: cap-x
+    kind: performance
     lane: nightly
     reason: because
     rmw: cyclone
@@ -124,6 +135,38 @@ def test_capacity_rows_band_exactly_their_knob_breakpoint(tmp_path: Path) -> Non
 """
     with pytest.raises(RegistryError, match="capacity_size"):
         load_registry(_write_registry(tmp_path, row))
+
+
+def test_boundary_rows_validate_their_failure_signature(tmp_path: Path) -> None:
+    row = """
+  - id: boundary-x
+    kind: boundary
+    lane: nightly
+    reason: because
+    rmw: cyclone
+    genre: probe
+    profile: finding-3.2mbit
+    duration_s: 60
+    load: { size: 18000, rate_hz: 20.0 }
+    metrics: [loss_pct]
+    boundary:
+      finding: docs/findings/example.md
+      bad_profile: finding-3.1mbit
+      good_oracle: { loss_pct: { max: 0.5 } }
+      failure_signature: { loss_pct: { min: 1.0 } }
+      next_steps: move the profile and ratchet
+"""
+    rows = load_registry(_write_registry(tmp_path, row))
+
+    assert rows[0].kind == "boundary"
+    assert rows[0].boundary["bad_profile"] == "finding-3.1mbit"
+
+    broken = row.replace(
+        "failure_signature: { loss_pct: { min: 1.0 } }",
+        "failure_signature: { latency_p95_ms: { min: 1.0 } }",
+    )
+    with pytest.raises(RegistryError, match="unbanded metric"):
+        load_registry(_write_registry(tmp_path, broken))
 
 
 def _row(row_id: str = "probe-x", lane: str = "nightly") -> GateRow:

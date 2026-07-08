@@ -59,7 +59,7 @@ jobs:
             echo "repeats must be an integer in [2, 10], got: $k" >&2
             exit 1
           fi
-          rows="$(.venv/bin/rosotacom benchmark rows --format ids)"
+          rows="$(.venv/bin/rosotacom benchmark rows --calibratable --format ids)"
           repeats="$(seq 1 "$k" | jq -cs '.')"
           echo "rows=$rows" >> "$GITHUB_OUTPUT"
           echo "repeats=$repeats" >> "$GITHUB_OUTPUT"
@@ -163,7 +163,7 @@ jobs:
               --budgets budgets.jsonl \
               --report "calibration/${row}.json" \
               --note "runner-class calibration, K=${k} independent GitHub-hosted runs"
-          done < <(.venv/bin/rosotacom benchmark rows --format ids | jq -r '.[]')
+          done < <(.venv/bin/rosotacom benchmark rows --calibratable --format ids | jq -r '.[]')
           git --no-pager diff --no-index /dev/null budgets.jsonl || true
 
       - name: Upload calibrated bands

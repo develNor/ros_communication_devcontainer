@@ -55,8 +55,8 @@ Migrated summary: 400 expected, 400 delivered, 0 lost, max p95 latency
 306.927 ms.
 
 Verification: manual: run the commands above from a source checkout with Docker
-and `tc` privileges; automation waits for the RFC 0007 regression and boundary
-rows because the public row registry does not exist yet.
+and `tc` privileges; this is a no-loss negative-control finding rather than a
+must-fail boundary row, so it remains outside the RFC 0007 boundary gate.
 
 ## Status
 

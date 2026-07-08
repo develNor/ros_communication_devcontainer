@@ -9,6 +9,11 @@
 name: Benchmark Calibrate
 
 on:
+  # TEMPORARY (remove with the calibrated-bands commit): dispatch cannot reach a
+  # workflow that is not on the default branch yet, so the initial calibration
+  # of this PR branch triggers on push instead.
+  push:
+    branches: [issue-179-gate-lanes]
   workflow_dispatch:
     inputs:
       repeats:

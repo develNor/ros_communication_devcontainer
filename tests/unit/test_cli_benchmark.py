@@ -365,9 +365,12 @@ def test_capacity_driver_finds_breakpoint_with_stubbed_probe(
     assert result["capacity"] == 8000
     assert result["slice"]["knob"] == "size"
     assert result["slice"]["profile"] == "test-profile"
-    # Budget file was written.
-    assert (tmp_path / "budgets.jsonl").exists()
+    # No per-run budget file anymore: bands change only via `benchmark ratchet`.
+    assert not (tmp_path / "budgets.jsonl").exists()
     result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    # The self-contained result carries the provenance the band gate needs.
+    assert result_doc["runner"]["fingerprint"]
+    assert result_doc["sha"]
     assert result_doc["configuration"]["thresholds"]["max_loss_pct"] == 5.0
     assert result_doc["result"]["capacity"] == 8000
     assert result_doc["verdict"]["passed"] is True
@@ -1262,17 +1265,16 @@ def test_profile_requires_netem_seed_only_when_seeded_netem_is_generated() -> No
 
 
 # --------------------------------------------------------------------------- #
-# Budget save/load/compare roundtrip (CLI-level)
+# Band gate: compare + ratchet roundtrip (CLI-level, RFC 0007)
 # --------------------------------------------------------------------------- #
 
 
-def test_budget_roundtrip_from_capacity_run(tmp_path: Path) -> None:
-    """A capacity run writes a budget file that can be loaded and compared."""
-    from rosotacom.benchmark import BudgetKey, Direction, MetricSpec, compare_to_budget, find_baseline, load_budget
-
-    probe = _make_stub_probe(breakpoint_size=5000)
+def _capacity_run(tmp_path: Path, name: str, breakpoint_size: int) -> Path:
+    """One stubbed capacity run; returns the run directory holding result.json."""
+    run_dir = tmp_path / name
+    run_dir.mkdir()
     drive_capacity(
-        probe,
+        _make_stub_probe(breakpoint_size=breakpoint_size),
         profile="p",
         knob="size",
         low=1000,
@@ -1280,23 +1282,95 @@ def test_budget_roundtrip_from_capacity_run(tmp_path: Path) -> None:
         max_loss_pct=5.0,
         max_latency_ms=200.0,
         duration_s=1.0,
-        out_dir=tmp_path,
+        out_dir=run_dir,
     )
-    entries = load_budget(tmp_path / "budgets.jsonl")
-    assert len(entries) == 1
-    baseline = find_baseline(entries, profile="p", genre="capacity")
-    assert baseline is not None
-    assert baseline.metrics["capacity_size"] == 5000.0
+    return run_dir
 
-    # Compare against a slightly lower current value — no regression within tolerance.
-    specs = [MetricSpec("capacity_size", Direction.HIGHER_IS_BETTER, rel_tolerance=0.1)]
-    comparison = compare_to_budget(
-        BudgetKey(sha="test", profile="p", genre="capacity"),
-        specs,
-        baseline.metrics,
-        {"capacity_size": 4800.0},
-    )
-    assert not comparison.regressed  # 4800 is within 10% of 5000
+
+def _band_args(results: list[Path], budgets: Path, **overrides: Any) -> argparse.Namespace:
+    args: dict[str, Any] = {
+        "results": [str(result) for result in results],
+        "budgets": str(budgets),
+        "row": None,
+        "profile": None,
+        "metric": None,
+        "note": "",
+        "recalibrate": False,
+        "better": None,
+        "k": 3.0,
+        "floor": 0.0,
+        "floor_frac": 0.02,
+        "monitor": False,
+    }
+    args.update(overrides)
+    return argparse.Namespace(**args)
+
+
+def test_capacity_run_ratchet_compare_is_within(tmp_path: Path) -> None:
+    """The RFC 0007 §2 roundtrip: run → ratchet --recalibrate → compare is WITHIN."""
+    run = _capacity_run(tmp_path, "calibration", breakpoint_size=5000)
+    budgets = tmp_path / "budgets.jsonl"
+    assert benchmark_cli.benchmark_ratchet(_band_args([run], budgets, recalibrate=True, note="initial")) == 0
+    # A run directory or its result.json both address the same run.
+    assert benchmark_cli.benchmark_compare(_band_args([run / BENCHMARK_RESULT_FILE], budgets)) == 0
+
+
+def test_compare_gates_both_sides_and_banks_improvements(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """REGRESSED exits 1; IMPROVED exits 2 printing the exact ratchet command;
+    running that command banks the improvement and compare returns to WITHIN."""
+    from rosotacom.benchmark import WideningRefused, load_bands
+
+    calibration = _capacity_run(tmp_path, "calibration", breakpoint_size=5000)
+    regressed = _capacity_run(tmp_path, "regressed", breakpoint_size=4000)
+    improved = _capacity_run(tmp_path, "improved", breakpoint_size=6000)
+    budgets = tmp_path / "budgets.jsonl"
+    assert benchmark_cli.benchmark_ratchet(_band_args([calibration], budgets, recalibrate=True)) == 0
+    capsys.readouterr()
+
+    # Worse side: gate-red, and a plain ratchet refuses to loosen the band toward it.
+    assert benchmark_cli.benchmark_compare(_band_args([regressed], budgets)) == 1
+    assert "REGRESSED" in capsys.readouterr().out
+    with pytest.raises(WideningRefused, match="--recalibrate"):
+        benchmark_cli.benchmark_ratchet(_band_args([regressed], budgets))
+
+    # Better side: red too, with the exact ratchet command in the happy message.
+    improved_result = improved / BENCHMARK_RESULT_FILE
+    assert benchmark_cli.benchmark_compare(_band_args([improved_result], budgets)) == 2
+    out = capsys.readouterr().out
+    assert "IMPROVED" in out
+    assert f"rosotacom benchmark ratchet {improved_result} --budgets {budgets}" in out
+    # Monitor lanes report without blocking.
+    assert benchmark_cli.benchmark_compare(_band_args([improved_result], budgets, monitor=True)) == 0
+    capsys.readouterr()
+
+    # Run the printed command: the band re-centers, calibration provenance survives.
+    before = load_bands(budgets)[0]
+    assert benchmark_cli.benchmark_ratchet(_band_args([improved_result], budgets, note="stub got faster")) == 0
+    after = load_bands(budgets)[0]
+    assert after.center == 6000.0
+    assert after.half_width == before.half_width
+    assert after.provenance.sigma == before.provenance.sigma
+    assert after.provenance.floor == before.provenance.floor
+    assert after.provenance.note == "stub got faster"
+    assert benchmark_cli.benchmark_compare(_band_args([improved_result], budgets)) == 0
+
+
+def test_compare_refuses_bands_from_another_runner_class(tmp_path: Path) -> None:
+    """Uncalibrated or foreign-runner bands refuse to gate, naming the fix."""
+    import dataclasses
+
+    from rosotacom.benchmark import UNCALIBRATED_FINGERPRINT, FingerprintMismatch, load_bands, save_bands
+
+    run = _capacity_run(tmp_path, "run", breakpoint_size=5000)
+    budgets = tmp_path / "budgets.jsonl"
+    assert benchmark_cli.benchmark_ratchet(_band_args([run], budgets, recalibrate=True)) == 0
+    doctored = [
+        dataclasses.replace(band, provenance=dataclasses.replace(band.provenance, fingerprint=UNCALIBRATED_FINGERPRINT))
+        for band in load_bands(budgets)
+    ]
+    save_bands(budgets, doctored)
+    with pytest.raises(FingerprintMismatch, match="--recalibrate"):
+        benchmark_cli.benchmark_compare(_band_args([run], budgets))
 
 
 # --------------------------------------------------------------------------- #

@@ -604,7 +604,12 @@ benchmark probes. Benchmark sessions default to Cyclone DDS; pass `--rmw
 fastdds`, `--rmw cyclone`, or another supported session RMW value to pin a run.
 Each run writes a self-contained `result.json` under its benchmark artifact
 directory with the selected RMW, configured load and offered bandwidth, profile
-shaping context, thresholds, verdict, and per-topic loss/latency/jitter metrics.
+shaping context, thresholds, verdict, per-topic loss/latency/jitter metrics, and
+the runner fingerprint. Deterministic runs gate against the committed two-sided
+performance bands in `budgets.jsonl` via `rosotacom benchmark compare`, and
+bands move only through `rosotacom benchmark ratchet` — see
+[docs/performance-bands.md](docs/performance-bands.md) for the band schema,
+verdicts, and the ratchet workflow (RFC 0007).
 For live benchmark probes, `--duration` is the shaped publish window; after that
 rosotacom stops synthetic publishers and waits `--drain-s` seconds before
 tearing down shaping, so delayed in-flight messages are not miscounted as loss.

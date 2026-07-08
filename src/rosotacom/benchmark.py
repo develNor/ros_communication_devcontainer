@@ -8,7 +8,7 @@ What lives here is everything that can be exercised by a deterministic host test
 * size-pattern expansion (the a/b irregular-size load, mirrors ``sized_publisher``);
 * the capacity binary-search driver and its oracle (``loss < p`` and ``latency < L``);
 * sweep bounds + the shared-link guard (an unshaped run never saturates the LAN);
-* the budget store and the regression compare (per ``(SHA, profile, genre)``);
+* the committed band store, the two-sided compare, and the ratchet (RFC 0007);
 * recovery-metric extraction from a timeline of RFC 0003 transit records;
 * fixed-probe time-bin characterization for latency/loss/Hz/bandwidth plots;
 * the coarse linear-ramp curve (monitor-only trend).
@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import platform
 import re
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, field
+import socket
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -308,105 +311,404 @@ def find_capacity(
 
 
 # --------------------------------------------------------------------------- #
-# Genre 1/2 — budgets & baselines (the benchmark analogue of ``expect``)
+# Genre 1/2 — committed bands + the ratchet (RFC 0007, the analogue of ``expect``)
 # --------------------------------------------------------------------------- #
 
+BAND_SCHEMA = 2
 
-class Direction(str, Enum):
-    HIGHER_IS_BETTER = "higher_is_better"  # capacity numbers
-    LOWER_IS_BETTER = "lower_is_better"  # latency / recovery times
+# Half-width = max(k·σ, floor). The defaults are starting points; the runner-class
+# calibration (RFC 0007 checklist) settles them empirically per metric.
+DEFAULT_WIDTH_K = 3.0
+DEFAULT_FLOOR_FRAC = 0.02
+
+# Fingerprint for bands rewritten mechanically without measured runs (e.g. the v1
+# → v2 schema rewrite). It never matches a real runner class, so ``compare``
+# refuses these bands until a real calibration replaces them.
+UNCALIBRATED_FINGERPRINT = "uncalibrated"
+
+RECALIBRATE_HINT = "recalibrate on the target runner class: rosotacom benchmark ratchet <result.json ...> --recalibrate"
+
+
+class Better(str, Enum):
+    """A metric's better-direction: which way out of the band is an improvement."""
+
+    HIGHER = "higher"  # capacity numbers, completeness
+    LOWER = "lower"  # latency, loss, recovery times/bursts
+
+
+class Verdict(str, Enum):
+    WITHIN = "WITHIN"
+    REGRESSED = "REGRESSED"  # out of band on the worse side
+    IMPROVED = "IMPROVED"  # out of band on the better side — gate-red too: ratchet it
+
+
+class BandError(ValueError):
+    """A band refusal. Every path that declines to compare or ratchet raises this."""
+
+
+class FingerprintMismatch(BandError):
+    """Bands never transfer across runner classes (RFC 0007 §3)."""
+
+
+class WideningRefused(BandError):
+    """A plain ratchet only turns one way; moving toward worse needs ``--recalibrate``."""
 
 
 @dataclass(frozen=True)
-class MetricSpec:
-    """How one budgeted metric regresses: direction + a ± tolerance band."""
+class BandProvenance:
+    """Where a band's width comes from — a band without provenance is a guess."""
 
-    name: str
-    direction: Direction
-    rel_tolerance: float = 0.0
-    abs_tolerance: float = 0.0
-
-    def tolerance(self, baseline: float) -> float:
-        return max(self.abs_tolerance, abs(baseline) * self.rel_tolerance)
+    fingerprint: str  # runner class whose variance calibrated the width
+    window_s: float  # measurement window of one calibration run
+    repeats: int  # K calibration runs behind sigma
+    sigma: float  # run-to-run standard deviation across the K runs
+    floor: float  # minimum half-width; keeps one lucky calibration from minting an impossibly tight band
+    k: float  # half-width = max(k·sigma, floor)
+    source_sha: str  # commit whose run(s) last moved the band
+    ratcheted_at: str  # ISO timestamp of the last ratchet
+    note: str = ""  # one-line cause note for the last move ("gop default changed → smaller keyframes")
 
 
 @dataclass(frozen=True)
-class BudgetKey:
-    sha: str
+class Band:
+    """Committed two-sided envelope for one ``(row, profile, metric)``.
+
+    Leaving ``[lo, hi]`` toward worse is ``REGRESSED``; toward better is
+    ``IMPROVED`` — and in a gate lane both are red, the latter with the exact
+    ratchet command. Bands are never hand-edited: they change only through
+    :func:`ratchet_band`.
+    """
+
+    row: str
     profile: str
-    genre: str
+    metric: str
+    lo: float
+    hi: float
+    better: Better
+    provenance: BandProvenance
 
-
-@dataclass(frozen=True)
-class MetricComparison:
-    name: str
-    baseline: float
-    current: float
-    delta: float
-    regressed: bool
-
-
-@dataclass(frozen=True)
-class BudgetComparison:
-    key: BudgetKey
-    comparisons: list[MetricComparison]
+    def __post_init__(self) -> None:
+        if self.lo > self.hi:
+            raise BandError(f"band [{self.lo}, {self.hi}] for {self.metric!r} is inverted (lo > hi)")
 
     @property
-    def regressed(self) -> bool:
-        return any(comparison.regressed for comparison in self.comparisons)
+    def center(self) -> float:
+        return 0.5 * (self.lo + self.hi)
 
+    @property
+    def half_width(self) -> float:
+        return 0.5 * (self.hi - self.lo)
 
-def compare_metric(spec: MetricSpec, baseline: float, current: float) -> MetricComparison:
-    tol = spec.tolerance(baseline)
-    if spec.direction is Direction.HIGHER_IS_BETTER:
-        regressed = current < baseline - tol
-    else:
-        regressed = current > baseline + tol
-    return MetricComparison(spec.name, baseline, current, round(current - baseline, 6), regressed)
-
-
-def compare_to_budget(
-    key: BudgetKey,
-    specs: Sequence[MetricSpec],
-    baseline: dict[str, float],
-    current: dict[str, float],
-) -> BudgetComparison:
-    """Today's envelope vs the recorded baseline ± tolerance, per metric."""
-    comparisons = [
-        compare_metric(spec, float(baseline[spec.name]), float(current[spec.name]))
-        for spec in specs
-        if spec.name in baseline and spec.name in current
-    ]
-    return BudgetComparison(key=key, comparisons=comparisons)
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.row, self.profile, self.metric)
 
 
 @dataclass(frozen=True)
-class BudgetEntry:
-    key: BudgetKey
-    metrics: dict[str, float]
+class BandComparison:
+    band: Band
+    value: float
+    verdict: Verdict
 
 
-def save_budget(path: Path, entries: Iterable[BudgetEntry]) -> None:
-    """Persist budget entries (reuses the RFC 0003 forensic home — JSON lines)."""
-    lines = [json.dumps({**asdict(entry.key), "metrics": entry.metrics}, sort_keys=True) for entry in entries]
+def band_verdict(band: Band, value: float) -> Verdict:
+    """Two-sided verdict; the interval is closed (values on the edge are WITHIN)."""
+    if value < band.lo:
+        return Verdict.REGRESSED if band.better is Better.HIGHER else Verdict.IMPROVED
+    if value > band.hi:
+        return Verdict.IMPROVED if band.better is Better.HIGHER else Verdict.REGRESSED
+    return Verdict.WITHIN
+
+
+def compare_to_band(band: Band, value: float, *, fingerprint: str) -> BandComparison:
+    """Verdict for one measured value, refusing cross-runner-class comparisons.
+
+    A runner change must force a visible recalibration, never a silent shift —
+    so a fingerprint mismatch is a refusal, not a verdict.
+    """
+    if fingerprint != band.provenance.fingerprint:
+        raise FingerprintMismatch(
+            f"{band.metric} band for ({band.row}, {band.profile}) was calibrated on runner class "
+            f"{band.provenance.fingerprint!r}, but this run comes from {fingerprint!r}. "
+            f"Bands never transfer across runner classes — {RECALIBRATE_HINT}"
+        )
+    return BandComparison(band=band, value=float(value), verdict=band_verdict(band, float(value)))
+
+
+def save_bands(path: Path, bands: Iterable[Band]) -> None:
+    """Write the band store: one JSON line per (row, profile, metric), stably ordered.
+
+    The band diff is part of the reviewed change (RFC 0007 §2), so ordering and
+    key order are deterministic — a ratchet shows up as a minimal, readable diff.
+    """
+    ordered = sorted(bands, key=lambda band: band.key)
+    duplicates = [key for key, count in _count_keys(ordered).items() if count > 1]
+    if duplicates:
+        raise BandError(f"duplicate band keys {duplicates!r}; one band per (row, profile, metric)")
+    lines = [
+        json.dumps(
+            {
+                "schema": BAND_SCHEMA,
+                "row": band.row,
+                "profile": band.profile,
+                "metric": band.metric,
+                "lo": band.lo,
+                "hi": band.hi,
+                "better": band.better.value,
+                "provenance": asdict(band.provenance),
+            },
+            sort_keys=True,
+        )
+        for band in ordered
+    ]
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
-def load_budget(path: Path) -> list[BudgetEntry]:
-    entries: list[BudgetEntry] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+def load_bands(path: Path) -> list[Band]:
+    bands: list[Band] = []
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
-        row = json.loads(line)
-        metrics = row.pop("metrics", {})
-        entries.append(BudgetEntry(key=BudgetKey(**row), metrics={str(k): float(v) for k, v in metrics.items()}))
-    return entries
+        raw = json.loads(line)
+        schema = raw.get("schema")
+        if schema != BAND_SCHEMA:
+            raise BandError(
+                f"{path}:{line_no}: band schema {schema!r} is not supported (expected {BAND_SCHEMA}). "
+                f"v1 budget entries were removed without a migration shim — {RECALIBRATE_HINT}"
+            )
+        bands.append(
+            Band(
+                row=str(raw["row"]),
+                profile=str(raw["profile"]),
+                metric=str(raw["metric"]),
+                lo=float(raw["lo"]),
+                hi=float(raw["hi"]),
+                better=Better(raw["better"]),
+                provenance=BandProvenance(**raw["provenance"]),
+            )
+        )
+    duplicates = [key for key, count in _count_keys(bands).items() if count > 1]
+    if duplicates:
+        raise BandError(f"{path}: duplicate band keys {duplicates!r}; one band per (row, profile, metric)")
+    return bands
 
 
-def find_baseline(entries: Iterable[BudgetEntry], *, profile: str, genre: str) -> BudgetEntry | None:
-    """Most recent recorded entry for a ``(profile, genre)`` — the regression baseline."""
-    matching = [entry for entry in entries if entry.key.profile == profile and entry.key.genre == genre]
-    return matching[-1] if matching else None
+def _count_keys(bands: Iterable[Band]) -> dict[tuple[str, str, str], int]:
+    counts: dict[tuple[str, str, str], int] = {}
+    for band in bands:
+        counts[band.key] = counts.get(band.key, 0) + 1
+    return counts
+
+
+def find_band(bands: Iterable[Band], *, row: str, profile: str, metric: str) -> Band | None:
+    for band in bands:
+        if band.key == (row, profile, metric):
+            return band
+    return None
+
+
+def bands_for(bands: Iterable[Band], *, row: str, profile: str) -> list[Band]:
+    return [band for band in bands if band.row == row and band.profile == profile]
+
+
+def ratchet_band(
+    existing: Band | None,
+    values: Sequence[float],
+    *,
+    row: str,
+    profile: str,
+    metric: str,
+    better: Better,
+    fingerprint: str,
+    window_s: float,
+    source_sha: str,
+    ratcheted_at: str,
+    note: str = "",
+    recalibrate: bool = False,
+    k: float = DEFAULT_WIDTH_K,
+    floor: float = 0.0,
+    floor_frac: float = DEFAULT_FLOOR_FRAC,
+) -> Band:
+    """The only way a band changes (RFC 0007 §2). Center = median of ``values``.
+
+    Plain ratchet re-centers inside the calibrated width and only turns one way:
+    the worse edge may move toward better, never toward worse, and the width and
+    calibration provenance (σ, floor, k, fingerprint, window, repeats) are
+    preserved. ``recalibrate`` recomputes the width from the given runs — K fresh
+    repeats — with half-width ``max(k·σ, floor)``; that is the only path that may
+    widen a band, move it toward worse, or change its runner class.
+    """
+    if not values:
+        raise BandError(f"no values for {metric!r} — a ratchet needs at least one run")
+    center = _median([float(value) for value in values])
+
+    if recalibrate:
+        sigma = _sample_stdev([float(value) for value in values])
+        floor_used = max(float(floor), float(floor_frac) * abs(center))
+        half_width = max(float(k) * sigma, floor_used)
+        if half_width <= 0.0:
+            raise BandError(
+                f"recalibrated half-width for {metric!r} is 0 (σ=0 from {len(values)} run(s), floor=0) — "
+                "pass --floor or --floor-frac so the band has a width"
+            )
+        provenance = BandProvenance(
+            fingerprint=fingerprint,
+            window_s=float(window_s),
+            repeats=len(values),
+            sigma=sigma,
+            floor=floor_used,
+            k=float(k),
+            source_sha=source_sha,
+            ratcheted_at=ratcheted_at,
+            note=note,
+        )
+        return Band(
+            row=row,
+            profile=profile,
+            metric=metric,
+            lo=center - half_width,
+            hi=center + half_width,
+            better=better,
+            provenance=provenance,
+        )
+
+    if existing is None:
+        raise BandError(
+            f"no committed band for ({row}, {profile}, {metric}) — a first band is a calibration; "
+            "rerun with --recalibrate"
+        )
+    if better is not existing.better:
+        raise BandError(
+            f"better-direction for {metric!r} changed ({existing.better.value} → {better.value}); "
+            "that is a redesign of the metric — rerun with --recalibrate"
+        )
+    if fingerprint != existing.provenance.fingerprint:
+        raise FingerprintMismatch(
+            f"cannot ratchet the ({row}, {profile}, {metric}) band from runner class {fingerprint!r}: "
+            f"its width was calibrated on {existing.provenance.fingerprint!r}. {RECALIBRATE_HINT}"
+        )
+
+    half_width = existing.half_width
+    lo, hi = center - half_width, center + half_width
+    if existing.better is Better.HIGHER and lo < existing.lo:
+        raise WideningRefused(
+            f"ratchet would move the {metric!r} floor toward worse ({existing.lo:g} → {lo:g}). "
+            "A ratchet only tightens; a deliberate move toward worse needs --recalibrate"
+        )
+    if existing.better is Better.LOWER and hi > existing.hi:
+        raise WideningRefused(
+            f"ratchet would move the {metric!r} ceiling toward worse ({existing.hi:g} → {hi:g}). "
+            "A ratchet only tightens; a deliberate move toward worse needs --recalibrate"
+        )
+    provenance = replace(existing.provenance, source_sha=source_sha, ratcheted_at=ratcheted_at, note=note)
+    return Band(row=row, profile=profile, metric=metric, lo=lo, hi=hi, better=existing.better, provenance=provenance)
+
+
+def _sample_stdev(values: Sequence[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    return math.sqrt(sum((value - mean) ** 2 for value in values) / (len(values) - 1))
+
+
+def runner_fingerprint(env: Mapping[str, str] | None = None) -> str:
+    """Runner-class fingerprint recorded in bands and in every ``result.json``.
+
+    ``ROSOTACOM_RUNNER_CLASS`` names the class explicitly (the private bench pair
+    sets it); GitHub-hosted runners collapse to one class per OS/arch (their CPU
+    models vary run-to-run, the class does not); anything else is pinned to the
+    host, so an ad-hoc machine never silently compares against CI bands.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get("ROSOTACOM_RUNNER_CLASS", "").strip()
+    if explicit:
+        return explicit
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if env.get("RUNNER_ENVIRONMENT", "") == "github-hosted":
+        return f"github-hosted-{system}-{machine}"
+    return f"host-{socket.gethostname()}-{system}-{machine}"
+
+
+# Better-directions for the metrics the extraction below produces. New banded
+# metrics extend this table (or pass an explicit direction at ratchet time).
+_DEFAULT_BETTER: dict[str, Better] = {
+    "t_recover_s": Better.LOWER,
+    "t_steady_s": Better.LOWER,
+    "recovery_burst": Better.LOWER,
+    "lost_during_outage_total": Better.LOWER,
+}
+
+
+def default_better(metric: str) -> Better:
+    if metric.startswith("capacity_"):
+        return Better.HIGHER
+    better = _DEFAULT_BETTER.get(metric)
+    if better is None:
+        raise BandError(f"no default better-direction for metric {metric!r}; pass --better higher|lower")
+    return better
+
+
+def metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
+    """The band-comparable metrics of one self-contained ``result.json``.
+
+    Covers the deterministic genres the gate bands today: ``capacity`` (the
+    breakpoint) and ``recovery`` (the RFC 0005 recovery metric set). The
+    benched-set registry (RFC 0007 checklist) extends this to probe/replay rows.
+    """
+    genre = doc.get("genre")
+    if genre == "capacity":
+        knob = str((doc.get("configuration") or {}).get("knob") or "size")
+        capacity = (doc.get("result") or {}).get("capacity")
+        if capacity is None:
+            raise BandError("capacity run found no passing probe — there is no value to band")
+        return {f"capacity_{knob}": float(capacity)}
+    if genre == "recovery":
+        result = doc.get("result") or {}
+        metrics: dict[str, float] = {}
+        for metric, field_name in (("t_recover_s", "t_recover"), ("t_steady_s", "t_steady")):
+            if result.get(field_name) is not None:
+                metrics[metric] = float(result[field_name])
+        if result.get("recovery_burst") is not None:
+            metrics["recovery_burst"] = float(result["recovery_burst"])
+        lost = result.get("lost_during_outage") or {}
+        metrics["lost_during_outage_total"] = float(sum(int(count) for count in lost.values()))
+        return metrics
+    raise BandError(
+        f"genre {genre!r} has no band metrics yet — banded rows cover capacity and recovery today; "
+        "the benched-set registry (RFC 0007) extends the set"
+    )
+
+
+def result_row_id(doc: Mapping[str, Any]) -> str:
+    """Canonical row id of a run until the benched-set registry formalizes rows."""
+    genre = str(doc.get("genre") or "")
+    if genre == "capacity":
+        knob = str((doc.get("configuration") or {}).get("knob") or "size")
+        return f"capacity-{knob}"
+    return genre or "unknown"
+
+
+def result_profile(doc: Mapping[str, Any]) -> str:
+    profile = (doc.get("configuration") or {}).get("profile")
+    if not profile:
+        raise BandError("result.json carries no configuration.profile — cannot key a band without one")
+    return str(profile)
+
+
+def result_fingerprint(doc: Mapping[str, Any]) -> str:
+    fingerprint = (doc.get("runner") or {}).get("fingerprint")
+    if not fingerprint:
+        raise BandError("result.json carries no runner fingerprint — it predates band schema v2; re-run the benchmark")
+    return str(fingerprint)
+
+
+def result_window_s(doc: Mapping[str, Any]) -> float:
+    return float((doc.get("configuration") or {}).get("duration_s") or 0.0)
+
+
+def result_sha(doc: Mapping[str, Any]) -> str:
+    return str(doc.get("sha") or "unknown")
 
 
 # --------------------------------------------------------------------------- #

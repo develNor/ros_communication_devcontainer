@@ -7,8 +7,10 @@ feeds the transit-record pipeline. What lives here is the *benchmark-specific*
 orchestration; the underlying arming, collection, and session lifecycle are all
 reused from the existing OTA smoke path.
 
-The live runs themselves are *non-deterministic* (monitor-only, never gated).
-The glue below is host-tested via a **stubbed** ``run_point`` in
+Real-link runs are *non-deterministic* (monitor-only, never gated); the
+deterministic slice (emulated profiles, replay, loopback) gates against the
+committed two-sided bands via ``benchmark compare`` / ``benchmark ratchet``
+(RFC 0007). The glue below is host-tested via a **stubbed** ``run_point`` in
 ``tests/unit/test_cli_benchmark.py``.
 """
 
@@ -22,6 +24,7 @@ import math
 import re
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -1310,6 +1313,8 @@ def _write_benchmark_result(
         {
             "schema_version": 1,
             "created_at": datetime.now().isoformat(),
+            "sha": _current_sha(),
+            "runner": _runner_context(),
             "genre": genre,
             "context": context or {},
             "configuration": configuration,
@@ -1579,13 +1584,10 @@ def drive_capacity(
     Returns the capacity result dict (slice + capacity value + budget metrics).
     """
     from .benchmark import (
-        BudgetEntry,
-        BudgetKey,
         CapacitySlice,
         OracleThresholds,
         find_capacity,
         oracle_passes_topic,
-        save_budget,
     )
 
     thresholds = OracleThresholds(max_loss_pct=max_loss_pct, max_latency_ms=max_latency_ms)
@@ -1665,16 +1667,6 @@ def drive_capacity(
         "capacity_load": capacity_load,
     }
 
-    # Save budget entry.
-    budget_path = out_dir / "budgets.jsonl"
-    metrics: dict[str, float] = {}
-    if result.capacity is not None:
-        metrics[f"capacity_{knob}"] = float(result.capacity)
-    budget_entry = BudgetEntry(
-        key=BudgetKey(sha=_current_sha(), profile=profile_label, genre="capacity"),
-        metrics=metrics,
-    )
-    save_budget(budget_path, [budget_entry])
     result_path = _write_benchmark_result(
         out_dir,
         genre="capacity",
@@ -1699,10 +1691,10 @@ def drive_capacity(
             "passed": result.capacity is not None,
             "status": "capacity_found" if result.capacity is not None else "no_passing_probe",
         },
-        artifacts={"budget": budget_path.name, "stdout": "stdout.txt", "probes_dir": "probes"},
+        artifacts={"stdout": "stdout.txt", "probes_dir": "probes"},
     )
     capacity_result["result_file"] = str(result_path)
-    print(f"Capacity result: {knob}={result.capacity} (budget {budget_path}, result {result_path})")
+    print(f"Capacity result: {knob}={result.capacity} (result {result_path})")
     return capacity_result
 
 
@@ -4416,7 +4408,7 @@ def drive_loss_boundaries(
 
 
 def _current_sha() -> str:
-    """Best-effort current git SHA for budget keys."""
+    """Best-effort current git SHA for result/band provenance."""
     import subprocess
 
     try:
@@ -4430,6 +4422,23 @@ def _current_sha() -> str:
         return result.stdout.strip()
     except Exception:
         return "unknown"
+
+
+def _runner_context() -> dict[str, Any]:
+    """Runner identity embedded in every result so bands can refuse cross-class runs."""
+    import os
+    import platform
+    import socket
+
+    from .benchmark import runner_fingerprint
+
+    return {
+        "fingerprint": runner_fingerprint(),
+        "os": platform.system().lower(),
+        "machine": platform.machine().lower(),
+        "hostname": socket.gethostname(),
+        "cpu_count": os.cpu_count(),
+    }
 
 
 def _setup_benchmark_run_dir(args: argparse.Namespace, genre: str, profile: str | None) -> Path:
@@ -5265,13 +5274,8 @@ def benchmark_probe(args: argparse.Namespace) -> int:
 
 def benchmark_capacity(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark capacity``."""
-    from .cli import _load_runtime_config
-
     if getattr(args, "interactive", False):
         return _start_interactive_benchmark(args, "capacity")
-
-    runtime = _load_runtime_config(args)
-    artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
     run_dir = _setup_benchmark_run_dir(args, "capacity", args.profile)
     session_context = _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
@@ -5303,21 +5307,210 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
             result_context=result_context,
         )
 
-    # Resolve aggregated file output path
-    out_file_name = getattr(args, "out", "budgets.jsonl")
-    if artifacts_dir:
-        out_path = artifacts_dir / Path(out_file_name).name
-    else:
-        out_path = Path(out_file_name)
-
-    run_budgets_file = run_dir / "budgets.jsonl"
-    if run_budgets_file.is_file():
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "a", encoding="utf-8") as f_out:
-            f_out.write(run_budgets_file.read_text(encoding="utf-8"))
-        print(f"Aggregated budget result appended to {out_path}")
-
     print(f"Capacity: {result['slice']['knob']}={result['capacity']} → {run_dir / BENCHMARK_RESULT_FILE}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Band gate: compare + ratchet (RFC 0007)
+# --------------------------------------------------------------------------- #
+
+
+def _load_result_docs(paths: Sequence[str]) -> list[dict[str, Any]]:
+    """Load result.json documents; a run directory stands for its result.json."""
+    docs: list[dict[str, Any]] = []
+    for raw in paths:
+        path = Path(raw)
+        if path.is_dir():
+            path = path / BENCHMARK_RESULT_FILE
+        docs.append(json.loads(path.read_text(encoding="utf-8")))
+    return docs
+
+
+def _resolve_run_identity(docs: Sequence[dict[str, Any]], args: argparse.Namespace) -> tuple[str, str, str]:
+    """One (row, profile, fingerprint) for the given runs — repeats, not a mixture."""
+    from .benchmark import BandError, result_fingerprint, result_profile, result_row_id
+
+    rows = {getattr(args, "row", None) or result_row_id(doc) for doc in docs}
+    profiles = {getattr(args, "profile", None) or result_profile(doc) for doc in docs}
+    fingerprints = {result_fingerprint(doc) for doc in docs}
+    if len(rows) > 1 or len(profiles) > 1:
+        raise BandError(
+            f"the given runs span rows {sorted(rows)} and profiles {sorted(profiles)}; "
+            "compare/ratchet takes repeats of one (row, profile) per invocation"
+        )
+    if len(fingerprints) > 1:
+        raise BandError(
+            f"the given runs come from different runner classes {sorted(fingerprints)}; "
+            "use repeats from a single runner class"
+        )
+    return rows.pop(), profiles.pop(), fingerprints.pop()
+
+
+def _median_run_metrics(docs: Sequence[dict[str, Any]]) -> dict[str, float]:
+    """Per-metric median across the given runs (metrics all runs share)."""
+    from .benchmark import BandError, metrics_from_result
+
+    per_run = [metrics_from_result(doc) for doc in docs]
+    shared = set(per_run[0])
+    for metrics in per_run[1:]:
+        shared &= set(metrics)
+    if not shared:
+        raise BandError("the given runs share no metrics — they are not repeats of one row")
+    return {name: statistics.median([metrics[name] for metrics in per_run]) for name in sorted(shared)}
+
+
+def _ratchet_command(args: argparse.Namespace) -> str:
+    """The exact ratchet invocation for the runs/bands `compare` was called with."""
+    parts = ["rosotacom", "benchmark", "ratchet", *[str(p) for p in args.results], "--budgets", str(args.budgets)]
+    if getattr(args, "row", None):
+        parts += ["--row", str(args.row)]
+    if getattr(args, "profile", None):
+        parts += ["--profile", str(args.profile)]
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def benchmark_compare(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark compare`` — the two-sided gate verdict.
+
+    Exit codes: 0 all WITHIN (or ``--monitor``), 1 REGRESSED or any refusal
+    (fingerprint mismatch, missing band/metric), 2 IMPROVED beyond the band —
+    red too, but the fix is the printed ratchet command, not a revert.
+    """
+    from .benchmark import BandError, Verdict, bands_for, compare_to_band, load_bands
+
+    docs = _load_result_docs(args.results)
+    budgets_path = Path(args.budgets)
+    bands = load_bands(budgets_path)
+    row, profile, fingerprint = _resolve_run_identity(docs, args)
+    selected = bands_for(bands, row=row, profile=profile)
+    if not selected:
+        raise BandError(
+            f"no committed bands for ({row}, {profile}) in {budgets_path} — calibrate them first: "
+            f"{_ratchet_command(args)} --recalibrate"
+        )
+    run_metrics = _median_run_metrics(docs)
+
+    comparisons = []
+    for band in selected:
+        if band.metric not in run_metrics:
+            raise BandError(
+                f"the run(s) carry no {band.metric!r}, but ({row}, {profile}) bands it — "
+                "the gate cannot assert a missing metric"
+            )
+        comparisons.append(compare_to_band(band, run_metrics[band.metric], fingerprint=fingerprint))
+
+    for comparison in comparisons:
+        band = comparison.band
+        print(
+            f"{comparison.verdict.value:9s} {band.metric}: {comparison.value:g} vs [{band.lo:g}, {band.hi:g}] "
+            f"(better={band.better.value}, runner={band.provenance.fingerprint})"
+        )
+
+    regressed = [c for c in comparisons if c.verdict is Verdict.REGRESSED]
+    improved = [c for c in comparisons if c.verdict is Verdict.IMPROVED]
+    if regressed:
+        names = ", ".join(c.band.metric for c in regressed)
+        print(f"REGRESSED: {names} left the band on the worse side — fix the regression;")
+        print("a deliberate trade-off is a recalibration with a cause note:")
+        print(f"  {_ratchet_command(args)} --recalibrate --note '<why this level is accepted>'")
+        return 0 if args.monitor else 1
+    if improved:
+        names = ", ".join(c.band.metric for c in improved)
+        print(f"IMPROVED: {names} left the band on the better side — nice. Bank it in this same change:")
+        print(f"  {_ratchet_command(args)} --note '<one-line cause>'")
+        print(f"then commit the tightened {budgets_path} (the band diff is part of the review).")
+        return 0 if args.monitor else 2
+    print(f"WITHIN: all {len(comparisons)} banded metric(s) inside their bands.")
+    return 0
+
+
+def benchmark_ratchet(args: argparse.Namespace) -> int:
+    """Handler for ``rosotacom benchmark ratchet`` — the only way bands change."""
+    from .benchmark import (
+        BandError,
+        Better,
+        default_better,
+        find_band,
+        load_bands,
+        metrics_from_result,
+        ratchet_band,
+        result_sha,
+        result_window_s,
+        save_bands,
+    )
+
+    docs = _load_result_docs(args.results)
+    budgets_path = Path(args.budgets)
+    bands = load_bands(budgets_path) if budgets_path.is_file() else []
+    row, profile, fingerprint = _resolve_run_identity(docs, args)
+    run_metrics = _median_run_metrics(docs)
+    per_run = [metrics_from_result(doc) for doc in docs]
+
+    selected_metrics = sorted(run_metrics)
+    if args.metric:
+        missing = sorted(set(args.metric) - set(run_metrics))
+        if missing:
+            raise BandError(f"--metric {missing} not among the run metrics {sorted(run_metrics)}")
+        selected_metrics = sorted(set(args.metric))
+
+    windows = {result_window_s(doc) for doc in docs}
+    if len(windows) > 1:
+        raise BandError(f"the given runs disagree on window length {sorted(windows)} — calibrate from uniform repeats")
+    window_s = windows.pop()
+    shas = {result_sha(doc) for doc in docs}
+    source_sha = shas.pop() if len(shas) == 1 else "mixed"
+    ratcheted_at = datetime.now().isoformat(timespec="seconds")
+    better_override = Better(args.better) if getattr(args, "better", None) else None
+
+    updated: dict[tuple[str, str, str], Any] = {}
+    skipped: list[str] = []
+    for metric in selected_metrics:
+        values = [metrics[metric] for metrics in per_run]
+        existing = find_band(bands, row=row, profile=profile, metric=metric)
+        if existing is None and not args.recalibrate:
+            skipped.append(metric)
+            continue
+        better = better_override or (existing.better if existing is not None else default_better(metric))
+        new_band = ratchet_band(
+            existing,
+            values,
+            row=row,
+            profile=profile,
+            metric=metric,
+            better=better,
+            fingerprint=fingerprint,
+            window_s=window_s,
+            source_sha=source_sha,
+            ratcheted_at=ratcheted_at,
+            note=args.note,
+            recalibrate=args.recalibrate,
+            k=args.k,
+            floor=args.floor,
+            floor_frac=args.floor_frac,
+        )
+        if existing is not None:
+            print(
+                f"ratchet {row}/{profile} {metric}: [{existing.lo:g}, {existing.hi:g}] → "
+                f"[{new_band.lo:g}, {new_band.hi:g}]"
+            )
+        else:
+            print(
+                f"new band {row}/{profile} {metric}: [{new_band.lo:g}, {new_band.hi:g}] "
+                f"(calibrated from {len(values)} run(s), runner={fingerprint})"
+            )
+        updated[new_band.key] = new_band
+
+    if skipped:
+        print(f"skipped (no committed band; create with --recalibrate): {', '.join(skipped)}")
+    if not updated:
+        raise BandError(
+            f"no committed bands for ({row}, {profile}) match the run metrics {sorted(run_metrics)} — "
+            "create them with --recalibrate"
+        )
+    kept = [band for band in bands if band.key not in updated]
+    save_bands(budgets_path, kept + list(updated.values()))
+    print(f"{len(updated)} band(s) written to {budgets_path}")
     return 0
 
 
@@ -6084,7 +6277,6 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
     cap_parser.add_argument("--rate-hz", type=float, default=20.0, help="Publish rate (Hz).")
     cap_parser.add_argument("--topic", default="", help="Topic to evaluate (default: all).")
     cap_parser.add_argument("--duration", type=float, default=60.0, help="Seconds per probe point.")
-    cap_parser.add_argument("--out", default="budgets.jsonl", help="Output budget JSONL file.")
     cap_parser.set_defaults(func=benchmark_capacity)
 
     # --- ramp ---
@@ -6564,6 +6756,60 @@ def _register_benchmark_plot_parser(benchmark_subparsers: Any) -> None:
     plot_parser.set_defaults(func=benchmark_plot)
 
 
+def _register_benchmark_band_parsers(benchmark_subparsers: Any) -> None:
+    """Register ``compare`` and ``ratchet`` — offline band operations (RFC 0007)."""
+    from .benchmark import DEFAULT_FLOOR_FRAC, DEFAULT_WIDTH_K
+
+    compare_parser = benchmark_subparsers.add_parser(
+        "compare",
+        help="Gate result.json run(s) against the committed two-sided bands.",
+    )
+    compare_parser.add_argument("results", nargs="+", help="result.json file(s) or benchmark run director(y/ies).")
+    compare_parser.add_argument("--budgets", default="budgets.jsonl", help="Committed band store (JSONL).")
+    compare_parser.add_argument("--row", default=None, help="Band row id (default: derived from the run).")
+    compare_parser.add_argument("--profile", default=None, help="Band profile (default: from the run).")
+    compare_parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Report verdicts without blocking: exit 0 even when out of band.",
+    )
+    compare_parser.set_defaults(func=benchmark_compare)
+
+    ratchet_parser = benchmark_subparsers.add_parser(
+        "ratchet",
+        help="Rewrite committed bands from result.json run(s) — bands are never hand-edited.",
+    )
+    ratchet_parser.add_argument("results", nargs="+", help="result.json file(s) or benchmark run director(y/ies).")
+    ratchet_parser.add_argument("--budgets", default="budgets.jsonl", help="Committed band store (JSONL).")
+    ratchet_parser.add_argument("--row", default=None, help="Band row id (default: derived from the run).")
+    ratchet_parser.add_argument("--profile", default=None, help="Band profile (default: from the run).")
+    ratchet_parser.add_argument("--metric", action="append", help="Limit to these metrics (repeatable).")
+    ratchet_parser.add_argument("--note", default="", help="One-line cause note recorded in the band.")
+    ratchet_parser.add_argument(
+        "--recalibrate",
+        action="store_true",
+        help="Recompute the width from these runs (K fresh repeats) — the only path that may widen a "
+        "band, move it toward worse, or change its runner class.",
+    )
+    ratchet_parser.add_argument(
+        "--better",
+        choices=["higher", "lower"],
+        default=None,
+        help="Better-direction for newly calibrated metrics without a default.",
+    )
+    ratchet_parser.add_argument(
+        "--k", type=float, default=DEFAULT_WIDTH_K, help="Width multiplier: half-width = max(k*sigma, floor)."
+    )
+    ratchet_parser.add_argument("--floor", type=float, default=0.0, help="Absolute minimum half-width.")
+    ratchet_parser.add_argument(
+        "--floor-frac",
+        type=float,
+        default=DEFAULT_FLOOR_FRAC,
+        help="Minimum half-width as a fraction of the band center.",
+    )
+    ratchet_parser.set_defaults(func=benchmark_ratchet)
+
+
 def register_benchmark_parser(subparsers: Any) -> None:
     """Register the ``benchmark`` and ``ota-benchmark`` commands."""
     benchmark_parser = subparsers.add_parser(
@@ -6572,6 +6818,7 @@ def register_benchmark_parser(subparsers: Any) -> None:
     )
     benchmark_subparsers = benchmark_parser.add_subparsers(dest="benchmark_command", required=True)
     _register_benchmark_driver_parsers(benchmark_subparsers, ota_benchmark=False)
+    _register_benchmark_band_parsers(benchmark_subparsers)
     _register_benchmark_plot_parser(benchmark_subparsers)
 
     ota_parser = subparsers.add_parser(

@@ -24,6 +24,24 @@ profiles:
       - { for: 5s,  outage: catchup }
       - { for: 40s, uplink: { rate: 2.5mbit, delay: 90ms,  loss: 1%   } }
 
+  # RFC 0007 gate profiles — the canonical public conditions of the regression
+  # gate (see resources/benched-set.yaml). Deliberately plain committed netem
+  # numbers with NO random elements: gated metrics are pinned by the emulated
+  # rate/delay bottleneck, which is deterministic without a netem seed. This is
+  # not optional on the public runner class — GitHub-hosted `tc` rejects the
+  # netem `seed` option ("What is 'seed'?"), so seeded random loss/jitter cannot
+  # even be installed there, and unseeded random netem would be non-deterministic.
+  # A gate profile therefore uses rate/delay only (contract-tested); seeded
+  # *load* randomness (sized_publisher interval jitter) is application-level and
+  # works everywhere. Seeded random netem stays in the operator harness lanes.
+  gate-nominal:
+    uplink:   { rate: 20mbit, delay: 20ms }
+    downlink: { rate: 20mbit, delay: 20ms }
+
+  gate-tight:
+    uplink:   { rate: 1mbit, delay: 40ms }
+    downlink: { rate: 10mbit }
+
   # Public finding fixtures. These are small, deterministic emulation points used
   # by docs/findings; they intentionally carry no private host or calibration data.
   finding-3.2mbit:

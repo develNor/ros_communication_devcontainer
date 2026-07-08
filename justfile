@@ -51,8 +51,11 @@ test-e2e-transforms:
 test-e2e-remote-assist:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "remote_assist"
 
+# Two invocations on purpose: a shared `-k` filter would silently deselect
+# every test in the other files (contract-tested in test_benched_set_registry).
 test-e2e-runtime-tools:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "link_latency" tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "link_latency"
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py
 
 test-e2e-concurrency:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_parallel_smoke.py

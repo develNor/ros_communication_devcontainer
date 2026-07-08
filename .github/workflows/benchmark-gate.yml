@@ -1,0 +1,173 @@
+# Blocking performance regression gate (RFC 0007 §4).
+#
+# The matrix is the benched-set registry (src/rosotacom/resources/benched-set.yaml),
+# read via `rosotacom benchmark rows` — no row is hardcoded here. Every row runs
+# `rosotacom benchmark row`, which asserts the committed two-sided bands in
+# budgets.jsonl and writes a machine-readable verdict; the verdict job merges
+# them into one summary artifact a promotion gate can consume.
+#
+# Failure semantics: setup failure = red; REGRESSED = red; IMPROVED = red with
+# the exact ratchet command in the log and verdict (bank it, don't revert).
+name: Benchmark Gate
+
+on:
+  schedule:
+    - cron: "7 1 * * *"
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: "Registry lane to run"
+        required: false
+        default: "nightly"
+        type: choice
+        options: [nightly, merge-gate]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rows:
+    name: rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      rows: ${{ steps.list.outputs.rows }}
+      lane: ${{ steps.list.outputs.lane }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: List benched rows
+        id: list
+        run: |
+          lane="${{ github.event.inputs.lane || 'nightly' }}"
+          rows="$(.venv/bin/rosotacom benchmark rows --lane "$lane" --format ids)"
+          echo "lane=$lane" >> "$GITHUB_OUTPUT"
+          echo "rows=$rows" >> "$GITHUB_OUTPUT"
+          echo "benched rows ($lane): $rows"
+
+  gate:
+    name: gate-${{ matrix.row }}
+    needs: rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        row: ${{ fromJSON(needs.rows.outputs.rows) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just and tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just tmux
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Show Docker environment
+        run: docker info
+
+      - name: Run and gate the benched row
+        run: |
+          .venv/bin/rosotacom examples create "$RUNNER_TEMP/examples"
+          .venv/bin/rosotacom benchmark row "${{ matrix.row }}" \
+            --rosotacom-config "$RUNNER_TEMP/examples/rosotacom.yaml" \
+            --budgets budgets.jsonl \
+            --artifacts-dir gate-artifacts \
+            --verdict-file "gate-verdicts/${{ matrix.row }}.json"
+
+      - name: Upload row verdict
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-gate-verdict-${{ matrix.row }}
+          path: gate-verdicts/
+          if-no-files-found: ignore
+
+      - name: Upload row artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-gate-run-${{ matrix.row }}
+          path: gate-artifacts/
+          if-no-files-found: ignore
+
+  verdict:
+    name: verdict
+    needs: [rows, gate]
+    if: always() && needs.rows.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Download row verdicts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: benchmark-gate-verdict-*
+          path: gate-verdicts
+          merge-multiple: true
+
+      - name: Aggregate the gate summary
+        run: |
+          lane="${{ needs.rows.outputs.lane }}"
+          .venv/bin/rosotacom benchmark gate-summary \
+            --verdicts gate-verdicts \
+            --lane "$lane" \
+            --out benchmark-gate-summary.json
+
+      - name: Upload gate summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-gate-summary
+          path: benchmark-gate-summary.json
+          if-no-files-found: ignore

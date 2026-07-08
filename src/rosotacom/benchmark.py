@@ -637,6 +637,9 @@ _DEFAULT_BETTER: dict[str, Better] = {
     "t_steady_s": Better.LOWER,
     "recovery_burst": Better.LOWER,
     "lost_during_outage_total": Better.LOWER,
+    "loss_pct": Better.LOWER,
+    "latency_p50_ms": Better.LOWER,
+    "latency_p95_ms": Better.LOWER,
 }
 
 
@@ -649,14 +652,51 @@ def default_better(metric: str) -> Better:
     return better
 
 
+def _probe_metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
+    """Aggregate a probe run's per-attempt topic summaries into band metrics.
+
+    ``loss_pct`` is delivered-weighted across every attempt and topic (the
+    bottleneck-dominated gate metric); the latency percentiles are medians of
+    the per-attempt summaries (host-timing-dominated — monitor material on
+    shared runners, RFC 0007 §3).
+    """
+    attempts = (doc.get("measurements") or {}).get("attempts") or []
+    expected = 0
+    lost = 0
+    p50s: list[float] = []
+    p95s: list[float] = []
+    for attempt in attempts:
+        for topic_row in attempt.get("topics") or []:
+            if topic_row.get("expected") is None:
+                continue
+            expected += int(topic_row["expected"])
+            lost += int(topic_row.get("lost") or 0)
+            latency = topic_row.get("latency_ms") or {}
+            if latency.get("p50") is not None:
+                p50s.append(float(latency["p50"]))
+            if latency.get("p95") is not None:
+                p95s.append(float(latency["p95"]))
+    if expected <= 0:
+        raise BandError("probe run carries no per-topic expected/lost counts — there is nothing to band")
+    metrics = {"loss_pct": 100.0 * lost / expected}
+    if p50s:
+        metrics["latency_p50_ms"] = _median(p50s)
+    if p95s:
+        metrics["latency_p95_ms"] = _median(p95s)
+    return metrics
+
+
 def metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
     """The band-comparable metrics of one self-contained ``result.json``.
 
     Covers the deterministic genres the gate bands today: ``capacity`` (the
-    breakpoint) and ``recovery`` (the RFC 0005 recovery metric set). The
-    benched-set registry (RFC 0007 checklist) extends this to probe/replay rows.
+    breakpoint), ``probe`` (loss/completeness plus latency percentiles) and
+    ``recovery`` (the RFC 0005 recovery metric set). The benched-set registry
+    (RFC 0007 §4) picks which of these actually gate per row.
     """
     genre = doc.get("genre")
+    if genre == "probe":
+        return _probe_metrics_from_result(doc)
     if genre == "capacity":
         knob = str((doc.get("configuration") or {}).get("knob") or "size")
         capacity = (doc.get("result") or {}).get("capacity")
@@ -674,10 +714,7 @@ def metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
         lost = result.get("lost_during_outage") or {}
         metrics["lost_during_outage_total"] = float(sum(int(count) for count in lost.values()))
         return metrics
-    raise BandError(
-        f"genre {genre!r} has no band metrics yet — banded rows cover capacity and recovery today; "
-        "the benched-set registry (RFC 0007) extends the set"
-    )
+    raise BandError(f"genre {genre!r} has no band metrics yet — banded rows cover probe, capacity and recovery today")
 
 
 def result_row_id(doc: Mapping[str, Any]) -> str:

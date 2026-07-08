@@ -702,7 +702,7 @@ def test_metrics_and_row_derive_from_capacity_and_recovery_results() -> None:
 
     with pytest.raises(BandError, match="no value to band"):
         metrics_from_result({"genre": "capacity", "configuration": {"knob": "size"}, "result": {"capacity": None}})
-    with pytest.raises(BandError, match="registry"):
+    with pytest.raises(BandError, match="no band metrics"):
         metrics_from_result({"genre": "ramp"})
 
 

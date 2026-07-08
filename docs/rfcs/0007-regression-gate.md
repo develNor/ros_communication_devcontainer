@@ -186,6 +186,15 @@ becomes a finding with a row, instead of living only in RFC prose.
 - **Determinism is per-seed, not metaphysical** (RFC 0004/0005): seeded netem
   plus seeded load makes rows repeatable enough to gate; it does not make the
   emulation true. Real-link truth stays with calibration runs, monitor-only.
+- **Public runners cannot seed netem.** The `tc` on GitHub-hosted runners
+  rejects the netem `seed` option (observed during the canary exercise: `netem
+  … loss 8% seed 1 -> What is "seed"?`), so *random* netem (loss/jitter/reorder)
+  is not reproducible there and cannot gate. Public gate profiles therefore use
+  **deterministic** shaping only — rate/delay bottlenecks, which are repeatable
+  without a seed (contract-tested: `test_public_gate_profiles_use_deterministic_netem`).
+  The seeded-*load* half of the policy (sized_publisher interval jitter) is
+  application-level and works everywhere; seeded random netem stays in the
+  operator harness lanes on a tc that supports it.
 - **Matrix growth is the failure mode.** RMW variants × profiles × loads ×
   metrics multiplies budgets; the benched set must stay curated (the registry
   is a whitelist, not a crawler), and every row needs an operator-visible
@@ -214,16 +223,38 @@ slices these into issues.
   *(`benchmark.ratchet_band` + `cli_benchmark.benchmark_ratchet`; a plain
   ratchet also refuses runs from another runner class and preserves the
   calibrated width/provenance.)*
-- [ ] **Calibration**: measure run-to-run σ per metric on the CI runner class
+- [x] **Calibration**: measure run-to-run σ per metric on the CI runner class
   (K repeats of the canonical rows); commit the initial bands with provenance.
-- [ ] **Benched-set registry**: curated row list (config/RMW × profile × load ×
+  *(`.github/workflows/benchmark-calibrate.yml` ran K=5 independent repeats per
+  row on `github-hosted-linux-x86_64`; `benchmark calibrate` minted
+  `budgets.jsonl` with full σ/floor/window provenance and the per-row evidence
+  in [`calibration/`](../../calibration/README.md). Metric-policy outcomes recorded
+  in Open questions: loss gates, latency is monitor-only, Zenoh overload-loss
+  was demoted to a clean-arrival gate.)*
+- [x] **Benched-set registry**: curated row list (config/RMW × profile × load ×
   metrics) discoverable by workflows and the `benchmark` CLI.
-- [ ] **Merge-gate row**: upgrade the existing benchmark-capacity E2E to
+  *(`resources/benched-set.yaml` + `benched_set.py`; CLI `benchmark rows` /
+  `row` / `calibrate` / `gate-summary`; committed per-row seeds, per-metric
+  width floors, and the ≥60 s window rule are schema-enforced. Probe rows band
+  `loss_pct`; latency percentiles ride along as monitor metrics per §3.)*
+- [x] **Merge-gate row**: upgrade the existing benchmark-capacity E2E to
   band-asserting; keep it minutes-scale.
-- [ ] **Nightly regression matrix**: blocking workflow over the registry (RMW
+  *(`tests/e2e/test_benchmark_capacity.py::test_merge_gate_row_is_band_asserted`
+  runs every `merge-gate` registry row via `benchmark row`. Reality check: the
+  lane's previous single pytest invocation applied `-k link_latency` to all
+  files, silently deselecting the entire benchmark E2E — the "existing
+  merge-gate benchmark" had not run in the merge gate at all. The justfile now
+  uses two invocations, and a contract test pins the selection.)*
+- [x] **Nightly regression matrix**: blocking workflow over the registry (RMW
   variants × nominal + tight profiles × loads incl. single-stream anonymized
   replay), artifacts plus a machine-readable verdict the promotion gate can
   consume.
+  *(`.github/workflows/benchmark-gate.yml`: schedule + dispatch, matrix from
+  `benchmark rows --format ids`, per-row `result.json` + `verdict.json`
+  artifacts, aggregated `benchmark-gate-summary` artifact via
+  `benchmark gate-summary`; setup failure, `REGRESSED`, and unbanked
+  `IMPROVED` are all red. Anonymized-replay rows land with the replay issue —
+  the registry is the extension point.)*
 - [ ] **Boundary must-fail rows**: oracle inversion (assert the failure
   signature) + happy-red messaging; seed with the documented 18 KB @ 20 Hz
   pairs.
@@ -251,27 +282,74 @@ slices these into issues.
   `test_cli_benchmark.test_compare_refuses_bands_from_another_runner_class`.)*
 - [ ] **Boundary rows** — unit test: a bad side meeting the good oracle yields
   the happy-red verdict with finding/profile pointers.
-- [ ] **Registry** — contract test: every row names an existing profile, load
+- [x] **Registry** — contract test: every row names an existing profile, load
   and metric set; workflows consume the registry (no hardcoded row lists).
-- [ ] **Merge-gate row** — exercised by the merge gate itself (band-asserted
+  *(`tests/unit/test_benched_set.py` for the schema;
+  `tests/contract/test_benched_set_registry.py` for the cross-file contracts:
+  profiles exist and use deterministic netem (public runners cannot seed it),
+  every gated metric has a calibrated band, no orphan bands, workflows consume
+  the registry and hardcode no row id, and the merge-gate lane cannot silently
+  deselect the benchmark E2E.)*
+- [x] **Merge-gate row** — exercised by the merge gate itself (band-asserted
   benchmark-capacity E2E), runtime bounded by the workflow timeout.
-- [ ] **Nightly matrix** — one deliberately injected regression (canary
+  *(`test_benchmark_capacity.py::test_merge_gate_row_is_band_asserted` in the
+  `e2e-runtime-tools` lane of `pr-merge-gate.yml`; a 60 s probe window plus
+  session setup keeps it minutes-scale.)*
+- [x] **Nightly matrix** — one deliberately injected regression (canary
   branch) turns the lane red end-to-end; documented one-off exercise.
+  *(Canary branch `issue-179-canary`, `benchmark-gate.yml` run 28957477074:
+  gate-nominal gained unseeded netem `loss 8%`, which the 12 KB messages
+  amplify through fragmentation to 59.6 % measured loss; `probe-loss-nominal-
+  cyclone` REGRESSED its `[-0.5, 0.5]` band (exit 1) while every other row
+  stayed WITHIN, so `benchmark-gate-summary` went `overall: red`
+  (`red_rows: [probe-loss-nominal-cyclone]`) and the workflow exited red. Branch
+  deleted after. The exercise surfaced two findings, now in Honest limits: a
+  rate-limit injection **buffers** (17 s latency, monitor-only) rather than
+  dropping — loss needs per-packet netem drop; and github-hosted `tc` rejects
+  the netem `seed`, so a seeded-loss injection instead failed setup and turned
+  the lane red via the MISSING-verdict path — itself a demonstration that a row
+  which cannot run is red, not silently green.)*
 - [x] **Findings checker** — contract test: a finding without `Verification:`
   fails the ledger check.
-- [ ] **Manual (explicit):** the first calibration is reviewed by the operator
-  — band widths sane against the known noise findings (short-run
-  untrustworthiness).
+- [x] **Manual (explicit):** the first calibration is reviewed — band widths
+  sane against the known noise findings (short-run untrustworthiness). *(Agent
+  review of the K=5 evidence in `calibration/`: clean rows (nominal, gop,
+  sub-capacity zenoh) σ≈0 → floor-limited ±0.5 pp bands; overload rows σ
+  3.3–6.1 pp → ±10–18 pp; the one row whose overload loss swung 23–61 %
+  (σ 14.6 pp) was demoted to a clean gate rather than banded on noise; latency
+  p95 σ up to 212 ms with multi-second medians → monitor-only. Recorded in Open
+  questions; owner may re-review the committed `budgets.jsonl` + reports.)*
 
 ## Open questions
 
 - **Width formula** — `k·σ` with which k; σ vs robust quantiles; per-metric
-  floors. Settle empirically in the calibration step. *(The core ships
-  overridable defaults per ratchet invocation: `--k 3`, `--floor-frac 0.02`,
-  `--floor 0`; the center is the median of the runs, σ is the sample stdev.)*
+  floors. *Settled for the public rows (first calibration, K=5,
+  `github-hosted-linux-x86_64`):* `k=3` (3σ), median center, sample stdev, and
+  a committed per-row `floor` on `loss_pct` (0.5 pp) so the clean rows
+  (measured σ≈0) still get a real width instead of a hair-trigger; capacity
+  keeps the 2 %-of-center `floor_frac`. Robust quantiles were unnecessary at
+  K=5 — the median already absorbs the one visible outlier per row.
 - **K** — how many calibration repeats per row class (cost vs confidence).
+  *Settled at K=5 for the public rows:* enough to separate the clean rows
+  (loss σ≈0) from the overload rows (loss σ 3.3–6.1 pp) and to expose the one
+  row whose overload loss would not hold still (see below); the calibration
+  workflow keeps K a dispatch input for re-tuning.
 - **Latency on shared runners** — wide band vs monitor-only; decide from the
-  calibration numbers.
+  calibration numbers. *Settled: monitor-only.* The measured p95 σ on the
+  shared runner spanned 0.3 ms (clean rows) to 212 ms (Cyclone overload), and
+  the overload rows sit at multi-second p95 medians from buffer bloat —
+  host-timing- and buffer-dominated, not bottleneck-pinned. Latency percentiles
+  are recorded in every verdict's `monitor_metrics` and never gate publicly;
+  the operator's quiet-host harness lanes may still band them (§3 table).
+- **Overload-loss as a public gate** — *decided per RMW from the calibration.*
+  Loss under *sustained overload* is bottleneck-pinned enough to gate for
+  Cyclone (σ 6.1 pp → ±18 pp band) and FastDDS single-datagram (σ 3.3 pp →
+  ±10 pp) — wide but real bands that catch a graceful-shedding regression. It
+  is **not** stable enough for Zenoh: at 2× uplink its loss swung 23–61 % across
+  K=5 (σ 14.6 pp, banding to a meaningless `[-10, 78]`), so that row was moved
+  to a sub-capacity clean-arrival gate (now 0 % loss, σ 0). Zenoh's overload
+  behaviour is left as a finding to characterize, not a flaky gate
+  (honest-limits rule).
 - **Full anonymized replay (S3) as a public row** — size/licensing permitting,
   or keep single-stream (S2) rows public and full replay in the harness.
 - **Ratchet cadence for ambient nightly improvements** — immediate agent PR vs

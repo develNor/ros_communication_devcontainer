@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from rosotacom.benched_set import GateRow, load_registry
+from rosotacom.benched_set import GateRow, load_registry, profiles_for_row
 from rosotacom.benchmark import UNCALIBRATED_FINGERPRINT, load_bands
 from rosotacom.network_profiles import Profile, load_profiles_file
 
@@ -36,7 +36,8 @@ def profiles() -> dict[str, Profile]:
 
 
 def test_every_row_names_a_committed_public_profile(rows: list[GateRow], profiles: dict[str, Profile]) -> None:
-    missing = sorted({row.profile for row in rows} - set(profiles))
+    referenced = {profile for row in rows for profile in profiles_for_row(row)}
+    missing = sorted(referenced - set(profiles))
     assert not missing, (
         f"registry rows reference profiles {missing} that are not committed in {PROFILES_PATH.name}; "
         "gate profiles are public, plain-netem, and live next to the other example profiles"
@@ -77,7 +78,7 @@ def test_public_gate_profiles_use_deterministic_netem(rows: list[GateRow], profi
     the operator harness lanes on a tc that supports it (RFC 0007 §3, honest
     limits)."""
     problems: list[str] = []
-    for profile_name in sorted({row.profile for row in rows}):
+    for profile_name in sorted({profile for row in rows for profile in profiles_for_row(row)}):
         problems += _random_netem_directions(profiles[profile_name])
     assert not problems, (
         "random netem in public gate profiles (github-hosted tc cannot seed it, so it cannot gate "

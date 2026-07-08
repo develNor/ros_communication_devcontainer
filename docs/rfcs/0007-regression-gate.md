@@ -255,9 +255,15 @@ slices these into issues.
   `benchmark gate-summary`; setup failure, `REGRESSED`, and unbanked
   `IMPROVED` are all red. Anonymized-replay rows land with the replay issue —
   the registry is the extension point.)*
-- [ ] **Boundary must-fail rows**: oracle inversion (assert the failure
+- [x] **Boundary must-fail rows**: oracle inversion (assert the failure
   signature) + happy-red messaging; seed with the documented 18 KB @ 20 Hz
-  pairs.
+  pairs. *(`GateRow.kind=boundary` + `benchmark row` now run good/bad sides,
+  assert `good_oracle` and `failure_signature`, and emit `BOUNDARY_WIDENED`
+  with finding/profile pointers plus the good-side ratchet command. The public
+  nightly seed is the deterministic bandwidth pair
+  `boundary-loss-18kb20hz-bandwidth-cyclone`; jitter-profile pairs remain
+  explicit manual/operator checks until the runner class can install seeded
+  random netem.)*
 - [x] **Findings ledger here** with the `Verification:` field and a schema
   check; migrate the emulated-reproducible findings from the operator harness;
   seed the SPDP-30 s quirk finding.
@@ -280,8 +286,11 @@ slices these into issues.
   the recalibration instruction.
   *(`test_benchmark.test_compare_refuses_cross_runner_fingerprints_with_recalibration_instruction`,
   `test_cli_benchmark.test_compare_refuses_bands_from_another_runner_class`.)*
-- [ ] **Boundary rows** — unit test: a bad side meeting the good oracle yields
+- [x] **Boundary rows** — unit test: a bad side meeting the good oracle yields
   the happy-red verdict with finding/profile pointers.
+  *(`test_cli_benchmark.test_boundary_row_requires_the_bad_side_to_stay_bad`
+  and
+  `test_cli_benchmark.test_boundary_row_happy_reds_when_bad_side_meets_the_good_oracle`.)*
 - [x] **Registry** — contract test: every row names an existing profile, load
   and metric set; workflows consume the registry (no hardcoded row lists).
   *(`tests/unit/test_benched_set.py` for the schema;

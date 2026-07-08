@@ -67,9 +67,11 @@ rosotacom benchmark capacity --project src/rosotacom/resources/examples/rosotaco
 Migrated summary: 4000 expected, 4000 delivered, 0 lost, max p95 latency
 93.138 ms.
 
-Verification: manual: run the commands above from a source checkout with Docker
-and `tc` privileges; automation waits for the RFC 0007 boundary rows because the
-public row registry does not exist yet.
+Verification: nightly row `boundary-loss-18kb20hz-bandwidth-cyclone` re-proves
+the deterministic bandwidth pair (`finding-3.2mbit` good,
+`finding-3.1mbit` bad) via `rosotacom benchmark row`; jitter cases remain
+manual with the commands above because public runners cannot install seeded
+random netem yet.
 
 ## Status
 

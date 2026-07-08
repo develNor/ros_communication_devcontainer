@@ -21,10 +21,11 @@ from typing import Any
 
 import yaml
 
-REGISTRY_SCHEMA = 1
+REGISTRY_SCHEMA = 2
 REGISTRY_RESOURCE = "resources/benched-set.yaml"
 
 LANES = ("merge-gate", "nightly")
+ROW_KINDS = ("performance", "boundary")
 GENRES = ("probe", "capacity")
 
 # The RFC 0003 metrics each genre can put under a band today. The metric policy
@@ -71,6 +72,8 @@ class GateRow:
     floors: dict[str, float] = field(default_factory=dict)  # committed minimum half-widths per gated metric
     repeats: int = 1  # in-run repeats (median vote / attempts)
     window_note: str = ""  # why a sub-60 s window is still a valid gate
+    kind: str = "performance"  # performance = normal band row; boundary = good/bad envelope assertion
+    boundary: dict[str, Any] = field(default_factory=dict)
 
 
 def packaged_registry_path() -> Path:
@@ -95,6 +98,7 @@ def _string_tuple(row_id: str, raw: dict[str, Any], key: str) -> tuple[str, ...]
 _ROW_KEYS = frozenset(
     {
         "id",
+        "kind",
         "lane",
         "reason",
         "rmw",
@@ -109,8 +113,73 @@ _ROW_KEYS = frozenset(
         "floors",
         "repeats",
         "window_note",
+        "boundary",
     }
 )
+
+
+def _threshold_rules(
+    row_id: str,
+    boundary: dict[str, Any],
+    key: str,
+    metrics: tuple[str, ...],
+) -> dict[str, dict[str, float]]:
+    raw = boundary.get(key)
+    if not isinstance(raw, dict) or not raw:
+        raise RegistryError(f"row {row_id!r}: boundary.{key!r} must be a non-empty metric threshold mapping")
+    parsed: dict[str, dict[str, float]] = {}
+    for metric, rule in raw.items():
+        metric_name = str(metric)
+        if metric_name not in metrics:
+            raise RegistryError(f"row {row_id!r}: boundary.{key!r} references unbanded metric {metric_name!r}")
+        if not isinstance(rule, dict) or not rule:
+            raise RegistryError(f"row {row_id!r}: boundary.{key!r}.{metric_name!r} must be a threshold mapping")
+        unknown = sorted(set(rule) - {"min", "max"})
+        if unknown:
+            raise RegistryError(f"row {row_id!r}: boundary.{key!r}.{metric_name!r} has unknown keys {unknown}")
+        parsed_rule: dict[str, float] = {}
+        for side in ("min", "max"):
+            if side not in rule:
+                continue
+            value = rule[side]
+            if not isinstance(value, int | float):
+                raise RegistryError(f"row {row_id!r}: boundary.{key!r}.{metric_name!r}.{side} must be numeric")
+            parsed_rule[side] = float(value)
+        if not parsed_rule:
+            raise RegistryError(f"row {row_id!r}: boundary.{key!r}.{metric_name!r} needs min and/or max")
+        if "min" in parsed_rule and "max" in parsed_rule and parsed_rule["min"] > parsed_rule["max"]:
+            raise RegistryError(f"row {row_id!r}: boundary.{key!r}.{metric_name!r} has min > max")
+        parsed[metric_name] = parsed_rule
+    return parsed
+
+
+def _parse_boundary(row_id: str, raw: dict[str, Any], metrics: tuple[str, ...]) -> dict[str, Any]:
+    boundary = raw.get("boundary") or {}
+    if not isinstance(boundary, dict):
+        raise RegistryError(f"row {row_id!r}: 'boundary' must be a mapping")
+    expected = {"finding", "bad_profile", "good_oracle", "failure_signature", "next_steps"}
+    unknown = sorted(set(boundary) - expected)
+    if unknown:
+        raise RegistryError(f"row {row_id!r}: boundary has unknown keys {unknown}")
+    missing = sorted(key for key in expected if key not in boundary)
+    if missing:
+        raise RegistryError(f"row {row_id!r}: boundary is missing {missing}")
+    finding = str(boundary["finding"]).strip()
+    bad_profile = str(boundary["bad_profile"]).strip()
+    next_steps = str(boundary["next_steps"]).strip()
+    if not finding:
+        raise RegistryError(f"row {row_id!r}: boundary.finding must be a non-empty string")
+    if not bad_profile:
+        raise RegistryError(f"row {row_id!r}: boundary.bad_profile must be a non-empty string")
+    if not next_steps:
+        raise RegistryError(f"row {row_id!r}: boundary.next_steps must be a non-empty string")
+    return {
+        "finding": finding,
+        "bad_profile": bad_profile,
+        "good_oracle": _threshold_rules(row_id, boundary, "good_oracle", metrics),
+        "failure_signature": _threshold_rules(row_id, boundary, "failure_signature", metrics),
+        "next_steps": next_steps,
+    }
 
 
 def _parse_row(raw: Any) -> GateRow:
@@ -123,6 +192,9 @@ def _parse_row(raw: Any) -> GateRow:
     if unknown:
         raise RegistryError(f"row {row_id!r}: unknown keys {unknown} — the registry is a whitelist, extend it in code")
 
+    kind = _require_str(row_id, raw, "kind")
+    if kind not in ROW_KINDS:
+        raise RegistryError(f"row {row_id!r}: kind {kind!r} is not one of {list(ROW_KINDS)}")
     lane = _require_str(row_id, raw, "lane")
     if lane not in LANES:
         raise RegistryError(f"row {row_id!r}: lane {lane!r} is not one of {list(LANES)}")
@@ -165,6 +237,13 @@ def _parse_row(raw: Any) -> GateRow:
         if not isinstance(floor, int | float) or floor <= 0:
             raise RegistryError(f"row {row_id!r}: floor for {metric!r} must be a positive number")
 
+    if kind == "performance":
+        if raw.get("boundary"):
+            raise RegistryError(f"row {row_id!r}: performance rows do not carry boundary metadata")
+        boundary: dict[str, Any] = {}
+    else:
+        boundary = _parse_boundary(row_id, raw, metrics)
+
     repeats_raw = raw.get("repeats", 1)
     if not isinstance(repeats_raw, int) or repeats_raw < 1:
         raise RegistryError(f"row {row_id!r}: 'repeats' must be an integer >= 1")
@@ -192,6 +271,8 @@ def _parse_row(raw: Any) -> GateRow:
         floors={str(metric): float(floor) for metric, floor in floors.items()},
         repeats=repeats_raw,
         window_note=window_note,
+        kind=kind,
+        boundary=boundary,
     )
     _validate_genre_parameters(row)
     return row
@@ -264,6 +345,18 @@ def rows_for_lane(rows: list[GateRow], lane: str | None) -> list[GateRow]:
     return [row for row in rows if row.lane == lane]
 
 
+def rows_for_calibration(rows: list[GateRow]) -> list[GateRow]:
+    """Rows that mint committed two-sided bands through the calibration workflow."""
+    return [row for row in rows if row.kind == "performance"]
+
+
+def profiles_for_row(row: GateRow) -> tuple[str, ...]:
+    profiles = [row.profile]
+    if row.kind == "boundary":
+        profiles.append(str(row.boundary["bad_profile"]))
+    return tuple(profiles)
+
+
 def find_row(rows: list[GateRow], row_id: str) -> GateRow:
     for row in rows:
         if row.id == row_id:
@@ -287,12 +380,14 @@ def verdict_document(
     result_path: str,
     refusal: str | None = None,
     ratchet_command: str | None = None,
+    boundary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The machine-readable per-run verdict a downstream gate can consume."""
-    return {
+    doc = {
         "schema": VERDICT_SCHEMA,
         "kind": "benchmark-gate-verdict",
         "row": row.id,
+        "row_kind": row.kind,
         "lane": row.lane,
         "rmw": row.rmw,
         "genre": row.genre,
@@ -310,6 +405,9 @@ def verdict_document(
         "refusal": refusal,
         "ratchet_command": ratchet_command,
     }
+    if boundary is not None:
+        doc["boundary"] = boundary
+    return doc
 
 
 def write_verdict(path: Path, doc: dict[str, Any]) -> None:

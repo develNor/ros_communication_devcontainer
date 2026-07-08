@@ -634,7 +634,8 @@ question under test, pass `--cyclone-spdp-interval 150s` or another longer
 positive `ms`/`s` duration. Making SPDP too frequent improves stale-peer and
 reconnect detection cadence but contaminates tight-link latency more often;
 making it too lax quiets short probes but hides discovery/liveliness overhead and
-delays detection of changed peer state.
+delays detection of changed peer state. The living record for this quirk is the
+[SPDP discovery-burst finding](docs/findings/cyclone-spdp-discovery-bursts.md).
 Use `benchmark probe` when you want a fixed payload/rate under one profile
 instead of a breakpoint search. It writes the normal `result.json` plus
 `time-bins.jsonl` with per-second loss, delivered Hz, payload bandwidth, and
@@ -724,8 +725,9 @@ For contributor setup, local checks, PR workflow, CI, and releases, see
 issue-driven work tracking in [docs/work-items.md](docs/work-items.md).
 
 The test and measurement architecture is recorded in the
-[design RFCs](docs/rfcs/README.md); see [docs/testing.md](docs/testing.md) for the
-test taxonomy. The diagnosis-first quality workflow is described in
+[design RFCs](docs/rfcs/README.md), with measured public effects in the
+[findings ledger](docs/findings/README.md); see [docs/testing.md](docs/testing.md)
+for the test taxonomy. The diagnosis-first quality workflow is described in
 [docs/quality-model.md](docs/quality-model.md), with owner-facing entrypoints in
 [docs/owner-runbook.md](docs/owner-runbook.md). Reusable maintainer procedures
 live in [docs/playbooks/README.md](docs/playbooks/README.md). Quality rules live

@@ -23,3 +23,45 @@ profiles:
       - { for: 15s, uplink: { rate: 1mbit,   delay: 180ms, loss: 3%   } }
       - { for: 5s,  outage: catchup }
       - { for: 40s, uplink: { rate: 2.5mbit, delay: 90ms,  loss: 1%   } }
+
+  # Public finding fixtures. These are small, deterministic emulation points used
+  # by docs/findings; they intentionally carry no private host or calibration data.
+  finding-3.2mbit:
+    uplink: { rate: 3.2mbit }
+    downlink: {}
+
+  finding-3.1mbit:
+    uplink: { rate: 3.1mbit }
+    downlink: {}
+
+  finding-delay-5ms:
+    uplink: { delay: 5ms }
+    downlink: {}
+
+  finding-delay-50ms:
+    uplink: { delay: 50ms }
+    downlink: {}
+
+  finding-delay-300ms:
+    uplink: { delay: 300ms }
+    downlink: {}
+
+  finding-jitter18:
+    uplink: { delay: 30ms, jitter: 18ms, distribution: normal }
+    downlink: {}
+
+  finding-jitter27:
+    uplink: { delay: 30ms, jitter: 27ms, distribution: normal }
+    downlink: {}
+
+  finding-3.2mbit-jitter18:
+    uplink: { rate: 3.2mbit, delay: 30ms, jitter: 18ms, distribution: normal }
+    downlink: {}
+
+  finding-tight-irregular:
+    uplink: { rate: 3.2mbit, delay: 50ms, jitter: 18ms, distribution: normal }
+    downlink: {}
+
+  finding-spdp-tight:
+    uplink: { rate: 3.2mbit }
+    downlink: {}

@@ -86,6 +86,24 @@ Apply a **step change** to the environment — a *timeline profile* (RFC 0004), 
 
 A recovery benchmark **is** a timeline profile plus recovery-specific metrics.
 
+### A/B tuning experiments (#22)
+
+The genres above measure *one* configuration against a boundary or a committed
+budget. The **fix** step of the loop needs the sibling question — "does candidate
+config B beat baseline config A on the **same** load and profile?" — as a
+first-class verdict. `benchmark ab` holds the synthetic `a_to_b` load and the
+profile/seed constant and varies the whole session config (the pipeline knobs:
+`throttle_hz`, `drop`, QoS, compression, ffmpeg …), runs baseline and candidates
+**interleaved with a rotating start** over `--repeats`, and classifies each
+candidate against the baseline per topic and metric as **IMPROVED / WITHIN /
+REGRESSED**. This is the *same* two-sided verdict as the committed-band gate
+(§Budgets, RFC 0007) — a band on the ephemeral `[baseline ± tolerance]` envelope
+rather than a committed one — so an A/B cell and a gate cell read identically.
+The repeat spread (min/median/max) and a `separated` flag travel with every cell
+so small-N effects are read honestly (a directional screen, not a significance
+test; sharpest in the boundary regime). Full design, config model and the
+statistical-power note: [../benchmark-ab.md](../benchmark-ab.md).
+
 ## Budgets & baselines — the verdict for benchmarks
 
 A benchmark does not pass/fail against an absolute bound; it **regresses or not
@@ -209,6 +227,11 @@ slice and reuses RFC 0003 + 0004.
   0004 / the harness, the metric extraction is here).
 - [x] Add coarse linear-ramp curves (latency-vs-load) for trend
   (`benchmark.linear_ramp`).
+- [x] Add the A/B tuning-experiment driver (#22): interleaved baseline-vs-candidate
+  runs on the same load/profile, per topic+metric IMPROVED/WITHIN/REGRESSED verdict
+  reusing the RFC 0007 `Better`/`Verdict` language, repeat-spread + separation
+  reporting (`benchmark.ab_verdict`, `cli_benchmark.drive_ab` / `benchmark ab`;
+  [../benchmark-ab.md](../benchmark-ab.md)).
 - [ ] Wire the nightly benchmark run as a **monitor** (alerts on budget regression,
   never blocks); the harness wires the actual runner. *(FZI-private — see below.)*
 - [x] Cover the driver oracle, budget compare, and recovery metrics with tests
@@ -286,6 +309,14 @@ reviewed rather than asserted in a blocking test.
 - [x] **Coarse linear-ramp curves** — curve builder host-tested
   (`test_linear_ramp_builds_the_response_curve`); the trend output stays
   **monitor-only**: nightly, reviewed, not gated.
+- [x] **A/B tuning experiments** (#22) — host unit tests on the pure verdict layer
+  (interleave schedule + rotation, three-way classification with the tolerance
+  band, spread aggregation, determinism, dropped-topic failure, markdown render:
+  `test_ab_*`, `test_classify_change_*`, `test_render_ab_markdown_*` in
+  `test_benchmark.py`) and on the driver + handler with a stubbed `run_point`
+  (`test_drive_ab_*`, `test_benchmark_ab_handler_*` in `test_cli_benchmark.py`);
+  one Docker-backed slow-lane E2E proves the directional verdict on a `throttle_hz`
+  difference (`tests/e2e/test_benchmark_ab.py`, `ROSOTACOM_RUN_E2E=1`). Automatable.
 - [ ] **Nightly benchmark run wired as a monitor** (alerts on budget regression,
   never blocks) — **operator/harness check**: the public repo defines the genre;
   the actual runner topology is FZI-private, so the wiring is confirmed manually in

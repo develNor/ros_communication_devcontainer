@@ -411,13 +411,22 @@ class BandComparison:
     verdict: Verdict
 
 
+def _two_sided_verdict(value: float, *, lo: float, hi: float, better: Better) -> Verdict:
+    """WITHIN / IMPROVED / REGRESSED for a value against a closed ``[lo, hi]`` envelope.
+
+    Shared by the committed-band gate (:func:`band_verdict`) and A/B experiments
+    (:func:`classify_change`) so both speak one verdict language.
+    """
+    if value < lo:
+        return Verdict.REGRESSED if better is Better.HIGHER else Verdict.IMPROVED
+    if value > hi:
+        return Verdict.IMPROVED if better is Better.HIGHER else Verdict.REGRESSED
+    return Verdict.WITHIN
+
+
 def band_verdict(band: Band, value: float) -> Verdict:
     """Two-sided verdict; the interval is closed (values on the edge are WITHIN)."""
-    if value < band.lo:
-        return Verdict.REGRESSED if band.better is Better.HIGHER else Verdict.IMPROVED
-    if value > band.hi:
-        return Verdict.IMPROVED if band.better is Better.HIGHER else Verdict.REGRESSED
-    return Verdict.WITHIN
+    return _two_sided_verdict(value, lo=band.lo, hi=band.hi, better=band.better)
 
 
 def compare_to_band(band: Band, value: float, *, fingerprint: str) -> BandComparison:
@@ -1251,3 +1260,361 @@ class RampPoint:
 def linear_ramp(values: Iterable[float], measure: Callable[[float], float]) -> list[RampPoint]:
     """The whole response curve (latency-vs-load). Monitor-only: trended, never gated."""
     return [RampPoint(float(value), float(measure(value))) for value in values]
+
+
+# --------------------------------------------------------------------------- #
+# A/B tuning experiments (#22): candidate config vs baseline, same load+profile
+# --------------------------------------------------------------------------- #
+#
+# The regression gate asks "is this run within a committed envelope?"; an A/B
+# experiment asks the sibling question "is candidate config B better, worse or
+# unchanged vs baseline config A on the *same* load and profile?". Both are
+# two-sided and both speak the same Better/Verdict language: an A/B cell is just
+# :func:`_two_sided_verdict` on the ephemeral ``[baseline +/- tolerance]``
+# envelope. This layer is pure and host-testable; the live runs (Docker graphs,
+# emulated profiles) live in the CLI, injected as a ``run_point`` (RFC 0005).
+
+# The per-topic metrics an A/B experiment watches, with their better-direction.
+# Names mirror the gate's band metrics (``_DEFAULT_BETTER``) so a verdict reads
+# the same in both places. Read off ``transit.summarize_transit_records``.
+AB_METRICS: dict[str, Better] = {
+    "completeness_pct": Better.HIGHER,
+    "loss_pct": Better.LOWER,
+    "latency_p50_ms": Better.LOWER,
+    "latency_p95_ms": Better.LOWER,
+    "jitter_p50_ms": Better.LOWER,
+    "jitter_p95_ms": Better.LOWER,
+}
+
+# The default watched set: the completeness/loss pair (bottleneck-dominated —
+# counted off exact sequence numbers, so trustworthy even on a shared runner)
+# plus the p95 tails (host-timing-dominated — directional hints, which is why the
+# spread is always reported, not just the median).
+DEFAULT_AB_METRICS: tuple[str, ...] = ("completeness_pct", "loss_pct", "latency_p95_ms", "jitter_p95_ms")
+
+# A candidate median within this relative OR the metric's absolute half-width of
+# the baseline median is called unchanged (WITHIN). The absolute floors keep
+# sub-millisecond tail noise on a tiny baseline from reading as a change; loss
+# and completeness are exact percentages and get no floor (a real 1% delta is
+# signal).
+DEFAULT_AB_REL_TOLERANCE = 0.10
+DEFAULT_AB_ABS_TOLERANCE: dict[str, float] = {
+    "latency_p50_ms": 1.0,
+    "latency_p95_ms": 2.0,
+    "jitter_p50_ms": 1.0,
+    "jitter_p95_ms": 2.0,
+}
+
+
+def ab_better(metric: str) -> Better:
+    """The better-direction of an A/B-watched metric (raises on an unknown one)."""
+    better = AB_METRICS.get(metric)
+    if better is None:
+        raise BandError(f"metric {metric!r} is not an A/B-watched metric; known: {sorted(AB_METRICS)}")
+    return better
+
+
+def _bare_topic(label: str) -> str:
+    """``a->b:/topic`` -> ``/topic``; a plain topic label is returned unchanged."""
+    return label.split(":", 1)[1] if ":" in label else label
+
+
+def ab_metrics_from_topic(topic_summary: Mapping[str, Any]) -> dict[str, float | None]:
+    """Pull the A/B-watched metrics out of one topic's transit-summary block.
+
+    A metric is ``None`` when the run produced no sample for it (e.g. latency
+    with 100% loss); the aggregator drops ``None`` holes from a spread.
+    """
+    expected = topic_summary.get("expected")
+    delivered = topic_summary.get("delivered")
+    completeness: float | None = None
+    if expected and delivered is not None:
+        completeness = round(100.0 * float(delivered) / float(expected), 3)
+    ota = topic_summary.get("ota_hop_ms") or {}
+    jitter = topic_summary.get("jitter_ms") or {}
+
+    def opt(value: Any) -> float | None:
+        return None if value is None else float(value)
+
+    return {
+        "completeness_pct": completeness,
+        "loss_pct": opt(topic_summary.get("loss_pct")),
+        "latency_p50_ms": opt(ota.get("p50")),
+        "latency_p95_ms": opt(ota.get("p95")),
+        "jitter_p50_ms": opt(jitter.get("p50")),
+        "jitter_p95_ms": opt(jitter.get("p95")),
+    }
+
+
+@dataclass(frozen=True)
+class AbTolerance:
+    """Half-width of the unchanged band around a baseline value: ``max(abs, rel*|baseline|)``."""
+
+    rel: float = DEFAULT_AB_REL_TOLERANCE
+    abs: float = 0.0
+
+    def half_width(self, baseline: float) -> float:
+        return max(self.abs, abs(baseline) * self.rel)
+
+
+def default_ab_tolerance(metric: str, *, rel: float = DEFAULT_AB_REL_TOLERANCE) -> AbTolerance:
+    """The default tolerance for a metric: ``rel`` plus the metric's absolute floor."""
+    return AbTolerance(rel=rel, abs=DEFAULT_AB_ABS_TOLERANCE.get(metric, 0.0))
+
+
+def classify_change(baseline: float, candidate: float, *, better: Better, tol: AbTolerance) -> Verdict:
+    """Candidate vs baseline as WITHIN / IMPROVED / REGRESSED.
+
+    ``_two_sided_verdict`` on the ephemeral ``[baseline +/- tol]`` envelope, so an
+    A/B cell classifies identically to a committed-band gate cell.
+    """
+    half = tol.half_width(baseline)
+    return _two_sided_verdict(candidate, lo=baseline - half, hi=baseline + half, better=better)
+
+
+def ab_schedule(configs: Sequence[str], repeats: int) -> list[tuple[str, int]]:
+    """Deterministic interleaving of ``configs`` over ``repeats`` as ``(config, repeat)``.
+
+    Every repeat runs each config exactly once; the starting config rotates each
+    repeat so no config is always measured first. Interleaving (not "all of A,
+    then all of B") spreads any slow host-drift across every config, and the
+    rotation removes the residual first-slot warm-up bias — both guard the verdict
+    against drift being mistaken for a config effect. Deterministic by
+    construction, so a verdict is reproducible from the same runs.
+    """
+    if repeats < 1:
+        raise ValueError("repeats must be >= 1.")
+    if not configs:
+        raise ValueError("need at least one config.")
+    order: list[tuple[str, int]] = []
+    count = len(configs)
+    for repeat in range(1, repeats + 1):
+        rotation = (repeat - 1) % count
+        rotated = [*configs[rotation:], *configs[:rotation]]
+        order.extend((config, repeat) for config in rotated)
+    return order
+
+
+@dataclass(frozen=True)
+class MetricSpread:
+    """Repeat-to-repeat spread of one metric for one config+topic."""
+
+    n: int  # repeats that produced a value
+    min: float
+    median: float
+    max: float
+    values: list[float]  # per-repeat, in execution order
+
+
+def _metric_spread(values: Sequence[float]) -> MetricSpread | None:
+    vals = [float(v) for v in values]
+    if not vals:
+        return None
+    return MetricSpread(
+        n=len(vals),
+        min=round(min(vals), 3),
+        median=round(_median(vals), 3),
+        max=round(max(vals), 3),
+        values=[round(v, 3) for v in vals],
+    )
+
+
+@dataclass(frozen=True)
+class AbRun:
+    """One executed run in an experiment: which config, which 1-based repeat, its summary."""
+
+    config: str
+    repeat: int
+    summary: Mapping[str, Any]  # transit.summarize_transit_records output
+
+
+@dataclass(frozen=True)
+class AbCell:
+    """One (topic, metric) candidate-vs-baseline verdict, both spreads carried."""
+
+    topic: str
+    metric: str
+    better: str  # Better value
+    baseline: MetricSpread | None
+    candidate: MetricSpread | None
+    verdict: str | None  # Verdict value; None when a side has no sample
+    delta: float | None  # candidate.median - baseline.median
+    separated: bool | None  # spreads disjoint => effect separable at this N
+
+
+@dataclass(frozen=True)
+class CandidateReport:
+    """A candidate config's full comparison against the baseline."""
+
+    config: str
+    cells: list[AbCell]
+    regressed: list[list[str]]  # [topic, metric] pairs that regressed beyond tolerance
+    improved: list[list[str]]  # [topic, metric] pairs that improved beyond tolerance
+    dropped_topics: list[str]  # topics the baseline delivered that this config did not
+    passed: bool  # no regression and no dropped topic
+
+
+@dataclass(frozen=True)
+class AbReport:
+    baseline: str
+    metrics: list[str]
+    repeats: int
+    candidates: list[CandidateReport]
+    passed: bool  # every candidate passed
+
+
+def _collect_ab_metrics(
+    runs: Iterable[AbRun], *, metrics: Sequence[str], topic_filter: str
+) -> dict[str, dict[str, dict[str, list[float]]]]:
+    """``{config: {topic: {metric: [per-repeat values]}}}`` in execution order."""
+    collected: dict[str, dict[str, dict[str, list[float]]]] = {}
+    for run in runs:
+        topics = run.summary.get("topics") or {}
+        for topic_label, topic_summary in topics.items():
+            if topic_filter and topic_filter not in {topic_label, _bare_topic(topic_label)}:
+                continue
+            values = ab_metrics_from_topic(topic_summary)
+            per_topic = collected.setdefault(run.config, {}).setdefault(topic_label, {})
+            for metric in metrics:
+                value = values.get(metric)
+                if value is not None:
+                    per_topic.setdefault(metric, []).append(value)
+    return collected
+
+
+def ab_verdict(
+    runs: Sequence[AbRun],
+    *,
+    baseline: str,
+    metrics: Sequence[str] = DEFAULT_AB_METRICS,
+    tolerances: Mapping[str, AbTolerance] | None = None,
+    topic: str = "",
+) -> AbReport:
+    """Classify every candidate config against the baseline, per topic and metric.
+
+    Comparison is on the per-config **median** of each metric across repeats (one
+    unlucky repeat cannot flip a verdict), and both spreads travel with the cell
+    so a reader sees whether the medians are actually separable at this N
+    (``separated``). A candidate ``passed`` iff nothing regressed beyond tolerance
+    and it did not drop a topic the baseline delivered.
+    """
+    metric_list = list(metrics)
+    tol_map = {metric: (tolerances or {}).get(metric) or default_ab_tolerance(metric) for metric in metric_list}
+    ordered = sorted(runs, key=lambda run: (run.config, run.repeat))
+    collected = _collect_ab_metrics(ordered, metrics=metric_list, topic_filter=topic)
+
+    if baseline not in collected:
+        raise BandError(f"baseline config {baseline!r} produced no runs to compare against.")
+
+    configs_in_order: list[str] = []
+    for run in ordered:
+        if run.config not in configs_in_order:
+            configs_in_order.append(run.config)
+    repeats = max((run.repeat for run in ordered), default=0)
+    baseline_topics = collected[baseline]
+
+    candidates: list[CandidateReport] = []
+    for config in configs_in_order:
+        if config == baseline:
+            continue
+        candidate_topics = collected.get(config, {})
+        cells: list[AbCell] = []
+        regressed: list[list[str]] = []
+        improved: list[list[str]] = []
+        dropped: list[str] = []
+        for topic_label in sorted(baseline_topics):
+            candidate_metrics = candidate_topics.get(topic_label)
+            if candidate_metrics is None:
+                dropped.append(topic_label)
+                continue
+            baseline_metrics = baseline_topics[topic_label]
+            for metric in metric_list:
+                better = ab_better(metric)
+                baseline_spread = _metric_spread(baseline_metrics.get(metric, []))
+                candidate_spread = _metric_spread(candidate_metrics.get(metric, []))
+                verdict: Verdict | None = None
+                delta: float | None = None
+                separated: bool | None = None
+                if baseline_spread is not None and candidate_spread is not None:
+                    verdict = classify_change(
+                        baseline_spread.median, candidate_spread.median, better=better, tol=tol_map[metric]
+                    )
+                    delta = round(candidate_spread.median - baseline_spread.median, 3)
+                    separated = candidate_spread.max < baseline_spread.min or baseline_spread.max < candidate_spread.min
+                    if verdict is Verdict.REGRESSED:
+                        regressed.append([topic_label, metric])
+                    elif verdict is Verdict.IMPROVED:
+                        improved.append([topic_label, metric])
+                cells.append(
+                    AbCell(
+                        topic=topic_label,
+                        metric=metric,
+                        better=better.value,
+                        baseline=baseline_spread,
+                        candidate=candidate_spread,
+                        verdict=None if verdict is None else verdict.value,
+                        delta=delta,
+                        separated=separated,
+                    )
+                )
+        candidates.append(
+            CandidateReport(
+                config=config,
+                cells=cells,
+                regressed=regressed,
+                improved=improved,
+                dropped_topics=dropped,
+                passed=not regressed and not dropped,
+            )
+        )
+
+    return AbReport(
+        baseline=baseline,
+        metrics=metric_list,
+        repeats=repeats,
+        candidates=candidates,
+        passed=all(candidate.passed for candidate in candidates),
+    )
+
+
+def _fmt_spread(spread: MetricSpread | None) -> str:
+    if spread is None:
+        return "n/a"
+    if spread.min == spread.max:
+        return f"{spread.median:g}"
+    return f"{spread.median:g} ({spread.min:g}–{spread.max:g})"
+
+
+def render_ab_markdown(report: AbReport) -> str:
+    """A self-describing markdown table per candidate: the paper-grade byproduct."""
+    lines: list[str] = []
+    verdict_word = "PASS" if report.passed else "FAIL"
+    lines.append(f"# A/B verdict: **{verdict_word}** (baseline `{report.baseline}`, {report.repeats} repeats)")
+    lines.append("")
+    lines.append(
+        "Cells compare the candidate median against the baseline median; "
+        "`baseline`/`candidate` show `median (min–max)` across repeats. "
+        "`sep?` is yes when the two spreads do not overlap (the effect is "
+        "separable at this repeat count)."
+    )
+    for candidate in report.candidates:
+        lines.append("")
+        status = "PASS" if candidate.passed else "FAIL"
+        lines.append(f"## `{candidate.config}` vs `{report.baseline}` — **{status}**")
+        if candidate.dropped_topics:
+            lines.append("")
+            lines.append(
+                f"Dropped topics (baseline delivered, candidate did not): {', '.join(candidate.dropped_topics)}"
+            )
+        lines.append("")
+        lines.append("| topic | metric | better | baseline | candidate | Δ | sep? | verdict |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for cell in candidate.cells:
+            delta = "" if cell.delta is None else f"{cell.delta:+g}"
+            sep = "" if cell.separated is None else ("yes" if cell.separated else "no")
+            verdict = cell.verdict or "n/a"
+            lines.append(
+                f"| {cell.topic} | {cell.metric} | {cell.better} | "
+                f"{_fmt_spread(cell.baseline)} | {_fmt_spread(cell.candidate)} | {delta} | {sep} | {verdict} |"
+            )
+    return "\n".join(lines)

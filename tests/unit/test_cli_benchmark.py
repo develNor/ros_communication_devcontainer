@@ -20,6 +20,7 @@ import yaml
 
 import rosotacom.cli as cli
 import rosotacom.cli_benchmark as benchmark_cli
+from rosotacom.benchmark import AbTolerance, default_ab_tolerance
 from rosotacom.cli_benchmark import (
     BENCHMARK_RESULT_FILE,
     DEFAULT_BENCHMARK_DRAIN_S,
@@ -43,7 +44,9 @@ from rosotacom.cli_benchmark import (
     _requirements_target_quality,
     _result_once_script,
     _start_interactive_benchmark,
+    benchmark_ab,
     collect_transit_summary,
+    drive_ab,
     drive_capacity,
     drive_loss_boundaries,
     drive_matrix,
@@ -2953,3 +2956,225 @@ def test_probe_driver_prints_latency_and_arrival_spacing_details(
     row = result["attempts"][0]["topics"][0]
     assert row["latency_trend_ms"]["delta"] == 40.0
     assert row["inter_arrival_ms"]["stall_then_bunch_pct"] == 100.0
+
+
+# --------------------------------------------------------------------------- #
+# A/B tuning experiments (#22): candidate configs vs baseline, same load
+# --------------------------------------------------------------------------- #
+
+
+def _ab_topic_summary(*, delivered: int, expected: int = 100, latency_p95: float = 100.0) -> dict[str, Any]:
+    lost = expected - delivered
+    return {
+        "topics": {
+            "a->b:/bench_capacity": {
+                "expected": expected,
+                "delivered": delivered,
+                "lost": lost,
+                "loss_pct": round(100.0 * lost / expected, 3),
+                "ota_hop_ms": {"p50": latency_p95 * 0.6, "p95": latency_p95},
+                "jitter_ms": {"p50": 2.0, "p95": 5.0},
+            }
+        }
+    }
+
+
+def _ab_configs(base: Path, labels: list[str]) -> list[dict[str, Any]]:
+    configs: list[dict[str, Any]] = []
+    for index, label in enumerate(labels):
+        root = base / "configs" / label
+        (root / benchmark_cli.AB_SESSION_NAME).mkdir(parents=True)
+        configs.append(
+            {"label": label, "is_baseline": index == 0, "source": base / f"{label}.yaml", "configs_root": root}
+        )
+    return configs
+
+
+def _ab_tols(metrics: list[str]) -> dict[str, AbTolerance]:
+    return {metric: default_ab_tolerance(metric) for metric in metrics}
+
+
+def test_drive_ab_interleaves_aggregates_and_writes_result(tmp_path: Path) -> None:
+    canned = {
+        "baseline": _ab_topic_summary(delivered=70, latency_p95=150.0),
+        "fast": _ab_topic_summary(delivered=98, latency_p95=95.0),
+        "worse": _ab_topic_summary(delivered=40, latency_p95=250.0),
+    }
+    order: list[str] = []
+
+    def stub(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path, config: dict[str, Any]):
+        order.append(str(config["label"]))
+        return canned[str(config["label"])]
+
+    metrics = ["completeness_pct", "loss_pct", "latency_p95_ms"]
+    report = drive_ab(
+        stub,
+        configs=_ab_configs(tmp_path, ["baseline", "fast", "worse"]),
+        baseline_label="baseline",
+        profile="ab-ci",
+        load={"size_a": 18_000, "rate": 20},
+        duration_s=1.0,
+        repeats=2,
+        metrics=metrics,
+        tolerances=_ab_tols(metrics),
+        topic="",
+        out_dir=tmp_path,
+    )
+
+    # Interleaved with a rotating start (ab_schedule), one run per (config, repeat).
+    assert order == ["baseline", "fast", "worse", "fast", "worse", "baseline"]
+
+    result = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text())
+    assert result["genre"] == "ab"
+    assert result["verdict"]["passed"] is False  # "worse" regresses; "fast" does not
+    assert "worse" in result["verdict"]["regressed"]
+    assert "fast" not in result["verdict"]["regressed"]
+    assert [(s["order"], s["config"]) for s in result["configuration"]["schedule"][:3]] == [
+        (1, "baseline"),
+        (2, "fast"),
+        (3, "worse"),
+    ]
+    rows = [json.loads(line) for line in (tmp_path / "ab.jsonl").read_text().splitlines()]
+    assert len(rows) == 6
+    assert (tmp_path / "ab.md").read_text().count("vs `baseline`") == 2
+    assert report["passed"] is False
+
+
+def test_drive_ab_verdict_is_deterministic(tmp_path: Path) -> None:
+    def stub(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path, config: dict[str, Any]):
+        return _ab_topic_summary(delivered=80 if config["is_baseline"] else 96)
+
+    def once(name: str) -> dict[str, Any]:
+        out = tmp_path / name
+        out.mkdir()
+        metrics = ["completeness_pct", "loss_pct"]
+        return drive_ab(
+            stub,
+            configs=_ab_configs(out, ["baseline", "cand"]),
+            baseline_label="baseline",
+            profile="p",
+            load={"size_a": 1, "rate": 20},
+            duration_s=1.0,
+            repeats=3,
+            metrics=metrics,
+            tolerances=_ab_tols(metrics),
+            topic="",
+            out_dir=out,
+        )
+
+    assert once("run_a") == once("run_b")
+
+
+def _write_ab_config(path: Path, throttle_hz: int) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 50}, "b": {"domain_id": 51}},
+        "shared": {"ota_domain_id": 52, "rmw": "cyclone", "use_status_overview": True},
+        "topics": {
+            "a_to_b": [
+                {
+                    "topic": "/bench_capacity",
+                    "type": "com_msgs/msg/SizedPayload",
+                    "processing": {"use_ota_wrapper": True, "throttle_hz": throttle_hz},
+                }
+            ]
+        },
+    }
+    (path / "session-definition.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    return path
+
+
+def _ab_handler_args(tmp_path: Path, *, baseline: Path, candidate: Path, **overrides: Any) -> argparse.Namespace:
+    project = tmp_path / "proj"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "rosotacom.yaml").write_text("profiles: profiles.yaml\n", encoding="utf-8")
+    (project / "profiles.yaml").write_text(
+        "profiles:\n  ab-ci:\n    uplink: { rate: 1mbit }\n    downlink: { rate: 10mbit }\n", encoding="utf-8"
+    )
+    args: dict[str, Any] = {
+        "rosotacom_config": str(project / "rosotacom.yaml"),
+        "ros2docker_config": None,
+        "deployment": None,
+        "session_configs_dir": None,
+        "scenario_configs_dir": None,
+        "session_instances_dir": None,
+        "profiles_file": str(project / "profiles.yaml"),
+        "artifacts_dir": str(tmp_path / "artifacts"),
+        "profile": "ab-ci",
+        "baseline": str(baseline),
+        "candidate": [f"unthrottled={candidate}"],
+        "repeats": 2,
+        "size": 18_000,
+        "size_pattern": None,
+        "rate_hz": 20.0,
+        "streams": 1,
+        "interval_jitter_ms": 0.0,
+        "interval_jitter_seed": 42,
+        "duration": 1.0,
+        "topic": "",
+        "metrics": None,
+        "rel_tolerance": None,
+        "abs_tolerance": None,
+        "fail_on_regression": False,
+        "out": "ab.jsonl",
+        "rmw": "cyclone",
+        "qos_reliability": None,
+        "qos_depth": None,
+        "cyclone_spdp_interval": None,
+    }
+    args.update(overrides)
+    namespace = argparse.Namespace(**args)
+
+    # The stub reads throttle_hz from the config the wrapper just activated via
+    # session_configs_dir — so the test exercises the real materialize+swap path.
+    def run_point(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        root = Path(namespace.session_configs_dir[0])
+        cfg = yaml.safe_load((root / benchmark_cli.AB_SESSION_NAME / "session-definition.yaml").read_text())
+        throttle = cfg["topics"]["a_to_b"][0]["processing"]["throttle_hz"]
+        # Heavier throttle => more offered load => more loss under the tight profile.
+        return _ab_topic_summary(delivered=96 if throttle <= 5 else 55)
+
+    namespace._test_run_point = run_point
+    return namespace
+
+
+def test_benchmark_ab_handler_materializes_configs_and_gates_exit_code(tmp_path: Path) -> None:
+    baseline = _write_ab_config(tmp_path / "base", throttle_hz=5)
+    candidate = _write_ab_config(tmp_path / "cand", throttle_hz=20)
+
+    # Default: verdict lives in result.json, exit 0 even on a regression.
+    args = _ab_handler_args(tmp_path, baseline=baseline, candidate=candidate)
+    assert benchmark_ab(args) == 0
+
+    run_dir = next((tmp_path / "artifacts").rglob("result.json")).parent
+    result = json.loads((run_dir / BENCHMARK_RESULT_FILE).read_text())
+    assert result["genre"] == "ab"
+    assert result["verdict"]["passed"] is False
+    assert "unthrottled" in result["verdict"]["regressed"]
+    # The knob difference is captured in the self-describing diff.
+    assert "throttle_hz" in (run_dir / "configs" / "unthrottled.diff").read_text()
+
+    # --fail-on-regression makes the process exit reflect the verdict.
+    args2 = _ab_handler_args(tmp_path / "again", baseline=baseline, candidate=candidate, fail_on_regression=True)
+    assert benchmark_ab(args2) == 1
+
+
+def test_prepare_ab_config_requires_an_a_to_b_load_topic(tmp_path: Path) -> None:
+    source = tmp_path / "no_load"
+    source.mkdir()
+    (source / "session-definition.yaml").write_text(
+        yaml.safe_dump(
+            {"peers": {"a": {}, "b": {}}, "topics": {"b_to_a": [{"topic": "/x", "type": "std_msgs/msg/String"}]}}
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(rmw="cyclone", cyclone_spdp_interval=None, qos_reliability=None, qos_depth=None)
+    with pytest.raises(ValueError, match="a_to_b"):
+        benchmark_cli._prepare_ab_config(
+            args,
+            label="baseline",
+            source_yaml=source / "session-definition.yaml",
+            is_baseline=True,
+            run_dir=tmp_path / "run",
+        )

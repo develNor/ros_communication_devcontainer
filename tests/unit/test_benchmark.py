@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from rosotacom.benchmark import (
+    AbRun,
+    AbTolerance,
     Band,
     BandError,
     BandProvenance,
@@ -19,10 +21,16 @@ from rosotacom.benchmark import (
     SweepBounds,
     Verdict,
     WideningRefused,
+    ab_better,
+    ab_metrics_from_topic,
+    ab_schedule,
+    ab_verdict,
     band_verdict,
     capacity_binary_search,
     characterize_probe_records,
+    classify_change,
     compare_to_band,
+    default_ab_tolerance,
     default_better,
     exclude_probe_warmup,
     expand_size_pattern,
@@ -42,6 +50,7 @@ from rosotacom.benchmark import (
     pattern_mean_bytes,
     ratchet_band,
     recovery_metrics,
+    render_ab_markdown,
     result_row_id,
     runner_fingerprint,
     save_bands,
@@ -822,3 +831,169 @@ def test_linear_ramp_builds_the_response_curve() -> None:
         (2_000.0, 40.0),
         (4_000.0, 80.0),
     ]
+
+
+# --- A/B tuning experiments (#22) ------------------------------------------ #
+
+
+def _ab_summary(
+    *,
+    delivered: int = 100,
+    expected: int = 100,
+    latency_p95: float = 100.0,
+    jitter_p95: float = 5.0,
+    topic: str = "a->b:/t",
+) -> dict[str, object]:
+    lost = expected - delivered
+    return {
+        "schema_version": 1,
+        "topics": {
+            topic: {
+                "expected": expected,
+                "delivered": delivered,
+                "lost": lost,
+                "loss_pct": round(100.0 * lost / expected, 3) if expected else 0.0,
+                "ota_hop_ms": {"p50": round(latency_p95 * 0.6, 3), "p95": latency_p95},
+                "jitter_ms": {"p50": round(jitter_p95 * 0.4, 3), "p95": jitter_p95},
+            }
+        },
+    }
+
+
+def test_ab_schedule_interleaves_and_rotates() -> None:
+    # Each repeat runs every config once; the starting config rotates each repeat.
+    assert ab_schedule(["A", "B"], 3) == [("A", 1), ("B", 1), ("B", 2), ("A", 2), ("A", 3), ("B", 3)]
+    assert ab_schedule(["A", "B", "C"], 2) == [
+        ("A", 1),
+        ("B", 1),
+        ("C", 1),
+        ("B", 2),
+        ("C", 2),
+        ("A", 2),
+    ]
+    # Every (config, repeat) appears exactly once.
+    order = ab_schedule(["A", "B", "C"], 4)
+    assert sorted(order) == sorted((c, r) for r in range(1, 5) for c in "ABC")
+
+
+def test_ab_schedule_rejects_empty_inputs() -> None:
+    with pytest.raises(ValueError):
+        ab_schedule([], 3)
+    with pytest.raises(ValueError):
+        ab_schedule(["A"], 0)
+
+
+def test_classify_change_both_directions_with_tolerance() -> None:
+    tol = AbTolerance(rel=0.05, abs=0.0)
+    # HIGHER better (completeness/capacity): up = improved, down = regressed.
+    assert classify_change(100.0, 110.0, better=Better.HIGHER, tol=tol) is Verdict.IMPROVED
+    assert classify_change(100.0, 90.0, better=Better.HIGHER, tol=tol) is Verdict.REGRESSED
+    assert classify_change(100.0, 103.0, better=Better.HIGHER, tol=tol) is Verdict.WITHIN
+    # LOWER better (loss/latency): down = improved, up = regressed.
+    assert classify_change(20.0, 10.0, better=Better.LOWER, tol=tol) is Verdict.IMPROVED
+    assert classify_change(20.0, 30.0, better=Better.LOWER, tol=tol) is Verdict.REGRESSED
+    # The band is closed: a value exactly on the edge is unchanged.
+    assert classify_change(100.0, 105.0, better=Better.HIGHER, tol=tol) is Verdict.WITHIN
+
+
+def test_classify_change_absolute_floor_swallows_tiny_noise() -> None:
+    # 2 ms latency floor keeps a sub-floor wiggle on a tiny baseline as unchanged.
+    tol = default_ab_tolerance("latency_p95_ms")  # rel 0.10, abs 2.0
+    assert classify_change(5.0, 6.5, better=Better.LOWER, tol=tol) is Verdict.WITHIN
+    assert classify_change(5.0, 8.0, better=Better.LOWER, tol=tol) is Verdict.REGRESSED
+
+
+def test_ab_metrics_from_topic_reads_completeness_and_none_holes() -> None:
+    metrics = ab_metrics_from_topic(_ab_summary(delivered=80, expected=100)["topics"]["a->b:/t"])
+    assert metrics["completeness_pct"] == 80.0
+    assert metrics["loss_pct"] == 20.0
+    assert metrics["latency_p95_ms"] == 100.0
+    # A wiped-out stream carries no latency sample -> None (dropped from a spread).
+    wiped = {"expected": 100, "delivered": 0, "lost": 100, "loss_pct": 100.0, "ota_hop_ms": {"p95": None}}
+    assert ab_metrics_from_topic(wiped)["latency_p95_ms"] is None
+    assert ab_metrics_from_topic(wiped)["completeness_pct"] == 0.0
+
+
+def test_ab_better_rejects_unknown_metric() -> None:
+    assert ab_better("loss_pct") is Better.LOWER
+    assert ab_better("completeness_pct") is Better.HIGHER
+    with pytest.raises(BandError):
+        ab_better("bogus_metric")
+
+
+def test_ab_verdict_aggregates_spread_and_classifies() -> None:
+    # Baseline: heavy loss; candidate: clean. Two repeats each.
+    runs = [
+        AbRun("baseline", 1, _ab_summary(delivered=60, latency_p95=150.0)),
+        AbRun("baseline", 2, _ab_summary(delivered=70, latency_p95=130.0)),
+        AbRun("cand", 1, _ab_summary(delivered=99, latency_p95=90.0)),
+        AbRun("cand", 2, _ab_summary(delivered=97, latency_p95=95.0)),
+    ]
+    report = ab_verdict(runs, baseline="baseline")
+    assert report.passed is True  # candidate only improves / holds
+    candidate = report.candidates[0]
+    assert candidate.config == "cand"
+    cells = {(c.topic, c.metric): c for c in candidate.cells}
+    completeness = cells[("a->b:/t", "completeness_pct")]
+    # Spread reported as min/median/max, not just the mean.
+    assert completeness.baseline is not None and completeness.candidate is not None
+    assert (completeness.baseline.min, completeness.baseline.max) == (60.0, 70.0)
+    assert completeness.candidate.median == 98.0
+    assert completeness.verdict == Verdict.IMPROVED.value
+    assert completeness.separated is True  # 60–70 vs 97–99 do not overlap
+    assert ["a->b:/t", "completeness_pct"] in candidate.improved
+    assert candidate.regressed == []
+
+
+def test_ab_verdict_flags_regression_and_overall_fail() -> None:
+    runs = [
+        AbRun("baseline", 1, _ab_summary(delivered=99, latency_p95=90.0)),
+        AbRun("worse", 1, _ab_summary(delivered=70, latency_p95=200.0)),
+    ]
+    report = ab_verdict(runs, baseline="baseline")
+    candidate = report.candidates[0]
+    assert candidate.passed is False
+    assert ["a->b:/t", "loss_pct"] in candidate.regressed
+    assert ["a->b:/t", "latency_p95_ms"] in candidate.regressed
+    assert report.passed is False
+
+
+def test_ab_verdict_dropped_topic_is_a_failure() -> None:
+    runs = [
+        AbRun("baseline", 1, _ab_summary(topic="a->b:/t")),
+        AbRun("cand", 1, _ab_summary(topic="a->b:/other")),  # baseline's /t vanished
+    ]
+    report = ab_verdict(runs, baseline="baseline")
+    candidate = report.candidates[0]
+    assert candidate.dropped_topics == ["a->b:/t"]
+    assert candidate.passed is False
+
+
+def test_ab_verdict_is_deterministic_regardless_of_run_order() -> None:
+    runs = [
+        AbRun("baseline", 1, _ab_summary(delivered=80)),
+        AbRun("baseline", 2, _ab_summary(delivered=82)),
+        AbRun("cand", 1, _ab_summary(delivered=95)),
+        AbRun("cand", 2, _ab_summary(delivered=97)),
+    ]
+    first = dataclasses.asdict(ab_verdict(runs, baseline="baseline"))
+    shuffled = [runs[2], runs[0], runs[3], runs[1]]
+    second = dataclasses.asdict(ab_verdict(shuffled, baseline="baseline"))
+    assert first == second
+
+
+def test_ab_verdict_rejects_missing_baseline() -> None:
+    with pytest.raises(BandError):
+        ab_verdict([AbRun("cand", 1, _ab_summary())], baseline="baseline")
+
+
+def test_render_ab_markdown_is_self_describing() -> None:
+    runs = [
+        AbRun("baseline", 1, _ab_summary(delivered=70)),
+        AbRun("cand", 1, _ab_summary(delivered=98)),
+    ]
+    markdown = render_ab_markdown(ab_verdict(runs, baseline="baseline"))
+    assert "A/B verdict: **PASS**" in markdown
+    assert "`cand` vs `baseline`" in markdown
+    assert "| topic | metric |" in markdown
+    assert "IMPROVED" in markdown

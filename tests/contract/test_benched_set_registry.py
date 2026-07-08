@@ -52,23 +52,37 @@ def _random_netem_directions(profile: Profile) -> list[str]:
             for name in ("jitter_ms", "loss_pct", "reorder_pct", "duplicate_pct")
         )
 
-    unseeded: list[str] = []
+    random_dirs: list[str] = []
     segments = profile.timeline if profile.is_timeline else [profile]
     for index, segment in enumerate(segments):
         for direction in ("uplink", "downlink"):
             shaping = getattr(segment, direction, None)
-            if shaping_is_random(shaping) and getattr(shaping, "seed", None) is None:
-                unseeded.append(f"{profile.name}[{index}].{direction}")
-    return unseeded
+            if shaping_is_random(shaping):
+                random_dirs.append(f"{profile.name}[{index}].{direction}")
+    return random_dirs
 
 
-def test_gated_profiles_seed_their_random_netem_elements(rows: list[GateRow], profiles: dict[str, Profile]) -> None:
-    """Seed policy is explicit (vision): a gated row's profile either has no
-    random netem element or commits a seed for each one."""
+def test_public_gate_profiles_use_deterministic_netem(rows: list[GateRow], profiles: dict[str, Profile]) -> None:
+    """Public gate profiles must shape with *deterministic* netem only —
+    rate/delay bottlenecks, no random loss/jitter/reorder/duplicate.
+
+    The vision's "seed policy is explicit" is realizable for the seeded *load*
+    (application-level RNG in sized_publisher, committed in the registry) but
+    NOT for random *netem* on the public runner class: the tc on GitHub-hosted
+    runners rejects the netem `seed` option (observed: `netem … loss 8% seed 1
+    -> What is "seed"?`), so a seeded-random public profile cannot even be
+    installed there, and an unseeded one is non-deterministic — either way it
+    must not gate. Determinism for public rows therefore comes from the pinned
+    bottleneck (rate/delay), which needs no seed. Seeded-random netem stays in
+    the operator harness lanes on a tc that supports it (RFC 0007 §3, honest
+    limits)."""
     problems: list[str] = []
     for profile_name in sorted({row.profile for row in rows}):
         problems += _random_netem_directions(profiles[profile_name])
-    assert not problems, f"unseeded random netem in gated profiles: {problems}"
+    assert not problems, (
+        "random netem in public gate profiles (github-hosted tc cannot seed it, so it cannot gate "
+        f"deterministically): {problems}. Use a rate/delay bottleneck instead."
+    )
 
 
 def test_every_gated_metric_has_a_calibrated_band(rows: list[GateRow]) -> None:

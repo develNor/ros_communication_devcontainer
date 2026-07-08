@@ -186,6 +186,15 @@ becomes a finding with a row, instead of living only in RFC prose.
 - **Determinism is per-seed, not metaphysical** (RFC 0004/0005): seeded netem
   plus seeded load makes rows repeatable enough to gate; it does not make the
   emulation true. Real-link truth stays with calibration runs, monitor-only.
+- **Public runners cannot seed netem.** The `tc` on GitHub-hosted runners
+  rejects the netem `seed` option (observed during the canary exercise: `netem
+  … loss 8% seed 1 -> What is "seed"?`), so *random* netem (loss/jitter/reorder)
+  is not reproducible there and cannot gate. Public gate profiles therefore use
+  **deterministic** shaping only — rate/delay bottlenecks, which are repeatable
+  without a seed (contract-tested: `test_public_gate_profiles_use_deterministic_netem`).
+  The seeded-*load* half of the policy (sized_publisher interval jitter) is
+  application-level and works everywhere; seeded random netem stays in the
+  operator harness lanes on a tc that supports it.
 - **Matrix growth is the failure mode.** RMW variants × profiles × loads ×
   metrics multiplies budgets; the benched set must stay curated (the registry
   is a whitelist, not a crawler), and every row needs an operator-visible
@@ -277,16 +286,29 @@ slices these into issues.
   and metric set; workflows consume the registry (no hardcoded row lists).
   *(`tests/unit/test_benched_set.py` for the schema;
   `tests/contract/test_benched_set_registry.py` for the cross-file contracts:
-  profiles exist, random netem is seeded, every gated metric has a calibrated
-  band, no orphan bands, workflows consume the registry and hardcode no row
-  id, and the merge-gate lane cannot silently deselect the benchmark E2E.)*
+  profiles exist and use deterministic netem (public runners cannot seed it),
+  every gated metric has a calibrated band, no orphan bands, workflows consume
+  the registry and hardcode no row id, and the merge-gate lane cannot silently
+  deselect the benchmark E2E.)*
 - [x] **Merge-gate row** — exercised by the merge gate itself (band-asserted
   benchmark-capacity E2E), runtime bounded by the workflow timeout.
   *(`test_benchmark_capacity.py::test_merge_gate_row_is_band_asserted` in the
   `e2e-runtime-tools` lane of `pr-merge-gate.yml`; a 60 s probe window plus
   session setup keeps it minutes-scale.)*
-- [ ] **Nightly matrix** — one deliberately injected regression (canary
+- [x] **Nightly matrix** — one deliberately injected regression (canary
   branch) turns the lane red end-to-end; documented one-off exercise.
+  *(Canary branch `issue-179-canary`, `benchmark-gate.yml` run 28957477074:
+  gate-nominal gained unseeded netem `loss 8%`, which the 12 KB messages
+  amplify through fragmentation to 59.6 % measured loss; `probe-loss-nominal-
+  cyclone` REGRESSED its `[-0.5, 0.5]` band (exit 1) while every other row
+  stayed WITHIN, so `benchmark-gate-summary` went `overall: red`
+  (`red_rows: [probe-loss-nominal-cyclone]`) and the workflow exited red. Branch
+  deleted after. The exercise surfaced two findings, now in Honest limits: a
+  rate-limit injection **buffers** (17 s latency, monitor-only) rather than
+  dropping — loss needs per-packet netem drop; and github-hosted `tc` rejects
+  the netem `seed`, so a seeded-loss injection instead failed setup and turned
+  the lane red via the MISSING-verdict path — itself a demonstration that a row
+  which cannot run is red, not silently green.)*
 - [x] **Findings checker** — contract test: a finding without `Verification:`
   fails the ledger check.
 - [x] **Manual (explicit):** the first calibration is reviewed — band widths

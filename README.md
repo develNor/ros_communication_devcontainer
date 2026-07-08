@@ -440,6 +440,24 @@ summary. Wrapped-topic corrected latency requires `shared.use_heartbeat: true`;
 sample age, and symmetric-path assumption. Uncorrected OTA delay remains a
 separate field.
 
+Compare how a stream changes across recorded stages — for example native
+pre-processing, processed handoff, and post-OTA transit rows:
+
+```bash
+rosotacom stream-stats \
+  --bag pre=logs/b/metrics/stages_20260702_172900:/sensors/camera/front_medium/resized/image_rect_color \
+  --bag handoff=logs/b/metrics/stages_20260702_172900:/sensors/camera/front_medium/resized/image_rect_color/compressed/restamped/drop1of2/ffmpeg \
+  --events post=logs/b/status/events.jsonl:/sensors/camera/front_medium/resized/image_rect_color \
+  --out stream-stats
+```
+
+The command emits a side-by-side Markdown table plus `stream-stats.json`, with
+per-stage size distributions, observed rate, interval regularity, and FFMPEG
+GOP/keyframe shape when available. Bag sources require `rosbag2_py`; `events`
+sources work from the recorded RFC 0003 transit rows. See
+[docs/ffmpeg-keyframes.md](docs/ffmpeg-keyframes.md) for the GOP methodology
+and example camera interpretation.
+
 Turn a whole recorded instance into an explanation of *where* and *how*
 delivery degraded — loss bursts, latency excursions, and rate collapses with
 exact boundaries, joined with link-trace/profile/keyframe context:

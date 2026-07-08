@@ -419,6 +419,21 @@ saturated/probed/capacity-like; otherwise the converter omits rate instead of
 fabricating capacity. The generated YAML carries a provenance comment with the
 source path, SHA-256, parameters, and these caveats.
 
+Render an offline route map when a run also has GPS or pose samples:
+
+```bash
+rosotacom geomap --bag session-instances/.../rosbags/a/native --gps-topic /fix \
+  --trace session-instances/.../logs/a/status/link_trace.jsonl \
+  --metric observed_tx_kbps \
+  --out-csv artifacts/geo-link-quality.csv \
+  --out-html artifacts/geo-link-quality.html
+```
+
+`geomap` writes georeferenced CSV samples, an HTML report, and a sibling
+`.route.png` route image. The timestamp offset between trace/event time and
+bag/GPS time is explicit; see [docs/geo-link-map.md](docs/geo-link-map.md) for
+the alignment model, CSV fixture workflow, and supported metrics.
+
 Read it from the host with the `status` command:
 
 ```bash

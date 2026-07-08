@@ -7131,6 +7131,68 @@ def metrics_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def geomap_command(args: argparse.Namespace) -> int:
+    from rosotacom.geomap import (
+        join_metric_samples,
+        load_gps_csv,
+        load_gps_from_bag,
+        load_metrics_for_inputs,
+        write_geo_csv,
+        write_geomap_html,
+        write_manifest,
+    )
+
+    gps_csv = cast(str | None, getattr(args, "gps_csv", None))
+    bag = cast(str | None, getattr(args, "bag", None))
+    if bool(gps_csv) == bool(bag):
+        raise RuntimeError("provide exactly one GPS source: --gps-csv or --bag")
+    if bag and not getattr(args, "gps_topic", None):
+        raise RuntimeError("--bag requires --gps-topic")
+
+    if gps_csv:
+        gps_samples = load_gps_csv(gps_csv)
+    else:
+        assert bag is not None
+        gps_samples = load_gps_from_bag(
+            bag,
+            topic=args.gps_topic,
+            storage_id=args.storage_id,
+            time_source=args.gps_time_source,
+            origin_latitude=args.origin_lat,
+            origin_longitude=args.origin_lon,
+        )
+    metric_samples = load_metrics_for_inputs(
+        traces=tuple(args.trace or ()),
+        events=tuple(args.events or ()),
+        event_bin_s=args.event_bin_s,
+        event_time_field=args.event_time_field,
+        event_topic=args.event_topic,
+    )
+    if not metric_samples:
+        raise RuntimeError("no metric samples found; provide at least one non-empty --trace or --events input")
+
+    joined = join_metric_samples(
+        gps_samples,
+        metric_samples,
+        metric=args.metric,
+        trace_to_gps_offset_s=args.trace_to_gps_offset_s,
+        max_gap_s=args.max_gap_s,
+    )
+    if not joined:
+        raise RuntimeError(
+            "no georeferenced samples after timestamp join; check --trace-to-gps-offset-s, --max-gap-s, and --metric"
+        )
+
+    write_geo_csv(joined, args.out_csv)
+    write_geomap_html(joined, args.out_html, metric=args.metric, title=args.title)
+    if args.manifest:
+        write_manifest(args.manifest, csv_path=args.out_csv, html_path=args.out_html, sample_count=len(joined))
+
+    print(f"Wrote {len(joined)} georeferenced samples to {args.out_csv}")
+    print(f"Wrote geo link-quality map to {args.out_html}")
+    return 0
+
+
 def profile_from_trace_command(args: argparse.Namespace) -> int:
     from rosotacom.trace_profiles import TraceProfileConfig, parse_window, write_trace_profile
 
@@ -7740,6 +7802,7 @@ def main(argv: list[str] | None = None) -> int:
         "status",
         "metrics",
         "videoquality",
+        "geomap",
         "report",
         "stream-stats",
         "test",
@@ -7906,6 +7969,94 @@ def main(argv: list[str] | None = None) -> int:
         "--records", action="store_true", help="Emit joined per-(topic, seq) records instead of a summary."
     )
     metrics_parser.set_defaults(func=metrics_command)
+
+    geomap_parser = subparsers.add_parser(
+        "geomap",
+        help="Join GPS/pose samples with link trace or transit metrics and render a geo-referenced HTML map.",
+    )
+    gps_group = geomap_parser.add_mutually_exclusive_group(required=True)
+    gps_group.add_argument(
+        "--gps-csv",
+        help=(
+            "Host-only GPS CSV fixture with time_s/latitude/longitude columns "
+            "(aliases: stamp_s, timestamp_s, bag_time_s, lat, lon, lng)."
+        ),
+    )
+    gps_group.add_argument("--bag", help="rosbag2 directory, metadata.yaml, or bag file containing the GPS topic.")
+    geomap_parser.add_argument("--gps-topic", help="GPS, NavSatFix, PoseStamped, or Odometry topic to read from --bag.")
+    geomap_parser.add_argument(
+        "--gps-time-source",
+        choices=["bag", "header"],
+        default="bag",
+        help="Timestamp source for --bag GPS samples: rosbag record time or message header.stamp (default: bag).",
+    )
+    geomap_parser.add_argument("--storage-id", help="rosbag2 storage id override (default: metadata storage id).")
+    geomap_parser.add_argument(
+        "--origin-lat",
+        type=float,
+        help="WGS84 latitude used to project local pose/odometry x/y meters; required with --origin-lon.",
+    )
+    geomap_parser.add_argument(
+        "--origin-lon",
+        type=float,
+        help="WGS84 longitude used to project local pose/odometry x/y meters; required with --origin-lat.",
+    )
+    geomap_parser.add_argument("--trace", action="append", default=[], help="link_trace.jsonl input. Repeatable.")
+    geomap_parser.add_argument("--events", action="append", default=[], help="events.jsonl input. Repeatable.")
+    geomap_parser.add_argument(
+        "--event-bin-s",
+        type=float,
+        default=1.0,
+        help="Seconds per transit-metric bin when --events is used (default: 1).",
+    )
+    geomap_parser.add_argument(
+        "--event-time-field",
+        choices=["t_wrap", "t_com_in"],
+        default="t_wrap",
+        help="Transit timestamp field to join when --events is used (default: t_wrap).",
+    )
+    geomap_parser.add_argument(
+        "--event-topic",
+        help="Only use this transit topic or source->target:/topic label from --events.",
+    )
+    geomap_parser.add_argument(
+        "--metric",
+        choices=[
+            "observed_tx_kbps",
+            "observed_rx_kbps",
+            "rtt_ms",
+            "loss_pct",
+            "delivery_pct",
+            "event_loss_pct",
+            "ota_hop_ms",
+        ],
+        default="observed_tx_kbps",
+        help="Metric used to color the route.",
+    )
+    geomap_parser.add_argument(
+        "--trace-to-gps-offset-s",
+        type=float,
+        default=0.0,
+        help=(
+            "Seconds added to each trace/events timestamp before joining to GPS time. "
+            "Use 0 only when both sources already share the same epoch."
+        ),
+    )
+    geomap_parser.add_argument(
+        "--max-gap-s",
+        type=float,
+        default=1.0,
+        help="Maximum absolute nearest GPS/metric timestamp gap to keep (default: 1).",
+    )
+    geomap_parser.add_argument("--out-csv", required=True, help="Output CSV path for georeferenced samples.")
+    geomap_parser.add_argument(
+        "--out-html",
+        required=True,
+        help="Output HTML report; also writes a sibling .route.png.",
+    )
+    geomap_parser.add_argument("--manifest", help="Optional YAML sidecar with output paths and sample count.")
+    geomap_parser.add_argument("--title", help="Optional HTML report title.")
+    geomap_parser.set_defaults(func=geomap_command)
 
     profile_parser = subparsers.add_parser("profile", help="Generate and inspect network profiles.")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)

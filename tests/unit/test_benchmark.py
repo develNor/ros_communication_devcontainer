@@ -32,6 +32,7 @@ from rosotacom.benchmark import (
     compare_to_band,
     default_ab_tolerance,
     default_better,
+    evaluate_bag_run,
     exclude_probe_warmup,
     expand_size_pattern,
     find_band,
@@ -1038,3 +1039,158 @@ def test_render_ab_markdown_is_self_describing() -> None:
     assert "`cand` vs `baseline`" in markdown
     assert "| topic | metric |" in markdown
     assert "IMPROVED" in markdown
+
+
+# --- bag-as-load oracle (per-topic replay verdict) ------------------------- #
+
+
+def _topic_summary(
+    *,
+    expected: int,
+    delivered: int,
+    latency_p95: float | None = 60.0,
+    jitter_p95: float = 3.0,
+    reordered: int = 0,
+) -> dict[str, object]:
+    lost = expected - delivered
+    return {
+        "expected": expected,
+        "delivered": delivered,
+        "lost": lost,
+        "reordered": reordered,
+        "loss_pct": round(100.0 * lost / expected, 3) if expected else 0.0,
+        "ota_hop_ms": {"p50": (latency_p95 or 0.0) * 0.6, "p95": latency_p95},
+        "jitter_ms": {"p50": jitter_p95 * 0.5, "p95": jitter_p95},
+    }
+
+
+def test_summary_topic_name_strips_direction_label() -> None:
+    from rosotacom.benchmark import summary_topic_name
+
+    assert summary_topic_name("a->b:/topic5") == "/topic5"
+    assert summary_topic_name("/topic5") == "/topic5"
+
+
+def test_evaluate_bag_run_passes_when_every_contract_topic_clears() -> None:
+    summary = {
+        "topics": {
+            "a->b:/topic5": _topic_summary(expected=100, delivered=100, latency_p95=80.0),
+            "b->a:/topic9": _topic_summary(expected=200, delivered=199, latency_p95=120.0),
+        }
+    }
+    ground_truth = {"/topic5": {"count": 100}, "/topic9": {"count": 200}}
+    verdict = evaluate_bag_run(
+        summary,
+        thresholds=OracleThresholds(max_loss_pct=5.0, max_latency_ms=250.0),
+        ground_truth=ground_truth,
+        min_completeness=0.95,
+    )
+    assert verdict.passes is True
+    assert verdict.failing_topics == ()
+    # Row aggregates: worst-case rate metrics, summed counts.
+    assert verdict.expected == 300
+    assert verdict.delivered == 299
+    assert verdict.latency_p95_ms == 120.0
+    by_topic = {t.topic: t for t in verdict.topics}
+    assert by_topic["/topic9"].completeness == 0.995
+
+
+def test_evaluate_bag_run_fails_and_names_incomplete_topic() -> None:
+    # /topic5 delivers only 80/100 of the bag: within the network-loss bound but
+    # below the completeness floor — the whole run fails and names it.
+    summary = {
+        "topics": {
+            "a->b:/topic5": _topic_summary(expected=100, delivered=80, latency_p95=90.0),
+            "b->a:/topic9": _topic_summary(expected=100, delivered=100, latency_p95=90.0),
+        }
+    }
+    ground_truth = {"/topic5": {"count": 100}, "/topic9": {"count": 100}}
+    verdict = evaluate_bag_run(
+        summary,
+        thresholds=OracleThresholds(max_loss_pct=50.0, max_latency_ms=250.0),
+        ground_truth=ground_truth,
+        min_completeness=0.95,
+    )
+    assert verdict.passes is False
+    assert verdict.failing_topics == ("/topic5",)
+    assert verdict.representative_topic == "/topic5"
+    bad = {t.topic: t for t in verdict.topics}["/topic5"]
+    assert bad.completeness == 0.8
+    assert "incomplete" in bad.reason
+    assert verdict.loss_free is False
+
+
+def test_evaluate_bag_run_latency_bound_fails_a_topic() -> None:
+    summary = {
+        "topics": {
+            "a->b:/topic5": _topic_summary(expected=100, delivered=100, latency_p95=900.0),
+        }
+    }
+    verdict = evaluate_bag_run(
+        summary,
+        thresholds=OracleThresholds(max_loss_pct=5.0, max_latency_ms=250.0),
+        ground_truth={"/topic5": {"count": 100}},
+    )
+    assert verdict.passes is False
+    assert verdict.failing_topics == ("/topic5",)
+    assert "latency" in {t.topic: t for t in verdict.topics}["/topic5"].reason
+    # Zero network loss, so the boundary "loss_free" is still true even though the
+    # oracle fails on latency — the two axes stay separable.
+    assert verdict.loss_free is True
+    assert verdict.latency_ok is False
+
+
+def test_evaluate_bag_run_required_topic_absent_counts_as_lost() -> None:
+    # The contract requires /topic5 and /topic9 but the run delivered only /topic5.
+    summary = {"topics": {"a->b:/topic5": _topic_summary(expected=100, delivered=100)}}
+    verdict = evaluate_bag_run(
+        summary,
+        thresholds=OracleThresholds(max_loss_pct=5.0, max_latency_ms=250.0),
+        ground_truth={"/topic5": {"count": 100}, "/topic9": {"count": 100}},
+        required_topics=["/topic5", "/topic9"],
+    )
+    assert verdict.passes is False
+    assert verdict.failing_topics == ("/topic9",)
+    missing = {t.topic: t for t in verdict.topics}["/topic9"]
+    assert missing.reason == "absent"
+    assert missing.delivered == 0
+    assert missing.lost == 100
+
+
+def test_evaluate_bag_run_without_ground_truth_uses_network_loss_only() -> None:
+    # No bag counts: the completeness gate is skipped, so a fully-delivered,
+    # low-latency contract still passes on loss + latency alone.
+    summary = {
+        "topics": {
+            "a->b:/topic5": _topic_summary(expected=100, delivered=100, latency_p95=70.0),
+            "b->a:/topic9": _topic_summary(expected=50, delivered=50, latency_p95=70.0),
+        }
+    }
+    verdict = evaluate_bag_run(
+        summary,
+        thresholds=OracleThresholds(max_loss_pct=0.0, max_latency_ms=250.0),
+    )
+    assert verdict.passes is True
+    assert verdict.loss_free is True
+    assert all(t.completeness is None for t in verdict.topics)
+
+
+def test_evaluate_bag_run_is_order_independent() -> None:
+    thresholds = OracleThresholds(max_loss_pct=5.0, max_latency_ms=250.0)
+    gt = {"/a": {"count": 100}, "/b": {"count": 100}}
+    forward = {
+        "topics": {
+            "x->y:/a": _topic_summary(expected=100, delivered=100),
+            "y->x:/b": _topic_summary(expected=100, delivered=70),
+        }
+    }
+    reverse = {
+        "topics": {
+            "y->x:/b": _topic_summary(expected=100, delivered=70),
+            "x->y:/a": _topic_summary(expected=100, delivered=100),
+        }
+    }
+    a = evaluate_bag_run(forward, thresholds=thresholds, ground_truth=gt)
+    b = evaluate_bag_run(reverse, thresholds=thresholds, ground_truth=gt)
+    assert a.failing_topics == b.failing_topics == ("/b",)
+    assert a.passes == b.passes is False

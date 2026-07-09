@@ -199,6 +199,209 @@ def oracle_passes_topic(topic_summary: dict[str, Any], thresholds: OracleThresho
 
 
 # --------------------------------------------------------------------------- #
+# Bag-as-load oracle: a whole replay contract, judged per topic
+# --------------------------------------------------------------------------- #
+#
+# When the benchmark *load* is a bag replay (a real session/scenario) rather than
+# a single synthetic stream, one probe point delivers many topics at once. The
+# verdict is then per topic — each contract topic must clear the network-loss and
+# latency bound *and* deliver a high-enough share of the bag's known messages
+# (completeness ground truth from ``bag_ground_truth``) — aggregated to a run
+# verdict: the run passes iff every required topic passes, and the failing topics
+# are named. This mirrors ``oracle_passes_topic`` for the loss/latency part and
+# adds the completeness gate the known-source replay makes possible (RFC 0002,
+# "Live vs replay"). It is pure so the search over replay verdicts is host-tested.
+
+
+@dataclass(frozen=True)
+class TopicVerdict:
+    """Per-topic verdict of one replay run against the contract + bag ground truth."""
+
+    topic: str
+    passes: bool
+    expected: int | None  # bag ground-truth count when known, else the run's own expected
+    delivered: int | None
+    lost: int | None
+    reordered: int | None
+    loss_pct: float
+    completeness: float | None  # delivered / bag-count; None when no ground truth
+    latency_p95_ms: float | None
+    jitter_p95_ms: float | None
+    loss_free: bool  # zero network loss AND (when known) complete against the bag
+    latency_ok: bool
+    reason: str  # "ok" or the first failing check, for the failing-topics list
+
+
+@dataclass(frozen=True)
+class BagRunVerdict:
+    """Run verdict aggregated over every required contract topic of one replay."""
+
+    passes: bool
+    loss_free: bool
+    latency_ok: bool
+    topics: tuple[TopicVerdict, ...]
+    failing_topics: tuple[str, ...]
+    representative_topic: str
+    # Row aggregates (summed counts; worst-case rate metrics across topics):
+    expected: int
+    delivered: int
+    lost: int
+    reordered: int
+    loss_pct: float
+    latency_p95_ms: float | None
+    jitter_p95_ms: float | None
+
+
+def summary_topic_name(label: str) -> str:
+    """The bare ROS topic of a ``summarize_transit_records`` label.
+
+    Labels are ``"<source>-><target>:<topic>"`` when directions are known (peer
+    identities carry no ``:``) and just ``"<topic>"`` otherwise; ROS topics never
+    contain ``:``, so the topic is everything after the first ``:``.
+    """
+    if "->" in label and ":" in label:
+        return label.split(":", 1)[1]
+    return label
+
+
+def _topic_data_by_name(summary: dict[str, Any]) -> dict[str, tuple[str, dict[str, Any]]]:
+    """Index a run summary by bare topic name, keeping the richest per-topic row.
+
+    A contract topic flows one direction, but if a name appears under several
+    labels the entry with the most delivered messages is the real stream.
+    """
+    topics = summary.get("topics")
+    if not isinstance(topics, dict):
+        return {}
+    indexed: dict[str, tuple[str, dict[str, Any]]] = {}
+    for label, data in topics.items():
+        if not isinstance(data, dict):
+            continue
+        name = summary_topic_name(str(label))
+        current = indexed.get(name)
+        if current is None or int(data.get("delivered") or 0) > int(current[1].get("delivered") or 0):
+            indexed[name] = (str(label), data)
+    return indexed
+
+
+def evaluate_bag_run(
+    summary: dict[str, Any],
+    *,
+    thresholds: OracleThresholds,
+    ground_truth: dict[str, dict[str, Any]] | None = None,
+    min_completeness: float = 0.95,
+    required_topics: Sequence[str] | None = None,
+) -> BagRunVerdict:
+    """Judge one replay run's transit summary against the whole contract.
+
+    ``required_topics`` is the set the run must deliver (the session's carried
+    topics); when omitted it is taken from ``ground_truth`` if given, else from
+    every topic in the summary. ``ground_truth`` maps ROS topic -> bag facts
+    (``bag_ground_truth``); when a topic has a bag ``count`` the completeness gate
+    (``delivered / count >= min_completeness``) applies on top of the loss/latency
+    oracle. A required topic missing from the summary counts as fully lost.
+    """
+    if not 0.0 < min_completeness <= 1.0:
+        raise ValueError("min_completeness must be within (0, 1].")
+    indexed = _topic_data_by_name(summary)
+    if required_topics is not None:
+        names = [str(name) for name in required_topics]
+    elif ground_truth is not None:
+        names = sorted(name for name in ground_truth if name in indexed) or sorted(indexed)
+    else:
+        names = sorted(indexed)
+
+    quantile = thresholds.latency_quantile
+    verdicts: list[TopicVerdict] = []
+    for name in names:
+        label, data = indexed.get(name, (name, {}))
+        gt = (ground_truth or {}).get(name) or {}
+        gt_count = int(gt.get("count") or 0) if gt else 0
+
+        delivered = data.get("delivered")
+        delivered_n = int(delivered) if delivered is not None else 0
+        lost = data.get("lost")
+        reordered = data.get("reordered")
+        run_expected = data.get("expected")
+        loss_pct = float(data.get("loss_pct", 100.0)) if data else 100.0
+        latency_p95 = (data.get("ota_hop_ms") or {}).get(quantile) if data else None
+        jitter_p95 = (data.get("jitter_ms") or {}).get("p95") if data else None
+        latency_val = None if latency_p95 is None else float(latency_p95)
+
+        expected_out = gt_count if gt_count > 0 else (int(run_expected) if run_expected is not None else None)
+        completeness = (delivered_n / gt_count) if gt_count > 0 else None
+
+        latency_ok = latency_val is not None and latency_val <= thresholds.max_latency_ms
+        loss_ok = loss_pct <= thresholds.max_loss_pct
+        no_network_loss = loss_pct <= 0.0 and int(lost or 0) == 0
+        complete = completeness is None or completeness >= min_completeness
+        passes = bool(data) and loss_ok and latency_ok and complete
+        loss_free = bool(data) and no_network_loss and complete
+
+        if not data:
+            reason = "absent"
+        elif not complete:
+            reason = f"incomplete({completeness:.3f}<{min_completeness:g})"
+        elif not loss_ok:
+            reason = f"loss({loss_pct:.3g}%>{thresholds.max_loss_pct:g}%)"
+        elif not latency_ok:
+            if latency_val is None:
+                reason = "latency(none)"
+            else:
+                reason = f"latency({latency_val:.3g}>{thresholds.max_latency_ms:g}ms)"
+        else:
+            reason = "ok"
+
+        verdicts.append(
+            TopicVerdict(
+                topic=name,
+                passes=passes,
+                expected=expected_out,
+                delivered=delivered_n if data else 0,
+                lost=int(lost) if lost is not None else (expected_out if not data and expected_out else None),
+                reordered=int(reordered) if reordered is not None else None,
+                loss_pct=loss_pct,
+                completeness=round(completeness, 6) if completeness is not None else None,
+                latency_p95_ms=latency_val,
+                jitter_p95_ms=None if jitter_p95 is None else float(jitter_p95),
+                loss_free=loss_free,
+                latency_ok=latency_ok,
+                reason=reason,
+            )
+        )
+
+    failing = tuple(v.topic for v in verdicts if not v.passes)
+    passes = bool(verdicts) and not failing
+    loss_free = bool(verdicts) and all(v.loss_free for v in verdicts)
+    latency_ok = bool(verdicts) and all(v.latency_ok for v in verdicts)
+
+    expected_total = sum(int(v.expected) for v in verdicts if v.expected is not None)
+    delivered_total = sum(int(v.delivered) for v in verdicts if v.delivered is not None)
+    lost_total = sum(int(v.lost) for v in verdicts if v.lost is not None)
+    reordered_total = sum(int(v.reordered) for v in verdicts if v.reordered is not None)
+    loss_values = [v.loss_pct for v in verdicts]
+    latency_values = [v.latency_p95_ms for v in verdicts if v.latency_p95_ms is not None]
+    jitter_values = [v.jitter_p95_ms for v in verdicts if v.jitter_p95_ms is not None]
+    representative = failing[0] if failing else (verdicts[0].topic if verdicts else "")
+
+    return BagRunVerdict(
+        passes=passes,
+        loss_free=loss_free,
+        latency_ok=latency_ok,
+        topics=tuple(verdicts),
+        failing_topics=failing,
+        representative_topic=representative,
+        expected=expected_total,
+        delivered=delivered_total,
+        lost=lost_total,
+        reordered=reordered_total,
+        loss_pct=max(loss_values) if loss_values else 100.0,
+        latency_p95_ms=max(latency_values) if latency_values else None,
+        jitter_p95_ms=max(jitter_values) if jitter_values else None,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Genre 1 — sweep bounds + shared-link guard
 # --------------------------------------------------------------------------- #
 

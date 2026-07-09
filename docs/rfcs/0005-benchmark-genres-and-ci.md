@@ -232,6 +232,14 @@ slice and reuses RFC 0003 + 0004.
   reusing the RFC 0007 `Better`/`Verdict` language, repeat-spread + separation
   reporting (`benchmark.ab_verdict`, `cli_benchmark.drive_ab` / `benchmark ab`;
   [../benchmark-ab.md](../benchmark-ab.md)).
+- [x] Let `requirements` / `loss-boundaries` take a **bag replay as the load** (#21):
+  a `--target <session>` probe = one full replay run under the candidate profile,
+  judged by a per-topic whole-contract oracle (loss + latency + optional `--bag`
+  completeness ground truth) aggregated to a run verdict with failing-topic list;
+  local (Docker) execution reuses the smoke contract publishers, OTA reuses the
+  target session/scenario (`benchmark.evaluate_bag_run`,
+  `cli_benchmark._probe_sample_verdict` / `_benchmark_replay_inputs`;
+  [../benchmark-bag-as-load.md](../benchmark-bag-as-load.md)).
 - [ ] Wire the nightly benchmark run as a **monitor** (alerts on budget regression,
   never blocks); the harness wires the actual runner. *(FZI-private — see below.)*
 - [x] Cover the driver oracle, budget compare, and recovery metrics with tests
@@ -317,6 +325,15 @@ reviewed rather than asserted in a blocking test.
   (`test_drive_ab_*`, `test_benchmark_ab_handler_*` in `test_cli_benchmark.py`);
   one Docker-backed slow-lane E2E proves the directional verdict on a `throttle_hz`
   difference (`tests/e2e/test_benchmark_ab.py`, `ROSOTACOM_RUN_E2E=1`). Automatable.
+- [x] **Bag replay as the load** (#21) — host unit tests on the pure per-topic
+  oracle (whole-contract pass/fail, completeness floor, latency bound, absent-topic
+  and order independence: `test_evaluate_bag_run_*` in `test_benchmark.py`) and on
+  both drivers with a stubbed `run_point` consuming multi-topic replay verdicts
+  (`test_loss_boundaries_driver_consumes_replay_verdicts_*`,
+  `test_requirements_driver_consumes_replay_verdicts_*` in `test_cli_benchmark.py`);
+  one Docker-backed slow-lane E2E runs `loss-boundaries` against packaged example 15
+  (costmap) and asserts the replay identity + per-topic verdicts
+  (`tests/e2e/test_benchmark_replay.py`, `ROSOTACOM_RUN_E2E=1`). Automatable.
 - [ ] **Nightly benchmark run wired as a monitor** (alerts on budget regression,
   never blocks) — **operator/harness check**: the public repo defines the genre;
   the actual runner topology is FZI-private, so the wiring is confirmed manually in

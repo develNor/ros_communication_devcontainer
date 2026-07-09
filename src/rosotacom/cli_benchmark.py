@@ -212,6 +212,28 @@ def collect_transit_records(instance_dir: Path) -> list[dict[str, Any]]:
     return join_transit_records(load_transit_records(events_files))
 
 
+def _benchmark_delivery_observed(status_paths: Sequence[Path], *, base: str | None) -> bool:
+    """True once any peer's ``status.json`` reports a delivered message.
+
+    ``base`` restricts the check to one topic (the single synthetic load topic);
+    ``None`` accepts any contract topic — used for replay loads whose topics cross
+    both directions, so the warm-up wait ends as soon as the replay is flowing.
+    """
+    for status_path in status_paths:
+        if not status_path.is_file():
+            continue
+        try:
+            status_data = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for topic_info in status_data.get("topics", []):
+            if base is not None and topic_info.get("base") != base:
+                continue
+            if any(stage.get("messages_total", 0) > 0 for stage in topic_info.get("stages", [])):
+                return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # Run-point primitive (the live probe, injected for testing)
 # --------------------------------------------------------------------------- #
@@ -2519,6 +2541,79 @@ def _selected_topic(summary: dict[str, Any], topic: str = "") -> tuple[str, dict
     return first_topic, topic_data if isinstance(topic_data, dict) else {}
 
 
+def _probe_sample_verdict(
+    summary: dict[str, Any],
+    *,
+    thresholds: Any,
+    topic: str,
+    bag_mode: bool,
+    ground_truth: dict[str, dict[str, Any]] | None = None,
+    min_completeness: float = 0.95,
+    required_topics: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """One probe run's verdict fields, shared by the requirements/boundary drivers.
+
+    In synthetic-load mode (``bag_mode`` false) this reproduces the single-topic
+    oracle the drivers have always used: the selected (or first) topic's loss,
+    latency ``p95`` and jitter ``p95``. In bag-as-load mode it aggregates the whole
+    replay contract with :func:`rosotacom.benchmark.evaluate_bag_run` — every
+    required topic must clear the loss/latency oracle and (when a bag supplies
+    ground truth) the completeness floor — and attaches the per-topic verdicts and
+    the failing-topic list. Both modes return the same keys, so the search loops
+    consume replay verdicts without any change to the boundary/requirements logic.
+    """
+    from .benchmark import oracle_passes_topic
+
+    if not bag_mode:
+        sample_topic, topic_data = _selected_topic(summary, topic)
+        loss_pct = float(topic_data.get("loss_pct", 100.0)) if topic_data else 100.0
+        lost = topic_data.get("lost") if topic_data else None
+        latency_p95 = (topic_data.get("ota_hop_ms") or {}).get("p95") if topic_data else None
+        jitter_p95 = (topic_data.get("jitter_ms") or {}).get("p95") if topic_data else None
+        loss_free = bool(loss_pct <= 0.0 and (lost is None or int(lost) == 0))
+        latency_ok = bool(latency_p95 is not None and float(latency_p95) <= thresholds.max_latency_ms)
+        return {
+            "topic": sample_topic,
+            "expected": topic_data.get("expected") if topic_data else None,
+            "delivered": topic_data.get("delivered") if topic_data else None,
+            "lost": int(lost) if lost is not None else None,
+            "reordered": topic_data.get("reordered") if topic_data else None,
+            "loss_pct": loss_pct,
+            "latency_p95_ms": float(latency_p95) if latency_p95 is not None else None,
+            "jitter_p95_ms": float(jitter_p95) if jitter_p95 is not None else None,
+            "loss_free": loss_free,
+            "latency_ok": latency_ok,
+            "passes": oracle_passes_topic(topic_data, thresholds) if topic_data else False,
+            "per_topic": None,
+            "failing_topics": None,
+        }
+
+    from .benchmark import evaluate_bag_run
+
+    verdict = evaluate_bag_run(
+        summary,
+        thresholds=thresholds,
+        ground_truth=ground_truth,
+        min_completeness=min_completeness,
+        required_topics=required_topics,
+    )
+    return {
+        "topic": verdict.representative_topic,
+        "expected": verdict.expected,
+        "delivered": verdict.delivered,
+        "lost": verdict.lost,
+        "reordered": verdict.reordered,
+        "loss_pct": verdict.loss_pct,
+        "latency_p95_ms": verdict.latency_p95_ms,
+        "jitter_p95_ms": verdict.jitter_p95_ms,
+        "loss_free": verdict.loss_free,
+        "latency_ok": verdict.latency_ok,
+        "passes": verdict.passes,
+        "per_topic": [_jsonable(dataclass_verdict) for dataclass_verdict in verdict.topics],
+        "failing_topics": list(verdict.failing_topics),
+    }
+
+
 def _sensitivity_analysis(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     baseline = next((row for row in rows if row.get("axis") == "baseline"), None)
     explicit_reference = next((row for row in rows if row.get("axis") == "reference"), None)
@@ -3182,9 +3277,15 @@ def drive_requirements(
     result_context: dict[str, Any] | None = None,
     generated_profiles_file: Path | None = None,
     profile_prefix: str = "requirements",
+    ground_truth: dict[str, dict[str, Any]] | None = None,
+    oracle_min_completeness: float = 0.95,
+    required_topics: Sequence[str] | None = None,
+    target: dict[str, Any] | None = None,
+    bag: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    from .benchmark import OracleThresholds, oracle_passes_topic
+    from .benchmark import OracleThresholds
 
+    bag_mode = target is not None or ground_truth is not None or required_topics is not None
     if bandwidth_low_bps <= 0.0 or bandwidth_high_bps <= 0.0:
         raise ValueError("Bandwidth bounds must be > 0.")
     if bandwidth_low_bps >= bandwidth_high_bps:
@@ -3322,29 +3423,34 @@ def drive_requirements(
         selected_topic = ""
         for repeat_index in range(1, local_probe_repeats + 1):
             summary = run_point(profile=profile_name, load=load, duration_s=duration_s, out_dir=out_dir)
-            sample_topic, topic_data = _selected_topic(summary, topic)
-            rows_for_print = _topic_rows(summary, topic)
-            if sample_topic and not selected_topic:
-                selected_topic = sample_topic
-            sample_passes = oracle_passes_topic(topic_data, thresholds) if topic_data else False
-            sample_loss_pct = float(topic_data.get("loss_pct", 100.0)) if topic_data else 100.0
-            sample_latency_p95 = (topic_data.get("ota_hop_ms") or {}).get("p95") if topic_data else None
-            sample_jitter_p95 = (topic_data.get("jitter_ms") or {}).get("p95") if topic_data else None
-            sample_lost = topic_data.get("lost") if topic_data else None
-            sample_loss_free = bool(sample_loss_pct <= 0.0 and (sample_lost is None or int(sample_lost) == 0))
+            verdict = _probe_sample_verdict(
+                summary,
+                thresholds=thresholds,
+                topic=topic,
+                bag_mode=bag_mode,
+                ground_truth=ground_truth,
+                min_completeness=oracle_min_completeness,
+                required_topics=required_topics,
+            )
+            rows_for_print = _topic_rows(summary, "" if bag_mode else topic)
+            if verdict["topic"] and not selected_topic:
+                selected_topic = verdict["topic"]
             sample = {
                 "repeat": repeat_index,
-                "passes": sample_passes,
-                "topic": sample_topic,
-                "expected": topic_data.get("expected") if topic_data else None,
-                "delivered": topic_data.get("delivered") if topic_data else None,
-                "lost": sample_lost,
-                "reordered": topic_data.get("reordered") if topic_data else None,
-                "loss_pct": sample_loss_pct,
-                "latency_p95_ms": float(sample_latency_p95) if sample_latency_p95 is not None else None,
-                "jitter_p95_ms": float(sample_jitter_p95) if sample_jitter_p95 is not None else None,
-                "loss_free": sample_loss_free,
+                "passes": verdict["passes"],
+                "topic": verdict["topic"],
+                "expected": verdict["expected"],
+                "delivered": verdict["delivered"],
+                "lost": verdict["lost"],
+                "reordered": verdict["reordered"],
+                "loss_pct": verdict["loss_pct"],
+                "latency_p95_ms": verdict["latency_p95_ms"],
+                "jitter_p95_ms": verdict["jitter_p95_ms"],
+                "loss_free": verdict["loss_free"],
             }
+            if verdict["failing_topics"] is not None:
+                sample["failing_topics"] = verdict["failing_topics"]
+                sample["per_topic"] = verdict["per_topic"]
             sample["target_quality"] = _requirements_target_quality(
                 sample,
                 max_loss_pct=max_loss_pct,
@@ -3429,6 +3535,8 @@ def drive_requirements(
             "repeat": repeat_summary,
             "samples": samples,
         }
+        if bag_mode:
+            row["failing_topics"] = sorted({t for s in samples for t in (s.get("failing_topics") or [])})
         target_quality = _requirements_target_quality(
             row,
             max_loss_pct=max_loss_pct,
@@ -3881,6 +3989,13 @@ def drive_requirements(
         "rows": rows,
         "analysis": analysis,
     }
+    if bag_mode:
+        result["replay"] = {
+            "target": target,
+            "bag": bag,
+            "required_topics": list(required_topics) if required_topics is not None else None,
+            "oracle_min_completeness": oracle_min_completeness,
+        }
     requirements_path = out_dir / "requirements.jsonl"
     requirements_path.write_text(
         "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n",
@@ -4040,9 +4155,21 @@ def drive_loss_boundaries(
     result_context: dict[str, Any] | None = None,
     generated_profiles_file: Path | None = None,
     profile_prefix: str = "loss_boundary",
+    ground_truth: dict[str, dict[str, Any]] | None = None,
+    oracle_min_completeness: float = 0.95,
+    required_topics: Sequence[str] | None = None,
+    target: dict[str, Any] | None = None,
+    bag: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Find discrete zero-loss good/bad boundaries for bandwidth and jitter."""
 
+    from .benchmark import OracleThresholds
+
+    bag_mode = target is not None or ground_truth is not None or required_topics is not None
+    # The boundary oracle is zero network loss plus the latency ceiling; in bag
+    # mode the completeness floor rides along inside ``loss_free`` (an incomplete
+    # replay is a lossy run).
+    oracle_thresholds = OracleThresholds(max_loss_pct=0.0, max_latency_ms=max_latency_ms)
     if downlink_mode not in {"mirror", "lan"}:
         raise ValueError("downlink_mode must be 'mirror' or 'lan'.")
     if latency_base_ms < 0.0:
@@ -4212,34 +4339,41 @@ def drive_loss_boundaries(
             )
             write_profiles()
             summary = run_point(profile=profile_name, load=load, duration_s=duration_s, out_dir=out_dir)
-            sample_topic, topic_data = _selected_topic(summary, topic)
-            rows_for_print = _topic_rows(summary, topic)
-            if sample_topic and not selected_topic:
-                selected_topic = sample_topic
-            sample_loss_pct = float(topic_data.get("loss_pct", 100.0)) if topic_data else 100.0
-            sample_lost = int(topic_data.get("lost", 0)) if topic_data and topic_data.get("lost") is not None else None
-            sample_latency_p95 = (topic_data.get("ota_hop_ms") or {}).get("p95") if topic_data else None
-            sample_jitter_p95 = (topic_data.get("jitter_ms") or {}).get("p95") if topic_data else None
-            loss_free = bool(sample_loss_pct <= 0.0 and (sample_lost is None or sample_lost == 0))
-            latency_ok = bool(sample_latency_p95 is not None and float(sample_latency_p95) <= max_latency_ms)
+            verdict = _probe_sample_verdict(
+                summary,
+                thresholds=oracle_thresholds,
+                topic=topic,
+                bag_mode=bag_mode,
+                ground_truth=ground_truth,
+                min_completeness=oracle_min_completeness,
+                required_topics=required_topics,
+            )
+            rows_for_print = _topic_rows(summary, "" if bag_mode else topic)
+            if verdict["topic"] and not selected_topic:
+                selected_topic = verdict["topic"]
+            loss_free = verdict["loss_free"]
+            latency_ok = verdict["latency_ok"]
             good = loss_free and latency_ok
             lossy = not loss_free
             sample = {
                 "sample": sample_index,
                 "seed": sample_seed,
-                "topic": sample_topic,
-                "expected": topic_data.get("expected") if topic_data else None,
-                "delivered": topic_data.get("delivered") if topic_data else None,
-                "lost": sample_lost,
-                "reordered": topic_data.get("reordered") if topic_data else None,
-                "loss_pct": sample_loss_pct,
-                "latency_p95_ms": float(sample_latency_p95) if sample_latency_p95 is not None else None,
-                "jitter_p95_ms": float(sample_jitter_p95) if sample_jitter_p95 is not None else None,
+                "topic": verdict["topic"],
+                "expected": verdict["expected"],
+                "delivered": verdict["delivered"],
+                "lost": verdict["lost"],
+                "reordered": verdict["reordered"],
+                "loss_pct": verdict["loss_pct"],
+                "latency_p95_ms": verdict["latency_p95_ms"],
+                "jitter_p95_ms": verdict["jitter_p95_ms"],
                 "loss_free": loss_free,
                 "latency_ok": latency_ok,
                 "good": good,
                 "lossy": lossy,
             }
+            if verdict["failing_topics"] is not None:
+                sample["failing_topics"] = verdict["failing_topics"]
+                sample["per_topic"] = verdict["per_topic"]
             samples.append(sample)
             sample_measurements.append(
                 {
@@ -4324,6 +4458,8 @@ def drive_loss_boundaries(
             "repeat": repeat_summary,
             "samples": samples,
         }
+        if bag_mode:
+            row["failing_topics"] = sorted({t for s in samples for t in (s.get("failing_topics") or [])})
         rows.append(row)
         measurements.append({"row": row, "samples": sample_measurements})
         row_cache[cache_key] = row
@@ -4501,6 +4637,13 @@ def drive_loss_boundaries(
             }[seed_policy],
         },
     }
+    if bag_mode:
+        result["replay"] = {
+            "target": target,
+            "bag": bag,
+            "required_topics": list(required_topics) if required_topics is not None else None,
+            "oracle_min_completeness": oracle_min_completeness,
+        }
     boundaries_path = out_dir / "loss-boundaries.json"
     boundaries_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _write_benchmark_result(
@@ -4789,6 +4932,25 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
         help="Override benchmark session QoS depth for the whole run.",
     )
     parser.set_defaults(ota_benchmark=ota_benchmark)
+
+
+def _add_benchmark_replay_args(parser: argparse.ArgumentParser) -> None:
+    """Bag-as-load options: a replay ``--target`` (session/scenario, via the shared
+    ``--target``/``--target-type``) plus its per-topic completeness ground truth."""
+    parser.add_argument(
+        "--bag",
+        help=(
+            "rosbag2 metadata.yaml (or bag dir) giving per-topic message-count ground "
+            "truth for the replay --target. Adds the completeness gate (delivered / "
+            "bag-count) on top of the loss/latency oracle."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-min-completeness",
+        type=float,
+        default=0.95,
+        help="Bag-as-load: min delivered/bag-count per topic to pass (default: 0.95).",
+    )
 
 
 def _abort_on_local_benchmark_conflicts(args: argparse.Namespace) -> None:
@@ -5130,27 +5292,36 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
                 return run
 
+            # Replay-as-load: the target session's own contract publishers drive
+            # the link (bag-shaped synthetic payloads via `_start_smoke_topic_publishers`,
+            # both directions), instead of a single `sized_publisher` stream. The
+            # container lifecycle, profile shaping, measurement window and transit
+            # collection below are identical to the synthetic path.
+            replay = bool(getattr(args, "_benchmark_replay_target", None))
             ros_setup_a = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "a")
+            ros_setup_b = _smoke_ros_setup(smoke_instance.config_container_dir, cfg, "b")
             topics_a = cfg.get("topics", {}).get("a_to_b", [])
-            publisher_streams = _publisher_streams_for_topic_specs(topics_a, load)
+            replay_publisher_duration = int(duration_s + 120.0)
             pub_cmds = []
-            for topic_index, topic_spec in enumerate(topics_a):
-                topic_name = topic_spec.get("topic")
-                publisher_args = " ".join(
-                    shlex.quote(str(part))
-                    for part in _sized_publisher_param_args(topic_name, load, streams=publisher_streams)
-                )
-                log_path = (
-                    "${ROSOTACOM_LOGS_DIR}/a/sized_publisher.log"
-                    if len(topics_a) == 1
-                    else f"${{ROSOTACOM_LOGS_DIR}}/a/sized_publisher_{topic_index}.log"
-                )
-                cmd = (
-                    f"{ros_setup_a} && timeout 300 ros2 run com_py sized_publisher --ros-args "
-                    f"{publisher_args} "
-                    f'> "{log_path}" 2>&1'
-                )
-                pub_cmds.append(cmd)
+            if not replay:
+                publisher_streams = _publisher_streams_for_topic_specs(topics_a, load)
+                for topic_index, topic_spec in enumerate(topics_a):
+                    topic_name = topic_spec.get("topic")
+                    publisher_args = " ".join(
+                        shlex.quote(str(part))
+                        for part in _sized_publisher_param_args(topic_name, load, streams=publisher_streams)
+                    )
+                    log_path = (
+                        "${ROSOTACOM_LOGS_DIR}/a/sized_publisher.log"
+                        if len(topics_a) == 1
+                        else f"${{ROSOTACOM_LOGS_DIR}}/a/sized_publisher_{topic_index}.log"
+                    )
+                    cmd = (
+                        f"{ros_setup_a} && timeout 300 ros2 run com_py sized_publisher --ros-args "
+                        f"{publisher_args} "
+                        f'> "{log_path}" 2>&1'
+                    )
+                    pub_cmds.append(cmd)
 
             a_container: str | None = None
             b_container: str | None = None
@@ -5159,13 +5330,15 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
             measurement_window: tuple[float, float] | None = None
 
             def stop_local_publishers() -> None:
-                if not a_container:
-                    return
-                subprocess.run(
-                    ["docker", "exec", a_container, "pkill", "-f", "sized_publisher"],
-                    capture_output=True,
-                    check=False,
-                )
+                for container in (a_container, b_container) if replay else (a_container,):
+                    if not container:
+                        continue
+                    for pattern in ("sized_publisher", "ros2 topic pub"):
+                        subprocess.run(
+                            ["docker", "exec", container, "pkill", "-f", pattern],
+                            capture_output=True,
+                            check=False,
+                        )
 
             try:
                 from .cli import _smoke_network_labels, _smoke_target_key
@@ -5199,49 +5372,55 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     container_tc_overrides[b_container] = install_seeded_tc(b_container)
 
                 # 1. Start the publishers
-                for cmd in pub_cmds:
-                    subprocess.run(
-                        ["docker", "exec", "-d", a_container, "bash", "-c", cmd],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
+                if replay:
+                    from .cli import _start_smoke_topic_publishers
 
-                # 2. Wait for discovery to complete on unshaped network
-                if not getattr(args, "dry_run", False):
-                    topic_name = topics_a[0].get("topic") if topics_a else "/bench_capacity"
-                    # A. Wait for local subscription discovery
-                    info_cmd = f"{ros_setup_a} && ros2 topic info {shlex.quote(topic_name)}"
-                    for _ in range(30):
-                        res = subprocess.run(
-                            ["docker", "exec", a_container, "bash", "-c", info_cmd],
+                    _start_smoke_topic_publishers(
+                        {"a": a_container, "b": b_container},
+                        {"a": ros_setup_a, "b": ros_setup_b},
+                        cfg,
+                        log_line=print,
+                        duration=float(replay_publisher_duration),
+                    )
+                else:
+                    for cmd in pub_cmds:
+                        subprocess.run(
+                            ["docker", "exec", "-d", a_container, "bash", "-c", cmd],
                             capture_output=True,
                             text=True,
                             check=False,
                         )
-                        output = res.stdout or ""
-                        if "Subscription count: 0" not in output and "Subscription count:" in output:
-                            break
-                        time.sleep(0.5)
 
-                    # B. Wait for end-to-end message delivery to Peer B (status.json reports messages_total > 0)
-                    status_json_path = smoke_instance.host_dir / "logs" / "b" / "status" / "status.json"
+                # 2. Wait for discovery to complete on unshaped network
+                if not getattr(args, "dry_run", False):
+                    default_topic = "/bench_capacity"
+                    topic_name = (topics_a[0].get("topic") if topics_a else default_topic) or default_topic
+                    if not replay:
+                        # A. Wait for local subscription discovery of the single load topic.
+                        info_cmd = f"{ros_setup_a} && ros2 topic info {shlex.quote(topic_name)}"
+                        for _ in range(30):
+                            res = subprocess.run(
+                                ["docker", "exec", a_container, "bash", "-c", info_cmd],
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                            )
+                            output = res.stdout or ""
+                            if "Subscription count: 0" not in output and "Subscription count:" in output:
+                                break
+                            time.sleep(0.5)
+
+                    # B. Wait for end-to-end delivery: the load topic to Peer B in
+                    # synthetic mode, or any contract topic reaching either peer in
+                    # replay mode (topics cross both directions).
+                    status_paths = (
+                        [smoke_instance.host_dir / "logs" / peer / "status" / "status.json" for peer in ("a", "b")]
+                        if replay
+                        else [smoke_instance.host_dir / "logs" / "b" / "status" / "status.json"]
+                    )
                     for _ in range(60):
-                        if status_json_path.is_file():
-                            try:
-                                status_data = json.loads(status_json_path.read_text(encoding="utf-8"))
-                                found_msg = False
-                                for topic_info in status_data.get("topics", []):
-                                    if topic_info.get("base") == topic_name:
-                                        if any(
-                                            stage.get("messages_total", 0) > 0 for stage in topic_info.get("stages", [])
-                                        ):
-                                            found_msg = True
-                                            break
-                                if found_msg:
-                                    break
-                            except Exception:
-                                pass
+                        if _benchmark_delivery_observed(status_paths, base=None if replay else topic_name):
+                            break
                         time.sleep(0.5)
                     time.sleep(3.0)
 
@@ -6780,6 +6959,99 @@ def benchmark_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def _session_contract_topics(cfg: dict[str, Any]) -> list[str]:
+    """Every topic a session carries, across all directions — the required set."""
+    names: list[str] = []
+    topics = cfg.get("topics")
+    if isinstance(topics, dict):
+        for entries in topics.values():
+            if not isinstance(entries, list):
+                continue
+            for item in entries:
+                name = item.get("topic") if isinstance(item, dict) else None
+                if isinstance(name, str) and name not in names:
+                    names.append(name)
+    return names
+
+
+@dataclass
+class _BenchmarkReplay:
+    """Bag-as-load inputs: which session runs, the required topics, ground truth."""
+
+    session_name: str
+    required_topics: list[str] | None
+    ground_truth: dict[str, dict[str, Any]] | None
+    target: dict[str, Any] | None
+    bag: dict[str, Any] | None
+    lab_replay: bool
+
+
+def _benchmark_replay_inputs(
+    args: argparse.Namespace, runtime: Any, *, genre_session_name: str
+) -> _BenchmarkReplay | None:
+    """Resolve a ``--target``/``--bag`` replay load, or ``None`` for synthetic load.
+
+    A session ``--target`` supplies the required contract topics (both directions)
+    and, when not an OTA run, switches the live probe to run that session's own
+    publishers in the lab (Docker) — a probe point is then one full replay under
+    the candidate profile. ``--bag`` supplies per-topic completeness ground truth.
+    """
+    target = getattr(args, "target", None)
+    target_type = getattr(args, "target_type", None) or "auto"
+    bag_arg = getattr(args, "bag", None)
+    if not target and not bag_arg:
+        return None
+
+    from .cli import _effective_session_config, _resolve_session
+
+    is_ota = _is_ota_benchmark(args)
+    ground_truth: dict[str, dict[str, Any]] | None = None
+    bag_identity: dict[str, Any] | None = None
+    if bag_arg:
+        from .bag_ground_truth import bag_ground_truth
+
+        ground_truth = bag_ground_truth(bag_arg)
+        bag_identity = {"metadata": str(Path(bag_arg)), "topics": sorted(ground_truth)}
+
+    required_topics: list[str] | None = None
+    target_identity: dict[str, Any] | None = None
+    lab_replay = False
+    session_name = genre_session_name
+    if target:
+        target_identity = {"name": str(target), "type": target_type}
+        session_cfg: dict[str, Any] | None = None
+        if target_type in ("session", "auto"):
+            try:
+                session = _resolve_session(str(target), runtime)
+                session_cfg = _effective_session_config(session.host_dir, runtime)
+            except Exception:
+                session_cfg = None
+        if session_cfg is not None:
+            required_topics = _session_contract_topics(session_cfg) or None
+            target_identity["type"] = "session"
+            if not is_ota:
+                lab_replay = True
+                session_name = str(target)
+                args._benchmark_replay_target = str(target)
+        elif not is_ota:
+            raise ValueError(
+                f"--target {target!r} did not resolve to a session for a local replay benchmark. "
+                "Local (Docker) replay supports two-peer session targets; use ota-benchmark "
+                "for scenarios or real hosts."
+            )
+    elif ground_truth is not None:
+        required_topics = sorted(ground_truth)
+
+    return _BenchmarkReplay(
+        session_name=session_name,
+        required_topics=required_topics,
+        ground_truth=ground_truth,
+        target=target_identity,
+        bag=bag_identity,
+        lab_replay=lab_replay,
+    )
+
+
 def benchmark_requirements(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark requirements``."""
     from .cli import _load_runtime_config
@@ -6806,10 +7078,15 @@ def benchmark_requirements(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     args.profiles_file = str(generated_profiles_file)
-    args.qos_reliability = getattr(args, "qos_reliability", None) or "best_effort"
-    args.qos_depth = int(getattr(args, "qos_depth", None) or 1)
+    replay = _benchmark_replay_inputs(args, runtime, genre_session_name=BENCHMARK_SESSIONS_BY_GENRE["requirements"])
+    if replay is None:
+        # Synthetic load pins the benchmark QoS; a replay keeps its session's own.
+        args.qos_reliability = getattr(args, "qos_reliability", None) or "best_effort"
+        args.qos_depth = int(getattr(args, "qos_depth", None) or 1)
+        session_name = BENCHMARK_SESSIONS_BY_GENRE["requirements"]
+    else:
+        session_name = replay.session_name
 
-    session_name = BENCHMARK_SESSIONS_BY_GENRE["requirements"]
     session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
     result_context = _benchmark_result_context(
         args,
@@ -6821,6 +7098,9 @@ def benchmark_requirements(args: argparse.Namespace) -> int:
     result_context["requirements"] = {
         "generated_profiles_file": str(generated_profiles_file),
     }
+    if replay is not None:
+        result_context["requirements"]["replay_target"] = replay.target
+        result_context["requirements"]["bag"] = replay.bag
 
     rate_hz = float(getattr(args, "rate_hz", 20.0))
     size = int(getattr(args, "size", 18_000))
@@ -6854,8 +7134,8 @@ def benchmark_requirements(args: argparse.Namespace) -> int:
             rate_hz=rate_hz,
             size=size,
             streams=streams,
-            qos_reliability=str(args.qos_reliability),
-            qos_depth=int(args.qos_depth),
+            qos_reliability=str(getattr(args, "qos_reliability", None) or "best_effort"),
+            qos_depth=int(getattr(args, "qos_depth", None) or 1),
             topic=getattr(args, "topic", ""),
             out_dir=run_dir,
             bandwidth_high_bps=bandwidth_high_bps,
@@ -6885,6 +7165,11 @@ def benchmark_requirements(args: argparse.Namespace) -> int:
             result_context=result_context,
             generated_profiles_file=generated_profiles_file,
             profile_prefix=str(getattr(args, "profile_prefix", "requirements")),
+            ground_truth=replay.ground_truth if replay else None,
+            required_topics=replay.required_topics if replay else None,
+            target=replay.target if replay else None,
+            bag=replay.bag if replay else None,
+            oracle_min_completeness=float(getattr(args, "oracle_min_completeness", 0.95)),
         )
 
     out_file_name = getattr(args, "out", "requirements.jsonl")
@@ -6928,10 +7213,14 @@ def benchmark_loss_boundaries(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     args.profiles_file = str(generated_profiles_file)
-    args.qos_reliability = getattr(args, "qos_reliability", None) or "best_effort"
-    args.qos_depth = int(getattr(args, "qos_depth", None) or 1)
+    replay = _benchmark_replay_inputs(args, runtime, genre_session_name=BENCHMARK_SESSIONS_BY_GENRE["requirements"])
+    if replay is None:
+        args.qos_reliability = getattr(args, "qos_reliability", None) or "best_effort"
+        args.qos_depth = int(getattr(args, "qos_depth", None) or 1)
+        session_name = BENCHMARK_SESSIONS_BY_GENRE["requirements"]
+    else:
+        session_name = replay.session_name
 
-    session_name = BENCHMARK_SESSIONS_BY_GENRE["requirements"]
     session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
     result_context = _benchmark_result_context(
         args,
@@ -6943,6 +7232,9 @@ def benchmark_loss_boundaries(args: argparse.Namespace) -> int:
     result_context["loss_boundaries"] = {
         "generated_profiles_file": str(generated_profiles_file),
     }
+    if replay is not None:
+        result_context["loss_boundaries"]["replay_target"] = replay.target
+        result_context["loss_boundaries"]["bag"] = replay.bag
 
     rate_hz = float(getattr(args, "rate_hz", 20.0))
     size = int(getattr(args, "size", 18_000))
@@ -6971,8 +7263,8 @@ def benchmark_loss_boundaries(args: argparse.Namespace) -> int:
             rate_hz=rate_hz,
             size=size,
             streams=streams,
-            qos_reliability=str(args.qos_reliability),
-            qos_depth=int(args.qos_depth),
+            qos_reliability=str(getattr(args, "qos_reliability", None) or "best_effort"),
+            qos_depth=int(getattr(args, "qos_depth", None) or 1),
             topic=getattr(args, "topic", ""),
             out_dir=run_dir,
             axes=_parse_loss_boundary_axes(getattr(args, "axes", "all")),
@@ -6996,6 +7288,11 @@ def benchmark_loss_boundaries(args: argparse.Namespace) -> int:
             result_context=result_context,
             generated_profiles_file=generated_profiles_file,
             profile_prefix=str(getattr(args, "profile_prefix", "loss_boundary")),
+            ground_truth=replay.ground_truth if replay else None,
+            required_topics=replay.required_topics if replay else None,
+            target=replay.target if replay else None,
+            bag=replay.bag if replay else None,
+            oracle_min_completeness=float(getattr(args, "oracle_min_completeness", 0.95)),
         )
 
     out_file_name = getattr(args, "out", "loss-boundaries.json")
@@ -7421,6 +7718,7 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
         help="Search for a tight network profile that satisfies a ROS 2 stream quality target.",
     )
     _add_benchmark_common_args(requirements_parser, ota_benchmark=ota_benchmark)
+    _add_benchmark_replay_args(requirements_parser)
     requirements_parser.add_argument("--max-loss", type=float, default=5.0, help="Oracle: max ROS 2 loss %%.")
     requirements_parser.add_argument(
         "--max-latency-ms", type=float, default=250.0, help="Oracle: max acceptable p95 latency (ms)."
@@ -7605,6 +7903,7 @@ def _register_benchmark_driver_parsers(benchmark_subparsers: Any, *, ota_benchma
         help="Find discrete zero-loss good/bad boundaries for bandwidth and jitter.",
     )
     _add_benchmark_common_args(loss_boundaries_parser, ota_benchmark=ota_benchmark)
+    _add_benchmark_replay_args(loss_boundaries_parser)
     loss_boundaries_parser.add_argument(
         "--max-latency-ms",
         type=float,

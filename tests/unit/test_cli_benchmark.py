@@ -1232,6 +1232,183 @@ def test_loss_boundaries_driver_finds_discrete_good_and_bad_cases(tmp_path: Path
     assert result_doc["result"]["analysis"]["seed_policy"] == "seedless"
 
 
+def test_loss_boundaries_driver_consumes_replay_verdicts_across_topics(tmp_path: Path) -> None:
+    # Bag-as-load: the probe returns a whole replay contract (two topics). The
+    # boundary is driven by the hard stream /topic5; the light /topic9 always
+    # clears. The search logic is unchanged — it consumes the aggregated verdict —
+    # and the failing topic is named on the bad rows.
+    from rosotacom.network_profiles import parse_ms, parse_rate_bps
+
+    generated_file = tmp_path / "generated-profiles.yaml"
+    candidate_counts: dict[tuple[int, int], int] = {}
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        assert profile is not None
+        spec = yaml.safe_load(generated_file.read_text(encoding="utf-8"))["profiles"][profile]["uplink"]
+        bandwidth = parse_rate_bps(spec["rate"])
+        jitter = parse_ms(spec.get("jitter", 0), "jitter")
+        key = (int(round(bandwidth / 100_000.0)), int(round(jitter)))
+        sample_index = candidate_counts.get(key, 0) + 1
+        candidate_counts[key] = sample_index
+        if bandwidth < 3_200_000.0:
+            lossy = True
+        elif jitter <= 18.0:
+            lossy = False
+        elif jitter >= 27.0:
+            lossy = True
+        else:
+            lossy = sample_index % 2 == 0
+        lost = 3 if lossy else 0
+        latency_p95 = 35.0 + jitter
+        return {
+            "topics": {
+                "a->b:/topic5": {
+                    "expected": 400,
+                    "delivered": 400 - lost,
+                    "lost": lost,
+                    "loss_pct": lost / 400 * 100.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": latency_p95 * 0.6, "p95": latency_p95},
+                    "jitter_ms": {"p50": jitter * 0.5, "p95": jitter},
+                },
+                "b->a:/topic9": {
+                    "expected": 200,
+                    "delivered": 200,
+                    "lost": 0,
+                    "loss_pct": 0.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": 20.0, "p95": 40.0},
+                    "jitter_ms": {"p50": 1.0, "p95": 2.0},
+                },
+            }
+        }
+
+    result = drive_loss_boundaries(
+        probe,
+        max_latency_ms=250.0,
+        rate_hz=20.0,
+        size=18_000,
+        streams=1,
+        qos_reliability="best_effort",
+        qos_depth=1,
+        topic="",
+        out_dir=tmp_path,
+        axes=_parse_loss_boundary_axes("bandwidth"),
+        bandwidth_low_bps=3_000_000.0,
+        bandwidth_high_bps=4_000_000.0,
+        bandwidth_step_bps=100_000.0,
+        latency_base_ms=30.0,
+        jitter_low_ms=0.0,
+        jitter_high_ms=30.0,
+        jitter_step_ms=1.0,
+        min_duration_s=20.0,
+        min_messages=100,
+        distribution="normal",
+        downlink_mode="lan",
+        probe_repeats=10,
+        good_clean_count=10,
+        bad_lossy_count=10,
+        result_context={"test": True},
+        generated_profiles_file=generated_file,
+        ground_truth={"/topic5": {"count": 400}, "/topic9": {"count": 200}},
+        required_topics=["/topic5", "/topic9"],
+        target={"name": "15_remote_assist_anonymized_costmap", "type": "session"},
+        bag={"metadata": "bags/costmap/metadata.yaml"},
+    )
+
+    bandwidth_boundary = result["boundaries"]["bandwidth"]
+    assert bandwidth_boundary["good_boundary"]["candidate"]["bandwidth_bps"] == pytest.approx(3_200_000.0)
+    assert bandwidth_boundary["bad_boundary"]["candidate"]["bandwidth_bps"] == pytest.approx(3_100_000.0)
+    # The whole-contract verdict is driven by the hard topic, named on the bad row.
+    bad_row = next(row for row in result["rows"] if row["classification"] == "bad")
+    assert bad_row["failing_topics"] == ["/topic5"]
+    assert bad_row["samples"][0]["per_topic"][0]["topic"] in {"/topic5", "/topic9"}
+    # Replay identity is recorded in the result.
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["result"]["replay"]["target"]["name"] == "15_remote_assist_anonymized_costmap"
+    assert result_doc["result"]["replay"]["bag"]["metadata"].endswith("metadata.yaml")
+
+
+def test_requirements_driver_consumes_replay_verdicts_with_completeness_floor(tmp_path: Path) -> None:
+    # A tight profile must carry the whole contract: /topic5 needs bandwidth, and
+    # /topic9 is incomplete below 2 Mbit/s. The search reuses the requirements
+    # logic against the aggregated per-topic verdict.
+    from rosotacom.network_profiles import parse_rate_bps
+
+    generated_file = tmp_path / "generated-profiles.yaml"
+
+    def probe(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        assert profile is not None
+        spec = yaml.safe_load(generated_file.read_text(encoding="utf-8"))["profiles"][profile]["uplink"]
+        bandwidth = parse_rate_bps(spec["rate"])
+        topic5_lost = max(0, int(round((4_000_000.0 - bandwidth) / 1_000_000.0 * 4.0)))
+        topic9_delivered = 200 if bandwidth >= 2_000_000.0 else 150
+        return {
+            "topics": {
+                "a->b:/topic5": {
+                    "expected": 400,
+                    "delivered": 400 - topic5_lost,
+                    "lost": topic5_lost,
+                    "loss_pct": topic5_lost / 400 * 100.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": 40.0, "p95": 80.0},
+                    "jitter_ms": {"p50": 1.0, "p95": 2.0},
+                },
+                "b->a:/topic9": {
+                    "expected": topic9_delivered,
+                    "delivered": topic9_delivered,
+                    "lost": 0,
+                    "loss_pct": 0.0,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": 20.0, "p95": 40.0},
+                    "jitter_ms": {"p50": 1.0, "p95": 2.0},
+                },
+            }
+        }
+
+    result = drive_requirements(
+        probe,
+        max_loss_pct=5.0,
+        max_latency_ms=250.0,
+        rate_hz=20.0,
+        size=18_000,
+        streams=1,
+        qos_reliability="best_effort",
+        qos_depth=1,
+        topic="",
+        out_dir=tmp_path,
+        bandwidth_high_bps=10_000_000.0,
+        bandwidth_low_bps=1_000_000.0,
+        latency_base_ms=0.0,
+        latency_high_ms=300.0,
+        jitter_high_ms=60.0,
+        loss_high_pct=10.0,
+        axes=_parse_requirements_axes("bandwidth"),
+        min_duration_s=20.0,
+        min_messages=100,
+        search_iterations=6,
+        search_rounds=1,
+        distribution="normal",
+        final_refine_iterations=0,
+        loss_coupling="independent",
+        result_context={"test": True},
+        generated_profiles_file=generated_file,
+        ground_truth={"/topic5": {"count": 400}, "/topic9": {"count": 200}},
+        required_topics=["/topic5", "/topic9"],
+        oracle_min_completeness=0.95,
+        target={"name": "15_remote_assist_anonymized_costmap", "type": "session"},
+        bag={"metadata": "bags/costmap/metadata.yaml"},
+    )
+
+    # Passing requires both topics: /topic5 loss-bounded AND /topic9 complete
+    # (>=190/200), so the tight bandwidth sits at/above the 2 Mbit/s completeness knee.
+    assert result["analysis"]["final_passes"] is True
+    assert result["profile"]["candidate"]["bandwidth_bps"] >= 2_000_000.0
+    result_doc = json.loads((tmp_path / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    assert result_doc["result"]["replay"]["required_topics"] == ["/topic5", "/topic9"]
+    assert result_doc["result"]["replay"]["oracle_min_completeness"] == 0.95
+
+
 def test_requirements_zero_loss_target_reports_loss_as_limiter() -> None:
     quality = _requirements_target_quality(
         {"loss_pct": 0.25, "latency_p95_ms": 10.0},

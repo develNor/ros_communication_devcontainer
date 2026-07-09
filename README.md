@@ -701,6 +701,23 @@ rosotacom benchmark loss-boundaries --rate-hz 20 --size 18000 --qos-reliability 
 rosotacom benchmark loss-boundaries --rate-hz 20 --size 18000 --qos-reliability best_effort --qos-depth 1 --max-latency-ms 250 --latency-base-ms 30 --downlink-mode lan --bandwidth-low 2.8mbit --bandwidth-high 4mbit --bandwidth-step 0.1mbit --jitter-low-ms 0 --jitter-high-ms 40 --jitter-step-ms 1 --min-duration 20 --min-messages 100 --probe-repeats 1 --netem-seeds 101,102,103,104,105,106,107,108,109,110
 ```
 
+Both `requirements` and `loss-boundaries` also accept a **bag replay as the
+load** instead of the synthetic `sized_publisher` stream: pass `--target
+<session>` (a two-peer replay session such as `15_remote_assist_anonymized_costmap`)
+and, optionally, `--bag <metadata.yaml>` for per-topic completeness ground truth.
+A probe point is then one full replay run under the candidate profile, and the
+oracle judges the **whole contract** — every carried topic must clear the
+loss/latency bound and the `--oracle-min-completeness` floor — aggregated to a
+run verdict that names any failing topics. This answers "which network could
+carry *this bag*?" rather than "…this synthetic stream?". Because a probe now
+costs a full bag loop, keep the iteration budget small. See
+[docs/benchmark-bag-as-load.md](docs/benchmark-bag-as-load.md) for the oracle,
+the local-vs-OTA execution split, and cost guidance:
+
+```bash
+rosotacom benchmark loss-boundaries --target 15_remote_assist_anonymized_costmap --target-type session --axes bandwidth --bandwidth-low 0.5mbit --bandwidth-high 2mbit --bandwidth-step 0.5mbit --rate-hz 10 --min-duration 20 --min-messages 1 --probe-repeats 1 --good-clean-count 1 --bad-lossy-count 1 --max-latency-ms 1000
+```
+
 Use `benchmark ab` when the question is a **tuning** one: "does candidate config
 B beat baseline config A on the same load and profile?" Each `--baseline` and
 `--candidate label=…` is a whole session config (a directory or a

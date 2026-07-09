@@ -1,8 +1,9 @@
 """Offline image-quality metrics for decoded camera frames.
 
-The command layer accepts rosbag2 stage bags and simple JSON frame manifests.
-Metric math is intentionally independent of ROS so unit tests can cover the
-alignment and loss semantics without a runtime container.
+The command layer accepts rosbag2 stage bags (including a bare or unfinalized
+`.mcap` a killed recorder leaves behind) and simple JSON frame manifests. Metric
+math is intentionally independent of ROS so unit tests can cover the alignment
+and loss semantics without a runtime container.
 """
 
 from __future__ import annotations
@@ -284,16 +285,23 @@ def _topic_type(metadata: dict[str, Any], topic: str) -> str | None:
     return None
 
 
-def _require_supported_image_topic(metadata: dict[str, Any], topic: str) -> str:
-    msg_type = _topic_type(metadata, topic)
+def _require_supported_image_type(msg_type: str | None, topic: str, *, absent: str) -> str:
     if msg_type is None:
-        raise ValueError(f"topic {topic!r} is not present in bag metadata")
+        raise ValueError(absent)
     if msg_type not in SUPPORTED_IMAGE_TOPIC_TYPES:
         raise ValueError(
             f"topic {topic!r} has type {msg_type!r}; PSNR/SSIM requires {SENSOR_IMAGE_TYPE} "
             f"or JPEG/PNG {SENSOR_COMPRESSED_IMAGE_TYPE} frames"
         )
     return msg_type
+
+
+def _require_supported_image_topic(metadata: dict[str, Any], topic: str) -> str:
+    return _require_supported_image_type(
+        _topic_type(metadata, topic),
+        topic,
+        absent=f"topic {topic!r} is not present in bag metadata",
+    )
 
 
 def _parse_image_frame_cdr(
@@ -369,6 +377,70 @@ def read_rosbag_frames(path: str | Path, topic: str) -> list[VideoFrame]:
     if storage_id == "mcap":
         return _read_mcap_bag(bag_path, metadata, topic)
     raise ValueError(f"unsupported rosbag2 storage_identifier {storage_id!r}; expected sqlite3 or mcap")
+
+
+def _stage_mcap_files(path: Path) -> list[Path]:
+    """The `.mcap` split(s) of a metric stage bag, addressed as a bare file or a
+    directory that lacks a finalized `metadata.yaml` (e.g. a recorder killed at
+    session teardown)."""
+    if path.is_file() and path.suffix == ".mcap":
+        return [path]
+    if path.is_dir():
+        return sorted(p for p in path.glob("*.mcap") if p.is_file())
+    return []
+
+
+def read_mcap_stage_frames(path: str | Path, topic: str) -> list[VideoFrame]:
+    """Read image frames from a metric stage `.mcap` that has no rosbag2
+    `metadata.yaml`. rosbag2 writes `metadata.yaml` and the mcap summary/footer
+    only on clean shutdown; the metric recorder runs inside a container that is
+    torn down abruptly, so stage bags routinely arrive truncated. mcap is
+    self-describing, so the message type comes from the file's own Schema records
+    and a truncated tail is tolerated (the recorded prefix is kept)."""
+    try:
+        from mcap.exceptions import McapError
+        from mcap.records import Channel, Message, Schema
+        from mcap.stream_reader import StreamReader
+    except ImportError:
+        raise RuntimeError(
+            "mcap support requires the Python package `mcap`; reinstall rosotacom or install mcap"
+        ) from None
+
+    stage_path = Path(path)
+    schemas: dict[int, str] = {}
+    channels: dict[int, tuple[str, int]] = {}
+    rows: list[tuple[int, int, bytes]] = []
+    for mcap_path in _stage_mcap_files(stage_path):
+        with mcap_path.open("rb") as fp:
+            records = iter(StreamReader(fp).records)
+            while True:
+                try:
+                    record = next(records)
+                except StopIteration:
+                    break
+                except (struct.error, EOFError, McapError):
+                    # Unfinalized tail: keep what was decoded before the cut.
+                    break
+                if isinstance(record, Schema):
+                    schemas[record.id] = record.name
+                elif isinstance(record, Channel):
+                    channels[record.id] = (record.topic, record.schema_id)
+                elif isinstance(record, Message):
+                    channel = channels.get(record.channel_id)
+                    if channel is not None and channel[0] == topic:
+                        rows.append((int(record.log_time), channel[1], bytes(record.data)))
+    if not rows:
+        raise ValueError(f"topic {topic!r} has no messages in mcap stage bag {stage_path}")
+    msg_type = _require_supported_image_type(
+        schemas.get(rows[0][1]),
+        topic,
+        absent=f"topic {topic!r} has no schema in mcap stage bag {stage_path}",
+    )
+    rows.sort(key=lambda row: row[0])
+    return [
+        _parse_image_frame_cdr(msg_type, data, index=index, recorded_time_ns=timestamp, source=f"{stage_path}:{topic}")
+        for index, (timestamp, _schema_id, data) in enumerate(rows)
+    ]
 
 
 def _read_pnm(path: Path) -> tuple[int, int, str, int, bytes]:
@@ -463,6 +535,10 @@ def load_frames(path: str | Path, *, topic: str | None = None) -> list[VideoFram
         if not topic:
             raise ValueError("--topic is required when reading rosbag2 inputs")
         return read_rosbag_frames(frame_path, topic)
+    if _stage_mcap_files(frame_path):
+        if not topic:
+            raise ValueError("--topic is required when reading .mcap stage bags")
+        return read_mcap_stage_frames(frame_path, topic)
     return read_frame_manifest(frame_path)
 
 

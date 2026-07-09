@@ -12,10 +12,12 @@ import yaml
 from rosotacom.video_quality import (
     VideoFrame,
     compare_frame_sequences,
+    load_frames,
     parse_sensor_compressed_image_cdr,
     parse_sensor_image_cdr,
     psnr_db,
     read_frame_manifest,
+    read_mcap_stage_frames,
     read_rosbag_frames,
     ssim,
     threshold_failures,
@@ -283,6 +285,57 @@ def test_sqlite_rosbag_reader_loads_compressed_image_topic(tmp_path: Path) -> No
     assert frames[0].encoding == "rgb8"
     assert frames[0].data == pixels
     assert frames[0].recorded_time_ns == 456
+
+
+def _write_stage_mcap(path: Path, topic: str, cdrs: list[bytes], *, finalize: bool = True) -> None:
+    """Write a metric-stage `.mcap` the way `ros2 bag record -s mcap` does. With
+    finalize=False the summary/footer are omitted -- the shape a recorder killed
+    at session teardown leaves behind."""
+    from mcap.writer import Writer
+
+    with path.open("wb") as handle:
+        writer = Writer(handle, use_chunking=False)
+        writer.start()
+        schema_id = writer.register_schema(name="sensor_msgs/msg/Image", encoding="ros2msg", data=b"")
+        channel_id = writer.register_channel(topic=topic, message_encoding="cdr", schema_id=schema_id)
+        for index, cdr in enumerate(cdrs):
+            writer.add_message(channel_id=channel_id, log_time=1000 + index, data=cdr, publish_time=1000 + index)
+        if finalize:
+            writer.finish()
+
+
+def test_mcap_stage_reader_reads_bare_file_and_directory(tmp_path: Path) -> None:
+    cdrs = [_image_cdr(width=2, height=2, encoding="mono8", data=bytes([i, i + 1, i + 2, i + 3])) for i in range(3)]
+    mcap_path = tmp_path / "stages_x" / "stages_x_0.mcap"
+    mcap_path.parent.mkdir()
+    _write_stage_mcap(mcap_path, "/camera/image", cdrs)
+
+    # A bare .mcap path and the enclosing rosbag2 directory (no metadata.yaml)
+    # both resolve, and `load_frames` dispatches to the stage reader for each.
+    for target in (mcap_path, mcap_path.parent):
+        frames = read_mcap_stage_frames(target, "/camera/image")
+        assert [f.data for f in frames] == [bytes([i, i + 1, i + 2, i + 3]) for i in range(3)]
+        assert [f.recorded_time_ns for f in frames] == [1000, 1001, 1002]
+        assert load_frames(target, topic="/camera/image") == frames
+
+
+def test_mcap_stage_reader_tolerates_unfinalized_tail(tmp_path: Path) -> None:
+    cdrs = [_image_cdr(width=2, height=2, encoding="mono8", data=bytes([i, i, i, i])) for i in range(4)]
+    mcap_path = tmp_path / "stages_x_0.mcap"
+    _write_stage_mcap(mcap_path, "/camera/image", cdrs, finalize=False)
+
+    # No summary/footer, so the index-based rosbag reader cannot open it; the
+    # streaming stage reader still recovers the recorded frames.
+    frames = read_mcap_stage_frames(mcap_path, "/camera/image")
+    assert [bytes(f.data) for f in frames] == [bytes([i, i, i, i]) for i in range(4)]
+
+
+def test_mcap_stage_reader_rejects_unknown_topic(tmp_path: Path) -> None:
+    mcap_path = tmp_path / "stages_x_0.mcap"
+    _write_stage_mcap(mcap_path, "/camera/image", [_image_cdr(width=2, height=2, encoding="mono8", data=bytes(4))])
+
+    with pytest.raises(ValueError, match="no messages"):
+        read_mcap_stage_frames(mcap_path, "/camera/image/missing")
 
 
 def test_frame_manifest_and_synthetic_pair_are_comparable(tmp_path: Path) -> None:

@@ -5641,15 +5641,26 @@ def _content_integrity_specs(cfg: dict[str, Any], receiver_peer_key: str) -> lis
 
 
 def _smoke_sensor_image_message() -> str:
+    # A smooth low-frequency gradient stands in for a real camera frame. It
+    # survives the ffmpeg path's rgb8 -> yuv420p chroma subsampling and h264
+    # quantization with a comfortable PSNR/SSIM margin, so the synthetic-camera
+    # quality gate measures a realistic frame -- a high-frequency pattern would
+    # be blurred by the codec below any sane quality bar.
     width = 32
     height = 32
     data: list[str] = []
     for y in range(height):
         for x in range(width):
-            base = (x * 7 + y * 13) % 256
-            data.extend((str(base), str((base + 53) % 256), str((base + 101) % 256)))
+            r = (x * 255) // (width - 1)
+            g = (y * 255) // (height - 1)
+            b = ((x + y) * 255) // (width + height - 2)
+            data.extend((str(r), str(g), str(b)))
+    # `stamp: now` makes `ros2 topic pub` stamp each frame with the current time
+    # (re-evaluated per publish), like a real camera. Without it the stamp is
+    # epoch 0, the monitor guards the absurd age to "no header", and any
+    # latency_ms expect on the ffmpeg-decoded frame is unsatisfiable.
     return (
-        "{header: {frame_id: camera}, "
+        "{header: {stamp: now, frame_id: camera}, "
         f"height: {height}, width: {width}, encoding: rgb8, is_bigendian: false, step: {width * 3}, "
         "data: [" + ", ".join(data) + "]}"
     )

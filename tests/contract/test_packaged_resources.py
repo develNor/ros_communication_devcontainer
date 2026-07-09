@@ -91,6 +91,10 @@ def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
         assert "ros-kilted-domain-bridge" in apt_packages
         assert "ros-kilted-rmw-cyclonedds-cpp" in apt_packages
         assert "ros-kilted-rmw-zenoh-cpp" in apt_packages
+        # The ffmpeg encoder plugin (image_transport/ffmpeg_pub) is what the
+        # synthetic-camera-quality session needs to produce /camera/image/ffmpeg;
+        # the -msgs package alone only provides FFMPEGPacket definitions.
+        assert "ros-kilted-ffmpeg-image-transport" in apt_packages
         assert "ros-kilted-ffmpeg-image-transport-msgs" in apt_packages
 
 

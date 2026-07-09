@@ -1,14 +1,18 @@
 """Slow-lane E2E for ``rosotacom benchmark ab`` (#22).
 
-Two configs that differ only in ``throttle_hz`` on the synthetic load topic, run
-under a tight rate-limited profile, must produce the expected directional
-verdict: the light-throttle *baseline* offers little load and stays clean, while
-the heavy-throttle *candidate* offers the full 20 Hz × 18 KB (≈2.9 Mbit/s) into a
-1 Mbit/s uplink, congests, and therefore **regresses** on completeness/loss.
-That the A/B driver detects this direction — on a real graph, real shaping — is
-the end-to-end proof the pure-logic unit tests cannot give.
+Two configs that differ only in the OTA **QoS reliability** on the synthetic load
+topic, run under an emulated lossy link. QoS is the knob that keeps the topic
+name identical across configs (throttle/drop republish to a renamed topic via
+`topic_tools`, so they are not 1:1 comparable), which is exactly what an A/B
+verdict needs. The baseline uses `best_effort`; the candidate uses `reliable`,
+which recovers dropped samples by retransmission and therefore must never have
+*worse* completeness than best_effort under loss.
 
-Docker-backed, so gated behind ``ROSOTACOM_RUN_E2E=1`` like the other e2e lanes.
+The point is the end-to-end proof the pure-logic unit tests cannot give: on a
+real graph, under real shaping, `benchmark ab` materializes both configs, runs
+them interleaved, measures the *same* topic for both, and renders a coherent
+verdict. Docker-backed, so gated behind ``ROSOTACOM_RUN_E2E=1`` like the other
+e2e lanes.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ import yaml
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_TIMEOUT_S = 900
 SMOKE_NETWORK_NAME = "rosotacom-smoke"
-AB_PROFILE = "ab-congestion-ci"
+AB_PROFILE = "ab-loss-ci"
 
 pytestmark = [
     pytest.mark.e2e,
@@ -74,8 +78,12 @@ def _run(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str
     return result
 
 
-def _ab_config(throttle_hz: int) -> dict[str, object]:
-    """A bench_1_1-style single-stream config; only ``throttle_hz`` varies."""
+def _ab_config(reliability: str) -> dict[str, object]:
+    """A bench_1_1-style single-stream config; only the OTA QoS reliability varies.
+
+    QoS is pub/sub metadata, so the delivered topic stays ``/bench_capacity`` for
+    every config — the property the A/B topic-by-topic comparison relies on.
+    """
     return {
         "peers": {"a": {}, "b": {}},
         "peer_settings": {"a": {"domain_id": 50}, "b": {"domain_id": 51}},
@@ -85,7 +93,10 @@ def _ab_config(throttle_hz: int) -> dict[str, object]:
             "rmw": "cyclone",
             "qos": {
                 "defaults": {"depth": 1},
-                "for_role": {"ota_sub": {"reliability": "best_effort"}, "ota_pub": {"reliability": "best_effort"}},
+                "for_role": {
+                    "ota_sub": {"depth": 1, "reliability": reliability},
+                    "ota_pub": {"depth": 1, "reliability": reliability},
+                },
             },
         },
         "topics": {
@@ -93,7 +104,7 @@ def _ab_config(throttle_hz: int) -> dict[str, object]:
                 {
                     "topic": "/bench_capacity",
                     "type": "com_msgs/msg/SizedPayload",
-                    "processing": {"use_ota_wrapper": True, "throttle_hz": throttle_hz},
+                    "processing": {"use_ota_wrapper": True},
                 }
             ]
         },
@@ -105,18 +116,19 @@ def ab_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
     project = tmp_path_factory.mktemp("rosotacom") / "examples"
     _run([sys.executable, "-m", "rosotacom", "examples", "create", str(project)], timeout=60)
 
-    # Tight uplink: 20 Hz × 18 KB ≈ 2.9 Mbit/s does not fit 1 Mbit/s, but the
-    # throttled 4 Hz ≈ 0.58 Mbit/s does — so the difference is pure congestion.
+    # Ample bandwidth (no congestion) with a plain per-packet loss — deterministic
+    # enough for CI without a netem seed (GitHub tc rejects `seed`), and it is the
+    # loss that best_effort cannot recover but reliable can.
     (project / "profiles.yaml").write_text(
-        f"profiles:\n  {AB_PROFILE}:\n    uplink:   {{ rate: 1mbit }}\n    downlink: {{ rate: 10mbit }}\n",
+        f"profiles:\n  {AB_PROFILE}:\n    uplink:   {{ rate: 8mbit, loss: 20% }}\n    downlink: {{ rate: 8mbit }}\n",
         encoding="utf-8",
     )
     baseline = project / "ab-configs" / "baseline"
-    candidate = project / "ab-configs" / "unthrottled"
+    candidate = project / "ab-configs" / "reliable"
     baseline.mkdir(parents=True)
     candidate.mkdir(parents=True)
-    (baseline / "session-definition.yaml").write_text(yaml.safe_dump(_ab_config(4)), encoding="utf-8")
-    (candidate / "session-definition.yaml").write_text(yaml.safe_dump(_ab_config(20)), encoding="utf-8")
+    (baseline / "session-definition.yaml").write_text(yaml.safe_dump(_ab_config("best_effort")), encoding="utf-8")
+    (candidate / "session-definition.yaml").write_text(yaml.safe_dump(_ab_config("reliable")), encoding="utf-8")
     return project
 
 
@@ -128,8 +140,9 @@ def _result_path(stdout: str) -> Path:
     return paths[-1]
 
 
-def test_benchmark_ab_directional_verdict(ab_project: Path) -> None:
-    """Heavier throttle (more offered load) regresses under congestion."""
+def test_benchmark_ab_reliability_verdict(ab_project: Path) -> None:
+    """End-to-end: both configs are measured on the same topic and the reliable
+    candidate never regresses completeness vs best_effort under loss."""
     result = _run(
         [
             sys.executable,
@@ -144,7 +157,7 @@ def test_benchmark_ab_directional_verdict(ab_project: Path) -> None:
             "--baseline",
             str(ab_project / "ab-configs" / "baseline"),
             "--candidate",
-            f"unthrottled={ab_project / 'ab-configs' / 'unthrottled'}",
+            f"reliable={ab_project / 'ab-configs' / 'reliable'}",
             "--size",
             "18000",
             "--rate-hz",
@@ -161,12 +174,20 @@ def test_benchmark_ab_directional_verdict(ab_project: Path) -> None:
 
     doc = json.loads(_result_path(result.stdout).read_text(encoding="utf-8"))
     assert doc["genre"] == "ab"
-    # The candidate offered ~5× the baseline load into the same 1 Mbit/s pipe, so
-    # the driver must call it a regression on the bottleneck-dominated metrics.
-    assert doc["verdict"]["passed"] is False
-    regressed = doc["verdict"]["regressed"].get("unthrottled", [])
-    regressed_metrics = {metric for _topic, metric in regressed}
-    assert regressed_metrics & {"loss_pct", "completeness_pct"}, doc["verdict"]
-    # Exactly one candidate, and its per-run measurements were recorded.
-    assert len(doc["result"]["candidates"]) == 1
     assert len(doc["measurements"]["runs"]) == 2  # baseline + candidate, 1 repeat each
+    assert len(doc["result"]["candidates"]) == 1
+
+    candidate = doc["result"]["candidates"][0]
+    assert candidate["config"] == "reliable"
+    # The core end-to-end guarantee: the reliable run kept the same topic as the
+    # baseline (no topic-rename), so both were measured and none dropped.
+    assert candidate["dropped_topics"] == [], candidate
+    measured = [
+        cell for cell in candidate["cells"] if cell["metric"] == "completeness_pct" and cell["verdict"] is not None
+    ]
+    assert measured, f"completeness was not measured for both configs: {candidate['cells']}"
+    # Directional claim that holds regardless of how effective retransmission is
+    # on this runner: reliable recovers losses, so it never *regresses*
+    # completeness vs best_effort (it improves it or leaves it unchanged).
+    completeness_regressed = [pair for pair in candidate["regressed"] if pair[1] == "completeness_pct"]
+    assert not completeness_regressed, f"reliable regressed completeness vs best_effort: {candidate}"

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from rosotacom.benched_set import GateRow, load_registry
+from rosotacom.benched_set import GateRow, load_registry, profiles_for_row
 from rosotacom.benchmark import UNCALIBRATED_FINGERPRINT, load_bands
 from rosotacom.network_profiles import Profile, load_profiles_file
 
@@ -36,7 +36,8 @@ def profiles() -> dict[str, Profile]:
 
 
 def test_every_row_names_a_committed_public_profile(rows: list[GateRow], profiles: dict[str, Profile]) -> None:
-    missing = sorted({row.profile for row in rows} - set(profiles))
+    referenced = {profile for row in rows for profile in profiles_for_row(row)}
+    missing = sorted(referenced - set(profiles))
     assert not missing, (
         f"registry rows reference profiles {missing} that are not committed in {PROFILES_PATH.name}; "
         "gate profiles are public, plain-netem, and live next to the other example profiles"
@@ -77,7 +78,7 @@ def test_public_gate_profiles_use_deterministic_netem(rows: list[GateRow], profi
     the operator harness lanes on a tc that supports it (RFC 0007 §3, honest
     limits)."""
     problems: list[str] = []
-    for profile_name in sorted({row.profile for row in rows}):
+    for profile_name in sorted({profile for row in rows for profile in profiles_for_row(row)}):
         problems += _random_netem_directions(profiles[profile_name])
     assert not problems, (
         "random netem in public gate profiles (github-hosted tc cannot seed it, so it cannot gate "
@@ -174,7 +175,8 @@ def test_gate_workflows_exist_and_consume_the_registry(rows: list[GateRow]) -> N
 
 def test_merge_gate_lane_actually_selects_the_benchmark_e2e() -> None:
     """Regression contract for the silent deselection this work found: the
-    runtime-tools recipe must run tests/e2e/test_benchmark_capacity.py in a
+    runtime-tools recipe must run both benchmark E2E files
+    (tests/e2e/test_benchmark_capacity.py and tests/e2e/test_benchmark_ab.py) in a
     pytest invocation that carries no `-k` filter (a `-k` from another file's
     selection would deselect every benchmark test without failing)."""
     recipe = re.search(
@@ -183,7 +185,8 @@ def test_merge_gate_lane_actually_selects_the_benchmark_e2e() -> None:
         re.MULTILINE,
     )
     assert recipe, "justfile recipe test-e2e-runtime-tools is missing"
-    benchmark_lines = [line for line in recipe.group(1).splitlines() if "test_benchmark_capacity.py" in line]
-    assert benchmark_lines, "test-e2e-runtime-tools no longer runs tests/e2e/test_benchmark_capacity.py"
-    poisoned = [line for line in benchmark_lines if re.search(r"\s-k\s", line)]
-    assert not poisoned, f"a -k filter would silently deselect the benchmark E2E: {poisoned}"
+    for e2e_file in ("test_benchmark_capacity.py", "test_benchmark_ab.py"):
+        benchmark_lines = [line for line in recipe.group(1).splitlines() if e2e_file in line]
+        assert benchmark_lines, f"test-e2e-runtime-tools no longer runs tests/e2e/{e2e_file}"
+        poisoned = [line for line in benchmark_lines if re.search(r"\s-k\s", line)]
+        assert not poisoned, f"a -k filter would silently deselect the benchmark E2E {e2e_file}: {poisoned}"

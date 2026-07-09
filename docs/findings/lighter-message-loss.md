@@ -47,8 +47,9 @@ alternating run used mean payload 9000 bytes and offered payload bandwidth
 2.88 Mbit/s.
 
 Verification: manual: run the two commands above from a source checkout with
-Docker and `tc` privileges; automation waits for the RFC 0007 regression matrix
-row for patterned loads because the public row registry does not exist yet.
+Docker and `tc` privileges; the public registry exists, but this finding still
+uses a random-jitter profile that cannot become a deterministic public gate
+until the runner class can seed netem.
 
 ## Status
 

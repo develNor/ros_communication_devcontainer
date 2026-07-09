@@ -23,13 +23,14 @@
 # src/rosotacom/resources/examples/profiles.yaml (plain netem numbers; private
 # per-link calibration data stays in the operator harness).
 
-version: 1
+version: 2
 
 rows:
   # ------------------------------------------------------------------ #
   # merge-gate: one minutes-scale row on every PR (RFC 0007 §4)
   # ------------------------------------------------------------------ #
   - id: probe-loss-gop-tight-cyclone
+    kind: performance
     lane: merge-gate
     reason: >-
       Per-PR regression row: camera-shaped burst load (GOP keyframe/delta size
@@ -57,6 +58,7 @@ rows:
   # nightly: default RMW deep (nominal + tight steady + breakpoint)
   # ------------------------------------------------------------------ #
   - id: probe-loss-nominal-cyclone
+    kind: performance
     lane: nightly
     reason: >-
       A clean link must stay clean: completeness on the nominal profile catches
@@ -71,6 +73,7 @@ rows:
     monitor: [latency_p50_ms, latency_p95_ms]
 
   - id: probe-loss-tight-cyclone
+    kind: performance
     lane: nightly
     reason: >-
       Steady load at ~2x the emulated uplink capacity: the graceful-shedding
@@ -88,6 +91,7 @@ rows:
     monitor: [latency_p50_ms, latency_p95_ms]
 
   - id: capacity-size-tight-cyclone
+    kind: performance
     lane: nightly
     reason: >-
       The capacity breakpoint (largest payload the tight uplink still carries
@@ -105,10 +109,44 @@ rows:
     oracle: { max_loss_pct: 5.0, max_latency_ms: 1000.0 }
     metrics: [capacity_size]
 
+  - id: boundary-loss-18kb20hz-bandwidth-cyclone
+    kind: boundary
+    lane: nightly
+    reason: >-
+      Working-envelope boundary assertion for the public 18 KB @ 20 Hz bandwidth
+      finding: the 3.2 Mbit/s side must stay zero-loss, while the adjacent
+      3.1 Mbit/s side must stay measurably lossy. If the 3.1 Mbit/s side becomes
+      zero-loss, the transport improved past the documented envelope and this row
+      turns happy-red so the bad-side profile and finding are tightened together.
+      This is the deterministic public subset of the finding; jitter boundary
+      rows stay out of the public gate until seeded-random netem is available on
+      the runner class.
+    rmw: cyclone
+    genre: probe
+    profile: finding-3.2mbit
+    duration_s: 60
+    load: { size: 18000, rate_hz: 20.0 }
+    metrics: [loss_pct]
+    floors: { loss_pct: 0.5 }
+    monitor: [latency_p50_ms, latency_p95_ms]
+    boundary:
+      finding: docs/findings/zero-loss-boundaries-18kb-20hz.md
+      bad_profile: finding-3.1mbit
+      good_oracle:
+        loss_pct: { max: 0.5 }
+      failure_signature:
+        loss_pct: { min: 1.0 }
+      next_steps: >-
+        Move the bad-side bandwidth profile below the new zero-loss point, update
+        docs/findings/zero-loss-boundaries-18kb-20hz.md and
+        docs/findings/jitter-loss-bandwidth-latency.md, then ratchet the
+        good-side band printed by the row.
+
   # ------------------------------------------------------------------ #
   # nightly: S2 anonymized replay-derived single-stream rows
   # ------------------------------------------------------------------ #
   - id: replay-costmap-nominal-cyclone
+    kind: performance
     lane: nightly
     reason: >-
       S2 costmap replay shape under the clean public profile: the row uses the
@@ -139,6 +177,7 @@ rows:
     monitor: [latency_p50_ms, latency_p95_ms, payload_bandwidth_bps]
 
   - id: replay-costmap-tight-cyclone
+    kind: performance
     lane: nightly
     reason: >-
       S2 costmap replay shape under the rate-limited public profile: the mean
@@ -169,6 +208,7 @@ rows:
     monitor: [latency_p50_ms, latency_p95_ms, payload_bandwidth_bps]
 
   - id: replay-camera-nominal-cyclone
+    kind: performance
     lane: nightly
     reason: >-
       S2 ffmpeg camera replay shape under the clean public profile: GOP-shaped
@@ -202,6 +242,7 @@ rows:
     monitor: [latency_p50_ms, latency_p95_ms, payload_bandwidth_bps]
 
   - id: replay-camera-tight-cyclone
+    kind: performance
     lane: nightly
     reason: >-
       S2 ffmpeg camera replay shape under the tight public profile: the average
@@ -238,6 +279,7 @@ rows:
   # nightly: remaining supported RMW variants, shallow (one tight row each)
   # ------------------------------------------------------------------ #
   - id: probe-loss-tight-fastdds
+    kind: performance
     lane: nightly
     reason: >-
       Shallow FastDDS coverage: single-datagram payloads at ~2x the tight
@@ -256,6 +298,7 @@ rows:
     monitor: [latency_p50_ms, latency_p95_ms]
 
   - id: probe-loss-tight-zenoh
+    kind: performance
     lane: nightly
     reason: >-
       Shallow Zenoh coverage completing the supported-RMW axis: 12 KB messages

@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -5592,6 +5592,125 @@ def _gate_exit_code(comparisons: Sequence[Any], *, budgets: Any, ratchet_hint: s
     return 0
 
 
+def _threshold_failures(metrics: dict[str, float], rules: dict[str, dict[str, float]]) -> list[str]:
+    failures: list[str] = []
+    for metric, rule in rules.items():
+        if metric not in metrics:
+            failures.append(f"{metric}: missing")
+            continue
+        value = float(metrics[metric])
+        if "min" in rule and value < float(rule["min"]):
+            failures.append(f"{metric}: {value:g} < min {float(rule['min']):g}")
+        if "max" in rule and value > float(rule["max"]):
+            failures.append(f"{metric}: {value:g} > max {float(rule['max']):g}")
+    return failures
+
+
+def _format_thresholds(rules: dict[str, dict[str, float]]) -> str:
+    parts: list[str] = []
+    for metric, rule in sorted(rules.items()):
+        limits = []
+        if "min" in rule:
+            limits.append(f">= {float(rule['min']):g}")
+        if "max" in rule:
+            limits.append(f"<= {float(rule['max']):g}")
+        parts.append(f"{metric} {' and '.join(limits)}")
+    return ", ".join(parts)
+
+
+def _boundary_side_row(row: Any, *, side: str, profile: str) -> Any:
+    return replace(row, id=f"{row.id}-{side}", profile=profile)
+
+
+def _drive_boundary_row(args: argparse.Namespace, row: Any, run_dir: Path) -> dict[str, dict[str, Any]]:
+    """Run a boundary row's good and bad sides under their committed profiles."""
+    sides = {
+        "good": row.profile,
+        "bad": str(row.boundary["bad_profile"]),
+    }
+    docs: dict[str, dict[str, Any]] = {}
+    for side, profile in sides.items():
+        side_dir = run_dir / side
+        _drive_gate_row(args, _boundary_side_row(row, side=side, profile=profile), side_dir)
+        docs[side] = json.loads((side_dir / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
+    return docs
+
+
+def _boundary_verdict(
+    row: Any,
+    *,
+    comparisons: Sequence[Any],
+    side_metrics: dict[str, dict[str, float]],
+    budgets: Any,
+    ratchet_hint: str,
+) -> tuple[str, int, str | None]:
+    """Map a good/bad boundary pair to the gate verdict.
+
+    Normal rows assert success. Boundary rows assert both success (good side)
+    and a documented failure signature (bad side). If the bad side now satisfies
+    the good oracle, the system improved past the documented envelope: the row is
+    happy-red with a concrete boundary-moving/ratchet message.
+    """
+    from .benchmark import Verdict
+
+    finding = str(row.boundary["finding"])
+    bad_profile = str(row.boundary["bad_profile"])
+    good_oracle = row.boundary["good_oracle"]
+    failure_signature = row.boundary["failure_signature"]
+    next_steps = str(row.boundary["next_steps"])
+
+    good_verdicts = {comparison.verdict for comparison in comparisons}
+    if Verdict.REGRESSED in good_verdicts:
+        print(
+            f"REGRESSED: boundary good side {row.profile} no longer satisfies {finding}; "
+            "fix the regression or recalibrate the documented good boundary."
+        )
+        print(f"  good oracle: {_format_thresholds(good_oracle)}")
+        return Verdict.REGRESSED.value, 1, None
+    if Verdict.IMPROVED in good_verdicts:
+        print(f"IMPROVED: boundary good side {row.profile} beat its band. Bank it before judging the pair:")
+        print(f"  {ratchet_hint} --note '<one-line cause>'")
+        return Verdict.IMPROVED.value, 2, ratchet_hint
+
+    good_oracle_failures = _threshold_failures(side_metrics["good"], good_oracle)
+    if good_oracle_failures:
+        print(
+            f"REGRESSED: boundary good side {row.profile} stayed within its band but failed "
+            f"the documented oracle for {finding}: {'; '.join(good_oracle_failures)}"
+        )
+        return Verdict.REGRESSED.value, 1, None
+
+    failure_signature_failures = _threshold_failures(side_metrics["bad"], failure_signature)
+    if not failure_signature_failures:
+        print(
+            f"WITHIN: boundary good side {row.profile} passed and bad side {bad_profile} still matches "
+            f"the documented failure signature ({_format_thresholds(failure_signature)})."
+        )
+        return Verdict.WITHIN.value, 0, None
+
+    bad_good_failures = _threshold_failures(side_metrics["bad"], good_oracle)
+    if not bad_good_failures:
+        print(
+            f"BOUNDARY_WIDENED: bad side {bad_profile} now satisfies the good oracle for {finding} "
+            f"({_format_thresholds(good_oracle)})."
+        )
+        print(f"  profiles: good={row.profile}, bad={bad_profile}")
+        print(f"  next: {next_steps}")
+        print("  after moving the bad-side profile and updating the finding, bank the good-side band:")
+        print(f"  {ratchet_hint} --note '<one-line cause>'")
+        print(f"then commit the tightened {budgets} and the finding/profile update together.")
+        return "BOUNDARY_WIDENED", 2, ratchet_hint
+
+    print(
+        f"REGRESSED: bad side {bad_profile} no longer matches the documented failure signature for {finding}, "
+        "but it also did not satisfy the good oracle."
+    )
+    print(f"  signature misses: {'; '.join(failure_signature_failures)}")
+    print(f"  good-oracle misses: {'; '.join(bad_good_failures)}")
+    print(f"  next: {next_steps}")
+    return Verdict.REGRESSED.value, 1, None
+
+
 def benchmark_compare(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark compare`` — the two-sided gate verdict.
 
@@ -5719,9 +5838,11 @@ def _load_gate_registry(args: argparse.Namespace) -> list[Any]:
 
 def benchmark_rows(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark rows`` — list the benched set."""
-    from .benched_set import rows_for_lane
+    from .benched_set import rows_for_calibration, rows_for_lane
 
     rows = rows_for_lane(_load_gate_registry(args), args.lane)
+    if getattr(args, "calibratable", False):
+        rows = rows_for_calibration(rows)
     if args.format == "ids":
         print(json.dumps([row.id for row in rows]))
     elif args.format == "json":
@@ -5807,6 +5928,111 @@ def benchmark_row(args: argparse.Namespace) -> int:
     args.profile = row.profile
 
     run_dir = _setup_benchmark_run_dir(args, f"row-{row.id}", row.profile)
+    if row.kind == "boundary":
+        side_docs = _drive_boundary_row(args, row, run_dir)
+        side_result_paths = {side: str(run_dir / side / BENCHMARK_RESULT_FILE) for side in ("good", "bad")}
+        boundary_summary_path = run_dir / "boundary-result.json"
+
+        boundary_refusal: str | None = None
+        side_metrics: dict[str, dict[str, float]] = {}
+        try:
+            for side, doc in side_docs.items():
+                side_metrics[side] = metrics_from_result(doc)
+        except BandError as exc:
+            boundary_refusal = str(exc)
+
+        fingerprints = {result_fingerprint(doc) for doc in side_docs.values()}
+        fingerprint = fingerprints.pop() if len(fingerprints) == 1 else "mixed"
+        shas = {result_sha(doc) for doc in side_docs.values()}
+        sha = shas.pop() if len(shas) == 1 else "mixed"
+        if fingerprint == "mixed":
+            side_fingerprints = sorted(result_fingerprint(doc) for doc in side_docs.values())
+            boundary_refusal = f"boundary sides came from different runner classes: {side_fingerprints}"
+
+        good_run_dir = run_dir / "good"
+        ratchet_hint = _ratchet_command([good_run_dir], args.budgets, row=row.id, profile=row.profile)
+        boundary_comparisons: list[Any] = []
+        exit_code = 0
+        verdict = "RAN"
+        gate = not (args.no_compare or args.monitor)
+        ratchet_command: str | None = None
+
+        if not args.no_compare and boundary_refusal is None:
+            try:
+                boundary_comparisons = _compare_docs_to_bands(
+                    [side_docs["good"]],
+                    Path(args.budgets),
+                    row=row.id,
+                    profile=row.profile,
+                    required_metrics=row.metrics,
+                    ratchet_hint=ratchet_hint,
+                )
+            except BandError as exc:
+                boundary_refusal = str(exc)
+
+        if boundary_refusal is not None:
+            print(f"REFUSED: {boundary_refusal}")
+            verdict = "REFUSED"
+            exit_code = 1
+        elif not args.no_compare:
+            print(f"Boundary row {row.id}: good={row.profile}, bad={row.boundary['bad_profile']}")
+            _print_band_comparisons(boundary_comparisons)
+            verdict, exit_code, ratchet_command = _boundary_verdict(
+                row,
+                comparisons=boundary_comparisons,
+                side_metrics=side_metrics,
+                budgets=args.budgets,
+                ratchet_hint=ratchet_hint,
+            )
+
+        boundary_payload = {
+            "finding": row.boundary["finding"],
+            "good_profile": row.profile,
+            "bad_profile": row.boundary["bad_profile"],
+            "good_oracle": row.boundary["good_oracle"],
+            "failure_signature": row.boundary["failure_signature"],
+            "next_steps": row.boundary["next_steps"],
+            "sides": {
+                side: {
+                    "profile": row.profile if side == "good" else row.boundary["bad_profile"],
+                    "metrics": side_metrics.get(side, {}),
+                    "result": side_result_paths[side],
+                }
+                for side in ("good", "bad")
+            },
+        }
+        boundary_summary_path.write_text(
+            json.dumps(boundary_payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        verdict_doc = verdict_document(
+            row,
+            verdict=verdict,
+            exit_code=exit_code,
+            gate=gate,
+            sha=sha,
+            fingerprint=fingerprint,
+            created_at=datetime.now().isoformat(timespec="seconds"),
+            metrics={
+                name: side_metrics.get("good", {})[name] for name in row.metrics if name in side_metrics.get("good", {})
+            },
+            monitor_metrics={
+                name: side_metrics.get("good", {})[name] for name in row.monitor if name in side_metrics.get("good", {})
+            },
+            bands={
+                c.band.metric: {"lo": c.band.lo, "hi": c.band.hi, "better": c.band.better.value}
+                for c in boundary_comparisons
+            },
+            result_path=str(boundary_summary_path),
+            refusal=boundary_refusal,
+            ratchet_command=ratchet_command,
+            boundary=boundary_payload,
+        )
+        verdict_path = Path(args.verdict_file) if args.verdict_file else run_dir / "verdict.json"
+        write_verdict(verdict_path, verdict_doc)
+        print(f"Gate verdict {verdict} ({row.id}) written to {verdict_path}")
+        return 0 if args.monitor else exit_code
+
     _drive_gate_row(args, row, run_dir)
 
     doc = json.loads((run_dir / BENCHMARK_RESULT_FILE).read_text(encoding="utf-8"))
@@ -5886,6 +6112,8 @@ def benchmark_calibrate(args: argparse.Namespace) -> int:
     from .benchmark import _sample_stdev, metrics_from_result, result_fingerprint, result_window_s
 
     row = find_row(_load_gate_registry(args), args.row_id)
+    if row.kind != "performance":
+        raise ValueError(f"row {row.id!r} is a {row.kind} row; boundary rows are not calibrated by budgets.jsonl")
     note = args.note or f"runner-class calibration of benched row {row.id}"
     # One ratchet per gated metric so each takes its committed floor (the
     # registry's `floors` are the reviewed per-metric width parameters).
@@ -7587,6 +7815,11 @@ def _register_benchmark_gate_parsers(benchmark_subparsers: Any, *, ota_benchmark
     )
     rows_parser.add_argument("--registry", default=None, help="Registry file (default: the packaged benched set).")
     rows_parser.add_argument("--lane", choices=list(LANES), default=None, help="Only rows of this lane.")
+    rows_parser.add_argument(
+        "--calibratable",
+        action="store_true",
+        help="Only rows whose metrics mint committed bands through benchmark calibrate.",
+    )
     rows_parser.add_argument(
         "--format",
         choices=["text", "ids", "json"],

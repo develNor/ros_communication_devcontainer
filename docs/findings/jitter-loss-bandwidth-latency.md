@@ -70,9 +70,10 @@ rosotacom benchmark probe --project src/rosotacom/resources/examples/rosotacom.y
 Migrated summary: 406 expected, 406 delivered, 0 lost, p95 latency rose to
 447.429 ms by the last time bin under the 3.1 Mbit/s profile.
 
-Verification: manual: run the commands above from a source checkout with Docker
-and `tc` privileges; automation waits for the RFC 0007 regression and boundary
-rows because the public row registry does not exist yet.
+Verification: nightly row `boundary-loss-18kb20hz-bandwidth-cyclone` re-proves
+the deterministic bandwidth boundary; the jitter boundary and latency-buildup
+diagnostic remain manual with the commands above because public runners cannot
+install seeded random netem yet.
 
 ## Status
 

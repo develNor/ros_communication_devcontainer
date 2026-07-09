@@ -1642,6 +1642,97 @@ def test_capacity_row_gates_the_breakpoint(
     assert json.loads(gate_verdict.read_text(encoding="utf-8"))["verdict"] == "REGRESSED"
 
 
+def _write_boundary_band(budgets: Path, row_id: str) -> None:
+    from rosotacom.benchmark import Band, BandProvenance, Better, runner_fingerprint, save_bands
+
+    save_bands(
+        budgets,
+        [
+            Band(
+                row=row_id,
+                profile="finding-3.2mbit",
+                metric="loss_pct",
+                lo=-0.5,
+                hi=0.5,
+                better=Better.LOWER,
+                provenance=BandProvenance(
+                    fingerprint=runner_fingerprint(),
+                    window_s=60.0,
+                    repeats=1,
+                    sigma=0.0,
+                    floor=0.5,
+                    k=3.0,
+                    source_sha="test",
+                    ratcheted_at="2026-07-09T00:00:00",
+                    note="test boundary band",
+                ),
+            )
+        ],
+    )
+
+
+def test_boundary_row_requires_the_bad_side_to_stay_bad(
+    monkeypatch: pytest.MonkeyPatch, examples_project: Path, tmp_path: Path
+) -> None:
+    row_id = "boundary-loss-18kb20hz-bandwidth-cyclone"
+    budgets = tmp_path / "budgets.jsonl"
+    _write_boundary_band(budgets, row_id)
+
+    def stub(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        loss = 3.0 if profile == "finding-3.1mbit" else 0.0
+        return _make_stub_probe(loss_pct=loss)(profile=profile, load=load, duration_s=duration_s, out_dir=out_dir)
+
+    verdict_path = tmp_path / "boundary.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "boundary",
+        row_id,
+        stub=stub,
+        budgets=budgets,
+        verdict=verdict_path,
+    )
+
+    assert rc == 0
+    doc = json.loads(verdict_path.read_text(encoding="utf-8"))
+    assert doc["verdict"] == "WITHIN"
+    assert doc["boundary"]["sides"]["bad"]["metrics"]["loss_pct"] == pytest.approx(3.0)
+
+
+def test_boundary_row_happy_reds_when_bad_side_meets_the_good_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    examples_project: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    row_id = "boundary-loss-18kb20hz-bandwidth-cyclone"
+    budgets = tmp_path / "budgets.jsonl"
+    _write_boundary_band(budgets, row_id)
+
+    verdict_path = tmp_path / "boundary-widened.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "boundary-widened",
+        row_id,
+        stub=_make_stub_probe(loss_pct=0.0),
+        budgets=budgets,
+        verdict=verdict_path,
+    )
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "BOUNDARY_WIDENED" in out
+    assert "docs/findings/zero-loss-boundaries-18kb-20hz.md" in out
+    assert "good=finding-3.2mbit, bad=finding-3.1mbit" in out
+    assert "rosotacom benchmark ratchet" in out
+    doc = json.loads(verdict_path.read_text(encoding="utf-8"))
+    assert doc["verdict"] == "BOUNDARY_WIDENED"
+    assert doc["boundary"]["finding"] == "docs/findings/zero-loss-boundaries-18kb-20hz.md"
+    assert doc["boundary"]["bad_profile"] == "finding-3.1mbit"
+    assert "rosotacom benchmark ratchet" in doc["ratchet_command"]
+
+
 def test_gate_summary_aggregates_rows_and_reds_on_missing_or_regressed(tmp_path: Path) -> None:
     from rosotacom.benched_set import find_row, load_registry, rows_for_lane, verdict_document, write_verdict
 

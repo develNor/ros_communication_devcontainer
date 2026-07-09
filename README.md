@@ -705,8 +705,10 @@ Use `benchmark ab` when the question is a **tuning** one: "does candidate config
 B beat baseline config A on the same load and profile?" Each `--baseline` and
 `--candidate label=…` is a whole session config (a directory or a
 `session-definition.yaml`) that shares the synthetic `a_to_b` load and differs
-only in the pipeline knobs under test (`throttle_hz`, `drop`, QoS, compression,
-…). The driver runs them interleaved with a rotating start over `--repeats`,
+only in the pipeline knobs under test (QoS reliability/depth/lifespan,
+compression, ffmpeg gop/bitrate/crf, … — knobs that keep the delivered topic
+name, unlike `throttle_hz`/`drop` which republish to a renamed topic; see the
+doc). The driver runs them interleaved with a rotating start over `--repeats`,
 then classifies every candidate against the baseline per topic and metric as
 **IMPROVED / WITHIN / REGRESSED** — the same verdict language the regression gate
 uses — with a two-sided tolerance band (`--rel-tolerance`, `--abs-tolerance`).

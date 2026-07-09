@@ -118,6 +118,29 @@ def test_registry_refuses_floors_for_unbanded_metrics(tmp_path: Path) -> None:
         load_registry(_write_registry(tmp_path, row))
 
 
+def test_registry_validates_replay_expect_metadata(tmp_path: Path) -> None:
+    row = _probe_row_yaml(
+        extra="""    replay:
+      source: fixture replay
+      public_example: 15_remote_assist_anonymized_costmap
+      bag_topic: /topic1
+      native_count: 10
+      native_duration_s: 1.0
+      native_hz: 10.0
+      size_basis: serialized_message_bytes
+      expect: { min_count: 9, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }
+"""
+    )
+    loaded = load_registry(_write_registry(tmp_path, row))
+    assert loaded[0].replay["expect"]["vs_bag_ratio"] == 0.9
+
+    missing_expect = row.replace(
+        "expect: { min_count: 9, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }", "expect: {}"
+    )
+    with pytest.raises(RegistryError, match="min_count"):
+        load_registry(_write_registry(tmp_path, missing_expect))
+
+
 def test_capacity_rows_band_exactly_their_knob_breakpoint(tmp_path: Path) -> None:
     row = """
   - id: cap-x

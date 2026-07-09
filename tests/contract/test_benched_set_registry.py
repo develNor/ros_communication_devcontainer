@@ -103,6 +103,39 @@ def test_every_gated_metric_has_a_calibrated_band(rows: list[GateRow]) -> None:
     assert not problems, "budgets.jsonl is missing calibrated bands:\n" + "\n".join(problems)
 
 
+def test_public_s2_replay_rows_carry_whole_bag_expect_metadata(rows: list[GateRow]) -> None:
+    """Issue #185 / harness #34: the public nightly gate must keep the S2
+    anonymized costmap and camera replay shapes under both nominal and tight
+    profiles, with the generated whole-bag expect thresholds recorded next to
+    the row."""
+    expected = {
+        ("replay-costmap-nominal-cyclone", "gate-nominal", "15_remote_assist_anonymized_costmap"),
+        ("replay-costmap-tight-cyclone", "gate-tight", "15_remote_assist_anonymized_costmap"),
+        ("replay-camera-nominal-cyclone", "gate-nominal", "16_remote_assist_anonymized_camera"),
+        ("replay-camera-tight-cyclone", "gate-tight", "16_remote_assist_anonymized_camera"),
+    }
+    by_id = {row.id: row for row in rows}
+    missing = sorted(row_id for row_id, _profile, _example in expected if row_id not in by_id)
+    assert not missing, f"missing public S2 replay nightly rows: {missing}"
+
+    for row_id, profile, public_example in expected:
+        row = by_id[row_id]
+        assert row.lane == "nightly"
+        assert row.genre == "probe"
+        assert row.profile == profile
+        assert set(row.metrics) == {"loss_pct", "completeness_pct"}
+        assert row.replay["public_example"] == public_example
+        assert row.replay["bag_topic"] == "/topic1"
+        assert row.replay["native_count"] == 1396
+        assert row.replay["expect"] == {
+            "min_count": 1256,
+            "completeness_min_ratio": 0.9,
+            "vs_bag_ratio": 0.9,
+        }
+    assert by_id["replay-camera-tight-cyclone"].replay["keyframes"] == 285
+    assert by_id["replay-camera-tight-cyclone"].replay["gop_spacing_median_frames"] == 5
+
+
 def test_committed_bands_belong_to_registry_rows(rows: list[GateRow]) -> None:
     """No orphan bands: every committed band is one a benched row still gates,
     so a renamed/removed row cannot leave stale envelopes behind."""

@@ -143,6 +143,139 @@ rows:
         good-side band printed by the row.
 
   # ------------------------------------------------------------------ #
+  # nightly: S2 anonymized replay-derived single-stream rows
+  # ------------------------------------------------------------------ #
+  - id: replay-costmap-nominal-cyclone
+    kind: performance
+    lane: nightly
+    reason: >-
+      S2 costmap replay shape under the clean public profile: the row uses the
+      anonymized costmap bag's 10 Hz cadence, 8.3 KB mean compressed-grid
+      payload, and 12.7 ms interval jitter so the nightly gate proves the
+      transport still carries the public single-stream replay load losslessly.
+    rmw: cyclone
+    genre: probe
+    profile: gate-nominal
+    duration_s: 140
+    load: { size: 8332, rate_hz: 10.0, interval_jitter_ms: 12.7, interval_jitter_seed: 1501 }
+    replay:
+      source: S2 remote-assist anonymized costmap replay
+      public_example: 15_remote_assist_anonymized_costmap
+      scenario: anonymized_remote_assist_costmap
+      bag_topic: /topic1
+      full_contract_topic: /topic5
+      native_count: 1396
+      native_duration_s: 139.492
+      native_hz: 10.001
+      size_basis: serialized_message_bytes
+      size_mean_bytes: 8331.505
+      size_p90_bytes: 10208
+      interval_std_ms: 12.701
+      expect: { min_count: 1256, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }
+    metrics: [loss_pct, completeness_pct]
+    floors: { loss_pct: 0.5, completeness_pct: 0.5 }
+    monitor: [latency_p50_ms, latency_p95_ms, payload_bandwidth_bps]
+
+  - id: replay-costmap-tight-cyclone
+    kind: performance
+    lane: nightly
+    reason: >-
+      S2 costmap replay shape under the rate-limited public profile: the mean
+      payload load is below 1 Mbit/s, so a buffering, QoS, or fragmentation
+      regression that starts dropping this realistic compressed-grid stream
+      turns a clean row red.
+    rmw: cyclone
+    genre: probe
+    profile: gate-tight
+    duration_s: 140
+    load: { size: 8332, rate_hz: 10.0, interval_jitter_ms: 12.7, interval_jitter_seed: 1502 }
+    replay:
+      source: S2 remote-assist anonymized costmap replay
+      public_example: 15_remote_assist_anonymized_costmap
+      scenario: anonymized_remote_assist_costmap
+      bag_topic: /topic1
+      full_contract_topic: /topic5
+      native_count: 1396
+      native_duration_s: 139.492
+      native_hz: 10.001
+      size_basis: serialized_message_bytes
+      size_mean_bytes: 8331.505
+      size_p90_bytes: 10208
+      interval_std_ms: 12.701
+      expect: { min_count: 1256, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }
+    metrics: [loss_pct, completeness_pct]
+    floors: { loss_pct: 0.5, completeness_pct: 0.5 }
+    monitor: [latency_p50_ms, latency_p95_ms, payload_bandwidth_bps]
+
+  - id: replay-camera-nominal-cyclone
+    kind: performance
+    lane: nightly
+    reason: >-
+      S2 ffmpeg camera replay shape under the clean public profile: GOP-shaped
+      packets (one ~43 KB keyframe plus four ~4 KB delta frames at 10 Hz) and
+      measured replay jitter keep keyframe bursts in the regression matrix
+      without exposing any image payload.
+    rmw: cyclone
+    genre: probe
+    profile: gate-nominal
+    duration_s: 140
+    load: { size_pattern: 1x43KB+4x4KB, rate_hz: 10.0, interval_jitter_ms: 19.7, interval_jitter_seed: 1601 }
+    replay:
+      source: S2 remote-assist anonymized ffmpeg camera replay
+      public_example: 16_remote_assist_anonymized_camera
+      scenario: anonymized_remote_assist_camera
+      bag_topic: /topic1
+      full_contract_topic: /topic9
+      native_count: 1396
+      native_duration_s: 139.507
+      native_hz: 9.999
+      size_basis: ffmpeg_payload_bytes
+      size_mean_bytes: 12398.847
+      size_p90_bytes: 42300
+      interval_std_ms: 19.691
+      keyframes: 285
+      gop_spacing_median_frames: 5
+      keyframe_mean_bytes: 43723.425
+      expect: { min_count: 1256, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }
+    metrics: [loss_pct, completeness_pct]
+    floors: { loss_pct: 0.5, completeness_pct: 0.5 }
+    monitor: [latency_p50_ms, latency_p95_ms, payload_bandwidth_bps]
+
+  - id: replay-camera-tight-cyclone
+    kind: performance
+    lane: nightly
+    reason: >-
+      S2 ffmpeg camera replay shape under the tight public profile: the average
+      load fits the 1 Mbit/s uplink but keyframes burst above it, so the row
+      specifically exercises the buffering and fragmentation behavior that a
+      steady-size probe cannot see.
+    rmw: cyclone
+    genre: probe
+    profile: gate-tight
+    duration_s: 140
+    load: { size_pattern: 1x43KB+4x4KB, rate_hz: 10.0, interval_jitter_ms: 19.7, interval_jitter_seed: 1602 }
+    replay:
+      source: S2 remote-assist anonymized ffmpeg camera replay
+      public_example: 16_remote_assist_anonymized_camera
+      scenario: anonymized_remote_assist_camera
+      bag_topic: /topic1
+      full_contract_topic: /topic9
+      native_count: 1396
+      native_duration_s: 139.507
+      native_hz: 9.999
+      size_basis: ffmpeg_payload_bytes
+      size_mean_bytes: 12398.847
+      size_p90_bytes: 42300
+      interval_std_ms: 19.691
+      keyframes: 285
+      gop_spacing_median_frames: 5
+      keyframe_mean_bytes: 43723.425
+      expect: { min_count: 1256, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }
+    metrics: [loss_pct, completeness_pct]
+    floors: { loss_pct: 0.5, completeness_pct: 0.5 }
+    monitor: [latency_p50_ms, latency_p95_ms, payload_bandwidth_bps]
+
+  # ------------------------------------------------------------------ #
   # nightly: remaining supported RMW variants, shallow (one tight row each)
   # ------------------------------------------------------------------ #
   - id: probe-loss-tight-fastdds

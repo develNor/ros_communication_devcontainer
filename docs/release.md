@@ -86,11 +86,17 @@ distribution, and `SHA256SUMS`. Manual workflow dispatch validates and builds
 artifacts but does not publish; publishing a stable version requires a
 deliberate `vX.Y.Z` tag.
 
-Development-channel uploads use the same Trusted Publisher and the same
-`PYPI_PUBLISH_URL`. They are triggered by the CI workflow *completing
-successfully* on `develop`, not by the push itself, so a commit whose checks
-failed is never published. They skip the TestPyPI rehearsal: the dev channel is
-already the rehearsal.
+Development-channel uploads use the same `PYPI_PUBLISH_URL`. They are triggered
+by the CI workflow *completing successfully* on `develop`, not by the push
+itself, so a commit whose checks failed is never published. They skip the
+TestPyPI rehearsal: the dev channel is already the rehearsal.
+
+They need their **own** Trusted Publisher, because PyPI matches the OIDC claims
+of the workflow file and this one is `dev-release.yml`. Registering it is a
+one-time step, listed with the other out-of-git settings in
+[github-repository-settings.md](github-repository-settings.md). Without it the
+build succeeds and the upload fails with `invalid-publisher` — which reads like
+a code problem and is not one.
 
 The target index is set per repository by the `PYPI_PUBLISH_URL` Actions
 variable, and authorization is granted by the Trusted Publisher registered for

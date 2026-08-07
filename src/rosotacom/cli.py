@@ -2580,19 +2580,55 @@ def _ota_install_pin_script(plan: OtaSmokePlan) -> str:
     )
 
 
+def _ota_project_uses_packaged_configs(runtime: RuntimeConfig) -> bool:
+    """Whether any project config root points inside the installed rosotacom.
+
+    Most projects keep their session and scenario configs next to their own
+    `rosotacom.yaml`; only a project reusing rosotacom's packaged examples
+    reaches into the package. Asking this first keeps pin mode from querying the
+    peer for a path it would not use — which also keeps it working against
+    versions older than the `resources path package` lookup.
+    """
+    if not runtime.rosotacom_config:
+        return False
+    raw = _load_yaml_file(runtime.rosotacom_config)
+    for key in ("session_configs_dir", "scenario_configs_dir"):
+        if raw.get(key) is None:
+            continue
+        for value in _path_values(raw[key], key):
+            path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+            if path.is_absolute() and _relative_to(path.resolve(), PACKAGE_DIR) is not None:
+                return True
+    return False
+
+
 def _ota_remote_package_dir(peer: OtaSmokePeer, plan: OtaSmokePlan, *, dry_run: bool) -> str | None:
     """Ask the peer's own installation where its packaged resources live.
 
-    Only pin mode needs this: no source tree is staged, so a project config that
-    points into rosotacom's packaged examples has to be remapped onto the path
-    the peer's venv actually installed them at. The peer answers through the same
-    `resources path` interface every other external consumer uses.
+    Only pin mode needs this, and only for a project that reuses rosotacom's
+    packaged configs: no source tree is staged, so such a root has to be remapped
+    onto the path the peer's venv actually installed it at. The peer answers
+    through the same `resources path` interface every other external consumer
+    uses.
     """
     if dry_run:
         return f"{plan.workdir}/venv/<site-packages>/rosotacom"
     command = _ota_quote_cmd([f"{plan.workdir}/{plan.rosotacom}", "resources", "path", "package"])
-    result = _ota_run(peer, command, label=f"{peer.name}: locate packaged resources", dry_run=False)
-    return (result.stdout or "").strip() or None
+    result = _ota_run(
+        peer,
+        command,
+        label=f"{peer.name}: locate packaged resources",
+        dry_run=False,
+        check=False,
+    )
+    located = (result.stdout or "").strip()
+    if result.returncode != 0 or not located:
+        raise RuntimeError(
+            f"{peer.name}: rosotacom {plan.install_pin} cannot report its packaged resource paths, and this "
+            "project addresses configs inside the package. `resources path package` needs 2.4 or newer; "
+            "pin a newer version, or move the config roots into the project."
+        )
+    return located
 
 
 def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: OtaSmokePlan) -> None:
@@ -2646,7 +2682,11 @@ def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: O
 
             if from_pin:
                 local_root: Path | None = PACKAGE_DIR
-                remote_root = _ota_remote_package_dir(peer, plan, dry_run=dry_run)
+                remote_root = (
+                    _ota_remote_package_dir(peer, plan, dry_run=dry_run)
+                    if _ota_project_uses_packaged_configs(runtime)
+                    else None
+                )
             else:
                 local_root = source_checkout
                 remote_root = f"{plan.workdir}/source"

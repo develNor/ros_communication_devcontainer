@@ -2880,3 +2880,22 @@ def test_ota_manifest_records_what_the_peers_ran(tmp_path: Path) -> None:
 
     assert run["install_mode"] == "pin"
     assert run["install_pin"] == "2.4"
+
+
+def test_pin_mode_does_not_query_a_self_contained_project(tmp_path: Path) -> None:
+    # The peer lookup exists only for projects that reuse rosotacom's packaged
+    # configs. Running it unconditionally would make pin mode depend on a
+    # command that older pinned versions do not have, for an answer it would
+    # then discard.
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+
+    assert rosotacom._ota_project_uses_packaged_configs(runtime) is False
+
+
+def test_pin_mode_queries_a_project_reusing_packaged_configs(tmp_path: Path) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    config = rosotacom._load_yaml_file(runtime.rosotacom_config)
+    config["session_configs_dir"] = str(rosotacom.EXAMPLE_PROJECT_DIR / "sessions")
+    runtime.rosotacom_config.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    assert rosotacom._ota_project_uses_packaged_configs(runtime) is True

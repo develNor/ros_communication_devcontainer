@@ -82,6 +82,16 @@ PROJECT_DIR = RESOURCE_DIR
 WS_DIR = RESOURCE_DIR / "ws"
 DEFAULT_ROS2DOCKER_CONFIG = RESOURCE_DIR / "ros2docker.json.example"
 EXAMPLE_PROJECT_DIR = RESOURCE_DIR / "examples"
+
+# Packaged resources external tooling may need to locate on the host. rosotacom
+# is installed in an isolated environment (pipx, or a project venv), so a
+# consumer cannot `import rosotacom` to find these; `rosotacom resources path`
+# is the supported lookup. Names are part of the CLI contract, the layout behind
+# them is not — ask for "com_msgs", not for "ws/ros2src/com_msgs".
+NAMED_RESOURCES = {
+    "ws": WS_DIR,
+    "com_msgs": WS_DIR / "ros2src" / "com_msgs",
+}
 SESSION_CONFIG_CONTAINER_DIR = "/session/configs"
 SESSION_DEFINITION_CONTAINER_DIR = "/session/definitions"
 SESSION_INSTANCE_CONTAINER_DIR = "/session/instances"
@@ -4618,6 +4628,20 @@ def examples_create_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def resources_path_command(args: argparse.Namespace) -> int:
+    """Print the host path of a packaged resource, for external tooling."""
+
+    path = NAMED_RESOURCES[args.name].resolve()
+    if not path.exists():
+        raise RuntimeError(
+            f"Packaged resource {args.name!r} is missing from this rosotacom "
+            f"installation (expected at {path}). The install is incomplete: "
+            f"reinstall the package."
+        )
+    print(path)
+    return 0
+
+
 def _require_project_file(raw: str | None) -> Path:
     config = _resolve_path(raw, Path.cwd(), must_exist=True)
     if not config or not config.is_file():
@@ -7801,43 +7825,50 @@ def videoquality_command(args: argparse.Namespace) -> int:
     return 0
 
 
+# `rosotacom <session>` is shorthand for `rosotacom start <session>`. To know when
+# NOT to insert the implicit "start", main() needs the set of real command names.
+# A subparser missing here becomes unreachable — `rosotacom foo` would silently
+# turn into `rosotacom start foo` — so a contract test keeps the two in sync.
+TOP_LEVEL_COMMANDS = {
+    "start",
+    "stop",
+    "doctor",
+    "ps",
+    "smoke",
+    "ota-smoke",
+    "status",
+    "metrics",
+    "videoquality",
+    "geomap",
+    "report",
+    "stream-stats",
+    "test",
+    "expect",
+    "calibrate",
+    "verify",  # retired; keep guarded so it is not rewritten as `start verify`.
+    "probe-publish",
+    "probe-check",
+    "probe-content",
+    "publish-test-topics",
+    "list-sessions",
+    "scenario",
+    "examples",
+    "resources",
+    "config",
+    "bundle",
+    "profile",
+    "completion",
+    "benchmark",
+    "ota-benchmark",
+    "anonymize",
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    commands = {
-        "start",
-        "stop",
-        "doctor",
-        "ps",
-        "smoke",
-        "ota-smoke",
-        "status",
-        "metrics",
-        "videoquality",
-        "geomap",
-        "report",
-        "stream-stats",
-        "test",
-        "expect",
-        "calibrate",
-        "verify",  # retired; keep guarded so it is not rewritten as `start verify`.
-        "probe-publish",
-        "probe-check",
-        "probe-content",
-        "publish-test-topics",
-        "list-sessions",
-        "scenario",
-        "examples",
-        "config",
-        "bundle",
-        "profile",
-        "completion",
-        "benchmark",
-        "ota-benchmark",
-        "anonymize",
-    }
     if not argv:
         argv = ["start"]
-    elif argv[0] not in commands and not argv[0].startswith("-"):
+    elif argv[0] not in TOP_LEVEL_COMMANDS and not argv[0].startswith("-"):
         argv = ["start", *argv]
 
     parser = argparse.ArgumentParser(prog="rosotacom")
@@ -8479,6 +8510,12 @@ def main(argv: list[str] | None = None) -> int:
     examples_create_parser.add_argument("target", help="Directory to create.")
     examples_create_parser.add_argument("--force", action="store_true", help="Replace the target if it exists.")
     examples_create_parser.set_defaults(func=examples_create_command)
+
+    resources_parser = subparsers.add_parser("resources", help="Locate resources packaged with rosotacom.")
+    resources_subparsers = resources_parser.add_subparsers(dest="resources_action", required=True)
+    resources_path_parser = resources_subparsers.add_parser("path", help="Print the host path of a packaged resource.")
+    resources_path_parser.add_argument("name", choices=sorted(NAMED_RESOURCES))
+    resources_path_parser.set_defaults(func=resources_path_command)
 
     config_parser = subparsers.add_parser("config", help="Inspect or set the active rosotacom project.")
     config_subparsers = config_parser.add_subparsers(dest="config_action", required=True)

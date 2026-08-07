@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 from importlib import resources
 from pathlib import Path
 
+import pytest
 import yaml
 
 import rosotacom.cli as cli
@@ -238,3 +240,47 @@ def test_native_chatter_waiter_reads_topic_info_without_broken_pipe(tmp_path: Pa
 
     assert result.stdout.strip() == "echo started"
     assert "BrokenPipeError" not in result.stderr
+
+
+def test_every_registered_subcommand_is_exempt_from_implicit_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `rosotacom <session>` is shorthand for `rosotacom start <session>`, so
+    # main() only skips the implicit "start" for names in TOP_LEVEL_COMMANDS.
+    # A subparser missing from that set is unreachable: the CLI silently turns
+    # `rosotacom foo ...` into `rosotacom start foo ...` and fails somewhere
+    # unrelated. Capture what is actually registered and compare.
+    captured: dict[str, argparse._SubParsersAction] = {}
+    original = argparse.ArgumentParser.add_subparsers
+
+    def spy(self: argparse.ArgumentParser, *args: object, **kwargs: object):
+        action = original(self, *args, **kwargs)
+        if self.prog == "rosotacom":
+            captured["top"] = action
+        return action
+
+    monkeypatch.setattr(argparse.ArgumentParser, "add_subparsers", spy)
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+
+    registered = set(captured["top"].choices)
+    assert registered, "no top-level subparsers were captured"
+
+    unreachable = registered - cli.TOP_LEVEL_COMMANDS
+    assert not unreachable, f"subcommands missing from TOP_LEVEL_COMMANDS: {sorted(unreachable)}"
+
+    # The reverse direction may legitimately carry retired names (e.g. "verify"),
+    # which stay guarded so they are not rewritten as `start verify`.
+    assert "resources" in registered
+
+
+def test_named_resources_point_at_real_packaged_directories() -> None:
+    for name, path in cli.NAMED_RESOURCES.items():
+        assert path.is_dir(), f"packaged resource {name!r} is not a directory: {path}"
+
+    # com_msgs is consumed by external builds (fleet_mgmt bakes it into its
+    # container images), so it must be a usable ROS 2 package, not just a folder.
+    com_msgs = cli.NAMED_RESOURCES["com_msgs"]
+    assert (com_msgs / "package.xml").is_file()
+    assert (com_msgs / "CMakeLists.txt").is_file()
+    assert list(com_msgs.glob("msg/*.msg"))

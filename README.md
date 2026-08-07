@@ -46,7 +46,11 @@ tooling, nothing rosotacom-specific:
 
 ```bash
 # released version (recommended for users)
-pipx install rosotacom            # isolated, on PATH everywhere
+pipx install rosotacom-dev        # isolated, on PATH everywhere
+
+<!-- The distribution is rosotacom-dev; the import name and the CLI stay
+     `rosotacom`. This fork publishes under its own name so that `rosotacom`
+     on PyPI stays reserved for the FZI upstream. -->
 #   or: pip install --user rosotacom
 
 # from a source checkout (developers)
@@ -107,7 +111,7 @@ rosotacom smoke                   # built-in example, zero config
 deactivate                        # back to your usual rosotacom
 ```
 
-For coexisting *released* versions, `pipx install rosotacom==2.2.0 --suffix=@2.2.0`
+For coexisting *released* versions, `pipx install rosotacom-dev==2.2.0 --suffix=@2.2.0`
 gives you a `rosotacom@2.2.0` alongside the default — standard pipx, no bespoke
 version manager.
 

@@ -19,7 +19,7 @@ Outputs are written to `<instance-dir>/report/` (override with `--out`):
 - `report.md` — the short human summary (also printed to stdout).
 - `figures/<stream>.png` — one timeline figure per stream with event windows
   shaded ("the plot that shows the degradation moment"). Requires the `[plots]`
-  extra (`pip install rosotacom[plots]`); skipped with a note otherwise, or with
+  extra (`pip install rosotacom-dev[plots]`); skipped with a note otherwise, or with
   `--no-figures`.
 
 All outputs are self-describing: the exact command, rosotacom version, git SHA

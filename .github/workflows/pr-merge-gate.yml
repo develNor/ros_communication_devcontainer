@@ -389,6 +389,46 @@ jobs:
           path: session-instances/
           if-no-files-found: ignore
 
+  e2e-media:
+    name: e2e-media
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: preflight-success
+    if: always() && !cancelled() && needs.preflight-success.result == 'success'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just and tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just tmux
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Show Docker environment
+        run: docker info
+
+      - name: Run media E2E tests
+        run: just test-e2e-media
+
+      - name: Upload session artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: session-instances-e2e-media
+          path: session-instances/
+          if-no-files-found: ignore
+
   ci-success:
     name: ci-success
     runs-on: ubuntu-latest
@@ -404,6 +444,7 @@ jobs:
       - e2e-remote-assist
       - e2e-runtime-tools
       - e2e-concurrency
+      - e2e-media
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
 
     steps:

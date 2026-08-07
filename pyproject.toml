@@ -3,7 +3,9 @@ requires = ["setuptools>=80", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rosotacom"
+# The development fork publishes under its own name so that `rosotacom` stays
+# reserved for the FZI upstream. Consumers of this line pin rosotacom-dev.
+name = "rosotacom-dev"
 description = "Host CLI for ROS OTA communication sessions."
 readme = "README.md"
 requires-python = ">=3.10"

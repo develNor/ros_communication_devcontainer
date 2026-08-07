@@ -90,10 +90,19 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  fast-e2e:
-    name: fast-e2e
+  e2e:
+    # The same five slices the merge gate runs, in parallel, instead of one
+    # sequential `just test-e2e-smoke` over the whole suite. That target is
+    # identical to nightly-e2e.yml's smoke-e2e job, so the release used to be
+    # the third sequential run of the same tests against the same tree; it
+    # dominated release wall-clock at roughly an hour. See issue #196.
+    name: e2e-${{ matrix.slice }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [core, transforms, remote-assist, runtime-tools, concurrency, media]
 
     steps:
       - name: Check out repository
@@ -118,13 +127,21 @@ jobs:
       - name: Show Docker environment
         run: docker info
 
-      - name: Run single-machine smoke matrix
-        run: just test-e2e-smoke
+      - name: Run E2E slice
+        run: just test-e2e-slice ${{ matrix.slice }}
+
+      - name: Upload session artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: session-instances-e2e-${{ matrix.slice }}
+          path: session-instances/
+          if-no-files-found: ignore
 
   publish:
     name: publish
     runs-on: ubuntu-latest
-    needs: [non-docker, package, fast-e2e]
+    needs: [non-docker, package, e2e]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     # No GitHub environment: authorization is the per-repo Trusted Publisher
     # (registered with a blank environment), so this needs no environment-admin
@@ -142,25 +159,43 @@ jobs:
       - name: Remove checksum sidecar
         run: rm -f dist/SHA256SUMS
 
-      - name: Verify configured publishing target
+      - name: Verify configured publishing targets
         env:
           PYPI_PUBLISH_URL: ${{ vars.PYPI_PUBLISH_URL }}
+          TESTPYPI_PUBLISH_URL: ${{ vars.TESTPYPI_PUBLISH_URL }}
         run: |
           if [ -z "$PYPI_PUBLISH_URL" ]; then
             echo "::error::PYPI_PUBLISH_URL is not configured for this repository."
             exit 1
           fi
-          case "$PYPI_PUBLISH_URL" in
-            https://*) ;;
-            *)
-              echo "::error::PYPI_PUBLISH_URL must be an HTTPS endpoint."
-              exit 1
-              ;;
-          esac
+          for url in "$PYPI_PUBLISH_URL" "$TESTPYPI_PUBLISH_URL"; do
+            [ -n "$url" ] || continue
+            case "$url" in
+              https://*) ;;
+              *)
+                echo "::error::PYPI_PUBLISH_URL must be an HTTPS endpoint (offending value: '$url')."
+                exit 1
+                ;;
+            esac
+          done
+          if [ -z "$TESTPYPI_PUBLISH_URL" ]; then
+            echo "::notice::TESTPYPI_PUBLISH_URL unset; skipping the rehearsal upload."
+          fi
 
-      # The destination is repository configuration, not shared git content:
-      # rehearsal index in the development fork, production index upstream.
-      # Trusted Publisher registration remains the authorization boundary.
+      # Destinations are repository configuration, not shared git content, and
+      # Trusted Publisher registration stays the authorization boundary on each
+      # index. The rehearsal upload runs first but must never gate the real one:
+      # TestPyPI prunes packages and may lack a publisher registration, and a
+      # failure there says nothing about the production upload. It is reported
+      # as a failed step so it stays visible instead of silently degrading.
+      - name: Publish distributions (rehearsal, TestPyPI)
+        if: vars.TESTPYPI_PUBLISH_URL != ''
+        continue-on-error: true
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ vars.TESTPYPI_PUBLISH_URL }}
+          skip-existing: true
+
       - name: Publish distributions
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

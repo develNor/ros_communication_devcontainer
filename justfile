@@ -55,10 +55,26 @@ test-e2e-remote-assist:
 # every test in the other files (contract-tested in test_benched_set_registry).
 test-e2e-runtime-tools:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "link_latency"
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py tests/e2e/test_benchmark_ab.py
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py tests/e2e/test_benchmark_ab.py tests/e2e/test_benchmark_replay.py
+
+# The remaining e2e files. Without this slice the partition is not one: the
+# monolithic `test-e2e-smoke` collects 28 tests, the other five collect 25, and
+# anonymization/video-quality/replay ran only in nightly and the release.
+test-e2e-media:
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_anonymize_e2e.py tests/e2e/test_video_quality_e2e.py
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "anonymized"
 
 test-e2e-concurrency:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_parallel_smoke.py
+
+# The five slices partition `test-e2e-smoke`; the merge gate and the release
+# both run them in parallel. This wrapper exists so a workflow matrix can select
+# a slice while the recipe name in the `run:` line stays a literal — a name
+# assembled by matrix interpolation is invisible to
+# tests/contract/test_workflow_contracts.py::test_referenced_just_recipes_exist.
+# Run one named slice of the e2e suite.
+test-e2e-slice slice:
+	just test-e2e-{{slice}}
 
 test-e2e-node nodeid:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q "{{nodeid}}"

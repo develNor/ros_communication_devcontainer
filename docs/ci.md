@@ -11,10 +11,14 @@ but one stable release line:
 
 - topic PRs are gated into the repository's active development branch by the
   GitHub checks below;
-- **`main`** is the stable release line;
+- every commit that lands there with green CI is published as a `X.Y.devN`
+  pre-release, so any commit is consumable without a release decision;
+- **`main`** is the stable line a repository synchronises upstream from;
 - moving development work to `main` is a deliberate maintainer operation and
   may require an external OTA gate;
-- releases are tags `vX.Y.Z` cut from `main` (see [release.md](release.md)).
+- releases are tags `vX.Y.Z` cut from a validated commit on the release line —
+  in this repository `develop`, its default branch (see
+  [release.md](release.md)).
 
 The OTA tier is not part of this repository's public CI. An operator-supplied
 external runner provides it as a manual promotion gate, as described generically

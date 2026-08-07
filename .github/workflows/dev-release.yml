@@ -1,0 +1,152 @@
+name: Dev release
+
+# Every commit that lands on develop becomes an installable pre-release.
+#
+# Consuming this package should not mean consuming something days old. Without
+# this, a downstream repository could only pin a version after someone decided
+# to cut a release, so "always consume the package, never the checkout" cost a
+# human decision per iteration — and the cheap way out was to stop consuming the
+# package.
+#
+# setuptools-scm already derives X.Y.devN from the history; those wheels were
+# built by CI and thrown away. This publishes them.
+#
+# `pip` does not resolve pre-releases unless asked, so the stable line is
+# unaffected: nobody gets a dev version by accident, and anybody who wants one
+# pins it exactly. Cutting a stable vX.Y stays a deliberate, human decision in
+# release.yml.
+#
+# It runs on workflow_run rather than on push, so a commit whose CI failed is
+# never published. workflow_run resolves this file from the default branch,
+# which is develop — the branch it watches.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    # `event == 'push'` keeps pull-request CI runs out: only what actually
+    # landed on develop is published.
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+    # Same authorization as release.yml: the per-repo Trusted Publisher,
+    # registered with a blank environment. No token, no environment admin.
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Check out the commit CI validated
+        uses: actions/checkout@v6
+        with:
+          # Pin to the validated commit: develop may have moved on since, and
+          # publishing a different tree than the one that passed would make the
+          # version meaningless.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          # setuptools-scm needs the full history and the tags to derive the
+          # version; a shallow clone silently yields 0.1.dev1.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Build and validate distributions
+        run: just package
+
+      - name: Require a pre-release version
+        id: version
+        run: |
+          set -euo pipefail
+          # A wheel filename is name-version-pytag-abitag-plattag.whl.
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel in dist/, found ${#wheels[@]}"
+            exit 1
+          fi
+          base="$(basename "${wheels[0]}" .whl)"
+          name="${base%%-*}"
+          rest="${base#*-}"
+          version="${rest%%-*}"
+          echo "distribution=${name//_/-}" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Built ${name//_/-} $version"
+          # A clean X.Y here means develop points at a tagged commit. That
+          # version belongs to the stable line and release.yml owns it, so skip
+          # rather than race it onto the index under a second identity.
+          if [ "${version#*.dev}" = "$version" ]; then
+            echo "::notice::$version is not a pre-release; the stable tag path owns it. Skipping."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Remove checksum sidecar
+        if: steps.version.outputs.publish == 'true'
+        run: rm -f dist/SHA256SUMS
+
+      - name: Verify configured publishing target
+        if: steps.version.outputs.publish == 'true'
+        env:
+          PYPI_PUBLISH_URL: ${{ vars.PYPI_PUBLISH_URL }}
+        run: |
+          if [ -z "$PYPI_PUBLISH_URL" ]; then
+            echo "::error::PYPI_PUBLISH_URL is not configured for this repository."
+            exit 1
+          fi
+          case "$PYPI_PUBLISH_URL" in
+            https://*) ;;
+            *)
+              echo "::error::PYPI_PUBLISH_URL must be an HTTPS endpoint (offending value: '$PYPI_PUBLISH_URL')."
+              exit 1
+              ;;
+          esac
+
+      # No TestPyPI rehearsal here. The dev channel *is* the rehearsal, and a
+      # second upload per commit would double the noise for no extra signal.
+      - name: Publish pre-release
+        if: steps.version.outputs.publish == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ vars.PYPI_PUBLISH_URL }}
+          skip-existing: true
+
+      - name: Summarise
+        if: steps.version.outputs.publish == 'true'
+        env:
+          DISTRIBUTION: ${{ steps.version.outputs.distribution }}
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # Markdown code block by indentation: no backticks, which shellcheck
+          # would read as command substitution.
+          {
+            echo "Published $VERSION from $COMMIT."
+            echo
+            echo "Consume it with:"
+            echo
+            echo "    pipx install \"$DISTRIBUTION==$VERSION\""
+          } >> "$GITHUB_STEP_SUMMARY"

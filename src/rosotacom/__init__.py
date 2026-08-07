@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import PackageNotFoundError, packages_distributions, version
 from typing import Any
-
-_DISTRIBUTION_NAME = "rosotacom"
 
 
 def _package_version() -> str:
-    try:
-        return version(_DISTRIBUTION_NAME)
-    except PackageNotFoundError:
-        return "0+unknown"
+    """Version of the distribution that ships this package.
+
+    The distribution name is looked up, not hardcoded. This source is published
+    as `rosotacom-dev` from the development fork and as `rosotacom` upstream, so
+    a hardcoded name resolves under one of them and silently degrades to
+    "0+unknown" under the other — which is what happened up to 2.3: every
+    installed `rosotacom-dev` misreported its own version, so `--version` could
+    not be compared against a pin, and the OTA source bundle wrote an invalid
+    PEP 440 version into its generated metadata.
+    """
+    for distribution in packages_distributions().get(__name__, ()):
+        try:
+            return version(distribution)
+        except PackageNotFoundError:
+            continue
+    return "0+unknown"
 
 
 __version__ = _package_version()

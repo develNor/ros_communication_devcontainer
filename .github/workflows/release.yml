@@ -77,6 +77,29 @@ jobs:
       - name: Build and validate distributions
         run: just package
 
+      # The mirror of the dev channel's guard. A tag build must produce the
+      # clean version the tag names; a pre-release here means the tag is not on
+      # the commit being built (a dirty tree, or a tag pushed from the wrong
+      # place), and the release would silently publish something else.
+      - name: Require a stable version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one wheel in dist/, found ${#wheels[@]}"
+            exit 1
+          fi
+          base="$(basename "${wheels[0]}" .whl)"
+          rest="${base#*-}"
+          version="${rest%%-*}"
+          expected="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$expected" ]; then
+            echo "::error::tag $GITHUB_REF_NAME builds version $version, not $expected."
+            exit 1
+          fi
+
       - name: Generate checksums
         run: |
           cd dist

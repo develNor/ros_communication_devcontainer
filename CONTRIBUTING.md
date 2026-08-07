@@ -112,17 +112,30 @@ repository settings that live outside git.
 
 ## Release Workflow
 
-Releases are built from tags in the form `vX.Y.Z`. Release PRs must include
-`docs/release-notes/vX.Y.Z.md`, copied from
-[docs/release-notes/TEMPLATE.md](docs/release-notes/TEMPLATE.md).
+Two channels, described in full in [docs/release.md](docs/release.md).
 
-After the release PR has merged to `main`, verify the exact commit and then:
+**Development channel.** Every commit that lands on the development branch with
+green CI is published automatically as `X.Y.devN`. There is nothing to do and
+nothing to decide: merging *is* releasing on this channel. Consume such a
+version with an exact pin, which is how a downstream repository tracks work in
+progress without reaching past the package boundary:
 
 ```bash
-git switch main
+pipx install "rosotacom-dev==2.4.dev3"
+```
+
+**Stable release.** Built from tags in the form `vX.Y.Z`. Release PRs must
+include `docs/release-notes/vX.Y.Z.md`, copied from
+[docs/release-notes/TEMPLATE.md](docs/release-notes/TEMPLATE.md) — the tagged
+commit has to contain its own notes, so the notes land in the PR, not after it.
+
+After the release PR has merged, verify the exact commit and then:
+
+```bash
+git switch develop
 git fetch --prune
 git pull --ff-only
-git tag vX.Y.Z
+git tag -a vX.Y.Z -m "rosotacom vX.Y.Z"
 git push origin vX.Y.Z
 ```
 

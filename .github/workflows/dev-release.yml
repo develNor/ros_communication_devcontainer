@@ -42,8 +42,13 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.event == 'push'
-    # Same authorization as release.yml: the per-repo Trusted Publisher,
-    # registered with a blank environment. No token, no environment admin.
+    # Authorized by a Trusted Publisher registered with a blank environment. No
+    # token, no environment admin.
+    #
+    # PyPI matches the OIDC claims of the *workflow file*, so this needs its own
+    # registration for `dev-release.yml`; release.yml's does not cover it. Until
+    # that exists the build succeeds and the upload fails with
+    # `invalid-publisher`. See docs/github-repository-settings.md.
     permissions:
       id-token: write
 

@@ -173,6 +173,23 @@ scripts/
 project-local directories first and shared/example directories later when one
 project should discover both.
 
+### Locating packaged resources
+
+rosotacom is installed in an isolated environment (pipx, or a project venv), so
+another tool cannot `import rosotacom` from a system Python to find the files
+that ship with it. Ask the CLI instead — it prints one absolute path, so it
+composes directly in a shell:
+
+```bash
+rosotacom resources path com_msgs   # the ROS 2 message package
+rosotacom resources path ws         # the packaged runtime workspace
+```
+
+Use this wherever another project needs rosotacom's files on the host, for
+example to bake `com_msgs` into its own container image. Ask for the resource by
+name rather than reconstructing a path: the names are part of the CLI contract,
+the layout behind them is not.
+
 See the [example project README](src/rosotacom/resources/examples/README.md)
 for the copyable example layout, the
 [session configuration reference](session-configuration.md) for the session

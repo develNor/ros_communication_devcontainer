@@ -2759,3 +2759,28 @@ def test_content_integrity_skips_transformed_topics() -> None:
         )
     )
     assert rosotacom._content_integrity_specs(cfg, "a") == []
+
+
+def test_resources_path_prints_an_absolute_existing_path(capsys: pytest.CaptureFixture[str]) -> None:
+    # External tooling cannot `import rosotacom` (pipx/venv isolation), so this
+    # command is the only supported way to locate packaged resources. It must
+    # print exactly one absolute path and nothing else, to stay shell-composable.
+    for name in rosotacom.NAMED_RESOURCES:
+        assert rosotacom.resources_path_command(argparse.Namespace(name=name)) == 0
+        out = capsys.readouterr().out
+        assert out.endswith("\n")
+        printed = Path(out.strip())
+        assert printed.is_absolute()
+        assert printed.is_dir()
+        assert len(out.splitlines()) == 1
+
+
+def test_resources_path_rejects_an_unknown_resource_name() -> None:
+    with pytest.raises(SystemExit):
+        rosotacom.main(["resources", "path", "no_such_resource"])
+
+
+def test_resources_path_reports_an_incomplete_installation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setitem(rosotacom.NAMED_RESOURCES, "ws", tmp_path / "gone")
+    with pytest.raises(RuntimeError, match="missing from this rosotacom installation"):
+        rosotacom.resources_path_command(argparse.Namespace(name="ws"))

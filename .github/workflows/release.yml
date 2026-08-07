@@ -128,7 +128,7 @@ jobs:
         run: docker info
 
       - name: Run E2E slice
-        run: just test-e2e-${{ matrix.slice }}
+        run: just test-e2e-slice ${{ matrix.slice }}
 
       - name: Upload session artifacts
         if: failure()
@@ -173,7 +173,7 @@ jobs:
             case "$url" in
               https://*) ;;
               *)
-                echo "::error::Publishing targets must be HTTPS endpoints; got '$url'."
+                echo "::error::PYPI_PUBLISH_URL must be an HTTPS endpoint (offending value: '$url')."
                 exit 1
                 ;;
             esac

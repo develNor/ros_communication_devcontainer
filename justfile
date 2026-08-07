@@ -60,6 +60,15 @@ test-e2e-runtime-tools:
 test-e2e-concurrency:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_parallel_smoke.py
 
+# The five slices partition `test-e2e-smoke`; the merge gate and the release
+# both run them in parallel. This wrapper exists so a workflow matrix can select
+# a slice while the recipe name in the `run:` line stays a literal — a name
+# assembled by matrix interpolation is invisible to
+# tests/contract/test_workflow_contracts.py::test_referenced_just_recipes_exist.
+# Run one named slice of the e2e suite.
+test-e2e-slice slice:
+	just test-e2e-{{slice}}
+
 test-e2e-node nodeid:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q "{{nodeid}}"
 

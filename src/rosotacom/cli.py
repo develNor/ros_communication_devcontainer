@@ -89,8 +89,10 @@ EXAMPLE_PROJECT_DIR = RESOURCE_DIR / "examples"
 # is the supported lookup. Names are part of the CLI contract, the layout behind
 # them is not — ask for "com_msgs", not for "ws/ros2src/com_msgs".
 NAMED_RESOURCES = {
+    "package": PACKAGE_DIR,
     "ws": WS_DIR,
     "com_msgs": WS_DIR / "ros2src" / "com_msgs",
+    "examples": EXAMPLE_PROJECT_DIR,
 }
 SESSION_CONFIG_CONTAINER_DIR = "/session/configs"
 SESSION_DEFINITION_CONTAINER_DIR = "/session/definitions"
@@ -99,6 +101,19 @@ EXTERNAL_SESSION_CONTAINER_DIR = "/session/current"
 RUN_SESSION_CONTAINER_PATH = "/ws/session/creation/run_session.py"
 DEFAULT_SMOKE_SESSION = "1_heartbeat"
 OTA_SUDO_MODES = ("passwordless", "askpass")
+
+# How ota-smoke puts rosotacom on each peer.
+#
+# `source` stages whatever the caller is running and installs it from source.
+# That is right while iterating on rosotacom itself: the peers run the code in
+# front of you, including uncommitted changes.
+#
+# `pin` installs a published version from the index and stages no source at all.
+# That is right when rehearsing a deployment: the peers then run the artefact
+# that ships, so a packaging defect — a file missing from the wheel, an
+# undeclared dependency — fails here rather than on a Versuchsträger. `source`
+# cannot catch that class of bug by construction.
+OTA_INSTALL_MODES = ("source", "pin")
 OTA_DEFAULT_SUDO_MODE = "passwordless"
 
 ws_creation_dir = WS_DIR / "session" / "creation"
@@ -194,6 +209,8 @@ class OtaSmokePlan:
     rosotacom: str
     project: str
     peers: dict[str, OtaSmokePeer]
+    install_mode: str = "source"
+    install_pin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1461,27 +1478,62 @@ def _infer_active_interactive_smoke_run(
     )
 
 
-def _ota_plan_from_bindings(bindings: dict[str, PeerBinding], *, workdir: str) -> OtaSmokePlan:
+def _ota_validate_install_mode(install_mode: str) -> str:
+    if install_mode not in OTA_INSTALL_MODES:
+        raise RuntimeError(
+            f"Unsupported OTA install mode {install_mode!r}; expected one of {', '.join(OTA_INSTALL_MODES)}."
+        )
+    return install_mode
+
+
+def _ota_rosotacom_path(install_mode: str) -> str:
+    """Where the peer's rosotacom executable lands, relative to the workdir."""
+    return "venv/bin/rosotacom" if install_mode == "pin" else "source/.venv/bin/rosotacom"
+
+
+def _ota_plan_from_bindings(
+    bindings: dict[str, PeerBinding],
+    *,
+    workdir: str,
+    install_mode: str = "source",
+    install_pin: str | None = None,
+) -> OtaSmokePlan:
     _ota_validate_prepare_workdir(workdir)
+    _ota_validate_install_mode(install_mode)
+    if install_mode == "pin":
+        # Defaulting to the caller's own version makes `--install-mode pin`
+        # mean "rehearse what I am running, as it ships" without a second flag.
+        install_pin = install_pin or __version__
+        if "+" in install_pin or install_pin == "0+unknown":
+            raise RuntimeError(
+                f"Cannot pin OTA peers to version {install_pin!r}: it is a local build, not something an "
+                "index can serve. Pass --install-pin with a published version, or use --install-mode source."
+            )
+    elif install_pin is not None:
+        raise RuntimeError("--install-pin only applies to --install-mode pin.")
     peers = {
         name: OtaSmokePeer(name=name, ssh=binding.ssh, address=binding.address) for name, binding in bindings.items()
     }
     return OtaSmokePlan(
         state_path=None,
         workdir=workdir,
-        rosotacom="source/.venv/bin/rosotacom",
+        rosotacom=_ota_rosotacom_path(install_mode),
         project="project/rosotacom.yaml",
         peers=peers,
+        install_mode=install_mode,
+        install_pin=install_pin,
     )
 
 
 def _ota_write_state(instance: SessionInstance, plan: OtaSmokePlan) -> OtaSmokePlan:
     path = instance.host_dir / "ota-deployment.yaml"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "workdir": plan.workdir,
         "rosotacom": plan.rosotacom,
         "project": plan.project,
+        "install_mode": plan.install_mode,
+        "install_pin": plan.install_pin,
         "peers": {name: {"address": peer.address, "ssh": peer.ssh} for name, peer in sorted(plan.peers.items())},
     }
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
@@ -1491,7 +1543,7 @@ def _ota_write_state(instance: SessionInstance, plan: OtaSmokePlan) -> OtaSmokeP
 def _ota_load_state(path_arg: str) -> OtaSmokePlan:
     path = Path(path_arg).expanduser().resolve()
     raw = _load_yaml_file(path)
-    if raw.get("schema_version") != 1:
+    if raw.get("schema_version") != 2:
         raise RuntimeError(f"Unsupported OTA deployment state: {path}")
     peers_raw = raw.get("peers")
     if not isinstance(peers_raw, dict) or len(peers_raw) != 2:
@@ -1505,12 +1557,15 @@ def _ota_load_state(path_arg: str) -> OtaSmokePlan:
             address=str(peer_raw["address"]),
             ssh=str(peer_raw["ssh"]) if peer_raw.get("ssh") else None,
         )
+    install_pin = raw.get("install_pin")
     return OtaSmokePlan(
         state_path=path,
         workdir=str(raw["workdir"]),
         rosotacom=str(raw["rosotacom"]),
         project=str(raw["project"]),
         peers=peers,
+        install_mode=_ota_validate_install_mode(str(raw["install_mode"])),
+        install_pin=str(install_pin) if install_pin else None,
     )
 
 
@@ -1625,11 +1680,124 @@ def _ota_source_checkout() -> Path | None:
     return None
 
 
+def _ota_requirement_is_optional(requirement: str) -> bool:
+    """Whether a Requires-Dist entry only applies to an extra.
+
+    `packaging` is not a runtime dependency, so the marker is inspected
+    textually. An extra-guarded requirement always carries `extra ==` in its
+    marker, which is enough to separate `pytest>=8.3; extra == "dev"` from a
+    runtime entry with an environment marker such as `tomli; python_version <
+    "3.11"`.
+    """
+    _, separator, marker = requirement.partition(";")
+    return bool(separator) and "extra" in marker and "==" in marker
+
+
+def _ota_installed_distribution() -> importlib.metadata.Distribution | None:
+    """The installed distribution that provides the running rosotacom package.
+
+    Deduplicated and order-preserving: a machine migrated from `rosotacom` to
+    `rosotacom-dev` can carry both dist-info directories in one environment, and
+    the first resolvable one is the one `__version__` reports.
+    """
+    candidates = importlib.metadata.packages_distributions().get(PACKAGE_DIR.name, ())
+    for candidate in dict.fromkeys(candidates):
+        try:
+            return importlib.metadata.distribution(candidate)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return None
+
+
+@dataclass(frozen=True)
+class OtaBundleMetadata:
+    """Packaging metadata of the rosotacom distribution that is running."""
+
+    name: str
+    version: str
+    requires_python: str
+    dependencies: tuple[str, ...]
+    console_scripts: tuple[tuple[str, str], ...]
+
+
+def _ota_bundle_metadata() -> OtaBundleMetadata:
+    """Read the running distribution's metadata for the OTA source bundle.
+
+    This used to be a literal in `_ota_packaged_source_bundle`, i.e. a second
+    copy of `pyproject.toml` maintained by hand. The copies drifted: `mcap` and
+    `Pillow` were added to the project and never to the literal, so a peer
+    prepared from an installed rosotacom got an environment that imported fine
+    and then failed inside the first MCAP or image code path — remotely only,
+    and only for OTA runs started from an install. Derive it instead, so there
+    is exactly one source of truth. `tests/contract/test_ota_source_bundle.py`
+    fails if this stops matching the distribution.
+    """
+    distribution = _ota_installed_distribution()
+    if distribution is None:
+        raise RuntimeError(
+            f"Cannot read the packaging metadata of the installed {PACKAGE_DIR.name!r} distribution, so "
+            "the OTA source bundle cannot be built. Run ota-smoke from a rosotacom checkout, or from an "
+            "installation made with pip/pipx rather than a bare copy of the package directory."
+        )
+    scripts = tuple(
+        (entry.name, entry.value)
+        for entry in sorted(distribution.entry_points, key=lambda entry: entry.name)
+        if entry.group == "console_scripts"
+    )
+    return OtaBundleMetadata(
+        name=distribution.metadata["Name"],
+        version=distribution.version,
+        requires_python=distribution.metadata.get("Requires-Python") or ">=3.10",
+        dependencies=tuple(
+            requirement
+            for requirement in (distribution.requires or ())
+            if not _ota_requirement_is_optional(requirement)
+        ),
+        console_scripts=scripts,
+    )
+
+
+def _ota_distribution_name() -> str:
+    """Name of the distribution that publishes this source.
+
+    Derived, never assumed: this source ships as `rosotacom-dev` from the
+    development fork and as `rosotacom` upstream, and pin mode has to ask the
+    index for the right one.
+    """
+    distribution = _ota_installed_distribution()
+    if distribution is not None:
+        return str(distribution.metadata["Name"])
+    checkout = _ota_source_checkout()
+    if checkout is not None:
+        # A checkout that was never installed still declares its own name. Read
+        # it textually: `tomllib` does not exist on the supported 3.10 floor.
+        match = re.search(
+            r"^\s*name\s*=\s*[\"']([^\"']+)[\"']",
+            (checkout / "pyproject.toml").read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        if match:
+            return match.group(1)
+    raise RuntimeError(
+        "Cannot determine which distribution publishes this rosotacom, so --install-mode pin cannot "
+        "name a package to install. Run from an installed rosotacom or from a checkout with a "
+        "readable pyproject.toml."
+    )
+
+
+def _ota_toml_string(value: str) -> str:
+    """Encode a string as a TOML basic string (JSON escaping is compatible)."""
+    return json.dumps(value)
+
+
 def _ota_packaged_source_bundle(destination: Path) -> Path:
+    metadata = _ota_bundle_metadata()
     source_root = destination / "rosotacom-source"
     package_target = source_root / "src" / "rosotacom"
     package_target.parent.mkdir(parents=True)
     shutil.copytree(PACKAGE_DIR, package_target)
+    dependencies = ", ".join(_ota_toml_string(item) for item in metadata.dependencies)
+    scripts = [f"{name} = {_ota_toml_string(target)}" for name, target in metadata.console_scripts]
     (source_root / "pyproject.toml").write_text(
         "\n".join(
             [
@@ -1638,15 +1806,13 @@ def _ota_packaged_source_bundle(destination: Path) -> Path:
                 'build-backend = "setuptools.build_meta"',
                 "",
                 "[project]",
-                'name = "rosotacom"',
-                f'version = "{__version__}"',
-                'requires-python = ">=3.10"',
-                'dependencies = ["argcomplete>=3.6,<4", "PyYAML>=6", "ros2docker>=0.1.4,<0.2"]',
+                f"name = {_ota_toml_string(metadata.name)}",
+                f"version = {_ota_toml_string(metadata.version)}",
+                f"requires-python = {_ota_toml_string(metadata.requires_python)}",
+                f"dependencies = [{dependencies}]",
                 "",
                 "[project.scripts]",
-                'rosotacom = "rosotacom.cli:main"',
-                'start_rosotacom = "rosotacom.cli:start_compat_main"',
-                'stop_rosotacom = "rosotacom.cli:stop_compat_main"',
+                *scripts,
                 "",
                 "[tool.setuptools]",
                 'package-dir = {"" = "src"}',
@@ -1922,6 +2088,10 @@ def _ota_write_manifest(
             "deployment_state": str(plan.state_path) if plan.state_path else None,
             "workdir": plan.workdir,
             "project": plan.project,
+            # What the peers actually ran, so a result can be attributed to an
+            # artefact rather than to "whatever was on the laptop that day".
+            "install_mode": plan.install_mode,
+            "install_pin": plan.install_pin,
             "peers": {
                 name: {"ssh_configured": bool(peer.ssh), "address": peer.address} for name, peer in plan.peers.items()
             },
@@ -2069,6 +2239,8 @@ def _resolve_ota_smoke_context(
         plan = _ota_plan_from_bindings(
             bindings,
             workdir=str(getattr(args, "workdir", None) or "/tmp/rosotacom_ota"),
+            install_mode=str(getattr(args, "install_mode", None) or "source"),
+            install_pin=getattr(args, "install_pin", None),
         )
     plan_peers = set(plan.peers)
     target_peers = set(_peer_keys_from_cfg(target.cfg))
@@ -2343,14 +2515,15 @@ def _ota_stage_text(peer: OtaSmokePeer, text: str, destination: str, *, dry_run:
 
 
 def _ota_remap_config_roots(
-    raw: Any, key: str, project_root: Path, source_checkout: Path | None, staged_source: str
+    raw: Any, key: str, project_root: Path, rosotacom_root: Path | None, remote_rosotacom_root: str | None
 ) -> Any:
-    """Rewrite config-root paths so they resolve on the remote staged tree.
+    """Rewrite config-root paths so they resolve on the remote.
 
     - relative roots resolve under the staged project, so keep them verbatim;
     - absolute roots inside the project become relative (staged with the project);
-    - absolute roots inside the staged rosotacom source point at the remote source
-      path (``{workdir}/source/...``), since the examples are staged there;
+    - absolute roots inside the local rosotacom tree point at wherever that tree
+      lives on the peer: the staged source (``{workdir}/source/...``) in source
+      mode, and the installed package directory in pin mode;
     - anything else is left untouched (it cannot be staged automatically and will
       surface as a clear "Path does not exist" on the remote).
     """
@@ -2367,9 +2540,9 @@ def _ota_remap_config_roots(
         if rel_to_project is not None:
             remapped.append(rel_to_project.as_posix())
             continue
-        rel_to_source = _relative_to(path, source_checkout) if source_checkout else None
-        if rel_to_source is not None:
-            remapped.append(f"{staged_source}/{rel_to_source.as_posix()}")
+        rel_to_source = _relative_to(path, rosotacom_root) if rosotacom_root else None
+        if rel_to_source is not None and remote_rosotacom_root:
+            remapped.append(f"{remote_rosotacom_root}/{rel_to_source.as_posix()}")
             continue
         remapped.append(str(value))
     if scalar:
@@ -2377,7 +2550,11 @@ def _ota_remap_config_roots(
     return remapped
 
 
-def _ota_remote_project_config(runtime: RuntimeConfig, plan: OtaSmokePlan, source_checkout: Path | None) -> str:
+def _ota_remote_project_config(
+    runtime: RuntimeConfig,
+    rosotacom_root: Path | None,
+    remote_rosotacom_root: str | None,
+) -> str:
     if not runtime.rosotacom_config:
         raise RuntimeError("ota-smoke requires an active rosotacom.yaml project.")
     raw = _load_yaml_file(runtime.rosotacom_config)
@@ -2386,26 +2563,105 @@ def _ota_remote_project_config(runtime: RuntimeConfig, plan: OtaSmokePlan, sourc
         raw["deployment"] = ".rosotacom/deployment.yaml"
     if runtime.profiles_file and _relative_to(runtime.profiles_file, project_root) is None:
         raw["profiles"] = ".rosotacom/profiles.yaml"
-    staged_source = f"{plan.workdir}/source"
     for key in ("session_configs_dir", "scenario_configs_dir"):
         if raw.get(key) is not None:
-            raw[key] = _ota_remap_config_roots(raw[key], key, project_root, source_checkout, staged_source)
+            raw[key] = _ota_remap_config_roots(raw[key], key, project_root, rosotacom_root, remote_rosotacom_root)
     return yaml.safe_dump(raw, sort_keys=False)
+
+
+def _ota_install_pin_script(plan: OtaSmokePlan) -> str:
+    """Create a venv on the peer and install the pinned release into it."""
+    venv = shlex.quote(f"{plan.workdir}/venv")
+    requirement = shlex.quote(f"{_ota_distribution_name()}=={plan.install_pin}")
+    return (
+        f"rm -rf {venv} && python3 -m venv {venv} && "
+        f"{venv}/bin/python -m pip install --upgrade pip && "
+        f"{venv}/bin/python -m pip install {requirement}"
+    )
+
+
+def _ota_project_uses_packaged_configs(runtime: RuntimeConfig) -> bool:
+    """Whether any project config root points inside the installed rosotacom.
+
+    Most projects keep their session and scenario configs next to their own
+    `rosotacom.yaml`; only a project reusing rosotacom's packaged examples
+    reaches into the package. Asking this first keeps pin mode from querying the
+    peer for a path it would not use — which also keeps it working against
+    versions older than the `resources path package` lookup.
+    """
+    if not runtime.rosotacom_config:
+        return False
+    raw = _load_yaml_file(runtime.rosotacom_config)
+    for key in ("session_configs_dir", "scenario_configs_dir"):
+        if raw.get(key) is None:
+            continue
+        for value in _path_values(raw[key], key):
+            path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+            if path.is_absolute() and _relative_to(path.resolve(), PACKAGE_DIR) is not None:
+                return True
+    return False
+
+
+def _ota_remote_package_dir(peer: OtaSmokePeer, plan: OtaSmokePlan, *, dry_run: bool) -> str | None:
+    """Ask the peer's own installation where its packaged resources live.
+
+    Only pin mode needs this, and only for a project that reuses rosotacom's
+    packaged configs: no source tree is staged, so such a root has to be remapped
+    onto the path the peer's venv actually installed it at. The peer answers
+    through the same `resources path` interface every other external consumer
+    uses.
+    """
+    if dry_run:
+        return f"{plan.workdir}/venv/<site-packages>/rosotacom"
+    command = _ota_quote_cmd([f"{plan.workdir}/{plan.rosotacom}", "resources", "path", "package"])
+    result = _ota_run(
+        peer,
+        command,
+        label=f"{peer.name}: locate packaged resources",
+        dry_run=False,
+        check=False,
+    )
+    located = (result.stdout or "").strip()
+    if result.returncode != 0 or not located:
+        raise RuntimeError(
+            f"{peer.name}: rosotacom {plan.install_pin} cannot report its packaged resource paths, and this "
+            "project addresses configs inside the package. `resources path package` needs 2.4 or newer; "
+            "pin a newer version, or move the config roots into the project."
+        )
+    return located
 
 
 def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: OtaSmokePlan) -> None:
     if not runtime.rosotacom_config:
         raise RuntimeError("ota-smoke requires an active rosotacom.yaml project.")
     dry_run = bool(getattr(args, "dry_run", False))
-    source_checkout = _ota_source_checkout()
+    from_pin = plan.install_mode == "pin"
+    source_checkout: Path | None = None
     temporary_bundle: Path | None = None
-    if source_checkout is None:
-        temporary_bundle = Path(tempfile.mkdtemp(prefix="rosotacom-ota-source-"))
-        source_checkout = _ota_packaged_source_bundle(temporary_bundle)
+    if not from_pin:
+        source_checkout = _ota_source_checkout()
+        if source_checkout is None:
+            temporary_bundle = Path(tempfile.mkdtemp(prefix="rosotacom-ota-source-"))
+            source_checkout = _ota_packaged_source_bundle(temporary_bundle)
     reuse = bool(getattr(args, "reuse", False))
     try:
         for peer in plan.peers.values():
-            if not reuse:
+            if reuse:
+                _ota_run(
+                    peer,
+                    f"test -x {shlex.quote(plan.workdir + '/' + plan.rosotacom)}",
+                    label=f"{peer.name}: reuse rosotacom",
+                    dry_run=dry_run,
+                )
+            elif from_pin:
+                _ota_run(
+                    peer,
+                    _ota_install_pin_script(plan),
+                    label=f"{peer.name}: install rosotacom {plan.install_pin} from the index",
+                    dry_run=dry_run,
+                )
+            else:
+                assert source_checkout is not None
                 _ota_stage_tree(
                     peer,
                     source_checkout,
@@ -2423,13 +2679,17 @@ def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: O
                         ".venv/bin/python -m pip install -e ."
                     )
                 _ota_run(peer, install, label=f"{peer.name}: install rosotacom", dry_run=dry_run)
-            else:
-                _ota_run(
-                    peer,
-                    f"test -x {shlex.quote(plan.workdir + '/' + plan.rosotacom)}",
-                    label=f"{peer.name}: reuse rosotacom",
-                    dry_run=dry_run,
+
+            if from_pin:
+                local_root: Path | None = PACKAGE_DIR
+                remote_root = (
+                    _ota_remote_package_dir(peer, plan, dry_run=dry_run)
+                    if _ota_project_uses_packaged_configs(runtime)
+                    else None
                 )
+            else:
+                local_root = source_checkout
+                remote_root = f"{plan.workdir}/source"
 
             project_root = runtime.rosotacom_config.parent
             _ota_stage_tree(
@@ -2441,7 +2701,7 @@ def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: O
             )
             _ota_stage_text(
                 peer,
-                _ota_remote_project_config(runtime, plan, source_checkout),
+                _ota_remote_project_config(runtime, local_root, remote_root),
                 f"{plan.workdir}/{plan.project}",
                 dry_run=dry_run,
                 label=f"{peer.name}: write staged project config",
@@ -7962,6 +8222,20 @@ def main(argv: list[str] | None = None) -> int:
         "--reuse",
         action="store_true",
         help="Reuse an already installed rosotacom source tree in the workdir.",
+    )
+    ota_smoke_parser.add_argument(
+        "--install-mode",
+        choices=list(OTA_INSTALL_MODES),
+        default="source",
+        help=(
+            "How the peers get rosotacom. 'source' (default) stages and installs what you are running — "
+            "right while iterating on rosotacom. 'pin' installs a published release from the index, so the "
+            "peers run the artefact that ships — right when rehearsing a deployment."
+        ),
+    )
+    ota_smoke_parser.add_argument(
+        "--install-pin",
+        help="Version for --install-mode pin (default: the version of the rosotacom you are running).",
     )
     ota_smoke_parser.add_argument(
         "--keep-workdir",

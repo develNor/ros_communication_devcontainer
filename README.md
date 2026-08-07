@@ -53,6 +53,9 @@ pipx install rosotacom-dev        # isolated, on PATH everywhere
      on PyPI stays reserved for the FZI upstream. -->
 #   or: pip install --user rosotacom
 
+# a specific development build (for consumers tracking work in progress)
+pipx install "rosotacom-dev==2.4.dev3"
+
 # from a source checkout (developers)
 cd /path/to/ros_communication_devcontainer
 ./install.sh                      # builds a checkout-local .venv
@@ -63,6 +66,12 @@ rosotacom --version
 python -m rosotacom --version
 rosotacom doctor
 ```
+
+Every commit that lands on the development branch with green CI is published as
+a `X.Y.devN` pre-release, so a consumer never has to wait for a release decision
+or reach past the package to a checkout. `pip` ignores pre-releases unless you
+pin one exactly, so this cannot reach you by accident. See
+[docs/release.md](docs/release.md).
 
 For a source checkout, that single `source .venv/bin/activate` command also
 enables completion. Nothing needs to be added to your shell configuration.
@@ -383,10 +392,10 @@ rosotacom ota-smoke 2_native_chatter \
   --peer b=robot
 ```
 
-`ota-smoke` accepts sessions and scenarios. It automatically stages and
-installs the currently selected rosotacom version, stages the active project,
-runs delivery and isolation checks, collects artifacts, stops the run, and
-removes the remote workdir. Add `--interactive` for a local control tmux with
+`ota-smoke` accepts sessions and scenarios. It puts rosotacom on each peer,
+stages the active project, runs delivery and isolation checks, collects
+artifacts, stops the run, and removes the remote workdir. Add `--interactive`
+for a local control tmux with
 one attachable communication/catmux window per peer with a live status pane below
 each one. Scenario targets also get one native application-container window per
 scenario app. Stop an interactive run with `rosotacom ota-smoke TARGET
@@ -394,6 +403,29 @@ scenario app. Stop an interactive run with `rosotacom ota-smoke TARGET
 metadata is not available. Use `--keep-running` to leave components up,
 `--keep-workdir` to retain staged files, or `--reuse` to reuse an existing
 installation.
+
+#### What the peers run: `--install-mode`
+
+```bash
+# default: stage and install what you are running, uncommitted changes included
+rosotacom ota-smoke 2_native_chatter --peer a=workstation --peer b=robot
+
+# rehearse a deployment: the peers install the published artefact
+rosotacom ota-smoke 2_native_chatter --peer a=workstation --peer b=robot \
+  --install-mode pin                # defaults to your own version
+rosotacom ota-smoke 2_native_chatter --peer a=workstation --peer b=robot \
+  --install-mode pin --install-pin 2.4
+```
+
+`source` is right while iterating on rosotacom itself — the peers run the code
+in front of you. `pin` is right when the run is meant to stand in for a real
+deployment: the peers install from the index, so a packaging defect (a file
+missing from the wheel, an undeclared dependency) fails in the rehearsal instead
+of on the target machine. `source` cannot catch that class of defect by
+construction, because it never builds the artefact that ships.
+
+The run manifest records which mode and which version the peers ran, so a result
+can be attributed to an artefact rather than to a working copy.
 
 ### Live status / debugging overview
 

@@ -18,6 +18,7 @@ import pytest
 import yaml
 
 import rosotacom.cli as rosotacom
+from rosotacom.deployment import PeerBinding
 
 
 @pytest.fixture(autouse=True)
@@ -2784,3 +2785,117 @@ def test_resources_path_reports_an_incomplete_installation(monkeypatch: pytest.M
     monkeypatch.setitem(rosotacom.NAMED_RESOURCES, "ws", tmp_path / "gone")
     with pytest.raises(RuntimeError, match="missing from this rosotacom installation"):
         rosotacom.resources_path_command(argparse.Namespace(name="ws"))
+
+
+def _ota_bindings() -> dict[str, PeerBinding]:
+    return {
+        "a": PeerBinding("a", "10.0.0.10", None, "workstation"),
+        "b": PeerBinding("b", "10.0.0.11", "robot-b", "robot"),
+    }
+
+
+def test_ota_source_mode_stages_a_checkout_and_owns_the_default() -> None:
+    plan = rosotacom._ota_plan_from_bindings(_ota_bindings(), workdir="/tmp/rosotacom_ota")
+
+    assert plan.install_mode == "source"
+    assert plan.install_pin is None
+    assert plan.rosotacom == "source/.venv/bin/rosotacom"
+
+
+def test_ota_pin_mode_defaults_to_the_running_version() -> None:
+    # `--install-mode pin` alone means "rehearse what I am running, as it
+    # ships", so it must not need a second flag to be useful.
+    plan = rosotacom._ota_plan_from_bindings(_ota_bindings(), workdir="/tmp/rosotacom_ota", install_mode="pin")
+
+    assert plan.install_pin == rosotacom.__version__
+    assert plan.rosotacom == "venv/bin/rosotacom"
+
+
+def test_ota_pin_mode_installs_the_published_distribution() -> None:
+    plan = rosotacom._ota_plan_from_bindings(
+        _ota_bindings(), workdir="/tmp/rosotacom_ota", install_mode="pin", install_pin="2.4"
+    )
+
+    script = rosotacom._ota_install_pin_script(plan)
+
+    assert "python3 -m venv /tmp/rosotacom_ota/venv" in script
+    assert f"pip install {rosotacom._ota_distribution_name()}==2.4" in script
+    # Nothing is staged in pin mode: the peer pulls the artefact from the index.
+    assert "source" not in script
+
+
+def test_ota_pin_mode_rejects_a_version_no_index_can_serve() -> None:
+    # A local build ("0+unknown", or anything with a local segment) would make
+    # the peers install some *other* version while the manifest claims this one.
+    for unusable in ("0+unknown", "2.4.dev3+g1234567"):
+        with pytest.raises(RuntimeError, match="not something an index can serve"):
+            rosotacom._ota_plan_from_bindings(
+                _ota_bindings(), workdir="/tmp/rosotacom_ota", install_mode="pin", install_pin=unusable
+            )
+
+
+def test_ota_install_pin_requires_pin_mode() -> None:
+    with pytest.raises(RuntimeError, match="only applies to --install-mode pin"):
+        rosotacom._ota_plan_from_bindings(
+            _ota_bindings(), workdir="/tmp/rosotacom_ota", install_mode="source", install_pin="2.4"
+        )
+
+
+def test_ota_rejects_an_unknown_install_mode() -> None:
+    with pytest.raises(RuntimeError, match="Unsupported OTA install mode"):
+        rosotacom._ota_plan_from_bindings(_ota_bindings(), workdir="/tmp/rosotacom_ota", install_mode="wheel")
+
+
+def test_ota_state_round_trips_the_install_mode(tmp_path: Path) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    plan = rosotacom._ota_plan_from_bindings(
+        _ota_bindings(), workdir="/tmp/rosotacom_ota", install_mode="pin", install_pin="2.4"
+    )
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "auto")
+    instance = rosotacom._resolve_session_instance(runtime, target.session, "ota")
+
+    plan = rosotacom._ota_write_state(instance, plan)
+
+    # A stop or a --state-file resume must reach the same executable the start
+    # installed; losing the mode here would look for a source tree that is
+    # not there.
+    assert rosotacom._ota_load_state(str(plan.state_path)) == plan
+
+
+def test_ota_manifest_records_what_the_peers_ran(tmp_path: Path) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    plan = rosotacom._ota_plan_from_bindings(
+        _ota_bindings(), workdir="/tmp/rosotacom_ota", install_mode="pin", install_pin="2.4"
+    )
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "auto")
+    instance = rosotacom._resolve_session_instance(runtime, target.session, "ota")
+    plan = rosotacom._ota_write_state(instance, plan)
+
+    rosotacom._ota_write_manifest(
+        instance, target, runtime, plan, tmux_session=None, interactive=False, phase="running"
+    )
+
+    manifest = yaml.safe_load((instance.host_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    run = manifest["ota_smoke_runs"]["scenario:demo"]
+
+    assert run["install_mode"] == "pin"
+    assert run["install_pin"] == "2.4"
+
+
+def test_pin_mode_does_not_query_a_self_contained_project(tmp_path: Path) -> None:
+    # The peer lookup exists only for projects that reuse rosotacom's packaged
+    # configs. Running it unconditionally would make pin mode depend on a
+    # command that older pinned versions do not have, for an answer it would
+    # then discard.
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+
+    assert rosotacom._ota_project_uses_packaged_configs(runtime) is False
+
+
+def test_pin_mode_queries_a_project_reusing_packaged_configs(tmp_path: Path) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    config = rosotacom._load_yaml_file(runtime.rosotacom_config)
+    config["session_configs_dir"] = str(rosotacom.EXAMPLE_PROJECT_DIR / "sessions")
+    runtime.rosotacom_config.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    assert rosotacom._ota_project_uses_packaged_configs(runtime) is True

@@ -43,6 +43,21 @@ Shared workflow:
   is unavailable, record why in the PR and final status.
 - Keep the PR description current with the issue link, validation commands,
   important SHAs, CI status, and any dependency on another PR or harness MR.
+
+Release autonomy — where the human decision actually is:
+
+- Agents run a change to the end: branch, PR, CI, auto-merge. Merging publishes
+  a `X.Y.devN` pre-release automatically (`.github/workflows/dev-release.yml`),
+  so a downstream repository can pin the result immediately. Nothing about that
+  needs a human, and a merged change that nobody can consume is not finished.
+- Cutting a stable `vX.Y.Z` tag is the one release step that is a decision, not
+  a consequence: the version is a promise to consumers and cannot be taken back
+  once it is on the index. Cut one only when the task says so.
+- A stable tag needs `docs/release-notes/vX.Y.Z.md` **in the tagged commit**.
+  Add it in the PR that will be tagged; adding it afterwards leaves the release
+  job failing on a tag that cannot be moved.
+- Never reuse or move a published version. If a release is wrong, supersede it
+  with the next one and say so in its notes.
 - Before reporting completion, check the remote PR state and CI results with
   `gh pr view` / `gh pr checks`; report the actual status, not just that a
   branch was pushed.

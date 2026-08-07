@@ -27,7 +27,7 @@
     "BASE_IMAGE": "osrf/ros:kilted-desktop-full-noble",
     "DIGEST": "@sha256:29eb6f48bb06549aba004a7a4b12c00ece23b156731df12cf1f3c1ae1b0fd178",
     "INSTALL_ZENOH":                 "1",
-    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp iw nload iftop iproute2 tshark ros-kilted-domain-bridge ros-kilted-rmw-cyclonedds-cpp ros-kilted-rmw-zenoh-cpp ros-kilted-ffmpeg-image-transport ros-kilted-ffmpeg-image-transport-msgs",
+    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp iw nload iftop iproute2 tshark ros-kilted-domain-bridge ros-kilted-rmw-cyclonedds-cpp ros-kilted-rmw-zenoh-cpp ros-kilted-topic-tools ros-kilted-image-transport ros-kilted-ffmpeg-image-transport ros-kilted-ffmpeg-image-transport-msgs",
     "PIP_PACKAGES":                  "numpy>=1.26,<2 lz4 pysnmp speedtest-cli psutil zstandard opencv-python"
   }
 }

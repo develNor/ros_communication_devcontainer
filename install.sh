@@ -9,13 +9,13 @@ set -euo pipefail
 #
 # Optional env vars:
 #   VENV_DIR=.venv
-#   ROS2DOCKER_SPEC='ros2docker==0.1.3'
+#   ROS2DOCKER_SPEC='ros2docker==0.1.4'
 #   BIN_DIR=~/.local/bin
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR"
 VENV_DIR="${VENV_DIR:-"$ROOT_DIR/.venv"}"
-ROS2DOCKER_SPEC="${ROS2DOCKER_SPEC:-"ros2docker==0.1.3"}"
+ROS2DOCKER_SPEC="${ROS2DOCKER_SPEC:-"ros2docker==0.1.4"}"
 BIN_DIR="${BIN_DIR:-"$HOME/.local/bin"}"
 
 INSTALL_GLOBAL_SYMLINKS=false

@@ -196,6 +196,15 @@ jobs:
           repository-url: ${{ vars.TESTPYPI_PUBLISH_URL }}
           skip-existing: true
 
+      # The rehearsal writes <dist>.publish.attestation next to each artifact,
+      # and it does so even when the upload itself then fails. Both publish
+      # steps share one dist/, so the second refuses to start: "distributions
+      # already have publish attestations". Clearing them makes the production
+      # upload independent of whether the rehearsal ran, succeeded, or failed.
+      - name: Clear rehearsal attestations
+        if: always()
+        run: rm -f dist/*.publish.attestation
+
       - name: Publish distributions
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

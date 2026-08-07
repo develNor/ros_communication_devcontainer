@@ -116,3 +116,74 @@ def test_precommit_ruff_matches_pyproject_pin() -> None:
         f"ruff pre-commit rev {rev!r} does not match pyproject pin "
         f"ruff=={pyproject_version}; keep local hooks and just/CI checks aligned"
     )
+
+
+def _release_e2e_slices() -> list[str]:
+    """The slice names the release matrix expands to."""
+    workflow = yaml.safe_load((WORKFLOWS_DIR / "release.yml").read_text(encoding="utf-8"))
+    return list(workflow["jobs"]["e2e"]["strategy"]["matrix"]["slice"])
+
+
+def _recipe_pytest_invocations(recipe: str) -> list[list[str]]:
+    """Every pytest argument list a recipe runs, with just's substitutions applied."""
+    import shlex
+
+    text = JUSTFILE_PATH.read_text(encoding="utf-8")
+    match = re.search(rf"^{re.escape(recipe)}\s*:[^\n]*\n(?P<body>(?:[ \t]+[^\n]*\n?)+)", text, re.MULTILINE)
+    assert match, f"recipe {recipe!r} not found in the justfile"
+
+    invocations: list[list[str]] = []
+    for line in match.group("body").splitlines():
+        line = line.strip()
+        if "-m pytest" not in line:
+            continue
+        tokens = shlex.split(line.replace("{{python}}", "python"))
+        start = tokens.index("pytest") + 1
+        invocations.append([t for t in tokens[start:] if t != "-q"])
+    return invocations
+
+
+def _collect_e2e_ids(args: list[str]) -> set[str]:
+    import os
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", *args],
+        capture_output=True,
+        text=True,
+        cwd=PACKAGE_ROOT,
+        env={**os.environ, "ROSOTACOM_RUN_E2E": "1"},
+        check=False,
+    )
+    return {line.strip() for line in result.stdout.splitlines() if line.startswith("tests/e2e/")}
+
+
+def test_e2e_slices_partition_the_whole_suite() -> None:
+    """The parallel slices must collect exactly what the monolith collects.
+
+    `test-e2e-smoke` is `pytest tests/e2e/ -m e2e`, so it picks up any new file
+    automatically; the slices name files and `-k` expressions by hand and do
+    not. When the merge gate was split into slices, three files
+    (anonymize, video-quality, benchmark-replay) and the two
+    `[remote-assist-anonymized-*]` parameters silently stopped being covered
+    there — `-k "remote_assist"` misses the latter because the parameter id
+    spells it with hyphens. Nothing failed, because nightly and the release
+    still ran the monolith. This test is what makes that drift loud.
+    """
+    monolith = _collect_e2e_ids(["tests/e2e/", "-m", "e2e"])
+    assert monolith, "collected no e2e tests; the monolith invocation changed"
+
+    covered: set[str] = set()
+    for slice_name in _release_e2e_slices():
+        for args in _recipe_pytest_invocations(f"test-e2e-{slice_name}"):
+            covered |= _collect_e2e_ids(args)
+
+    assert not monolith - covered, (
+        "These e2e tests run in `just test-e2e-smoke` but in no slice, so the "
+        "merge gate and the release would not run them:\n" + "\n".join(sorted(monolith - covered))
+    )
+    assert not covered - monolith, (
+        "These tests are selected by a slice but not by the monolith, so the "
+        "two definitions disagree:\n" + "\n".join(sorted(covered - monolith))
+    )

@@ -35,6 +35,18 @@ The distribution name is never hardcoded in the source. This code publishes as
 name. Assuming one is what made every installed `rosotacom-dev` up to 2.3 report
 its version as `0+unknown`.
 
+The two "dev" in `rosotacom-dev==2.4.dev3` are not the same word, and only one
+of them is about maturity:
+
+- `-dev` in the **distribution name** says which line publishes it — the
+  development fork, as opposed to the FZI upstream that publishes as
+  `rosotacom`. It is part of every version of this package, stable ones
+  included: `rosotacom-dev==2.4` is a stable release.
+- `.dev3` in the **version** says how far along that particular artefact is
+  within this line: the third commit after `v2.3`, on the way to `2.4`.
+
+So `rosotacom-dev` alone tells you nothing about maturity. The version does.
+
 ## Tags
 
 Stable releases use tags in this form:

@@ -30,3 +30,7 @@ src/rosotacom/resources/examples/sessions/**/b_to_a_topics.txt
 src/rosotacom/resources/examples/sessions/**/qos.yaml
 src/rosotacom/resources/examples/session-instances/
 CLAUDE.md
+
+# The dedicated agent account's credential lives here and must never reach a
+# commit. See docs/github-repository-settings.md, "Identities".
+.agents/

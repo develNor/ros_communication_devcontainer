@@ -143,7 +143,7 @@ def _patch_start_session_collaborators(
     monkeypatch.setattr(rosotacom, "_resolve_session", lambda session_dir, runtime: session)
     monkeypatch.setattr(rosotacom, "_effective_session_config", lambda *args, **kwargs: cfg)
     monkeypatch.setattr(rosotacom, "_scoped_image_name", lambda runtime: "image:id")
-    monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg, instance: [])
+    monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg, instance, **kwargs: [])
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "detached")
     monkeypatch.setattr(rosotacom, "_container_exists", lambda name: False)
     monkeypatch.setattr(rosotacom, "_wait_for_container_ready", lambda name: None)

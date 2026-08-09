@@ -1817,9 +1817,32 @@ def test_container_scripts_run_through_the_interpreter() -> None:
 
     Asserted as a property rather than as one literal command, so a second
     script added later fails here instead of on a machine.
+
+    The first version of this test looked only at `cli.py`, and the session
+    templates carried two more of exactly the same call — `get_ota_xml.py` and
+    `create_zenoh_json5.py`. Those failed the same way and cost the same
+    bring-up a second time: the redirect made the failure silent, leaving a
+    zero-byte DDS profile, so the symptom was an unexplained XML parser error
+    and an OTA layer that never came up. Anything that runs inside a container
+    is in scope here, not just what `cli.py` spawns.
     """
     assert rosotacom.RUN_SESSION_CONTAINER_ARGV[0] == "python3"
     assert rosotacom.RUN_SESSION_CONTAINER_ARGV[1].endswith("/run_session.py")
+
+    # The session content templates run commands in the container too, and a
+    # failure there is worse than an exec error: the call is redirected into a
+    # config file, so a non-executable script leaves an empty one and the next
+    # component reports a parse error instead of a missing interpreter.
+    content = Path(rosotacom.__file__).parent / "resources" / "ws" / "session" / "content"
+    for template in sorted(content.rglob("*.yaml")):
+        text = template.read_text(encoding="utf-8")
+        for match in re.finditer(r"(?<![\w/])(/ws/[\w/.-]+\.py)", text):
+            preceding = text[max(0, match.start() - 40) : match.start()]
+            assert "python3 " in preceding, (
+                f"{template.name}: {match.group(1)} is run by path. In a wheel "
+                "install it is not executable, and here the output is "
+                "redirected into a config file, so the failure is silent."
+            )
 
     # And the same for any container script added later. Comment lines are
     # dropped first: the explanation above quotes the failing path, and a test

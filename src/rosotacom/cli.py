@@ -4249,13 +4249,40 @@ def _create_scenario_tmux(
     return session_name
 
 
+def _local_ipc_run_args(network_isolated: bool) -> list[str]:
+    """Share the host IPC namespace, unless the run is network-isolated.
+
+    A peer has to exchange local-domain data with application containers on the
+    same machine — a replay, the control centre. With `--network host` but
+    `ipc=private` each container has its own `/dev/shm`, FastDDS sees two
+    participants on one host, negotiates shared memory, and writes into a
+    segment the other side cannot map. Discovery goes over UDP and works;
+    delivery goes over SHM and is dropped without a word.
+
+    The result is the worst shape a failure can take: the link comes up, the
+    heartbeat crosses at 10 Hz with 0% loss, every pipeline reads `pub=1 sub=1`
+    — and no payload ever enters it. Measured on 2026-08-09: 399 messages in
+    eight seconds inside the publisher's container, 0 in the peer's.
+
+    The OTA path never showed it, because the generated unicast profile pins
+    explicit locators and therefore forces UDP.
+
+    Not under `--network-name`. Sharing SHM there would let DDS bypass the very
+    boundary the isolation exists to simulate, and a test that passes through a
+    hole in its own isolation is worse than no test at all.
+    """
+    return [] if network_isolated else ["--ipc", "host"]
+
+
 def _base_extra_run_args(
     runtime: RuntimeConfig,
     session: ResolvedSession,
     cfg: dict[str, Any],
     instance: SessionInstance,
+    *,
+    network_isolated: bool = False,
 ) -> list[str]:
-    args: list[str] = []
+    args: list[str] = _local_ipc_run_args(network_isolated)
     ros2docker_cfg = load_config(runtime.ros2docker_config)
 
     if not ros2docker_cfg.get("mount_ws"):
@@ -4425,7 +4452,7 @@ def start_session(args: argparse.Namespace) -> str:
                 " (or pass --force to replace it, --skip-conflict-check to ignore it).",
             )
     image_name = _scoped_image_name(runtime)
-    extra_run_args = _base_extra_run_args(runtime, session, cfg, instance)
+    extra_run_args = _base_extra_run_args(runtime, session, cfg, instance, network_isolated=network_isolated)
     run_override: dict[str, object] = {}
     network_name = getattr(args, "network_name", None)
     if network_name:

@@ -1888,6 +1888,29 @@ def test_resolve_session_and_base_extra_run_args(tmp_path: Path, monkeypatch: py
     assert f"{runtime.session_configs_dir[0]}:/session/definitions:ro" in args
     assert f"{runtime.session_instances_dir}:/session/instances" in args
     assert "Configured sessions:" in rosotacom._format_available_sessions(runtime)
+    # A peer shares the host IPC namespace, so it can exchange local-domain
+    # data with application containers on the same machine. See
+    # `_local_ipc_run_args` for what happens without it.
+    assert args[:2] == ["--ipc", "host"]
+
+
+def test_a_peer_shares_the_host_ipc_namespace_unless_isolated() -> None:
+    """Without it, a peer receives nothing from a local application container.
+
+    `--network host` with `ipc=private` gives every container its own
+    /dev/shm. FastDDS sees two participants on one host, chooses shared memory,
+    and the reader never maps the writer's segment. Discovery succeeds, delivery
+    does not, and nothing in the output says so: the link comes up, the
+    heartbeat crosses at 10 Hz with 0% loss, and no payload ever enters it.
+
+    Isolated on 2026-08-09 with two containers from one image on one host:
+    `ipc=private` received 0 messages, `--ipc host` received 200.
+    """
+    assert rosotacom._local_ipc_run_args(network_isolated=False) == ["--ipc", "host"]
+    # Under network isolation it must not be shared: SHM would carry data
+    # straight past the boundary the isolation exists to simulate, and a test
+    # that passes through a hole in its own isolation is worse than none.
+    assert rosotacom._local_ipc_run_args(network_isolated=True) == []
 
 
 def test_container_helpers_use_docker_and_ros2docker_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1928,7 +1951,7 @@ def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         rosotacom,
         "_base_extra_run_args",
-        lambda runtime, session, cfg, instance: ["--network", "host"],
+        lambda runtime, session, cfg, instance, **kwargs: ["--network", "host"],
     )
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "detached")
     monkeypatch.setattr(rosotacom, "_list_docker_containers", lambda all_states=False: [])
@@ -1972,7 +1995,7 @@ def test_start_session_attach_dispatches_command_run(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(rosotacom, "_effective_session_config", lambda *args, **kwargs: cfg)
     monkeypatch.setattr(rosotacom, "_auto_identity", lambda *args: "a")
     monkeypatch.setattr(rosotacom, "_scoped_image_name", lambda runtime: "image:id")
-    monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg, instance: [])
+    monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg, instance, **kwargs: [])
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "attach")
     monkeypatch.setattr(rosotacom, "_list_docker_containers", lambda all_states=False: [])
     monkeypatch.setattr(rosotacom, "_stop_container_name", lambda *args, **kwargs: True)

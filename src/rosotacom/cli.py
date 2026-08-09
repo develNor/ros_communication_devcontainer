@@ -98,7 +98,19 @@ SESSION_CONFIG_CONTAINER_DIR = "/session/configs"
 SESSION_DEFINITION_CONTAINER_DIR = "/session/definitions"
 SESSION_INSTANCE_CONTAINER_DIR = "/session/instances"
 EXTERNAL_SESSION_CONTAINER_DIR = "/session/current"
-RUN_SESSION_CONTAINER_PATH = "/ws/session/creation/run_session.py"
+# Run through the interpreter, never as a bare path. `docker exec` on a bare
+# path relies on the file's executable bit, and a wheel does not carry
+# executable bits for package data: the bit is present in a checkout and gone
+# after an install. Every packaged machine therefore failed with
+# `exec: "/ws/session/creation/run_session.py": permission denied` and exit 126,
+# while the development laptop — an editable install over the checkout — worked.
+# That is the one shape no test exercised, and the only shape a control centre,
+# a vehicle or a bench machine ever runs.
+#
+# Not relying on the bit beats making the bit survive packaging: one is a
+# property of this command, the other a property of every tool in the chain.
+# `anonymize_bag.py` two thousand lines below already does it this way.
+RUN_SESSION_CONTAINER_ARGV = ("python3", "/ws/session/creation/run_session.py")
 DEFAULT_SMOKE_SESSION = "1_heartbeat"
 OTA_SUDO_MODES = ("passwordless", "askpass")
 
@@ -4299,7 +4311,7 @@ def _session_command(
     link_trace_modem_command: str | None = None,
 ) -> list[str]:
     parts = [
-        RUN_SESSION_CONTAINER_PATH,
+        *RUN_SESSION_CONTAINER_ARGV,
         "--session-dir",
         session.container_dir,
         "--output-dir",

@@ -1759,6 +1759,7 @@ def test_peer_binding_identity_and_command_helpers(tmp_path: Path, monkeypatch: 
         peer_address_overrides={"a": "10.0.0.1", "b": "10.0.0.2"},
         attach_mode="attach",
     ) == [
+        "python3",
         "/ws/session/creation/run_session.py",
         "--session-dir",
         "/session/current",
@@ -1799,6 +1800,41 @@ def test_peer_binding_identity_and_command_helpers(tmp_path: Path, monkeypatch: 
 
     with pytest.raises(RuntimeError, match="Duplicate"):
         rosotacom._parse_peer_address_overrides(["a=1.1.1.1", "a=2.2.2.2"])
+
+
+def test_container_scripts_run_through_the_interpreter() -> None:
+    """No `docker exec` may depend on a file's executable bit.
+
+    A wheel does not carry executable bits for package data, so a bare script
+    path works from a checkout and fails from an install with
+
+        exec: "/ws/session/creation/run_session.py": permission denied
+
+    and exit 126. That broke `rosotacom start` on every packaged machine —
+    bench, control centre, vehicle — while the development laptop's editable
+    install kept working, which is why it survived to a two-host bring-up on
+    2026-08-09 before anyone saw it.
+
+    Asserted as a property rather than as one literal command, so a second
+    script added later fails here instead of on a machine.
+    """
+    assert rosotacom.RUN_SESSION_CONTAINER_ARGV[0] == "python3"
+    assert rosotacom.RUN_SESSION_CONTAINER_ARGV[1].endswith("/run_session.py")
+
+    # And the same for any container script added later. Comment lines are
+    # dropped first: the explanation above quotes the failing path, and a test
+    # that reads prose as code would fail on the wrong thing.
+    code = "\n".join(
+        line
+        for line in Path(rosotacom.__file__).read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for match in re.finditer(r'"(/ws/[^"]*\.py)"', code):
+        preceding = code[max(0, match.start() - 200) : match.start()]
+        assert '"python3"' in preceding, (
+            f"{match.group(1)} is handed to the container without an interpreter; "
+            "a wheel install has no executable bit and this fails with exit 126"
+        )
 
 
 def test_resolve_session_and_base_extra_run_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

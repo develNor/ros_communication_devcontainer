@@ -7,6 +7,7 @@ from rosotacom.status_eval import (
     evaluate_reports,
     expectations_from_cfg,
     resolve_expect_for_profile,
+    topics_requiring_bag,
 )
 
 
@@ -350,11 +351,37 @@ def test_bag_completeness_above_ratio_passes() -> None:
 
 
 def test_bag_completeness_skipped_without_ground_truth() -> None:
+    # `evaluate_report` itself still skips -- it has no bag to compare against.
+    # That silence is exactly why the CLI must refuse the run one level up; see
+    # the `topics_requiring_bag` tests below (#214).
     topic = {"base": "/tf", "direction": "inbound", "overall": "OK", "stages": [_counted2("app_in", 1.0, 100)]}
     assert (
         evaluate_report({"peer": "a", "topics": [topic]}, {"/tf": {"completeness": {"vs_bag_ratio": 0.9}}}, None, None)
         == []
     )
+
+
+def test_topics_requiring_bag_lists_only_replay_only_expectations() -> None:
+    expect = {
+        "/tf": {"completeness": {"vs_bag_ratio": 0.1}},
+        "/costmap": {"completeness": {"vs_bag_ratio": 0.85}},
+        "/plain": {"hz": {"min": 5}},
+        "/within_peer_only": {"completeness": {"min_ratio": 0.7}},
+    }
+    assert topics_requiring_bag(expect) == ["/costmap", "/tf"]
+
+
+def test_topics_requiring_bag_is_empty_without_any_declaration() -> None:
+    assert topics_requiring_bag({"/plain": {"hz": {"min": 5}}}) == []
+    assert topics_requiring_bag({}) == []
+
+
+def test_topics_requiring_bag_sees_a_per_profile_declaration() -> None:
+    # RFC 0004: the conditional block can come from a profile override, so a
+    # profiled run must be inspected through the same resolution the evaluator
+    # uses -- otherwise the requirement is invisible under `--profile`.
+    expect = {"/tf": {"per_profile": {"lossy": {"completeness": {"vs_bag_ratio": 0.5}}}}}
+    assert topics_requiring_bag(expect, profile="lossy") == ["/tf"]
 
 
 def test_suggest_stream_topic_emits_hz_band() -> None:

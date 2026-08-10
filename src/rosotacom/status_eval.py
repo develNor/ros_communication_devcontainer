@@ -105,6 +105,27 @@ def resolve_expect_for_profile(expect: dict[str, Any], profile: str | None) -> d
     return resolved
 
 
+def topics_requiring_bag(expect_by_topic: dict[str, dict[str, Any]], profile: str | None = None) -> list[str]:
+    """Topics whose expectations can only be evaluated against a replay bag.
+
+    `completeness.vs_bag_ratio` compares the delivered rate to the *source's*
+    native rate, which only a bag knows. `_check_bag_completeness` returns
+    early when no ground truth was supplied, so without `--bag` such an
+    expectation is skipped in silence and the run still prints `TEST OK`.
+
+    A skipped assertion reads as coverage, which is worse than no assertion at
+    all: it is the exact shape of the defect these contracts exist to catch.
+    The caller uses this to refuse the run instead.
+    """
+    required = []
+    for base, raw in sorted((expect_by_topic or {}).items()):
+        expect = resolve_expect_for_profile(raw or {}, profile)
+        completeness = expect.get("completeness") or {}
+        if isinstance(completeness, dict) and completeness.get("vs_bag_ratio") is not None:
+            required.append(base)
+    return required
+
+
 def expectations_from_cfg(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Map a topic's base name -> its `expect` block, from a session config."""
     out: dict[str, dict[str, Any]] = {}

@@ -6540,6 +6540,26 @@ def test_command(args: argparse.Namespace) -> int:
         from . import bag_ground_truth
 
         ground_truth = bag_ground_truth.bag_ground_truth(bag)
+    elif not getattr(args, "suggest", False):
+        # A `vs_bag_ratio` needs the bag's native rate, and without one it is
+        # skipped rather than failed -- so the run would print TEST OK having
+        # checked nothing about completeness. Refuse instead: the declaration
+        # is the statement of intent, and honouring it or failing loudly is
+        # this command's job.
+        needs_bag = status_eval.topics_requiring_bag(expect_by_topic, profile)
+        if needs_bag:
+            listed = "\n".join(f"    {base}" for base in needs_bag)
+            print(
+                f"rosotacom test: {len(needs_bag)} topic(s) declare "
+                f"`completeness.vs_bag_ratio`, which compares the delivered rate "
+                f"to the source's native rate and can only be evaluated against "
+                f"the replay bag:\n{listed}\n"
+                f"Pass `--bag <dir>`, or drop the assertion from a session that "
+                f"is not replay-driven. Without a bag it would be skipped in "
+                f"silence and this run would report success.",
+                file=sys.stderr,
+            )
+            return 1
     reports: dict[str, Any] = {}
     failures: list[str] = []
 

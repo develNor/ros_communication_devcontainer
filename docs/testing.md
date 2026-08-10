@@ -75,6 +75,16 @@ planned decimation is not counted as OTA loss. The default `--min-ratio 0.9`
 leaves a safety margin for a healthy link; tune it per gate instead of
 committing a brittle 100% threshold.
 
+**`vs_bag_ratio` is replay-only, and the run refuses to pretend otherwise.** It
+compares the delivered rate to the source's native rate, which only the bag
+knows, so `rosotacom test` needs `--bag <dir>` to evaluate it. Until #214 a run
+without one skipped those assertions silently and still printed `TEST OK` — a
+session could declare completeness on every topic and have none of it checked.
+`test` now exits non-zero naming the topics instead. If a session genuinely is
+not replay-driven, drop the assertion rather than running without the bag: a
+skipped check reads as coverage, which is the failure mode these contracts
+exist to catch.
+
 Transient-local or explicitly latched topics become `mode: latched`, because the
 contract is that the held value arrives, not that the topic keeps ticking.
 Sparse volatile topics become `mode: existence`; the current expect model has no

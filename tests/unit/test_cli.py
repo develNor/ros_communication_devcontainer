@@ -982,6 +982,133 @@ def test_ota_collect_logs_extracts_each_peer_into_instance(
     assert not list(host_dir.glob("**/*.tar.gz.b64"))
 
 
+def _wait_script_env(tmp_path: Path, docker_stdout: str) -> dict[str, str]:
+    """PATH with a stub docker that prints `docker_stdout` for any invocation."""
+    stub = tmp_path / "bin" / "docker"
+    stub.parent.mkdir(exist_ok=True)
+    stub.write_text(f"#!/bin/sh\nprintf '%s\\n' {rosotacom.shlex.quote(docker_stdout)}\n", encoding="utf-8")
+    stub.chmod(0o755)
+    return {**os.environ, "PATH": f"{stub.parent}:{os.environ['PATH']}"}
+
+
+def test_ota_wait_script_is_unbounded_without_timeout() -> None:
+    script = rosotacom._ota_wait_for_running_container_suffix_script("_com_to_b", "a:communication")
+
+    assert "exit 1" not in script
+    assert "waiting for running container:" in script
+
+
+def test_ota_bounded_wait_script_fails_clearly_when_the_bound_is_hit(tmp_path: Path) -> None:
+    script = rosotacom._ota_wait_for_running_container_suffix_script(
+        "_scenario_demo_a_local_app", "a:application:local_app", timeout_s=2
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", script], env=_wait_script_env(tmp_path, "unrelated_container"), text=True, capture_output=True
+    )
+
+    assert result.returncode == 1
+    assert "[ERROR] no running container after 2s: a:application:local_app" in result.stderr
+
+
+def test_ota_bounded_wait_script_succeeds_once_the_container_runs(tmp_path: Path) -> None:
+    script = rosotacom._ota_wait_for_running_container_suffix_script(
+        "_scenario_demo_a_local_app", "a:application:local_app", timeout_s=2
+    )
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    container = rosotacom._scenario_container_name(runtime, "demo", "a", "local_app", "run1")
+
+    result = subprocess.run(
+        ["bash", "-c", script], env=_wait_script_env(tmp_path, container), text=True, capture_output=True
+    )
+
+    assert result.returncode == 0
+    assert f"[INFO] found running container: {container}" in result.stdout
+
+
+def test_ota_wait_for_scenario_applications_waits_per_declared_application(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
+    plan = _ota_plan(tmp_path)
+    ran: list[tuple[str, str]] = []
+
+    def fake_ota_run(peer: rosotacom.OtaSmokePeer, script: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        ran.append((peer.name, script))
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(rosotacom, "_ota_run", fake_ota_run)
+
+    assert rosotacom._ota_wait_for_scenario_applications(target, plan, dry_run=False) == []
+
+    assert [name for name, _script in ran] == ["a", "b"]
+    for identity, script in ran:
+        assert f"_scenario_demo_{identity}_local_app" in script
+        # The bound: verification must not wait forever, unlike the interactive panes.
+        assert "exit 1" in script
+
+
+def test_ota_wait_for_scenario_applications_reports_the_bound_not_the_topics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
+    plan = _ota_plan(tmp_path)
+
+    monkeypatch.setattr(
+        rosotacom,
+        "_ota_run",
+        lambda peer, script, **kwargs: subprocess.CompletedProcess([], 0 if peer.name == "a" else 1, "", ""),
+    )
+
+    errors = rosotacom._ota_wait_for_scenario_applications(target, plan, dry_run=False)
+
+    assert len(errors) == 1
+    assert "b: application 'local_app' has no running container" in errors[0]
+    assert "never came up" in errors[0]
+
+
+def test_ota_verify_only_stops_before_checks_when_applications_never_come_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "scenario")
+    plan = _ota_plan(tmp_path)
+    checks: list[str] = []
+
+    monkeypatch.setattr(rosotacom, "_resolve_ota_smoke_context", lambda args: (runtime, plan, target))
+    monkeypatch.setattr(
+        rosotacom,
+        "_ota_wait_for_scenario_applications",
+        lambda *args, **kwargs: ["b: application 'local_app' has no running container after 600s"],
+    )
+    monkeypatch.setattr(rosotacom, "_ota_start_session_publishers", lambda *args, **kwargs: checks.append("publishers"))
+    monkeypatch.setattr(rosotacom, "_ota_verify_delivery", lambda *args, **kwargs: checks.append("delivery") or [])
+    monkeypatch.setattr(rosotacom, "_ota_verify_isolation", lambda *args, **kwargs: checks.append("isolation") or [])
+
+    rc = rosotacom._ota_verify_only(argparse.Namespace(instance_id="run1", dry_run=False))
+
+    assert rc == 1
+    # The point of #218: no status checks against a scenario that is not up.
+    assert checks == []
+
+
+def test_ota_wait_for_scenario_applications_ignores_session_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "session")
+    plan = _ota_plan(tmp_path)
+    monkeypatch.setattr(rosotacom, "_ota_run", lambda *args, **kwargs: pytest.fail("session targets must not wait"))
+
+    assert rosotacom._ota_wait_for_scenario_applications(target, plan, dry_run=False) == []
+
+
 def test_ota_smoke_parser_accepts_stop_without_peer_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[argparse.Namespace] = []
     monkeypatch.setattr(rosotacom, "ota_smoke", lambda args: calls.append(args) or 0)
@@ -1076,6 +1203,9 @@ def test_noninteractive_ota_smoke_lifecycle_uses_generic_runner(
     monkeypatch.setattr(rosotacom, "_ota_preflight", lambda *args, **kwargs: calls.append("preflight"))
     monkeypatch.setattr(rosotacom, "_ota_prepare_hosts", lambda *args, **kwargs: calls.append("prepare"))
     monkeypatch.setattr(rosotacom, "_ota_start_peers", lambda *args, **kwargs: calls.append("start"))
+    monkeypatch.setattr(
+        rosotacom, "_ota_wait_for_scenario_applications", lambda *args, **kwargs: calls.append("wait-apps") or []
+    )
     monkeypatch.setattr(rosotacom, "_ota_start_session_publishers", lambda *args, **kwargs: calls.append("publishers"))
     monkeypatch.setattr(rosotacom, "_ota_verify_delivery", lambda *args, **kwargs: calls.append("test") or [])
     monkeypatch.setattr(rosotacom, "_ota_verify_isolation", lambda *args, **kwargs: calls.append("isolation") or [])
@@ -1104,6 +1234,7 @@ def test_noninteractive_ota_smoke_lifecycle_uses_generic_runner(
         "prepare",
         "start",
         "sleep:12",
+        "wait-apps",
         "publishers",
         "test",
         "isolation",
@@ -1161,6 +1292,8 @@ def test_ota_smoke_dry_run_exercises_generic_remote_flow(
     assert "b: reachable: running remote command" in out
     assert "a: start demo: running remote command" in out
     assert "b: start demo: running remote command" in out
+    assert "a: wait for application local_app: running remote command" in out
+    assert "b: wait for application local_app: running remote command" in out
     assert "a: rosotacom test: running remote command" in out
     assert "a: publish isolation probe: running remote command" in out
     assert "b: check isolation probe absent: running remote command" in out

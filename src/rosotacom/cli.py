@@ -3433,6 +3433,55 @@ def _ota_stop_peers(
         _ota_run(peer, command, label=f"{peer_name}: stop {target.name}", dry_run=dry_run, check=False)
 
 
+# How long verification waits for a scenario application container before it
+# gives up. Covers a first-run image build on a cold peer (observed ~3 min for
+# an apt-get install alone); the communication-container readiness wait uses
+# the same bound.
+OTA_SMOKE_APPLICATION_WAIT_TIMEOUT_S = 600
+
+
+def _ota_wait_for_scenario_applications(
+    target: InteractiveSmokeTarget,
+    plan: OtaSmokePlan,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    """Block until every scenario application container declared for the target
+    is running on its peer. The application windows start their container only
+    after the peer's communication container is up, so on a cold machine the
+    first check would otherwise run against applications that are still being
+    built and report their absence as missing publishers (#218). A session
+    target declares no applications and passes through untouched.
+
+    Running is deliberately the whole bound: whether an application *produces*
+    is exactly what the session's own expectations then check."""
+    definition = target.scenario_definition
+    if definition is None:
+        return []
+    errors: list[str] = []
+    for peer_name in sorted(plan.peers):
+        peer = plan.peers[peer_name]
+        for application in definition.applications.get(peer_name, ()):
+            suffix = _sanitize_docker_name(f"_scenario_{target.name}_{peer_name}_{application.name}")
+            label = f"{peer_name}: wait for application {application.name}"
+            script = _ota_wait_for_running_container_suffix_script(
+                suffix,
+                f"{peer_name}:application:{application.name}",
+                timeout_s=OTA_SMOKE_APPLICATION_WAIT_TIMEOUT_S,
+            )
+            result = _ota_run(peer, script, label=label, dry_run=dry_run, check=False)
+            if result.returncode != 0:
+                _ota_print_failure_output(label, result)
+                errors.append(
+                    f"{peer_name}: application '{application.name}' has no running container after "
+                    f"{OTA_SMOKE_APPLICATION_WAIT_TIMEOUT_S}s; the scenario never came up, so its "
+                    "topics were not checked"
+                )
+            else:
+                _print_completed_output(result)
+    return errors
+
+
 def _ota_verify_only(args: argparse.Namespace) -> int:
     _runtime, plan, target = _resolve_ota_smoke_context(args)
     instance_id = getattr(args, "instance_id", None)
@@ -3440,6 +3489,11 @@ def _ota_verify_only(args: argparse.Namespace) -> int:
         raise RuntimeError("ota-smoke --verify-only requires --instance-id.")
     dry_run = bool(getattr(args, "dry_run", False))
     print(f"OTA smoke verification starting: {target.name} ({target.target_type}), instance={instance_id}")
+    errors = _ota_wait_for_scenario_applications(target, plan, dry_run=dry_run)
+    if errors:
+        for error in errors:
+            print(f"OTA SMOKE ERROR: {error}", file=sys.stderr)
+        return 1
     print("OTA smoke: starting synthetic publishers where needed.")
     _ota_start_session_publishers(target, plan, dry_run=dry_run)
     errors = _ota_verify_delivery(target, plan, instance_id, dry_run=dry_run)
@@ -3452,15 +3506,35 @@ def _ota_verify_only(args: argparse.Namespace) -> int:
     return 0
 
 
-def _ota_wait_for_running_container_suffix_script(suffix: str, label: str) -> str:
+def _ota_wait_for_running_container_suffix_script(suffix: str, label: str, timeout_s: int | None = None) -> str:
     pattern = shlex.quote(f"{re.escape(suffix)}$")
     quoted_label = shlex.quote(label)
-    return (
-        "container=''; "
-        f"until container=$(docker ps --filter status=running --format '{{{{.Names}}}}' "
+    find_container = (
+        f"container=$(docker ps --filter status=running --format '{{{{.Names}}}}' "
         f"| grep -E {pattern} | head -n 1) "
-        '&& [ -n "$container" ]; do '
-        f"echo '[INFO] waiting for running container:' {quoted_label}; "
+        '&& [ -n "$container" ]'
+    )
+    if timeout_s is None:
+        return (
+            "container=''; "
+            f"until {find_container}; do "
+            f"echo '[INFO] waiting for running container:' {quoted_label}; "
+            "sleep 2; "
+            "done; "
+            'echo "[INFO] found running container: $container"'
+        )
+    # Bounded variant for captured (non-interactive) callers: one line up front
+    # instead of a poll-cadence echo, and a hard failure when the bound is hit.
+    attempts = max(1, int(timeout_s) // 2)
+    return (
+        f"echo '[INFO] waiting up to {int(timeout_s)}s for running container:' {quoted_label}; "
+        "container=''; tries=0; "
+        f"until {find_container}; do "
+        "tries=$((tries+1)); "
+        f'if [ "$tries" -ge {attempts} ]; then '
+        f"echo '[ERROR] no running container after {int(timeout_s)}s:' {quoted_label} >&2; "
+        "exit 1; "
+        "fi; "
         "sleep 2; "
         "done; "
         'echo "[INFO] found running container: $container"'
@@ -3866,6 +3940,9 @@ def _start_noninteractive_ota_smoke(args: argparse.Namespace) -> int:
         )
         if not dry_run:
             time.sleep(12)
+        wait_errors = _ota_wait_for_scenario_applications(target, plan, dry_run=dry_run)
+        if wait_errors:
+            raise RuntimeError("OTA smoke verification failed:\n  - " + "\n  - ".join(wait_errors))
         _ota_start_session_publishers(target, plan, dry_run=dry_run)
         errors += _ota_verify_delivery(target, plan, instance.instance_id, dry_run=dry_run, profile=profile_name)
         errors += _ota_verify_isolation(target, plan, dry_run=dry_run)

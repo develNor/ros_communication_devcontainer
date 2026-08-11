@@ -3198,7 +3198,7 @@ def _ota_verify_isolation(
     published = _ota_run(source, publish, label=f"{source_name}: publish isolation probe", dry_run=dry_run, check=False)
     if published.returncode != 0:
         _ota_print_failure_output(f"{source_name}: publish isolation probe", published)
-        errors.append(f"{source_name}: isolation probe publisher failed")
+        errors.append(f"{source_name}: isolation probe did not advertise (probe-publish output above names the cause)")
         return errors
     _print_completed_output(published)
     check = _ota_rosotacom_command(plan, _ota_probe_check_parts(target, receiver_name, peer_args), receiver)
@@ -6332,8 +6332,17 @@ def _stop_smoke_topic_publishers(containers: dict[str, str], specs: list[SmokeTo
         )
 
 
+# How long the graph may take to report the probe publisher. A loaded graph
+# (e.g. a control centre with hundreds of topics) can take well over the old
+# fixed 10 s to discover a new publisher, and that delay is not a defect.
+_PROBE_ADVERTISE_TIMEOUT_S = 60.0
+# The probe must outlive the advertise wait plus the peer's absence check, or
+# the absence check passes trivially against an already-stopped publisher.
+_PROBE_DURATION_S = 120.0
+
+
 def _publish_isolation_probe(
-    container_name: str, ros_setup: str, topic: str, *, rate: float = 5.0, duration: float = 30.0
+    container_name: str, ros_setup: str, topic: str, *, rate: float = 5.0, duration: float = _PROBE_DURATION_S
 ) -> None:
     """Publish a local-only topic in the container's local application domain,
     detached, for `duration` seconds (self-stops via `timeout`)."""
@@ -6362,6 +6371,45 @@ def _topic_present(container_name: str, ros_setup: str, topic: str) -> bool:
     return topic in names
 
 
+def _isolation_probe_running(container_name: str, topic: str) -> bool:
+    """Whether the probe publisher for `topic` is still alive in the container."""
+    result = subprocess.run(
+        ["docker", "exec", container_name, "pgrep", "-f", f"ros2 topic pub {topic}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _wait_for_probe_advertisement(
+    container_name: str,
+    ros_setup: str,
+    topic: str,
+    *,
+    timeout_s: float,
+    log_line: Callable[[str], None] | None = None,
+) -> str:
+    """Poll until `topic` is reported by the container's local graph.
+
+    Returns "advertised", "publisher-gone" (the probe process exited or never
+    started), or "timeout" (the publisher is alive but the graph did not report
+    the topic within `timeout_s`). Only "publisher-gone" points at a publisher
+    defect; a loaded graph reports late, which is what "timeout" captures.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if log_line is not None:
+            log_line(f"Waiting for isolation probe {topic} to advertise in {container_name}")
+        if _topic_present(container_name, ros_setup, topic):
+            return "advertised"
+        if not _isolation_probe_running(container_name, topic):
+            return "publisher-gone"
+        if time.monotonic() >= deadline:
+            return "timeout"
+        time.sleep(1)
+
+
 def _verify_isolation(
     pub_container: str,
     pub_setup: str,
@@ -6376,15 +6424,18 @@ def _verify_isolation(
     log_line(f"Starting isolation probe {topic} in {pub_container}")
     _publish_isolation_probe(pub_container, pub_setup, topic)
     try:
-        live = False
-        for _ in range(8):
-            log_line(f"Waiting for isolation probe {topic} to advertise in {pub_container}")
-            if _topic_present(pub_container, pub_setup, topic):
-                live = True
-                break
-            time.sleep(1)
-        if not live:
-            return [f"isolation check inconclusive: {topic} never advertised in {pub_container}"]
+        outcome = _wait_for_probe_advertisement(
+            pub_container, pub_setup, topic, timeout_s=_PROBE_ADVERTISE_TIMEOUT_S, log_line=log_line
+        )
+        if outcome == "publisher-gone":
+            return [
+                f"isolation check inconclusive: probe publisher for {topic} exited or never started in {pub_container}"
+            ]
+        if outcome == "timeout":
+            return [
+                f"isolation check inconclusive: probe publisher for {topic} is running in {pub_container} "
+                f"but the graph did not report it within {_PROBE_ADVERTISE_TIMEOUT_S:.0f}s"
+            ]
         log_line(f"Checking that isolation probe {topic} is absent in {check_container}")
         if _topic_present(check_container, check_setup, topic):
             return [f"isolation breach: {topic} from {pub_container} leaked to {check_container}"]
@@ -6516,12 +6567,32 @@ def probe_publish_command(args: argparse.Namespace) -> int:
     # Block until the topic is actually advertised so a caller's subsequent
     # absence check on the other peer is meaningful (not a false pass on a
     # publisher that never came up).
-    for _ in range(10):
-        if _topic_present(container, ros_setup, args.topic):
-            print(f"Publishing {args.topic} in {container} (identity {args.identity}); advertised.")
-            return 0
-        time.sleep(1)
-    print(f"ERROR: {args.topic} did not advertise in {container} (identity {args.identity})", file=sys.stderr)
+    started = time.monotonic()
+    outcome = _wait_for_probe_advertisement(container, ros_setup, args.topic, timeout_s=args.advertise_timeout)
+    if outcome == "advertised":
+        print(f"Publishing {args.topic} in {container} (identity {args.identity}); advertised.")
+        return 0
+    if outcome == "publisher-gone":
+        if time.monotonic() - started >= args.duration:
+            print(
+                f"ERROR: probe publisher for {args.topic} in {container} (identity {args.identity}) ran its "
+                f"{args.duration:.0f}s --duration without the graph reporting the topic; keep --duration "
+                f"above --advertise-timeout",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"ERROR: probe publisher for {args.topic} exited or never started in {container} "
+                f"(identity {args.identity})",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            f"ERROR: probe publisher for {args.topic} is running in {container} (identity {args.identity}) "
+            f"but the graph did not report it within {args.advertise_timeout:.0f}s; a loaded graph reports "
+            f"late, retry with a larger --advertise-timeout",
+            file=sys.stderr,
+        )
     return 1
 
 
@@ -8957,7 +9028,13 @@ def main(argv: list[str] | None = None) -> int:
     probe_publish_parser.add_argument("--instance-id")
     probe_publish_parser.add_argument("--topic", default=ISOLATION_PROBE_TOPIC)
     probe_publish_parser.add_argument("--rate", type=float, default=5.0)
-    probe_publish_parser.add_argument("--duration", type=float, default=30.0)
+    probe_publish_parser.add_argument("--duration", type=float, default=_PROBE_DURATION_S)
+    probe_publish_parser.add_argument(
+        "--advertise-timeout",
+        type=float,
+        default=_PROBE_ADVERTISE_TIMEOUT_S,
+        help="Seconds to wait for the local graph to report the probe topic before failing.",
+    )
     probe_publish_parser.add_argument(
         "--stop", action="store_true", help="Stop a running probe publisher instead of starting one."
     )

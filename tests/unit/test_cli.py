@@ -12,6 +12,7 @@ import sys
 import tarfile
 import zlib
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -3083,7 +3084,7 @@ def test_ota_cleanup_never_removes_a_checkout(tmp_path: Path, capsys: pytest.Cap
     # `--cleanup` exists to undo staging. In checkout mode the workdir is the
     # user's repository, so the same `rm -rf` would delete a checkout — with
     # its bags and untracked work — to remove files that were never created.
-    plan = _ota_checkout_plan(_write_checkout_project(tmp_path))
+    plan = replace(_ota_checkout_plan(_write_checkout_project(tmp_path)), state_path=tmp_path / "state.yaml")
     calls: list[str] = []
 
     original = rosotacom._ota_run
@@ -3108,3 +3109,38 @@ def test_ota_checkout_state_round_trips_the_peer_checkouts(tmp_path: Path) -> No
     # A --stop or --state-file resume must reach the same checkout the start
     # used; losing it would run the stop in the staging directory instead.
     assert rosotacom._ota_load_state(str(plan.state_path)) == plan
+
+
+def test_ota_stop_recovers_the_recorded_plan_instead_of_guessing(tmp_path: Path) -> None:
+    # A stop that reconstructs its plan from the command line guesses the
+    # install mode, and the default guess points at a staged interpreter that a
+    # checkout-mode run never installed: every peer stop then fails silently
+    # (they are best-effort) while the containers stay up.
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    plan = _ota_checkout_plan(_write_checkout_project(tmp_path))
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "auto")
+    instance = rosotacom._resolve_session_instance(runtime, target.session, "ota")
+    written = rosotacom._ota_write_state(instance, plan)
+
+    found = rosotacom._ota_latest_state_for(runtime, target, "ota")
+
+    assert found == str(written.state_path)
+    assert rosotacom._ota_load_state(found).install_mode == "checkout"
+    assert rosotacom._ota_latest_state_for(runtime, target, "no-such-instance") is None
+
+
+def test_ota_cleanup_refuses_to_act_on_a_guessed_plan(capsys: pytest.CaptureFixture[str]) -> None:
+    # Without recorded state the install mode is a default, not a fact. Removing
+    # a workdir on that basis is a destructive act taken on a guess.
+    plan = rosotacom._ota_plan_from_bindings(_ota_bindings(), workdir="/tmp/rosotacom_ota")
+    calls: list[str] = []
+
+    original = rosotacom._ota_run
+    try:
+        rosotacom._ota_run = lambda *args, **kwargs: calls.append(str(args))  # type: ignore[assignment]
+        rosotacom._ota_cleanup_hosts(plan, dry_run=False)
+    finally:
+        rosotacom._ota_run = original  # type: ignore[assignment]
+
+    assert calls == []
+    assert "no deployment state" in capsys.readouterr().out

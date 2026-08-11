@@ -2319,6 +2319,30 @@ def _infer_active_ota_smoke_run(
     )
 
 
+def _ota_latest_state_for(
+    runtime: RuntimeConfig, target: InteractiveSmokeTarget, instance_id: str | None
+) -> str | None:
+    """The newest `ota-deployment.yaml` for this target, if one is on disk.
+
+    Instances are laid out `<instances>/<date>/<session>_<time>_<instance-id>/`,
+    so a named instance can be matched by suffix and an unnamed one by
+    modification time. Returns None rather than raising: not finding a state is
+    a normal outcome (nothing was ever started here), and the caller has a
+    command line to fall back to.
+    """
+    root = _session_instances_root(runtime)
+    if not root.is_dir():
+        return None
+    candidates = sorted(
+        (path for path in root.glob("*/*/ota-deployment.yaml")),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if instance_id:
+        candidates = [path for path in candidates if path.parent.name.endswith(f"_{instance_id}")]
+    return str(candidates[0]) if candidates else None
+
+
 def _resolve_ota_smoke_context(
     args: argparse.Namespace,
 ) -> tuple[RuntimeConfig, OtaSmokePlan, InteractiveSmokeTarget]:
@@ -2327,6 +2351,21 @@ def _resolve_ota_smoke_context(
         getattr(args, "target", None), runtime, getattr(args, "target_type", "auto")
     )
     state_file = getattr(args, "state_file", None)
+    if not state_file and getattr(args, "stop", False):
+        # Stopping has to reach the run that exists, and the only record of how
+        # that run was deployed is the state a start wrote. Reconstructing a
+        # plan from the command line instead means guessing the install mode,
+        # and the default guess is `source` — which points the stop at
+        # `/tmp/rosotacom_ota/source/.venv/bin/rosotacom` for peers that were
+        # started from their own checkouts. Observed on 2026-08-11: every peer
+        # stop failed silently (they are best-effort), the containers stayed up,
+        # and the only visible action was a cleanup removing a staging directory
+        # that had never been created. Usually the live tmux session carries the
+        # state path; when it does not — a killed session, a run started from
+        # another terminal — the instance directory still does.
+        state_file = _ota_latest_state_for(runtime, target, getattr(args, "instance_id", None))
+        if state_file:
+            print(f"OTA smoke: stopping the run recorded in {state_file}")
     if state_file:
         plan = _ota_load_state(state_file)
     else:
@@ -3594,6 +3633,17 @@ def _list_ota_smoke(args: argparse.Namespace) -> int:
 
 
 def _ota_cleanup_hosts(plan: OtaSmokePlan, *, dry_run: bool) -> None:
+    if plan.state_path is None:
+        # No recorded state means this plan came from the command line, so its
+        # install mode is a default rather than a fact about the run. Removing a
+        # workdir on that basis is a destructive act taken on a guess: it is how
+        # a stop that reached no peer still reported doing something. Say what
+        # is missing instead.
+        print(
+            "OTA smoke: skipping cleanup — no deployment state for this run, so its install mode is unknown. "
+            "Pass --state-file if a workdir really needs removing."
+        )
+        return
     if plan.install_mode == "checkout":
         # The workdir is the user's repository here. `rm -rf` on it would delete
         # a checkout with its untracked work — bags, instance artefacts, local

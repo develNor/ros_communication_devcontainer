@@ -394,7 +394,11 @@ rosotacom ota-smoke 2_native_chatter \
 
 `ota-smoke` accepts sessions and scenarios. It puts rosotacom on each peer,
 stages the active project, runs delivery and isolation checks, collects
-artifacts, stops the run, and removes the remote workdir. Add `--interactive`
+artifacts, stops the run, and removes the remote workdir. For scenario targets
+the checks start only once every declared application container is running
+(bounded at 10 minutes, covering a cold peer's first image build); an
+application that never comes up fails the run by name instead of as missing
+publishers. Add `--interactive`
 for a local control tmux with
 one attachable communication/catmux window per peer with a live status pane below
 each one. Scenario targets also get one native application-container window per

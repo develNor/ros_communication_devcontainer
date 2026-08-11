@@ -3378,17 +3378,47 @@ def test_ota_peer_exec_replaces_the_ssh_client(tmp_path: Path) -> None:
     ]
 
 
-def test_ota_peer_exec_ignores_options_that_belong_to_ssh(tmp_path: Path) -> None:
-    # `-t` and `-o BatchMode=yes` are options of one client. Passing them to an
-    # arbitrary transport would be guessing at an interface it never agreed to,
-    # and the failure would look like a broken peer rather than a wrong flag.
+def test_ota_peer_exec_ignores_batch_mode_which_belongs_to_ssh(tmp_path: Path) -> None:
+    # `-o BatchMode=yes` is an option of one client. Passing it to an arbitrary
+    # transport would be guessing at an interface it never agreed to, and the
+    # failure would look like a broken peer rather than a wrong flag.
     plan = _ota_exec_plan(_write_checkout_project(tmp_path))
 
-    assert rosotacom._ota_remote_argv(plan.peers["a"], "true", tty=True, batch=True) == [
+    assert rosotacom._ota_remote_argv(plan.peers["a"], "true", batch=True) == [
         "remote-rosotacom",
         "majestic-tks",
         "true",
     ]
+
+
+def test_ota_peer_exec_carries_the_tty_request(tmp_path: Path) -> None:
+    # Dropping this cost a two-host run: the peer windows start their container
+    # with `docker run -i -t`, which refuses outright when the far side has no
+    # terminal, so a transport that cannot be told "this one is interactive"
+    # carries the probes and not the experiment.
+    plan = _ota_exec_plan(_write_checkout_project(tmp_path))
+
+    assert rosotacom._ota_remote_argv(plan.peers["a"], "true", tty=True) == [
+        "env",
+        "ROSOTACOM_PEER_TTY=1",
+        "remote-rosotacom",
+        "majestic-tks",
+        "true",
+    ]
+
+
+def test_ota_peer_exec_tty_is_a_variable_so_an_older_transport_still_works(
+    tmp_path: Path,
+) -> None:
+    # An environment variable rather than a flag, so a transport that does not
+    # understand it behaves exactly as before instead of dying on an argument it
+    # never agreed to parse. The argv contract is what makes any command usable
+    # as a transport at all.
+    plan = _ota_exec_plan(_write_checkout_project(tmp_path))
+    argv = rosotacom._ota_remote_argv(plan.peers["a"], "true", tty=True)
+
+    assert argv[-1] == "true"
+    assert not any(part.startswith("-") for part in argv)
 
 
 def test_ota_peer_exec_makes_a_peer_remote(tmp_path: Path) -> None:

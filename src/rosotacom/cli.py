@@ -143,6 +143,10 @@ OTA_DEFAULT_SUDO_MODE = "passwordless"
 # meet this because they call an absolute path inside the workdir; checkout mode
 # calls the peer's own command by name, so it has to say where that lives.
 OTA_CHECKOUT_PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
+#: Set for a `--peer-exec` transport when the script it is about to run needs a
+#: terminal on the far side. A transport that does not understand it is not
+#: broken by it, which is why this is an environment variable and not a flag.
+OTA_PEER_TTY_ENV = "ROSOTACOM_PEER_TTY"
 
 ws_creation_dir = WS_DIR / "session" / "creation"
 session_gen_path = ws_creation_dir / "generate_session_files.py"
@@ -1750,11 +1754,23 @@ def _ota_peer_target(peer: OtaSmokePeer) -> str:
 def _ota_remote_argv(peer: OtaSmokePeer, script: str, *, tty: bool = False, batch: bool = False) -> list[str]:
     # A named transport wins over the SSH alias, and it takes the script as its
     # last argument because that is the contract `ssh host <script>` already
-    # has. `tty` and `batch` are dropped on purpose rather than guessed at:
-    # they are options of one particular client, and a transport that is not
-    # ssh has no obligation to understand them.
+    # has. `batch` is dropped rather than guessed at: it is an option of one
+    # particular client, and a transport that is not ssh has no obligation to
+    # understand it.
+    #
+    # `tty` is not droppable, and assuming it was cost a two-host run. The peer
+    # windows start their container with `docker run -i -t`, which refuses
+    # outright when the far side has no terminal — so a transport that cannot be
+    # told "this one is interactive" can carry the probes and not the experiment.
+    # It travels as an environment variable rather than an argument because the
+    # argv contract is what makes any command usable here: a transport that
+    # ignores the variable behaves exactly as before instead of failing on a
+    # flag it never agreed to parse.
     if peer.exec_command:
-        return [*shlex.split(peer.exec_command), script]
+        argv = shlex.split(peer.exec_command)
+        if tty:
+            argv = ["env", f"{OTA_PEER_TTY_ENV}=1", *argv]
+        return [*argv, script]
     if peer.ssh:
         argv = ["ssh"]
         if batch:
@@ -3608,7 +3624,7 @@ def _ota_create_tmux(
             session_name,
             "-n",
             _safe_path_token(f"{first_peer.name}_communication"),
-            _ota_quote_cmd(_ota_remote_argv(first_peer, first_script, tty=bool(first_peer.ssh))),
+            _ota_quote_cmd(_ota_remote_argv(first_peer, first_script, tty=_ota_peer_is_remote(first_peer))),
         ),
         text=True,
         capture_output=True,
@@ -3688,7 +3704,7 @@ def _ota_create_tmux(
                 session_name,
                 "-n",
                 _safe_path_token(f"{peer.name}_communication"),
-                _ota_quote_cmd(_ota_remote_argv(peer, script, tty=bool(peer.ssh))),
+                _ota_quote_cmd(_ota_remote_argv(peer, script, tty=_ota_peer_is_remote(peer))),
             ),
             text=True,
             capture_output=True,
@@ -3719,7 +3735,7 @@ def _ota_create_tmux(
                         session_name,
                         "-n",
                         _safe_path_token(f"{peer.name}_{application.name}"),
-                        _ota_quote_cmd(_ota_remote_argv(peer, application_script, tty=bool(peer.ssh))),
+                        _ota_quote_cmd(_ota_remote_argv(peer, application_script, tty=_ota_peer_is_remote(peer))),
                     ),
                     text=True,
                     capture_output=True,
@@ -3884,7 +3900,7 @@ def _start_interactive_ota_smoke(args: argparse.Namespace) -> int:
     if target.target_type == "scenario":
         for peer_name, peer in plan.peers.items():
             attach = _ota_rosotacom_command(plan, ["scenario", "attach", target.name, "--identity", peer_name], peer)
-            attach_cmd = _ota_quote_cmd(_ota_remote_argv(peer, attach, tty=bool(peer.ssh)))
+            attach_cmd = _ota_quote_cmd(_ota_remote_argv(peer, attach, tty=_ota_peer_is_remote(peer)))
             print(f"Manual remote scenario reattach for {peer_name}: {attach_cmd}")
     if mode == "attach":
         subprocess.run(_tmux_command(runtime, "attach-session", "-t", created), check=True)

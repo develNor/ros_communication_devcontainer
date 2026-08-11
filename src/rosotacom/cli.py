@@ -125,8 +125,24 @@ OTA_SUDO_MODES = ("passwordless", "askpass")
 # that ships, so a packaging defect — a file missing from the wheel, an
 # undeclared dependency — fails here rather than on a Versuchsträger. `source`
 # cannot catch that class of bug by construction.
-OTA_INSTALL_MODES = ("source", "pin")
+#
+# `checkout` is the third answer, and it inverts the question: nothing is
+# staged and nothing is installed. Each peer runs the rosotacom it already has
+# from the project checkout it already has, so what is under test is the state
+# git put on that machine — including its dependency pins. `pin` still proves
+# the artefact ships correctly; only `checkout` proves *this machine* is ready,
+# which is what a deployment rehearsal actually asks. It is also the only mode
+# in which a project may reference anything outside its own directory: staging
+# copies the project directory, so a path leading above it cannot survive.
+OTA_INSTALL_MODES = ("source", "pin", "checkout")
 OTA_DEFAULT_SUDO_MODE = "passwordless"
+
+# `ssh host 'cmd'` runs a non-login shell, so a pipx install in ~/.local/bin is
+# not on PATH and the peer answers `rosotacom: command not found` — which reads
+# as a broken machine rather than a missing PATH entry. The staged modes never
+# meet this because they call an absolute path inside the workdir; checkout mode
+# calls the peer's own command by name, so it has to say where that lives.
+OTA_CHECKOUT_PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
 
 ws_creation_dir = WS_DIR / "session" / "creation"
 session_gen_path = ws_creation_dir / "generate_session_files.py"
@@ -212,6 +228,12 @@ class OtaSmokePeer:
     name: str
     ssh: str | None
     address: str
+    #: Absolute path of this peer's project checkout, in `checkout` install mode
+    #: only. Per peer rather than one plan-wide value because the same
+    #: repository lives at a different absolute path on every machine — a
+    #: control centre runs it under a different account than a laptop does — and
+    #: a single workdir would silently be wrong on all but one of them.
+    checkout: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1001,6 +1023,10 @@ def _parse_peer_ssh_overrides(overrides: list[str] | None) -> dict[str, str]:
     return parse_assignments(overrides, option="--peer-ssh")
 
 
+def _parse_peer_checkout_overrides(overrides: list[str] | None) -> dict[str, str]:
+    return parse_assignments(overrides, option="--peer-checkout")
+
+
 def _deployment_config(runtime: RuntimeConfig) -> DeploymentConfig | None:
     return load_deployment(runtime.deployment)
 
@@ -1500,7 +1526,33 @@ def _ota_validate_install_mode(install_mode: str) -> str:
 
 def _ota_rosotacom_path(install_mode: str) -> str:
     """Where the peer's rosotacom executable lands, relative to the workdir."""
+    if install_mode == "checkout":
+        # Not a path: the peer's own installation, whatever put it there. Naming
+        # a path here would re-introduce the thing this mode removes — an
+        # assumption by the orchestrator about the peer's file system.
+        return "rosotacom"
     return "venv/bin/rosotacom" if install_mode == "pin" else "source/.venv/bin/rosotacom"
+
+
+def _ota_checkout_project_path(project_config: Path) -> tuple[Path, str]:
+    """Split an active `rosotacom.yaml` into (checkout root, path inside it).
+
+    Checkout mode needs one repository-relative project path that is valid on
+    every peer, and the honest source for it is the local checkout: walk up from
+    the config until a `.git` entry appears. That is not a heuristic here — a
+    mode whose ground truth is "what git put on the machine" is entitled to
+    require that the project is in a repository, and requiring it makes the
+    failure legible instead of producing a path that happens to be wrong on the
+    other machine.
+    """
+    config = project_config.resolve()
+    for candidate in config.parents:
+        if (candidate / ".git").exists():
+            return candidate, config.relative_to(candidate).as_posix()
+    raise RuntimeError(
+        f"--install-mode checkout needs the project to live in a git checkout, and {config} is not in one. "
+        "The peers resolve the project by its path inside the repository, so there has to be a repository."
+    )
 
 
 def _ota_plan_from_bindings(
@@ -1509,9 +1561,30 @@ def _ota_plan_from_bindings(
     workdir: str,
     install_mode: str = "source",
     install_pin: str | None = None,
+    checkouts: Mapping[str, str] | None = None,
+    project: str | None = None,
 ) -> OtaSmokePlan:
-    _ota_validate_prepare_workdir(workdir)
     _ota_validate_install_mode(install_mode)
+    if install_mode == "checkout":
+        if not checkouts or not project:
+            raise RuntimeError("--install-mode checkout requires --peer-checkout for every peer.")
+        missing = sorted(set(bindings) - set(checkouts))
+        if missing:
+            raise RuntimeError(
+                "--install-mode checkout needs a checkout for every peer; missing: "
+                + ", ".join(f"--peer-checkout {name}=<path>" for name in missing)
+            )
+        unknown = sorted(set(checkouts) - set(bindings))
+        if unknown:
+            raise RuntimeError(f"--peer-checkout names a peer the session does not have: {', '.join(unknown)}")
+        for name, path in sorted(checkouts.items()):
+            if not path.startswith("/"):
+                raise RuntimeError(f"--peer-checkout {name}={path}: a peer checkout must be an absolute path.")
+            _ota_validate_prepare_workdir(path)
+    else:
+        _ota_validate_prepare_workdir(workdir)
+        if checkouts:
+            raise RuntimeError("--peer-checkout only applies to --install-mode checkout.")
     if install_mode == "pin":
         # Defaulting to the caller's own version makes `--install-mode pin`
         # mean "rehearse what I am running, as it ships" without a second flag.
@@ -1524,13 +1597,19 @@ def _ota_plan_from_bindings(
     elif install_pin is not None:
         raise RuntimeError("--install-pin only applies to --install-mode pin.")
     peers = {
-        name: OtaSmokePeer(name=name, ssh=binding.ssh, address=binding.address) for name, binding in bindings.items()
+        name: OtaSmokePeer(
+            name=name,
+            ssh=binding.ssh,
+            address=binding.address,
+            checkout=(checkouts or {}).get(name) if install_mode == "checkout" else None,
+        )
+        for name, binding in bindings.items()
     }
     return OtaSmokePlan(
         state_path=None,
         workdir=workdir,
         rosotacom=_ota_rosotacom_path(install_mode),
-        project="project/rosotacom.yaml",
+        project=(project or "") if install_mode == "checkout" else "project/rosotacom.yaml",
         peers=peers,
         install_mode=install_mode,
         install_pin=install_pin,
@@ -1540,13 +1619,16 @@ def _ota_plan_from_bindings(
 def _ota_write_state(instance: SessionInstance, plan: OtaSmokePlan) -> OtaSmokePlan:
     path = instance.host_dir / "ota-deployment.yaml"
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "workdir": plan.workdir,
         "rosotacom": plan.rosotacom,
         "project": plan.project,
         "install_mode": plan.install_mode,
         "install_pin": plan.install_pin,
-        "peers": {name: {"address": peer.address, "ssh": peer.ssh} for name, peer in sorted(plan.peers.items())},
+        "peers": {
+            name: {"address": peer.address, "ssh": peer.ssh, "checkout": peer.checkout}
+            for name, peer in sorted(plan.peers.items())
+        },
     }
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return replace(plan, state_path=path)
@@ -1555,7 +1637,7 @@ def _ota_write_state(instance: SessionInstance, plan: OtaSmokePlan) -> OtaSmokeP
 def _ota_load_state(path_arg: str) -> OtaSmokePlan:
     path = Path(path_arg).expanduser().resolve()
     raw = _load_yaml_file(path)
-    if raw.get("schema_version") != 2:
+    if raw.get("schema_version") != 3:
         raise RuntimeError(f"Unsupported OTA deployment state: {path}")
     peers_raw = raw.get("peers")
     if not isinstance(peers_raw, dict) or len(peers_raw) != 2:
@@ -1568,6 +1650,7 @@ def _ota_load_state(path_arg: str) -> OtaSmokePlan:
             name=str(name),
             address=str(peer_raw["address"]),
             ssh=str(peer_raw["ssh"]) if peer_raw.get("ssh") else None,
+            checkout=str(peer_raw["checkout"]) if peer_raw.get("checkout") else None,
         )
     install_pin = raw.get("install_pin")
     return OtaSmokePlan(
@@ -1680,9 +1763,15 @@ def _ota_project_cli_args(plan: OtaSmokePlan) -> list[str]:
     return ["--rosotacom-config", plan.project]
 
 
-def _ota_rosotacom_command(plan: OtaSmokePlan, parts: list[str]) -> str:
+def _ota_peer_workdir(plan: OtaSmokePlan, peer: OtaSmokePeer) -> str:
+    """The directory a peer's commands run in: its checkout, or the staging dir."""
+    return peer.checkout or plan.workdir
+
+
+def _ota_rosotacom_command(plan: OtaSmokePlan, parts: list[str], peer: OtaSmokePeer) -> str:
     command = [plan.rosotacom, *parts, *_ota_project_cli_args(plan)]
-    return f"cd {shlex.quote(plan.workdir)} && {_ota_quote_cmd(command)}"
+    prefix = OTA_CHECKOUT_PATH_PREFIX if plan.install_mode == "checkout" else ""
+    return f"{prefix}cd {shlex.quote(_ota_peer_workdir(plan, peer))} && {_ota_quote_cmd(command)}"
 
 
 def _ota_source_checkout() -> Path | None:
@@ -2248,11 +2337,27 @@ def _resolve_ota_smoke_context(
             peer_address=getattr(args, "peer_address", None),
             peer_ssh=getattr(args, "peer_ssh", None),
         )
+        install_mode = str(getattr(args, "install_mode", None) or "source")
+        checkouts = _parse_peer_checkout_overrides(getattr(args, "peer_checkout", None))
+        project: str | None = None
+        if install_mode == "checkout":
+            if not runtime.rosotacom_config:
+                raise RuntimeError("--install-mode checkout requires an active rosotacom.yaml project.")
+            local_checkout, project = _ota_checkout_project_path(runtime.rosotacom_config)
+            for name, path in sorted(checkouts.items()):
+                binding = bindings.get(name)
+                if binding is not None and not binding.ssh and Path(path).resolve() != local_checkout:
+                    raise RuntimeError(
+                        f"--peer-checkout {name}={path} names the peer that runs on this machine, but the active "
+                        f"project lives in {local_checkout}. Point it there, or give that peer an SSH target."
+                    )
         plan = _ota_plan_from_bindings(
             bindings,
             workdir=str(getattr(args, "workdir", None) or "/tmp/rosotacom_ota"),
-            install_mode=str(getattr(args, "install_mode", None) or "source"),
+            install_mode=install_mode,
             install_pin=getattr(args, "install_pin", None),
+            checkouts=checkouts,
+            project=project,
         )
     plan_peers = set(plan.peers)
     target_peers = set(_peer_keys_from_cfg(target.cfg))
@@ -2643,10 +2748,62 @@ def _ota_remote_package_dir(peer: OtaSmokePeer, plan: OtaSmokePlan, *, dry_run: 
     return located
 
 
+def _ota_verify_checkouts(plan: OtaSmokePlan, *, dry_run: bool) -> None:
+    """Checkout mode's replacement for staging: assert, do not install.
+
+    Nothing is copied and nothing is installed, so the only thing that can go
+    wrong is a peer that is not in the state the caller thinks it is in — an
+    unsynced checkout, a rosotacom that never got installed, a project path that
+    exists on the laptop and not on the other machine. Each of those has a
+    distinct one-line failure here, before any container starts, rather than a
+    confusing one an hour later.
+    """
+    for peer in plan.peers.values():
+        checkout = shlex.quote(_ota_peer_workdir(plan, peer))
+        project = shlex.quote(plan.project)
+        _ota_run(
+            peer,
+            f"test -d {checkout}",
+            label=f"{peer.name}: project checkout {_ota_peer_workdir(plan, peer)}",
+            dry_run=dry_run,
+            batch=True,
+        )
+        _ota_run(
+            peer,
+            f"test -f {checkout}/{project}",
+            label=f"{peer.name}: project config {plan.project} inside the checkout",
+            dry_run=dry_run,
+            batch=True,
+        )
+        _ota_run(
+            peer,
+            f"{OTA_CHECKOUT_PATH_PREFIX}command -v rosotacom >/dev/null 2>&1",
+            label=f"{peer.name}: rosotacom installed",
+            dry_run=dry_run,
+            batch=True,
+        )
+        version = _ota_run(
+            peer,
+            f"{OTA_CHECKOUT_PATH_PREFIX}rosotacom --version",
+            label=f"{peer.name}: rosotacom version",
+            dry_run=dry_run,
+            batch=True,
+            check=False,
+        )
+        if not dry_run and version.returncode == 0:
+            # Printed rather than enforced. Peers running different versions is
+            # a real hazard, but it is also a legitimate mid-migration state,
+            # and a check that refuses it would be the wrong place to find out.
+            print(f"+ {peer.name}: rosotacom {version.stdout.strip() or 'unknown'}")
+
+
 def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: OtaSmokePlan) -> None:
     if not runtime.rosotacom_config:
         raise RuntimeError("ota-smoke requires an active rosotacom.yaml project.")
     dry_run = bool(getattr(args, "dry_run", False))
+    if plan.install_mode == "checkout":
+        _ota_verify_checkouts(plan, dry_run=dry_run)
+        return
     from_pin = plan.install_mode == "pin"
     source_checkout: Path | None = None
     temporary_bundle: Path | None = None
@@ -2924,6 +3081,7 @@ def _ota_start_peers(
         command = _ota_rosotacom_command(
             plan,
             _ota_start_parts(target, peer_name, instance_id, peer_args, mode=mode, link_trace_parts=link_trace_parts),
+            peer,
         )
         _ota_run(peer, command, label=f"{peer_name}: start {target.name}", dry_run=dry_run)
 
@@ -2940,7 +3098,7 @@ def _ota_start_session_publishers(
     peer_args = _ota_peer_address_args(plan)
     for peer_name in sorted(plan.peers):
         peer = plan.peers[peer_name]
-        command = _ota_rosotacom_command(plan, _ota_publish_parts(target, peer_name, peer_args))
+        command = _ota_rosotacom_command(plan, _ota_publish_parts(target, peer_name, peer_args), peer)
         result = _ota_run(peer, command, label=f"{peer_name}: start synthetic publishers", dry_run=dry_run, check=False)
         _print_completed_output(result)
         if result.returncode != 0:
@@ -2958,7 +3116,7 @@ def _ota_stop_session_publishers(
     peer_args = _ota_peer_address_args(plan)
     for peer_name in sorted(plan.peers):
         peer = plan.peers[peer_name]
-        command = _ota_rosotacom_command(plan, _ota_publish_parts(target, peer_name, peer_args, stop=True))
+        command = _ota_rosotacom_command(plan, _ota_publish_parts(target, peer_name, peer_args, stop=True), peer)
         _ota_run(peer, command, label=f"{peer_name}: stop synthetic publishers", dry_run=dry_run, check=False)
 
 
@@ -2974,7 +3132,7 @@ def _ota_verify_delivery(
     print("OTA smoke: running status/expectation checks on every peer.")
     for peer_name in sorted(plan.peers):
         peer = plan.peers[peer_name]
-        command = _ota_rosotacom_command(plan, _ota_test_parts(target, instance_id, profile=profile))
+        command = _ota_rosotacom_command(plan, _ota_test_parts(target, instance_id, profile=profile), peer)
         result = _ota_run(peer, command, label=f"{peer_name}: rosotacom test", dry_run=dry_run, check=False)
         if result.returncode != 0:
             _ota_print_failure_output(f"{peer_name}: rosotacom test", result)
@@ -2997,14 +3155,14 @@ def _ota_verify_isolation(
     peer_args = _ota_peer_address_args(plan)
     errors: list[str] = []
     print(f"OTA smoke: checking isolation from {source_name} to {receiver_name}.")
-    publish = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=False))
+    publish = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=False), source)
     published = _ota_run(source, publish, label=f"{source_name}: publish isolation probe", dry_run=dry_run, check=False)
     if published.returncode != 0:
         _ota_print_failure_output(f"{source_name}: publish isolation probe", published)
         errors.append(f"{source_name}: isolation probe publisher failed")
         return errors
     _print_completed_output(published)
-    check = _ota_rosotacom_command(plan, _ota_probe_check_parts(target, receiver_name, peer_args))
+    check = _ota_rosotacom_command(plan, _ota_probe_check_parts(target, receiver_name, peer_args), receiver)
     checked = _ota_run(
         receiver,
         check,
@@ -3017,7 +3175,7 @@ def _ota_verify_isolation(
         errors.append(f"{receiver_name}: isolation probe crossed OTA boundary")
     else:
         _print_completed_output(checked)
-    stop = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=True))
+    stop = _ota_rosotacom_command(plan, _ota_probe_publish_parts(target, source_name, peer_args, stop=True), source)
     stopped = _ota_run(source, stop, label=f"{source_name}: stop isolation probe", dry_run=dry_run, check=False)
     _print_completed_output(stopped)
     return errors
@@ -3046,7 +3204,7 @@ def _ota_verify_content_integrity(
     for receiver_name, receiver in plan.peers.items():
         for topic, msg_type, field, expected in _content_integrity_specs(cfg, receiver_name):
             parts = _ota_content_check_parts(target, receiver_name, peer_args, topic, msg_type, field, expected)
-            cmd = _ota_rosotacom_command(plan, parts)
+            cmd = _ota_rosotacom_command(plan, parts, receiver)
             print(f"OTA smoke: checking content integrity for {receiver_name} {topic}.")
             result = _ota_run(
                 receiver, cmd, label=f"{receiver_name}: content integrity {topic}", dry_run=dry_run, check=False
@@ -3067,16 +3225,16 @@ def _ota_collect_logs(
 ) -> None:
     project = shlex.quote(plan.project)
     instance_suffix = shlex.quote(f"*_{instance.instance_id}")
-    script = (
-        f"cd {shlex.quote(plan.workdir)} && "
-        f"project_dir=$(dirname {project}) && "
-        f'instance_dir=$(find "$project_dir/session-instances" -mindepth 2 -maxdepth 2 '
-        f"-type d -name {instance_suffix} -print -quit 2>/dev/null) && "
-        'if [ -n "$instance_dir" ]; then '
-        'relative=${instance_dir#"$project_dir"/}; '
-        'tar cz -C "$project_dir" "$relative" 2>/dev/null | base64; fi'
-    )
     for peer in plan.peers.values():
+        script = (
+            f"cd {shlex.quote(_ota_peer_workdir(plan, peer))} && "
+            f"project_dir=$(dirname {project}) && "
+            f'instance_dir=$(find "$project_dir/session-instances" -mindepth 2 -maxdepth 2 '
+            f"-type d -name {instance_suffix} -print -quit 2>/dev/null) && "
+            'if [ -n "$instance_dir" ]; then '
+            'relative=${instance_dir#"$project_dir"/}; '
+            'tar cz -C "$project_dir" "$relative" 2>/dev/null | base64; fi'
+        )
         result = _ota_run(peer, script, label=f"{peer.name}: collect session-instances", dry_run=dry_run, check=False)
         if dry_run or not result.stdout.strip():
             continue
@@ -3139,7 +3297,7 @@ def _ota_stop_peers(
     peer_args = _ota_peer_address_args(plan)
     for peer_name in sorted(plan.peers):
         peer = plan.peers[peer_name]
-        command = _ota_rosotacom_command(plan, _ota_stop_parts(target, peer_name, instance_id, peer_args))
+        command = _ota_rosotacom_command(plan, _ota_stop_parts(target, peer_name, instance_id, peer_args), peer)
         _ota_run(peer, command, label=f"{peer_name}: stop {target.name}", dry_run=dry_run, check=False)
 
 
@@ -3186,7 +3344,9 @@ def _ota_application_run_script(
 ) -> str:
     communication_suffix = _sanitize_docker_name(f"_com_to_{_remote_peer_name(target.cfg, peer_name)}")
     label = f"{peer_name}:{application.name}"
-    command = _ota_rosotacom_command(plan, _ota_application_parts(target, peer_name, application, instance_id))
+    command = _ota_rosotacom_command(
+        plan, _ota_application_parts(target, peer_name, application, instance_id), plan.peers[peer_name]
+    )
     return (
         f"{_ota_wait_for_running_container_suffix_script(communication_suffix, f'{peer_name}:communication')}; "
         f"echo '[INFO] starting native application container:' {shlex.quote(label)}; "
@@ -3219,6 +3379,7 @@ def _ota_create_tmux(
             mode="attach",
             link_trace_parts=link_trace_parts,
         ),
+        first_peer,
     )
     first_script = (
         "set -e; "
@@ -3298,6 +3459,7 @@ def _ota_create_tmux(
                 mode="attach",
                 link_trace_parts=link_trace_parts,
             ),
+            peer,
         )
         script = (
             "set -e; "
@@ -3432,6 +3594,13 @@ def _list_ota_smoke(args: argparse.Namespace) -> int:
 
 
 def _ota_cleanup_hosts(plan: OtaSmokePlan, *, dry_run: bool) -> None:
+    if plan.install_mode == "checkout":
+        # The workdir is the user's repository here. `rm -rf` on it would delete
+        # a checkout with its untracked work — bags, instance artefacts, local
+        # edits — to clean up files this mode never created. There is nothing to
+        # remove: staging is what cleanup undoes, and staging did not happen.
+        print("OTA smoke: nothing to clean up — checkout mode staged nothing.")
+        return
     _ota_validate_prepare_workdir(plan.workdir)
     for peer in plan.peers.values():
         _ota_run(
@@ -3497,7 +3666,7 @@ def _start_interactive_ota_smoke(args: argparse.Namespace) -> int:
     print("Local control tmux prefix: Ctrl-b. Send the peer tmux/catmux prefix with Ctrl-b Ctrl-b.")
     if target.target_type == "scenario":
         for peer_name, peer in plan.peers.items():
-            attach = _ota_rosotacom_command(plan, ["scenario", "attach", target.name, "--identity", peer_name])
+            attach = _ota_rosotacom_command(plan, ["scenario", "attach", target.name, "--identity", peer_name], peer)
             attach_cmd = _ota_quote_cmd(_ota_remote_argv(peer, attach, tty=bool(peer.ssh)))
             print(f"Manual remote scenario reattach for {peer_name}: {attach_cmd}")
     if mode == "attach":
@@ -8266,6 +8435,16 @@ def main(argv: list[str] | None = None) -> int:
     _add_peer_arg(ota_smoke_parser)
     _add_peer_address_arg(ota_smoke_parser)
     _add_peer_ssh_arg(ota_smoke_parser)
+    ota_smoke_parser.add_argument(
+        "--peer-checkout",
+        action="append",
+        default=[],
+        metavar="PEER=PATH",
+        help=(
+            "Absolute path of a peer's project checkout, for --install-mode checkout. "
+            "Required for every peer in that mode; the same repository is at a different path on each machine."
+        ),
+    )
     ota_smoke_parser.add_argument("--target-type", choices=["auto", "session", "scenario"], default="auto")
     ota_smoke_parser.add_argument("--interactive", action="store_true", help="Open a local control tmux UI.")
     ota_smoke_parser.add_argument("--stop", action="store_true", help="Stop an OTA smoke run.")
@@ -8289,7 +8468,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "How the peers get rosotacom. 'source' (default) stages and installs what you are running — "
             "right while iterating on rosotacom. 'pin' installs a published release from the index, so the "
-            "peers run the artefact that ships — right when rehearsing a deployment."
+            "peers run the artefact that ships — right when rehearsing a deployment. 'checkout' stages and "
+            "installs nothing: each peer uses its own installed rosotacom and its own project checkout "
+            "(see --peer-checkout), so the run tests the machines as git left them."
         ),
     )
     ota_smoke_parser.add_argument(

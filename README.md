@@ -415,6 +415,11 @@ rosotacom ota-smoke 2_native_chatter --peer a=workstation --peer b=robot \
   --install-mode pin                # defaults to your own version
 rosotacom ota-smoke 2_native_chatter --peer a=workstation --peer b=robot \
   --install-mode pin --install-pin 2.4
+
+# test the machines as they are: no staging, no install, their own checkouts
+rosotacom ota-smoke 2_native_chatter --peer a=workstation --peer b=robot \
+  --peer-ssh b=robot-b --install-mode checkout \
+  --peer-checkout a=/home/me/fleet_mgmt --peer-checkout b=/home/robot/fleet_mgmt
 ```
 
 `source` is right while iterating on rosotacom itself — the peers run the code
@@ -423,6 +428,23 @@ deployment: the peers install from the index, so a packaging defect (a file
 missing from the wheel, an undeclared dependency) fails in the rehearsal instead
 of on the target machine. `source` cannot catch that class of defect by
 construction, because it never builds the artefact that ships.
+
+`checkout` answers a different question again: not "does this artefact work" but
+"is *this machine* ready". Nothing is staged and nothing is installed — each
+peer runs the rosotacom it already has, from the project checkout it already
+has, so what is under test is the state git and the machine's own install left
+behind, dependency pins included. Ground truth moves into the repository: push,
+pull, run. It is also the only mode in which a project may reference anything
+outside its own directory — staging copies the project directory, so a mount or
+config path leading above it cannot survive the copy and fails on the peer as a
+missing path.
+
+Because the same repository sits at a different absolute path on every machine,
+`--peer-checkout` is required for every peer; the path *inside* the repository
+is taken from your own checkout, so the project has to live in one. Preparation
+becomes verification: each peer is asked whether the checkout, the project file
+and `rosotacom` are there, and each version is printed. `--cleanup` does nothing
+in this mode — there is no staging to undo, and the workdir is your repository.
 
 The run manifest records which mode and which version the peers ran, so a result
 can be attributed to an artefact rather than to a working copy.

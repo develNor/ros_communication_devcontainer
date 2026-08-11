@@ -118,10 +118,59 @@ def test_precommit_ruff_matches_pyproject_pin() -> None:
     )
 
 
+#: Every workflow that runs the e2e suite, and the job whose matrix names the
+#: slices. All three must expand to the same list: the merge gate decides what
+#: may land, the release decides what ships, and nightly is the only one that
+#: runs against a tree nobody is watching.
+E2E_SLICE_MATRICES = {
+    "release.yml": "e2e",
+    "pr-merge-gate.yml": "e2e",
+    "nightly-e2e.yml": "smoke-e2e",
+}
+
+
+def _e2e_slices(workflow_name: str, job: str) -> list[str]:
+    workflow = yaml.safe_load((WORKFLOWS_DIR / workflow_name).read_text(encoding="utf-8"))
+    return list(workflow["jobs"][job]["strategy"]["matrix"]["slice"])
+
+
 def _release_e2e_slices() -> list[str]:
     """The slice names the release matrix expands to."""
-    workflow = yaml.safe_load((WORKFLOWS_DIR / "release.yml").read_text(encoding="utf-8"))
-    return list(workflow["jobs"]["e2e"]["strategy"]["matrix"]["slice"])
+    return _e2e_slices("release.yml", E2E_SLICE_MATRICES["release.yml"])
+
+
+def test_every_e2e_workflow_runs_the_same_slices() -> None:
+    """One slice list, three workflows.
+
+    Before this, the six e2e jobs in the merge gate were copy-pasted rather
+    than a matrix, and `ci-success` listed `e2e-media` in `needs` while
+    checking the results of only the other five — a failing media slice did not
+    fail the gate. A matrix cannot lose a slice that way, and this keeps the
+    three matrices from drifting apart instead.
+    """
+    lists = {name: _e2e_slices(name, job) for name, job in sorted(E2E_SLICE_MATRICES.items())}
+    reference = lists["release.yml"]
+    mismatched = {name: value for name, value in lists.items() if value != reference}
+    assert not mismatched, f"e2e slice lists disagree; release.yml has {reference} but: " + "; ".join(
+        f"{name} has {value}" for name, value in sorted(mismatched.items())
+    )
+
+
+def test_ci_success_checks_every_job_it_waits_for() -> None:
+    """A job in `needs` that nothing checks is a gate that does not gate.
+
+    `ci-success` runs with `if: always()`, so every needed job's failure has to
+    be turned into an exit code by hand. `e2e-media` sat in `needs` for a
+    release cycle with no matching check.
+    """
+    workflow = yaml.safe_load((WORKFLOWS_DIR / "pr-merge-gate.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["ci-success"]
+    script = "\n".join(_workflow_run_blocks(job))
+    unchecked = [name for name in job["needs"] if f"needs.{name}.result" not in script]
+    assert not unchecked, (
+        "ci-success waits for these jobs but never inspects their result, so "
+        "their failure does not fail the gate: " + ", ".join(unchecked)
+    )
 
 
 def _recipe_pytest_invocations(recipe: str) -> list[list[str]]:

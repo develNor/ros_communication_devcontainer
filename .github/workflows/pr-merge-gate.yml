@@ -189,12 +189,24 @@ jobs:
           fi
           echo "All preflight checks passed"
 
-  e2e-core:
-    name: e2e-core
+  e2e:
+    # One matrix job, not six near-identical copies. The copies were how
+    # `e2e-media` ended up listed in ci-success's `needs` with no check on its
+    # result: a failing media slice did not fail the gate. A matrix has one
+    # result for all slices, so that hole cannot be reopened by forgetting a
+    # paragraph. The slice list is the same one release.yml expands, and
+    # tests/contract/test_workflow_contracts.py keeps the three workflows and
+    # the justfile agreeing.
+    name: e2e-${{ matrix.slice }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     needs: preflight-success
     if: always() && !cancelled() && needs.preflight-success.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [core, transforms, remote-assist, runtime-tools, concurrency, media]
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -218,214 +230,14 @@ jobs:
       - name: Show Docker environment
         run: docker info
 
-      - name: Run core E2E tests
-        run: just test-e2e-core
+      - name: Run E2E slice
+        run: just test-e2e-slice ${{ matrix.slice }}
 
       - name: Upload session artifacts
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: session-instances-e2e-core
-          path: session-instances/
-          if-no-files-found: ignore
-
-  e2e-transforms:
-    name: e2e-transforms
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    needs: preflight-success
-    if: always() && !cancelled() && needs.preflight-success.result == 'success'
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install just and tmux
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just tmux
-
-      - name: Set up local environment
-        run: just setup
-
-      - name: Show Docker environment
-        run: docker info
-
-      - name: Run transform E2E tests
-        run: just test-e2e-transforms
-
-      - name: Upload session artifacts
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: session-instances-e2e-transforms
-          path: session-instances/
-          if-no-files-found: ignore
-
-  e2e-remote-assist:
-    name: e2e-remote-assist
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    needs: preflight-success
-    if: always() && !cancelled() && needs.preflight-success.result == 'success'
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install just and tmux
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just tmux
-
-      - name: Set up local environment
-        run: just setup
-
-      - name: Show Docker environment
-        run: docker info
-
-      - name: Run remote assist E2E tests
-        run: just test-e2e-remote-assist
-
-      - name: Upload session artifacts
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: session-instances-e2e-remote-assist
-          path: session-instances/
-          if-no-files-found: ignore
-
-  e2e-runtime-tools:
-    name: e2e-runtime-tools
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    needs: preflight-success
-    if: always() && !cancelled() && needs.preflight-success.result == 'success'
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install just and tmux
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just tmux
-
-      - name: Set up local environment
-        run: just setup
-
-      - name: Show Docker environment
-        run: docker info
-
-      - name: Run runtime tools E2E tests
-        run: just test-e2e-runtime-tools
-
-      - name: Upload session artifacts
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: session-instances-e2e-runtime-tools
-          path: session-instances/
-          if-no-files-found: ignore
-
-  e2e-concurrency:
-    name: e2e-concurrency
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    needs: preflight-success
-    if: always() && !cancelled() && needs.preflight-success.result == 'success'
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install just and tmux
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just tmux
-
-      - name: Set up local environment
-        run: just setup
-
-      - name: Show Docker environment
-        run: docker info
-
-      - name: Run concurrency E2E tests
-        run: just test-e2e-concurrency
-
-      - name: Upload session artifacts
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: session-instances-e2e-concurrency
-          path: session-instances/
-          if-no-files-found: ignore
-
-  e2e-media:
-    name: e2e-media
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    needs: preflight-success
-    if: always() && !cancelled() && needs.preflight-success.result == 'success'
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install just and tmux
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just tmux
-
-      - name: Set up local environment
-        run: just setup
-
-      - name: Show Docker environment
-        run: docker info
-
-      - name: Run media E2E tests
-        run: just test-e2e-media
-
-      - name: Upload session artifacts
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: session-instances-e2e-media
+          name: session-instances-e2e-${{ matrix.slice }}
           path: session-instances/
           if-no-files-found: ignore
 
@@ -439,12 +251,7 @@ jobs:
       - merge-lightweight
       - package
       - preflight-success
-      - e2e-core
-      - e2e-transforms
-      - e2e-remote-assist
-      - e2e-runtime-tools
-      - e2e-concurrency
-      - e2e-media
+      - e2e
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
 
     steps:
@@ -474,24 +281,8 @@ jobs:
             echo "preflight-success failed or was skipped: ${{ needs.preflight-success.result }}"
             exit 1
           fi
-          if [[ "${{ needs.e2e-core.result }}" != "success" ]]; then
-            echo "e2e-core failed or was skipped: ${{ needs.e2e-core.result }}"
-            exit 1
-          fi
-          if [[ "${{ needs.e2e-transforms.result }}" != "success" ]]; then
-            echo "e2e-transforms failed or was skipped: ${{ needs.e2e-transforms.result }}"
-            exit 1
-          fi
-          if [[ "${{ needs.e2e-remote-assist.result }}" != "success" ]]; then
-            echo "e2e-remote-assist failed or was skipped: ${{ needs.e2e-remote-assist.result }}"
-            exit 1
-          fi
-          if [[ "${{ needs.e2e-runtime-tools.result }}" != "success" ]]; then
-            echo "e2e-runtime-tools failed or was skipped: ${{ needs.e2e-runtime-tools.result }}"
-            exit 1
-          fi
-          if [[ "${{ needs.e2e-concurrency.result }}" != "success" ]]; then
-            echo "e2e-concurrency failed or was skipped: ${{ needs.e2e-concurrency.result }}"
+          if [[ "${{ needs.e2e.result }}" != "success" ]]; then
+            echo "one or more e2e slices failed or were skipped: ${{ needs.e2e.result }}"
             exit 1
           fi
           echo "ci-success passed"

@@ -46,15 +46,26 @@ def test_image_scan_is_advisory_and_not_a_pr_check() -> None:
 
 def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     merge_gate = MERGE_GATE_PATH.read_text(encoding="utf-8")
+    jobs = yaml.safe_load(merge_gate)["jobs"]
 
     assert "ci-success" in merge_gate
     assert "just test-nondocker-cov" in merge_gate
     assert "just package" in merge_gate
-    assert "just test-e2e-core" in merge_gate
-    assert "just test-e2e-transforms" in merge_gate
-    assert "just test-e2e-remote-assist" in merge_gate
-    assert "just test-e2e-runtime-tools" in merge_gate
-    assert "just test-e2e-concurrency" in merge_gate
+
+    # The gate runs the e2e suite as one matrix over named slices rather than
+    # six copy-pasted jobs, so the slice names live in the matrix and the
+    # recipe name in the `run:` line is `test-e2e-slice`. Which slices those
+    # are, and that they add up to the whole suite, is
+    # tests/contract/test_workflow_contracts.py's job.
+    assert "just test-e2e-slice" in merge_gate
+    assert set(jobs["e2e"]["strategy"]["matrix"]["slice"]) >= {
+        "core",
+        "transforms",
+        "remote-assist",
+        "runtime-tools",
+        "concurrency",
+        "media",
+    }
 
 
 def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
@@ -62,7 +73,6 @@ def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
     data = yaml.safe_load(content)
     jobs = data["jobs"]
 
-    # 1. ci-success depends on the new required jobs
     ci_success = jobs["ci-success"]
     needs = ci_success["needs"]
     expected_jobs = {
@@ -72,29 +82,19 @@ def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
         "merge-lightweight",
         "package",
         "preflight-success",
-        "e2e-core",
-        "e2e-transforms",
-        "e2e-remote-assist",
-        "e2e-runtime-tools",
-        "e2e-concurrency",
-    }
-    e2e_jobs = {
-        "e2e-core",
-        "e2e-transforms",
-        "e2e-remote-assist",
-        "e2e-runtime-tools",
-        "e2e-concurrency",
+        "e2e",
     }
     assert expected_jobs.issubset(set(needs))
 
-    for job in e2e_jobs:
-        assert jobs[job]["needs"] == "preflight-success"
-        assert jobs[job]["if"] == "always() && !cancelled() && needs.preflight-success.result == 'success'"
+    assert jobs["e2e"]["needs"] == "preflight-success"
+    assert jobs["e2e"]["if"] == "always() && !cancelled() && needs.preflight-success.result == 'success'"
 
-    # Check that required jobs are validated in the bash step of ci-success
+    # Every needed job's result must be turned into an exit code by hand,
+    # because ci-success runs with `if: always()`. This used to list the e2e
+    # jobs one by one and missed `e2e-media` entirely.
     check_step = next(step for step in ci_success["steps"] if step.get("name") == "Check required jobs")
     run_script = check_step["run"]
-    for job in expected_jobs:
+    for job in needs:
         if job == "dependency-review":
             assert f"needs.{job}.result" in run_script
         else:
@@ -107,7 +107,6 @@ def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
         for step in job.get("steps", []):
             assert step.get("continue-on-error", False) is False
             run_cmd = step.get("run", "")
-            # Ensure no masking with || true or || exit 0
             assert "|| true" not in run_cmd
             assert "|| exit 0" not in run_cmd
 

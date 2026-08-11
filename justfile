@@ -38,34 +38,34 @@ test-nondocker-cov:
 	{{python}} -m pytest -q tests/unit tests/contract --cov=rosotacom --cov-report=term-missing --cov-report=xml:coverage.xml
 
 test-e2e-smoke:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/ -m e2e
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/ -m e2e
 
 test-e2e-fast: test-e2e-smoke
 
 test-e2e-core:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "heartbeat or chatter"
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "heartbeat or chatter"
 
 test-e2e-transforms:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "occupancy_grid or sized_payload"
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "occupancy_grid or sized_payload"
 
 test-e2e-remote-assist:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "remote_assist"
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "remote_assist"
 
 # Two invocations on purpose: a shared `-k` filter would silently deselect
 # every test in the other files (contract-tested in test_benched_set_registry).
 test-e2e-runtime-tools:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "link_latency"
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py tests/e2e/test_benchmark_ab.py tests/e2e/test_benchmark_replay.py
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "link_latency"
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py tests/e2e/test_benchmark_ab.py tests/e2e/test_benchmark_replay.py
 
 # The remaining e2e files. Without this slice the partition is not one: the
 # monolithic `test-e2e-smoke` collects 28 tests, the other five collect 25, and
 # anonymization/video-quality/replay ran only in nightly and the release.
 test-e2e-media:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_anonymize_e2e.py tests/e2e/test_video_quality_e2e.py
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_smoke.py -k "anonymized"
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_anonymize_e2e.py tests/e2e/test_video_quality_e2e.py
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "anonymized"
 
 test-e2e-concurrency:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q tests/e2e/test_parallel_smoke.py
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_parallel_smoke.py
 
 # The five slices partition `test-e2e-smoke`; the merge gate and the release
 # both run them in parallel. This wrapper exists so a workflow matrix can select
@@ -77,7 +77,7 @@ test-e2e-slice slice:
 	just test-e2e-{{slice}}
 
 test-e2e-node nodeid:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q "{{nodeid}}"
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 "{{nodeid}}"
 
 test-e2e-rmw session:
 	ROSOTACOM_RUN_E2E=1 ROSOTACOM_RUN_FULL_E2E=1 {{python}} -m pytest -q "tests/e2e/test_smoke.py::test_full_rmw_heartbeat_smoke_matrix[{{session}}]"

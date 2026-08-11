@@ -3364,6 +3364,37 @@ def _ota_exec_plan(project_config: Path, command: str = "remote-rosotacom majest
     )
 
 
+def test_named_resources_reach_ros2docker_through_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A ros2docker config cannot compute a path into an isolated install, so it
+    # writes ${ROSOTACOM_COM_MSGS}. Until this, every caller had to export that
+    # itself -- which works right up to the point where the caller is not a
+    # shell on the same machine. A two-host run died on the far side with
+    # "Could not expand environment variables in host path" while the identical
+    # single-host run passed, because there the peer inherited the variable from
+    # the orchestrator. The single-host run could not have caught it.
+    for name in rosotacom.NAMED_RESOURCES:
+        monkeypatch.delenv(f"ROSOTACOM_{name.upper()}", raising=False)
+
+    rosotacom._export_named_resource_paths()
+
+    assert os.environ["ROSOTACOM_COM_MSGS"] == str(rosotacom.NAMED_RESOURCES["com_msgs"])
+    assert Path(os.environ["ROSOTACOM_COM_MSGS"]).name == "com_msgs"
+
+
+def test_an_explicit_resource_path_is_not_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # setdefault, not assignment: a caller pointing somewhere else on purpose --
+    # a checkout under development, say -- still wins.
+    monkeypatch.setenv("ROSOTACOM_COM_MSGS", "/somewhere/else")
+
+    rosotacom._export_named_resource_paths()
+
+    assert os.environ["ROSOTACOM_COM_MSGS"] == "/somewhere/else"
+
+
 def test_ota_peer_exec_replaces_the_ssh_client(tmp_path: Path) -> None:
     # The point of the flag: a peer can be reached by something that is not a
     # shell. The script arrives as the final argument, which is the contract

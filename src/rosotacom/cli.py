@@ -8659,8 +8659,34 @@ TOP_LEVEL_COMMANDS = {
 }
 
 
+def _export_named_resource_paths() -> None:
+    """Put the packaged resource paths in the environment for ros2docker.
+
+    A ros2docker config driven by rosotacom may need to bake a package that
+    lives *inside* the rosotacom install — `com_msgs` above all, since both
+    sides of a link must agree on the message definitions. The install is
+    isolated by design, so the config cannot compute the path and writes
+    `${ROSOTACOM_COM_MSGS}` instead. Something has to put it there, and until
+    now that was every caller's job: a shell snippet each project carried,
+    sourced before every start and stop script.
+
+    That works until the caller is not a shell on the same machine. A two-host
+    OTA run reached the control-centre application on the far side and died with
+    `Could not expand environment variables in host path:
+    '${ROSOTACOM_COM_MSGS}'` — while the identical single-host run passed,
+    because there the peer inherited the variable from the orchestrator's
+    environment. The single-host run could not have caught it by construction.
+
+    rosotacom owns the resource, so rosotacom exports it. `setdefault`, so a
+    caller that deliberately points somewhere else still wins.
+    """
+    for name, path in NAMED_RESOURCES.items():
+        os.environ.setdefault(f"ROSOTACOM_{name.upper()}", str(path))
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    _export_named_resource_paths()
     if not argv:
         argv = ["start"]
     elif argv[0] not in TOP_LEVEL_COMMANDS and not argv[0].startswith("-"):

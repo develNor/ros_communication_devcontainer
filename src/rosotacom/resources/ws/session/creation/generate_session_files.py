@@ -1574,6 +1574,27 @@ def _render_domain_bridge_yaml(name: str, topics: Dict[str, Dict[str, Any]]) -> 
     return _yaml_canonical_dump(cfg)
 
 
+#: Every key a topic's `processing:` mapping may carry. Module level because
+#: `session-configuration.md` claims to list exactly these, and
+#: tests/contract/test_session_configuration_doc.py compares the two: three
+#: keys (`latch`, `trickle_hz`, `use_ota_wrapper`) were live and undocumented,
+#: which is worse than undocumented — the reference says "Only these keys are
+#: allowed", so a reader had no reason to look further.
+KNOWN_PROCESSING_KEYS = {
+    "restamp_if",
+    "latch",
+    "trickle_hz",
+    "drop",
+    "framebridge",
+    "normalize_on_target",
+    "compress",
+    "use_ota_wrapper",
+    "throttle_hz",
+    "pixel_cap_preset",
+    "transport",
+}
+
+
 def _compute_pipeline(
     entry: TopicEntry,
     vars_map: Dict[str, Any],
@@ -1585,20 +1606,7 @@ def _compute_pipeline(
 ) -> Dict[str, Any]:
     proc = entry.processing or {}
 
-    known_keys = {
-        "restamp_if",
-        "latch",
-        "trickle_hz",
-        "drop",
-        "framebridge",
-        "normalize_on_target",
-        "compress",
-        "use_ota_wrapper",
-        "throttle_hz",
-        "pixel_cap_preset",
-        "transport",
-    }
-    unknown = set(proc.keys()) - known_keys
+    unknown = set(proc.keys()) - KNOWN_PROCESSING_KEYS
     if unknown:
         raise ValueError(f"Unknown processing keys for topic '{entry.base}': {sorted(unknown)}")
 

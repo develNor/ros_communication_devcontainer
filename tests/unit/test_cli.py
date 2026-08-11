@@ -1539,6 +1539,108 @@ def test_probe_verbs_dispatch_not_wrapped_in_start(monkeypatch: pytest.MonkeyPat
     assert seen[1][1].expect == "absent"
 
 
+def test_probe_publish_parser_advertise_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[argparse.Namespace] = []
+    monkeypatch.setattr(rosotacom, "probe_publish_command", lambda args: calls.append(args) or 0)
+
+    assert rosotacom.main(["probe-publish", "1_heartbeat", "--identity", "a"]) == 0
+    assert calls[0].advertise_timeout == rosotacom._PROBE_ADVERTISE_TIMEOUT_S
+    assert calls[0].duration == rosotacom._PROBE_DURATION_S
+
+    assert rosotacom.main(["probe-publish", "1_heartbeat", "--identity", "a", "--advertise-timeout", "90"]) == 0
+    assert calls[1].advertise_timeout == 90.0
+
+
+def _probe_publish_args(**overrides: object) -> argparse.Namespace:
+    args = argparse.Namespace(
+        identity="center",
+        stop=False,
+        topic="/local_only",
+        rate=5.0,
+        duration=rosotacom._PROBE_DURATION_S,
+        advertise_timeout=rosotacom._PROBE_ADVERTISE_TIMEOUT_S,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_probe_publish_waits_past_slow_polls_until_advertised(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(rosotacom, "_resolve_running_peer", lambda args, identity: ("box", "setup", {}))
+    monkeypatch.setattr(rosotacom, "_publish_isolation_probe", lambda *a, **k: None)
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: True)
+    monkeypatch.setattr(rosotacom.time, "sleep", lambda s: None)
+    present = iter([False] * 15 + [True])
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: next(present))
+
+    assert rosotacom.probe_publish_command(_probe_publish_args()) == 0
+    assert "advertised." in capsys.readouterr().out
+
+
+def test_probe_publish_failure_names_slow_graph_not_publisher(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Publisher alive but the deadline passes: the message must blame graph
+    # discovery, not the publisher (issue #219).
+    monkeypatch.setattr(rosotacom, "_resolve_running_peer", lambda args, identity: ("box", "setup", {}))
+    monkeypatch.setattr(rosotacom, "_publish_isolation_probe", lambda *a, **k: None)
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: True)
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: False)
+
+    assert rosotacom.probe_publish_command(_probe_publish_args(advertise_timeout=0.0)) == 1
+    err = capsys.readouterr().err
+    assert "is running" in err
+    assert "did not report it within" in err
+    assert "--advertise-timeout" in err
+
+
+def test_probe_publish_failure_names_dead_publisher(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(rosotacom, "_resolve_running_peer", lambda args, identity: ("box", "setup", {}))
+    monkeypatch.setattr(rosotacom, "_publish_isolation_probe", lambda *a, **k: None)
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: False)
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: False)
+
+    assert rosotacom.probe_publish_command(_probe_publish_args()) == 1
+    assert "exited or never started" in capsys.readouterr().err
+
+
+def test_wait_for_probe_advertisement_outcomes(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(rosotacom.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: True)
+    present = iter([False, False, True])
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: next(present))
+    assert rosotacom._wait_for_probe_advertisement("box", "setup", "/local_only", timeout_s=60.0) == "advertised"
+    assert len(sleeps) == 2
+
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: False)
+    assert rosotacom._wait_for_probe_advertisement("box", "setup", "/local_only", timeout_s=0.0) == "timeout"
+
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: False)
+    assert rosotacom._wait_for_probe_advertisement("box", "setup", "/local_only", timeout_s=60.0) == "publisher-gone"
+
+
+def test_verify_isolation_inconclusive_distinguishes_causes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rosotacom, "_publish_isolation_probe", lambda *a, **k: None)
+    stopped: list[str] = []
+    monkeypatch.setattr(rosotacom, "_stop_isolation_probe", lambda container, topic: stopped.append(container))
+
+    monkeypatch.setattr(rosotacom, "_wait_for_probe_advertisement", lambda *a, **k: "timeout")
+    errors = rosotacom._verify_isolation("pub", "ps", "chk", "cs", "/local_only", log_line=lambda _: None)
+    assert len(errors) == 1
+    assert "is running in pub" in errors[0]
+    assert "did not report it within" in errors[0]
+
+    monkeypatch.setattr(rosotacom, "_wait_for_probe_advertisement", lambda *a, **k: "publisher-gone")
+    errors = rosotacom._verify_isolation("pub", "ps", "chk", "cs", "/local_only", log_line=lambda _: None)
+    assert errors == ["isolation check inconclusive: probe publisher for /local_only exited or never started in pub"]
+    assert stopped == ["pub", "pub"]
+
+
 def test_expect_from_bag_fragment_passes_rosotacom_test(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

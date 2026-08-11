@@ -453,6 +453,34 @@ in this mode — there is no staging to undo, and the workdir is your repository
 The run manifest records which mode and which version the peers ran, so a result
 can be attributed to an artefact rather than to a working copy.
 
+#### How the peers are reached: `--peer-exec`
+
+`--peer-ssh` gives the orchestrator a shell on the peer, which is more than a
+run needs and more than some machines should hand out. `--peer-exec` names the
+transport instead:
+
+```bash
+rosotacom ota-smoke 2_native_chatter --peer a=workstation --peer b=robot \
+  --install-mode checkout \
+  --peer-checkout a=/home/me/fleet_mgmt --peer-checkout b=/home/robot/fleet_mgmt \
+  --peer-exec b='remote-rosotacom robot'
+```
+
+The command is run with the script as its final argument — the contract
+`ssh host <script>` already has — so anything of that shape can carry a peer: a
+wrapper that logs what a run asks for, a container exec, or a forced command
+that accepts some scripts and refuses the rest. rosotacom does not know or care
+which; it only stops assuming that reaching a peer means having a shell on it.
+
+Two restrictions, both load-bearing. It applies to `--install-mode checkout`
+only, because the staging modes push a tar stream and a file write by taking
+the ssh client's own argv apart, and a transport that promises no more than
+"run this script" cannot carry them. And a peer takes either `--peer-ssh` or
+`--peer-exec`, never both: leaving it ambiguous hides which one carried the run.
+
+`-t` and `-o BatchMode=yes` are dropped rather than forwarded. They are options
+of one client, and a transport that is not ssh never agreed to understand them.
+
 ### Live status / debugging overview
 
 Enable a continuously-updated, per-topic pipeline overview by setting

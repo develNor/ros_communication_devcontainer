@@ -771,7 +771,11 @@ def test_ota_smoke_plan_writes_state_and_manifest(tmp_path: Path) -> None:
     assert target.target_type == "scenario"
     assert plan.peers["b"].ssh == "robot-b"
     assert run["deployment_state"] == str(instance.host_dir / "ota-deployment.yaml")
-    assert run["peers"]["b"] == {"ssh_configured": True, "address": "10.0.0.11"}
+    assert run["peers"]["b"] == {
+        "ssh_configured": True,
+        "exec_configured": False,
+        "address": "10.0.0.11",
+    }
     assert rosotacom._ota_load_state(str(plan.state_path)) == plan
 
 
@@ -1283,7 +1287,9 @@ def test_ota_smoke_dry_run_exercises_generic_remote_flow(
     assert "required command tmux" in out
     assert "Python venv support" in out
     assert "reach peer b (10.0.0.11): running remote command" in out
-    assert "b: SSH reachable: running remote command" in out
+    # Named for what it checks rather than for one client: a peer can be
+    # reached by something other than ssh.
+    assert "b: reachable: running remote command" in out
     assert "a: start demo: running remote command" in out
     assert "b: start demo: running remote command" in out
     assert "a: wait for application local_app: running remote command" in out
@@ -1670,6 +1676,108 @@ def test_probe_verbs_dispatch_not_wrapped_in_start(monkeypatch: pytest.MonkeyPat
     ]
     assert all(args.session_dir == "1_heartbeat" for _, args in seen)
     assert seen[1][1].expect == "absent"
+
+
+def test_probe_publish_parser_advertise_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[argparse.Namespace] = []
+    monkeypatch.setattr(rosotacom, "probe_publish_command", lambda args: calls.append(args) or 0)
+
+    assert rosotacom.main(["probe-publish", "1_heartbeat", "--identity", "a"]) == 0
+    assert calls[0].advertise_timeout == rosotacom._PROBE_ADVERTISE_TIMEOUT_S
+    assert calls[0].duration == rosotacom._PROBE_DURATION_S
+
+    assert rosotacom.main(["probe-publish", "1_heartbeat", "--identity", "a", "--advertise-timeout", "90"]) == 0
+    assert calls[1].advertise_timeout == 90.0
+
+
+def _probe_publish_args(**overrides: object) -> argparse.Namespace:
+    args = argparse.Namespace(
+        identity="center",
+        stop=False,
+        topic="/local_only",
+        rate=5.0,
+        duration=rosotacom._PROBE_DURATION_S,
+        advertise_timeout=rosotacom._PROBE_ADVERTISE_TIMEOUT_S,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_probe_publish_waits_past_slow_polls_until_advertised(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(rosotacom, "_resolve_running_peer", lambda args, identity: ("box", "setup", {}))
+    monkeypatch.setattr(rosotacom, "_publish_isolation_probe", lambda *a, **k: None)
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: True)
+    monkeypatch.setattr(rosotacom.time, "sleep", lambda s: None)
+    present = iter([False] * 15 + [True])
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: next(present))
+
+    assert rosotacom.probe_publish_command(_probe_publish_args()) == 0
+    assert "advertised." in capsys.readouterr().out
+
+
+def test_probe_publish_failure_names_slow_graph_not_publisher(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Publisher alive but the deadline passes: the message must blame graph
+    # discovery, not the publisher (issue #219).
+    monkeypatch.setattr(rosotacom, "_resolve_running_peer", lambda args, identity: ("box", "setup", {}))
+    monkeypatch.setattr(rosotacom, "_publish_isolation_probe", lambda *a, **k: None)
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: True)
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: False)
+
+    assert rosotacom.probe_publish_command(_probe_publish_args(advertise_timeout=0.0)) == 1
+    err = capsys.readouterr().err
+    assert "is running" in err
+    assert "did not report it within" in err
+    assert "--advertise-timeout" in err
+
+
+def test_probe_publish_failure_names_dead_publisher(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(rosotacom, "_resolve_running_peer", lambda args, identity: ("box", "setup", {}))
+    monkeypatch.setattr(rosotacom, "_publish_isolation_probe", lambda *a, **k: None)
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: False)
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: False)
+
+    assert rosotacom.probe_publish_command(_probe_publish_args()) == 1
+    assert "exited or never started" in capsys.readouterr().err
+
+
+def test_wait_for_probe_advertisement_outcomes(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(rosotacom.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: True)
+    present = iter([False, False, True])
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: next(present))
+    assert rosotacom._wait_for_probe_advertisement("box", "setup", "/local_only", timeout_s=60.0) == "advertised"
+    assert len(sleeps) == 2
+
+    monkeypatch.setattr(rosotacom, "_topic_present", lambda *a: False)
+    assert rosotacom._wait_for_probe_advertisement("box", "setup", "/local_only", timeout_s=0.0) == "timeout"
+
+    monkeypatch.setattr(rosotacom, "_isolation_probe_running", lambda *a: False)
+    assert rosotacom._wait_for_probe_advertisement("box", "setup", "/local_only", timeout_s=60.0) == "publisher-gone"
+
+
+def test_verify_isolation_inconclusive_distinguishes_causes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rosotacom, "_publish_isolation_probe", lambda *a, **k: None)
+    stopped: list[str] = []
+    monkeypatch.setattr(rosotacom, "_stop_isolation_probe", lambda container, topic: stopped.append(container))
+
+    monkeypatch.setattr(rosotacom, "_wait_for_probe_advertisement", lambda *a, **k: "timeout")
+    errors = rosotacom._verify_isolation("pub", "ps", "chk", "cs", "/local_only", log_line=lambda _: None)
+    assert len(errors) == 1
+    assert "is running in pub" in errors[0]
+    assert "did not report it within" in errors[0]
+
+    monkeypatch.setattr(rosotacom, "_wait_for_probe_advertisement", lambda *a, **k: "publisher-gone")
+    errors = rosotacom._verify_isolation("pub", "ps", "chk", "cs", "/local_only", log_line=lambda _: None)
+    assert errors == ["isolation check inconclusive: probe publisher for /local_only exited or never started in pub"]
+    assert stopped == ["pub", "pub"]
 
 
 def test_expect_from_bag_fragment_passes_rosotacom_test(
@@ -3242,6 +3350,123 @@ def test_ota_checkout_state_round_trips_the_peer_checkouts(tmp_path: Path) -> No
     # A --stop or --state-file resume must reach the same checkout the start
     # used; losing it would run the stop in the staging directory instead.
     assert rosotacom._ota_load_state(str(plan.state_path)) == plan
+
+
+def _ota_exec_plan(project_config: Path, command: str = "remote-rosotacom majestic-tks") -> rosotacom.OtaSmokePlan:
+    _root, project = rosotacom._ota_checkout_project_path(project_config)
+    return rosotacom._ota_plan_from_bindings(
+        _ota_bindings(),
+        workdir="/tmp/rosotacom_ota",
+        install_mode="checkout",
+        checkouts={"a": str(project_config.parent.parent), "b": "/home/other/fleet_mgmt"},
+        project=project,
+        exec_commands={"a": command},
+    )
+
+
+def test_ota_peer_exec_replaces_the_ssh_client(tmp_path: Path) -> None:
+    # The point of the flag: a peer can be reached by something that is not a
+    # shell. The script arrives as the final argument, which is the contract
+    # `ssh host <script>` already has, so a forced command on the far side sees
+    # exactly one argument and can decide whether to run it.
+    plan = _ota_exec_plan(_write_checkout_project(tmp_path))
+
+    assert rosotacom._ota_remote_argv(plan.peers["a"], "true") == [
+        "remote-rosotacom",
+        "majestic-tks",
+        "true",
+    ]
+
+
+def test_ota_peer_exec_ignores_options_that_belong_to_ssh(tmp_path: Path) -> None:
+    # `-t` and `-o BatchMode=yes` are options of one client. Passing them to an
+    # arbitrary transport would be guessing at an interface it never agreed to,
+    # and the failure would look like a broken peer rather than a wrong flag.
+    plan = _ota_exec_plan(_write_checkout_project(tmp_path))
+
+    assert rosotacom._ota_remote_argv(plan.peers["a"], "true", tty=True, batch=True) == [
+        "remote-rosotacom",
+        "majestic-tks",
+        "true",
+    ]
+
+
+def test_ota_peer_exec_makes_a_peer_remote(tmp_path: Path) -> None:
+    # Everything that used to ask `peer.ssh` meant "is it over there". A peer
+    # behind a command transport is, and a caller that still reads `.ssh` would
+    # take the local branch for a machine on another host.
+    plan = _ota_exec_plan(_write_checkout_project(tmp_path))
+
+    assert rosotacom._ota_peer_is_remote(plan.peers["a"]) is True
+    assert rosotacom._ota_peer_is_remote(plan.peers["b"]) is True
+    assert rosotacom._ota_peer_target(plan.peers["a"]) == "remote-rosotacom majestic-tks"
+
+
+def test_ota_peer_exec_requires_checkout_mode() -> None:
+    # source and pin push a tree and a file to the peer by taking the ssh
+    # client's argv apart. A transport that only promises "run this script"
+    # cannot carry either.
+    with pytest.raises(RuntimeError, match="requires --install-mode checkout"):
+        rosotacom._ota_plan_from_bindings(
+            _ota_bindings(),
+            workdir="/tmp/rosotacom_ota",
+            install_mode="source",
+            exec_commands={"a": "remote-rosotacom majestic-tks"},
+        )
+
+
+def test_ota_peer_exec_refuses_to_share_a_peer_with_peer_ssh(tmp_path: Path) -> None:
+    _root, project = rosotacom._ota_checkout_project_path(_write_checkout_project(tmp_path))
+    with pytest.raises(RuntimeError, match="a peer is reached one way"):
+        rosotacom._ota_plan_from_bindings(
+            _ota_bindings(),
+            workdir="/tmp/rosotacom_ota",
+            install_mode="checkout",
+            checkouts={"a": "/home/go914/dev/fleet_mgmt", "b": "/home/other/fleet_mgmt"},
+            project=project,
+            # "b" already carries ssh robot-b in the fixture bindings.
+            exec_commands={"b": "remote-rosotacom majestic-tks"},
+        )
+
+
+def test_ota_peer_exec_names_a_peer_the_session_has(tmp_path: Path) -> None:
+    _root, project = rosotacom._ota_checkout_project_path(_write_checkout_project(tmp_path))
+    with pytest.raises(RuntimeError, match="names a peer the session does not have: c"):
+        rosotacom._ota_plan_from_bindings(
+            _ota_bindings(),
+            workdir="/tmp/rosotacom_ota",
+            install_mode="checkout",
+            checkouts={"a": "/home/go914/dev/fleet_mgmt", "b": "/home/other/fleet_mgmt"},
+            project=project,
+            exec_commands={"c": "remote-rosotacom majestic-tks"},
+        )
+
+
+def test_ota_peer_exec_survives_a_stop(tmp_path: Path) -> None:
+    # A stop reaches the peers the start reached. Losing the transport would
+    # send the stop down the local branch and leave the far side running, which
+    # is the shape of the defect --install-mode checkout introduced once
+    # already.
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    plan = _ota_exec_plan(_write_checkout_project(tmp_path))
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "auto")
+    instance = rosotacom._resolve_session_instance(runtime, target.session, "ota")
+
+    plan = rosotacom._ota_write_state(instance, plan)
+
+    assert rosotacom._ota_load_state(str(plan.state_path)) == plan
+    assert rosotacom._ota_load_state(str(plan.state_path)).peers["a"].exec_command == "remote-rosotacom majestic-tks"
+
+
+def test_ota_staging_refuses_a_command_transport(tmp_path: Path) -> None:
+    # Defence in depth for the check above: if the mode validation is ever
+    # loosened, the local branch of these helpers would copy the peer's tree
+    # onto the orchestrator and report success.
+    plan = _ota_exec_plan(_write_checkout_project(tmp_path))
+    peer = plan.peers["a"]
+
+    with pytest.raises(RuntimeError, match="over a command transport"):
+        rosotacom._ota_stage_text(peer, "x", "/tmp/x", dry_run=True, label="stage")
 
 
 def test_ota_stop_recovers_the_recorded_plan_instead_of_guessing(tmp_path: Path) -> None:

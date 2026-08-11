@@ -417,17 +417,22 @@ message types for `/com/...` topics. For that reason, user-defined topic entries
 The auto-generated heartbeat topic is the only exception because its type is known by the generator.
 
 #### Allowed `processing` keys
-Only these keys are allowed:
+Only these keys are allowed. The list is checked against the generator's
+`KNOWN_PROCESSING_KEYS` by `tests/contract/test_session_configuration_doc.py`,
+so a new knob cannot ship undocumented.
 
 ```yaml
 processing:
   restamp_if: true                # bool OR common bool strings OR "<VAR_NAME>" (template param name)
+  latch: false                    # bool, re-publish on value change only
+  trickle_hz: 1                   # number > 0, receiver-side periodic re-publish
   drop:                           # optional, message drop configuration
     drop_count: 2                 # int >= 0, number of messages to drop
     window_size: 3                # int > 0, window size (drop_count must be < window_size)
   framebridge: local_to_global    # local_to_global | global_to_local
   normalize_on_target: false      # bool
   compress: false                 # bool
+  use_ota_wrapper: false          # bool, wrap the payload for the OTA hop
   throttle_hz: 10                 # int > 0
   pixel_cap_preset: "wsvga"       # scalar, used as suffix only,
   transport:
@@ -435,6 +440,37 @@ processing:
     local_republish: false        # default false
     # plus type-specific params (see below)
 ```
+
+##### `latch` and `trickle_hz`: two answers to "the value did not change"
+
+Both address a topic that publishes rarely, and they sit on opposite ends of
+the link:
+
+- **`latch` is a sender-side filter.** The latch stage forwards a message only
+  when its value differs from the last one, to `<topic>{shared.processing_suffixes.latched}`
+  (default `/latched`). It saves OTA bandwidth on a state topic that repeats
+  itself. Its cost is that a receiver which subscribes *after* the last change
+  gets nothing — what the delivered value is then depends entirely on the OTA
+  QoS for the role (`depth`, `lifespan`, `durability`).
+- **`trickle_hz` is a receiver-side re-publish.** A local timer republishes the
+  last *delivered* value to `<final>/trickle` at that rate, whether or not
+  anything new arrived. Nothing extra crosses the link: the trickle topic is
+  not in the OTA topic lists. It exists for consumers that expect a steady
+  stream — visualization, state diagrams, watchdogs — and would otherwise treat
+  an unchanged value as a dead one.
+
+They compose: `latch: true` with `trickle_hz: 1` sends a message only on change
+and still gives the receiving side a 1 Hz stream.
+
+Because the trickle output is the real delivered topic, it is the monitored
+`native_in` stage rather than the pre-trickle `final` — otherwise the
+re-publish would be an observability blind spot whose rate no `expect` could
+assert. `expect.hz` on such a topic therefore describes the trickle rate plus
+whatever arrives over the link, which is why `examples/sessions/11_trickle`
+asserts `hz: {min: 2, max: 8}` for a 1 Hz source at `trickle_hz: 4`.
+
+`trickle_hz` must be greater than 0. It also sets the expected rate for a topic
+that has no `throttle_hz`.
 
 #### Processing pipeline order (exact)
 Given a base topic like `/tf`, stages are applied in this order:

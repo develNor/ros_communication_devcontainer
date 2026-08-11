@@ -234,6 +234,19 @@ class OtaSmokePeer:
     #: control centre runs it under a different account than a laptop does — and
     #: a single workdir would silently be wrong on all but one of them.
     checkout: str | None = None
+    #: How to reach this peer, when `ssh <alias> <script>` is not allowed to be
+    #: the answer. The command is given the script as its final argument, the
+    #: same contract ssh has, so anything with that shape can carry a peer:
+    #: a wrapper that logs, a container exec, or a capability that accepts only
+    #: some scripts and refuses the rest.
+    #:
+    #: This exists because "give the orchestrator a shell on the peer" is a poor
+    #: trade for a machine that is only meant to run one repository's test. An
+    #: SSH alias grants everything that account can do, forever, to whoever
+    #: holds the key; the operations a run actually needs are a short, fixed
+    #: list. Naming the transport lets the narrow thing be substituted without
+    #: this file having to know what narrow means.
+    exec_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1027,6 +1040,10 @@ def _parse_peer_checkout_overrides(overrides: list[str] | None) -> dict[str, str
     return parse_assignments(overrides, option="--peer-checkout")
 
 
+def _parse_peer_exec_overrides(overrides: list[str] | None) -> dict[str, str]:
+    return parse_assignments(overrides, option="--peer-exec")
+
+
 def _deployment_config(runtime: RuntimeConfig) -> DeploymentConfig | None:
     return load_deployment(runtime.deployment)
 
@@ -1563,8 +1580,31 @@ def _ota_plan_from_bindings(
     install_pin: str | None = None,
     checkouts: Mapping[str, str] | None = None,
     project: str | None = None,
+    exec_commands: Mapping[str, str] | None = None,
 ) -> OtaSmokePlan:
     _ota_validate_install_mode(install_mode)
+    if exec_commands:
+        unknown = sorted(set(exec_commands) - set(bindings))
+        if unknown:
+            raise RuntimeError(f"--peer-exec names a peer the session does not have: {', '.join(unknown)}")
+        # Staging modes send a tar stream and a file write, not a command, and
+        # both take the ssh client's own argv apart to do it. A transport that
+        # only promises "run this script" cannot carry them, and quietly
+        # writing the peer's files onto the orchestrator instead — which is
+        # what the local branch of the staging helpers would do — is the worst
+        # of the available outcomes.
+        if install_mode != "checkout":
+            raise RuntimeError(
+                f"--peer-exec requires --install-mode checkout (got {install_mode!r}): the other modes copy a "
+                "tree to the peer, which a command transport cannot carry."
+            )
+        both = sorted(name for name in exec_commands if bindings[name].ssh)
+        if both:
+            raise RuntimeError(
+                "--peer-exec and --peer-ssh both name "
+                + ", ".join(both)
+                + "; a peer is reached one way, and leaving it ambiguous hides which one carried the run."
+            )
     if install_mode == "checkout":
         if not checkouts or not project:
             raise RuntimeError("--install-mode checkout requires --peer-checkout for every peer.")
@@ -1602,6 +1642,7 @@ def _ota_plan_from_bindings(
             ssh=binding.ssh,
             address=binding.address,
             checkout=(checkouts or {}).get(name) if install_mode == "checkout" else None,
+            exec_command=(exec_commands or {}).get(name),
         )
         for name, binding in bindings.items()
     }
@@ -1619,14 +1660,19 @@ def _ota_plan_from_bindings(
 def _ota_write_state(instance: SessionInstance, plan: OtaSmokePlan) -> OtaSmokePlan:
     path = instance.host_dir / "ota-deployment.yaml"
     payload = {
-        "schema_version": 3,
+        "schema_version": 4,
         "workdir": plan.workdir,
         "rosotacom": plan.rosotacom,
         "project": plan.project,
         "install_mode": plan.install_mode,
         "install_pin": plan.install_pin,
         "peers": {
-            name: {"address": peer.address, "ssh": peer.ssh, "checkout": peer.checkout}
+            name: {
+                "address": peer.address,
+                "ssh": peer.ssh,
+                "checkout": peer.checkout,
+                "exec": peer.exec_command,
+            }
             for name, peer in sorted(plan.peers.items())
         },
     }
@@ -1637,7 +1683,7 @@ def _ota_write_state(instance: SessionInstance, plan: OtaSmokePlan) -> OtaSmokeP
 def _ota_load_state(path_arg: str) -> OtaSmokePlan:
     path = Path(path_arg).expanduser().resolve()
     raw = _load_yaml_file(path)
-    if raw.get("schema_version") != 3:
+    if raw.get("schema_version") != 4:
         raise RuntimeError(f"Unsupported OTA deployment state: {path}")
     peers_raw = raw.get("peers")
     if not isinstance(peers_raw, dict) or len(peers_raw) != 2:
@@ -1651,6 +1697,7 @@ def _ota_load_state(path_arg: str) -> OtaSmokePlan:
             address=str(peer_raw["address"]),
             ssh=str(peer_raw["ssh"]) if peer_raw.get("ssh") else None,
             checkout=str(peer_raw["checkout"]) if peer_raw.get("checkout") else None,
+            exec_command=str(peer_raw["exec"]) if peer_raw.get("exec") else None,
         )
     install_pin = raw.get("install_pin")
     return OtaSmokePlan(
@@ -1682,7 +1729,32 @@ def _ota_quote_cmd(parts: list[str]) -> str:
     return shlex.join(parts)
 
 
+def _ota_peer_is_remote(peer: OtaSmokePeer) -> bool:
+    """Does this peer run somewhere other than the orchestrator?
+
+    Asked as a question about the peer rather than about SSH. Every caller that
+    used to read ``peer.ssh`` for this meant "is it over there", and each one
+    that kept reading it after a second transport existed would have taken the
+    local branch for a machine on the other side of the room.
+    """
+    return bool(peer.ssh or peer.exec_command)
+
+
+def _ota_peer_target(peer: OtaSmokePeer) -> str:
+    """How to name this peer's location in output meant for a human."""
+    if peer.exec_command:
+        return peer.exec_command
+    return peer.ssh or "local shell"
+
+
 def _ota_remote_argv(peer: OtaSmokePeer, script: str, *, tty: bool = False, batch: bool = False) -> list[str]:
+    # A named transport wins over the SSH alias, and it takes the script as its
+    # last argument because that is the contract `ssh host <script>` already
+    # has. `tty` and `batch` are dropped on purpose rather than guessed at:
+    # they are options of one particular client, and a transport that is not
+    # ssh has no obligation to understand them.
+    if peer.exec_command:
+        return [*shlex.split(peer.exec_command), script]
     if peer.ssh:
         argv = ["ssh"]
         if batch:
@@ -2194,7 +2266,12 @@ def _ota_write_manifest(
             "install_mode": plan.install_mode,
             "install_pin": plan.install_pin,
             "peers": {
-                name: {"ssh_configured": bool(peer.ssh), "address": peer.address} for name, peer in plan.peers.items()
+                name: {
+                    "ssh_configured": bool(peer.ssh),
+                    "exec_configured": bool(peer.exec_command),
+                    "address": peer.address,
+                }
+                for name, peer in plan.peers.items()
             },
         },
     )
@@ -2378,6 +2455,7 @@ def _resolve_ota_smoke_context(
         )
         install_mode = str(getattr(args, "install_mode", None) or "source")
         checkouts = _parse_peer_checkout_overrides(getattr(args, "peer_checkout", None))
+        exec_commands = _parse_peer_exec_overrides(getattr(args, "peer_exec", None))
         project: str | None = None
         if install_mode == "checkout":
             if not runtime.rosotacom_config:
@@ -2385,10 +2463,12 @@ def _resolve_ota_smoke_context(
             local_checkout, project = _ota_checkout_project_path(runtime.rosotacom_config)
             for name, path in sorted(checkouts.items()):
                 binding = bindings.get(name)
-                if binding is not None and not binding.ssh and Path(path).resolve() != local_checkout:
+                remote = binding is not None and (binding.ssh or name in exec_commands)
+                if binding is not None and not remote and Path(path).resolve() != local_checkout:
                     raise RuntimeError(
                         f"--peer-checkout {name}={path} names the peer that runs on this machine, but the active "
-                        f"project lives in {local_checkout}. Point it there, or give that peer an SSH target."
+                        f"project lives in {local_checkout}. Point it there, or give that peer a transport "
+                        "(--peer-ssh or --peer-exec)."
                     )
         plan = _ota_plan_from_bindings(
             bindings,
@@ -2397,6 +2477,7 @@ def _resolve_ota_smoke_context(
             install_pin=getattr(args, "install_pin", None),
             checkouts=checkouts,
             project=project,
+            exec_commands=exec_commands,
         )
     plan_peers = set(plan.peers)
     target_peers = set(_peer_keys_from_cfg(target.cfg))
@@ -2428,7 +2509,7 @@ def _ota_network_sudo_passwords(
         return {peer.name: "" for peer in plan.peers.values()}
     passwords: dict[str, str] = {}
     for peer in plan.peers.values():
-        target = peer.ssh or "local shell"
+        target = _ota_peer_target(peer)
         passwords[peer.name] = getpass.getpass(f"sudo password for {peer.name} ({target}) [network shaping only]: ")
     return passwords
 
@@ -2528,8 +2609,8 @@ def _ota_preflight(
     sudo_mode = _validate_ota_sudo_mode(sudo_mode)
     sudo_passwords = sudo_passwords or {}
     for peer in plan.peers.values():
-        if peer.ssh:
-            _ota_run(peer, "true", label=f"{peer.name}: SSH reachable", dry_run=dry_run, batch=True)
+        if _ota_peer_is_remote(peer):
+            _ota_run(peer, "true", label=f"{peer.name}: reachable", dry_run=dry_run, batch=True)
         required = ["python3", "docker", "tar"]
         if require_tmux:
             required.append("tmux")
@@ -2634,6 +2715,12 @@ def _ota_stage_tree(peer: OtaSmokePeer, source: Path, destination: str, *, dry_r
         "-",
         ".",
     ]
+    # Reached only in the staging install modes, which `--peer-exec` refuses.
+    # Kept as a check rather than a comment because the failure it prevents is
+    # silent: the local branch below would copy the peer's tree onto the
+    # orchestrator and report success.
+    if peer.exec_command:
+        raise RuntimeError(f"Cannot stage files to {peer.name} over a command transport; use --install-mode checkout.")
     if not peer.ssh:
         print(f"+ {label}: copy {source} -> {destination}")
         if not dry_run:
@@ -2655,7 +2742,13 @@ def _ota_stage_tree(peer: OtaSmokePeer, source: Path, destination: str, *, dry_r
 
 
 def _ota_stage_text(peer: OtaSmokePeer, text: str, destination: str, *, dry_run: bool, label: str) -> None:
-    print(f"+ {label}: write {destination} on {peer.ssh or 'local host'}")
+    # Reached only in the staging install modes, which `--peer-exec` refuses.
+    # Kept as a check rather than a comment because the failure it prevents is
+    # silent: the local branch below would copy the peer's tree onto the
+    # orchestrator and report success.
+    if peer.exec_command:
+        raise RuntimeError(f"Cannot stage files to {peer.name} over a command transport; use --install-mode checkout.")
+    print(f"+ {label}: write {destination} on {_ota_peer_target(peer)}")
     if dry_run:
         return
     if peer.ssh:
@@ -8493,6 +8586,18 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Absolute path of a peer's project checkout, for --install-mode checkout. "
             "Required for every peer in that mode; the same repository is at a different path on each machine."
+        ),
+    )
+    ota_smoke_parser.add_argument(
+        "--peer-exec",
+        action="append",
+        default=[],
+        metavar="PEER=COMMAND",
+        help=(
+            "Run this peer's commands through COMMAND instead of ssh; the script is appended as the final "
+            "argument, the same contract ssh has. For --install-mode checkout only, and mutually exclusive "
+            "with --peer-ssh for the same peer. Use it to put a peer behind a transport narrower than a "
+            "shell, such as a forced command that accepts only this project's own commands."
         ),
     )
     ota_smoke_parser.add_argument("--target-type", choices=["auto", "session", "scenario"], default="auto")

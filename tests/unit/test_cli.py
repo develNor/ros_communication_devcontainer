@@ -783,8 +783,11 @@ def test_ota_smoke_command_building_and_remote_wrapping(tmp_path: Path) -> None:
     start = rosotacom._ota_rosotacom_command(
         plan,
         rosotacom._ota_start_parts(target, "a", "run1", peer_args, mode="detached"),
+        plan.peers["a"],
     )
-    stop = rosotacom._ota_rosotacom_command(plan, rosotacom._ota_stop_parts(target, "b", "run1", peer_args))
+    stop = rosotacom._ota_rosotacom_command(
+        plan, rosotacom._ota_stop_parts(target, "b", "run1", peer_args), plan.peers["b"]
+    )
 
     assert start.startswith("cd /tmp/rosotacom_ota && source/.venv/bin/rosotacom scenario start demo")
     assert "--identity a --mode detached --instance-id run1 --force" in start
@@ -2981,3 +2984,127 @@ def test_pin_mode_queries_a_project_reusing_packaged_configs(tmp_path: Path) -> 
     runtime.rosotacom_config.write_text(yaml.safe_dump(config), encoding="utf-8")
 
     assert rosotacom._ota_project_uses_packaged_configs(runtime) is True
+
+
+def _ota_checkout_plan(project_config: Path) -> rosotacom.OtaSmokePlan:
+    _root, project = rosotacom._ota_checkout_project_path(project_config)
+    return rosotacom._ota_plan_from_bindings(
+        _ota_bindings(),
+        workdir="/tmp/rosotacom_ota",
+        install_mode="checkout",
+        checkouts={"a": str(project_config.parent.parent), "b": "/home/other/fleet_mgmt"},
+        project=project,
+    )
+
+
+def _write_checkout_project(tmp_path: Path) -> Path:
+    """A project inside a git checkout, one directory below its root."""
+    root = tmp_path / "fleet_mgmt"
+    (root / ".git").mkdir(parents=True)
+    (root / "session").mkdir()
+    config = root / "session" / "rosotacom.yaml"
+    config.write_text("session_configs_dir:\n  - sessions\n", encoding="utf-8")
+    return config
+
+
+def test_ota_checkout_mode_runs_each_peer_from_its_own_checkout(tmp_path: Path) -> None:
+    # The whole point: two machines, one repository, two absolute paths. A
+    # single plan-wide workdir would be right on at most one of them.
+    plan = _ota_checkout_plan(_write_checkout_project(tmp_path))
+
+    assert plan.install_mode == "checkout"
+    assert plan.rosotacom == "rosotacom"
+    assert plan.project == "session/rosotacom.yaml"
+    assert plan.peers["a"].checkout == str(tmp_path / "fleet_mgmt")
+    assert plan.peers["b"].checkout == "/home/other/fleet_mgmt"
+
+    command = rosotacom._ota_rosotacom_command(plan, ["test"], plan.peers["b"])
+
+    assert command.startswith('export PATH="$HOME/.local/bin:$PATH"; cd /home/other/fleet_mgmt && rosotacom test')
+    assert "--rosotacom-config session/rosotacom.yaml" in command
+
+
+def test_ota_checkout_mode_puts_pipx_on_path_because_ssh_is_not_a_login_shell(tmp_path: Path) -> None:
+    # `ssh host 'cmd'` skips the login profile, so a pipx install in
+    # ~/.local/bin is invisible and the peer answers "command not found" —
+    # which reads as a broken machine. The staged modes never meet this
+    # because they call an absolute path.
+    plan = _ota_checkout_plan(_write_checkout_project(tmp_path))
+    staged = _ota_plan(tmp_path)
+
+    assert "$HOME/.local/bin" in rosotacom._ota_rosotacom_command(plan, ["test"], plan.peers["a"])
+    assert "PATH" not in rosotacom._ota_rosotacom_command(staged, ["test"], staged.peers["a"])
+
+
+def test_ota_checkout_mode_requires_a_checkout_for_every_peer(tmp_path: Path) -> None:
+    _root, project = rosotacom._ota_checkout_project_path(_write_checkout_project(tmp_path))
+    with pytest.raises(RuntimeError, match="--peer-checkout b=<path>"):
+        rosotacom._ota_plan_from_bindings(
+            _ota_bindings(),
+            workdir="/tmp/rosotacom_ota",
+            install_mode="checkout",
+            checkouts={"a": "/home/go914/dev/fleet_mgmt"},
+            project=project,
+        )
+
+
+def test_ota_checkout_mode_refuses_a_relative_or_dangerous_checkout(tmp_path: Path) -> None:
+    _root, project = rosotacom._ota_checkout_project_path(_write_checkout_project(tmp_path))
+    for bad, message in ((".", "absolute path"), ("/home", "broad top-level")):
+        with pytest.raises(RuntimeError, match=message):
+            rosotacom._ota_plan_from_bindings(
+                _ota_bindings(),
+                workdir="/tmp/rosotacom_ota",
+                install_mode="checkout",
+                checkouts={"a": bad, "b": bad},
+                project=project,
+            )
+
+
+def test_ota_peer_checkout_is_rejected_outside_checkout_mode() -> None:
+    with pytest.raises(RuntimeError, match="only applies to --install-mode checkout"):
+        rosotacom._ota_plan_from_bindings(
+            _ota_bindings(),
+            workdir="/tmp/rosotacom_ota",
+            install_mode="pin",
+            checkouts={"a": "/home/go914/dev/fleet_mgmt", "b": "/home/other/fleet_mgmt"},
+        )
+
+
+def test_ota_checkout_project_path_needs_a_repository(tmp_path: Path) -> None:
+    loose = tmp_path / "session" / "rosotacom.yaml"
+    loose.parent.mkdir(parents=True)
+    loose.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="git checkout"):
+        rosotacom._ota_checkout_project_path(loose)
+
+
+def test_ota_cleanup_never_removes_a_checkout(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # `--cleanup` exists to undo staging. In checkout mode the workdir is the
+    # user's repository, so the same `rm -rf` would delete a checkout — with
+    # its bags and untracked work — to remove files that were never created.
+    plan = _ota_checkout_plan(_write_checkout_project(tmp_path))
+    calls: list[str] = []
+
+    original = rosotacom._ota_run
+    try:
+        rosotacom._ota_run = lambda *args, **kwargs: calls.append(str(args))  # type: ignore[assignment]
+        rosotacom._ota_cleanup_hosts(plan, dry_run=False)
+    finally:
+        rosotacom._ota_run = original  # type: ignore[assignment]
+
+    assert calls == []
+    assert "staged nothing" in capsys.readouterr().out
+
+
+def test_ota_checkout_state_round_trips_the_peer_checkouts(tmp_path: Path) -> None:
+    runtime, _resolved = _write_test_scenario_project(tmp_path)
+    plan = _ota_checkout_plan(_write_checkout_project(tmp_path))
+    target = rosotacom._resolve_interactive_smoke_target("demo", runtime, "auto")
+    instance = rosotacom._resolve_session_instance(runtime, target.session, "ota")
+
+    plan = rosotacom._ota_write_state(instance, plan)
+
+    # A --stop or --state-file resume must reach the same checkout the start
+    # used; losing it would run the stop in the staging directory instead.
+    assert rosotacom._ota_load_state(str(plan.state_path)) == plan

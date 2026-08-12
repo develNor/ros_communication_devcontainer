@@ -998,24 +998,3 @@ def collect_stage_metadata(spec: Dict[str, Any]) -> Dict[str, Dict[str, List[Dic
                 }
             )
     return by_domain
-
-
-def collect_latched_stage_topics(spec: Dict[str, Any]) -> Dict[str, set]:
-    """Return {domain: {topic}} for every stage of a latched-mode topic.
-
-    A latched role's publisher offers TRANSIENT_LOCAL and retains its value, so
-    the observation subscription must request TRANSIENT_LOCAL to read the held
-    sample instead of racing the single publish. This is keyed off the declared
-    ``expect.mode == "latched"`` rather than off a live-publisher QoS probe, so
-    the read is correct even when the observer subscribes before the publisher
-    is visible on the graph (issue #231, Option A).
-    """
-    by_domain: Dict[str, set] = {"local": set(), "ota": set()}
-    for topic_spec in spec.get("topics", []):
-        expect = topic_spec.get("expect") or {}
-        if str(expect.get("mode", "")).strip().lower() != "latched":
-            continue
-        for stage in topic_spec.get("stages", []):
-            domain = stage.get("domain", "local")
-            by_domain.setdefault(domain, set()).add(stage["topic"])
-    return by_domain

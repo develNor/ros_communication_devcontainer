@@ -179,16 +179,18 @@ def test_observation_qos_matches_publisher_durability() -> None:
     assert "qos = self._observation_qos(topic)" in source
 
 
-def test_observation_qos_forces_transient_local_for_latched_role() -> None:
-    """#231 Option A: a declared latched role subscribes TRANSIENT_LOCAL from the
-    role, not only when a live-publisher probe happens to see the offered QoS
-    before the single latched publish -- otherwise the read races that publish.
+def test_observation_qos_does_not_force_transient_local_for_latched_roles() -> None:
+    """#231 regression: the observer must NOT force TRANSIENT_LOCAL for every
+    stage of a latched topic. A latched topic's native source stage is published
+    VOLATILE (the ROS 1 bridge offers no durability), and a TRANSIENT_LOCAL
+    reader is incompatible with a VOLATILE writer -- forcing it made the native
+    stage receive nothing and read a false STALLED (broke e2e-remote-assist).
+    The per-publisher QoS match already requests transient_local on the delivered
+    stages that offer it, which is the correct per-stage form of Option A.
     """
     source = STATUS_NODE_PY.read_text(encoding="utf-8")
-    assert "self._latched_topics" in source
-    assert "if topic in self._latched_topics:" in source
-    # The latched set is threaded into the local observer from the spec.
-    assert "latched_topics=latched_by_domain.get" in source
+    assert "self._latched_topics" not in source
+    assert "collect_latched_stage_topics" not in source
 
 
 # ---------------------------------------------------------------------------
@@ -304,30 +306,6 @@ def test_rollup_latched_never_delivered_still_stalled(tmp_path: Path) -> None:
     spec = {"direction": "inbound", "expect": {"mode": "latched"}}
     stages = [_sr("ota_recv", "/ota/b/site/latched", core.IDLE), _sr("app_in", "/b/site/latched", core.IDLE)]
     assert agg.rollup(spec, stages)["overall"] == core.STALLED
-
-
-def test_collect_latched_stage_topics_keys_off_expect_mode() -> None:
-    """#231: the latched set is derived from the declared expect.mode, covering
-    every stage of a latched topic and nothing of a streamed one."""
-    spec = {
-        "topics": [
-            {
-                "expect": {"mode": "latched"},
-                "stages": [
-                    {"stage": "app_in", "topic": "/b/site/latched", "domain": "local"},
-                    {"stage": "ota_recv", "topic": "/ota/b/site/latched", "domain": "ota"},
-                ],
-            },
-            {
-                "expect": {"mode": "stream"},
-                "stages": [{"stage": "native", "topic": "/b/twist", "domain": "local"}],
-            },
-        ]
-    }
-    latched = core.collect_latched_stage_topics(spec)
-    assert latched["local"] == {"/b/site/latched"}
-    assert latched["ota"] == {"/ota/b/site/latched"}
-    assert "/b/twist" not in latched["local"]
 
 
 def test_stage_diagnosis_names_the_three_latched_states(tmp_path: Path) -> None:

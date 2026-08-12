@@ -27,7 +27,7 @@
     "BASE_IMAGE":                    "ros:kilted-ros-base",
     "DIGEST":                        "@sha256:4ca53d5b084bdbe92a7a7d7186f56db6a716a6c7c33ad401ddb0ec82d6e9e479",
     "INSTALL_ZENOH":                 "1",
-    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp iw nload iftop iproute2 tshark ros-kilted-domain-bridge ros-kilted-rmw-cyclonedds-cpp ros-kilted-rmw-zenoh-cpp ros-kilted-topic-tools ros-kilted-image-transport ros-kilted-ffmpeg-image-transport ros-kilted-ffmpeg-image-transport-msgs",
+    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp iw nload iftop iproute2 tshark ros-kilted-domain-bridge ros-kilted-rmw-cyclonedds-cpp ros-kilted-rmw-zenoh-cpp ros-kilted-topic-tools ros-kilted-image-transport ros-kilted-ffmpeg-image-transport ros-kilted-ffmpeg-image-transport-msgs ros-kilted-gps-msgs python3-lz4",
     "PIP_PACKAGES":                  "numpy>=1.26,<2 lz4 pysnmp speedtest-cli psutil zstandard opencv-python"
   }
 }

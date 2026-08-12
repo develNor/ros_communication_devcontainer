@@ -4843,6 +4843,56 @@ def _parse_values(raw: str) -> list[float]:
 # --------------------------------------------------------------------------- #
 
 
+def benchmark_delta(args: argparse.Namespace) -> int:
+    """`rosotacom benchmark delta` — the cross-environment comparison.
+
+    Exits 0 whenever the comparison itself succeeded, including when rows are
+    unmatched or every metric moved. This is monitor-only by construction
+    (`benchmark_delta.compare` puts `monitor_only: true` first in the report):
+    the number is the deliverable, and an exit code would turn "explain this"
+    into "re-run until it is quiet".
+
+    It exits non-zero for the one thing that is a failure — no rows in common,
+    which means the two sides were not the same rows and the report would be
+    an empty table with a confident heading.
+    """
+    from . import benchmark_delta as delta_module
+
+    reference = delta_module.collect([Path(args.reference)])
+    measured = delta_module.collect([Path(args.measured)])
+    report = delta_module.compare(
+        reference,
+        measured,
+        label_reference=args.label_reference,
+        label_measured=args.label_measured,
+    )
+
+    if args.out:
+        Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    markdown = delta_module.render_markdown(report)
+    if args.markdown:
+        Path(args.markdown).write_text(markdown, encoding="utf-8")
+    else:
+        print(markdown)
+
+    counts = report["counts"]
+    print(
+        f"BENCHMARK DELTA: {counts['matched']} row(s) matched, "
+        f"{counts[f'only_{args.label_reference}']} only in {args.label_reference}, "
+        f"{counts[f'only_{args.label_measured}']} only in {args.label_measured} "
+        "(monitor-only)"
+    )
+    if not report["rows"]:
+        print(
+            "rosotacom: error: the two sets share no rows, so there is nothing to "
+            "compare. Check that both sides ran the same registry rows under the "
+            "same profile and RMW.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark: bool = False) -> None:
     from .cli import (
         OTA_DEFAULT_SUDO_MODE,
@@ -8067,6 +8117,18 @@ def _register_benchmark_band_parsers(benchmark_subparsers: Any) -> None:
         help="Report verdicts without blocking: exit 0 even when out of band.",
     )
     compare_parser.set_defaults(func=benchmark_compare)
+
+    delta_parser = benchmark_subparsers.add_parser(
+        "delta",
+        help="Compare two result.json sets taken in different environments (monitor-only).",
+    )
+    delta_parser.add_argument("reference", help="Directory or result.json for the reference environment.")
+    delta_parser.add_argument("measured", help="Directory or result.json for the measured environment.")
+    delta_parser.add_argument("--label-reference", default="emulated", help="Name for the reference side.")
+    delta_parser.add_argument("--label-measured", default="ota", help="Name for the measured side.")
+    delta_parser.add_argument("--out", default=None, help="Write the JSON report here.")
+    delta_parser.add_argument("--markdown", default=None, help="Write the Markdown summary here.")
+    delta_parser.set_defaults(func=benchmark_delta)
 
     ratchet_parser = benchmark_subparsers.add_parser(
         "ratchet",

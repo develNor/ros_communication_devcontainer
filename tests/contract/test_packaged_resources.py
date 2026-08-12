@@ -284,3 +284,67 @@ def test_named_resources_point_at_real_packaged_directories() -> None:
     assert (com_msgs / "package.xml").is_file()
     assert (com_msgs / "CMakeLists.txt").is_file()
     assert list(com_msgs.glob("msg/*.msg"))
+
+
+def _tracked_entries() -> list[tuple[str, str, str]]:
+    """``(mode, sha, path)`` for every tracked file, or skip outside a checkout."""
+    listing = subprocess.run(
+        ["git", "ls-files", "-s", "-z"],
+        cwd=PACKAGE_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if listing.returncode != 0:
+        pytest.skip("not a git checkout — nothing to say about tracked files")
+    entries = []
+    for record in listing.stdout.split("\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition("\t")
+        mode, sha, _stage = meta.split()
+        entries.append((mode, sha, path))
+    return entries
+
+
+def test_no_credential_path_is_tracked_and_no_symlink_escapes_the_repository() -> None:
+    """`.agents/` carries a repository-scoped write credential, and a tracked
+    symlink is checked out over whatever already sits at that path.
+
+    Both halves are the same defect (#238). `.gitignore` said `.agents/`, which
+    matches a directory only, so a `.agents` *symlink* — the shape a worktree
+    takes when it points at the main checkout's credential — was not ignored,
+    was committed, and on the next pull replaced a real credential directory
+    (git overwrites ignored files silently). Any tracked symlink pointing
+    outside the tree can do that to any path on any machine that has it, and
+    setuptools_scm puts every tracked file into the sdist, so it ships too.
+    """
+    credentials: list[str] = []
+    escaping: list[str] = []
+    for mode, sha, path in _tracked_entries():
+        if ".agents" in Path(path).parts:
+            credentials.append(path)
+        if mode != "120000":
+            continue
+        # A symlink's blob *is* its target, so this reads the same bytes a
+        # checkout would write — no dependence on the working tree.
+        target = subprocess.run(
+            ["git", "cat-file", "blob", sha],
+            cwd=PACKAGE_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        resolved = Path(os.path.normpath((PACKAGE_ROOT / path).parent / target))
+        if os.path.isabs(target) or not resolved.is_relative_to(PACKAGE_ROOT):
+            escaping.append(f"{path} -> {target}")
+
+    assert not credentials, (
+        f"agent credential paths are tracked: {credentials}. They must stay local to a checkout "
+        "(.gitignore covers `.agents`); a tracked one is published and overwrites the real "
+        "credential directory of anyone who pulls it."
+    )
+    assert not escaping, (
+        f"tracked symlinks point outside the repository: {escaping}. Checking one out overwrites "
+        "whatever is at that path, and it is shipped in the sdist."
+    )

@@ -33,4 +33,10 @@ CLAUDE.md
 
 # The dedicated agent account's credential lives here and must never reach a
 # commit. See docs/github-repository-settings.md, "Identities".
-.agents/
+#
+# No trailing slash, deliberately: `.agents/` matches a directory only, so a
+# `.agents` *symlink* — the shape a worktree gets when it points at the main
+# checkout's credential — slipped past it and was committed (#238). Without the
+# slash the pattern covers file, directory and symlink alike, and
+# tests/contract/test_packaged_resources.py fails if one is ever tracked again.
+.agents

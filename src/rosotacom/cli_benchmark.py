@@ -46,6 +46,7 @@ BENCHMARK_RESULT_FILE = "result.json"
 BENCHMARK_SESSIONS_BY_GENRE = {
     "probe": "bench_1_1_capacity",
     "capacity": "bench_1_1_capacity",
+    "replay": "bench_1_1_capacity",
     "sweep": "bench_1_2_load_sweep",
     "ramp": "bench_1_3_ramp",
     "recovery": "bench_1_4_recovery",
@@ -1466,6 +1467,8 @@ def drive_probe(
     result_context: dict[str, Any] | None = None,
     interval_jitter_ms: float = 0.0,
     interval_jitter_seed: int = 42,
+    genre: str = "probe",
+    replay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a fixed probe and characterize time-dependent latency/loss behavior."""
     if repeats < 1:
@@ -1578,19 +1581,25 @@ def drive_probe(
         "time_bin_count": len(time_bins),
         "plot_error": plot_error,
     }
+    configuration: dict[str, Any] = {
+        "profile": profile_label,
+        "load": load_info,
+        "topic": topic or None,
+        "repeats": repeats,
+        "duration_s": duration_s,
+        "bin_s": bin_s,
+        "render_plot": render_plot,
+    }
+    if replay is not None:
+        # The provenance travels with the measurement: a result.json that cannot
+        # name the bag it reproduces cannot be judged against that bag later.
+        configuration["replay"] = replay
+        result["replay"] = replay
     result_path = _write_benchmark_result(
         out_dir,
-        genre="probe",
+        genre=genre,
         context=result_context,
-        configuration={
-            "profile": profile_label,
-            "load": load_info,
-            "topic": topic or None,
-            "repeats": repeats,
-            "duration_s": duration_s,
-            "bin_s": bin_s,
-            "render_plot": render_plot,
-        },
+        configuration=configuration,
         result=result,
         measurements={"attempts": attempts, "time_bins": time_bins},
         verdict={"passed": True, "status": "completed"},
@@ -1599,6 +1608,35 @@ def drive_probe(
     result["result_file"] = str(result_path)
     print(f"Probe time bins saved to {bins_path}")
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Benchmark driver: replay
+# --------------------------------------------------------------------------- #
+
+
+def drive_replay(
+    run_point: RunPointFn,
+    *,
+    replay: dict[str, Any],
+    out_dir: Path,
+    **probe_kwargs: Any,
+) -> dict[str, Any]:
+    """Run a bag-derived load under an emulated profile.
+
+    Mechanically a probe — same load driver, same window, same per-topic
+    measurement — with one difference that is the whole point of the genre: the
+    load parameters come from a recording, so the run carries that recording's
+    provenance and is judged against its whole-bag ``expect`` fragment rather
+    than only against a calibrated band (RFC 0007 §3, "realistic loads").
+
+    The public repository ships the bag's *measured shape* (cadence, payload
+    distribution, interval jitter), not the recording: anonymized bags stay in
+    the operator harness. A row is therefore faithful to the bag exactly as far
+    as its committed provenance is, which is what
+    ``benched_set._validate_replay_load_matches_bag`` keeps true.
+    """
+    return drive_probe(run_point, out_dir=out_dir, genre="replay", replay=replay, **probe_kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -6105,9 +6143,8 @@ def _drive_gate_row(args: argparse.Namespace, row: Any, run_dir: Path) -> None:
 
     with log_stdout_stderr_to_file(run_dir / "stdout.txt"):
         _print_benchmark_warnings(result_context)
-        if row.genre == "probe":
-            drive_probe(
-                run_point,
+        if row.genre in ("probe", "replay"):
+            load_kwargs = dict(
                 profile=row.profile,
                 size=int(row.load.get("size") or 0),
                 size_pattern=row.load.get("size_pattern"),
@@ -6117,11 +6154,14 @@ def _drive_gate_row(args: argparse.Namespace, row: Any, run_dir: Path) -> None:
                 duration_s=row.duration_s,
                 bin_s=1.0,
                 render_plot=False,
-                out_dir=run_dir,
                 result_context=result_context,
                 interval_jitter_ms=float(row.load.get("interval_jitter_ms") or 0.0),
                 interval_jitter_seed=int(row.load.get("interval_jitter_seed") or 42),
             )
+            if row.genre == "replay":
+                drive_replay(run_point, replay=row.replay, out_dir=run_dir, **load_kwargs)
+            else:
+                drive_probe(run_point, out_dir=run_dir, **load_kwargs)
         else:
             drive_capacity(
                 run_point,
@@ -6139,15 +6179,67 @@ def _drive_gate_row(args: argparse.Namespace, row: Any, run_dir: Path) -> None:
             )
 
 
+def _replay_expect_result(row: Any, doc: dict[str, Any]) -> dict[str, Any]:
+    """Judge one replay run against the bag's whole-bag ``expect`` fragment."""
+    from .benched_set import replay_expect_failures
+    from .benchmark import probe_delivery_totals, result_window_s
+
+    expected, delivered, attempts = probe_delivery_totals(doc)
+    window_s = result_window_s(doc)
+    per_attempt = delivered / attempts if attempts else 0
+    failures = replay_expect_failures(
+        row,
+        expected=expected // attempts if attempts else 0,
+        delivered=int(per_attempt),
+        duration_s=window_s,
+    )
+    return {
+        "expect": dict(row.replay["expect"]),
+        "bag": {
+            "source": row.replay["source"],
+            "public_example": row.replay["public_example"],
+            "native_count": row.replay["native_count"],
+            "native_hz": row.replay["native_hz"],
+        },
+        "measured": {
+            "expected": expected // attempts if attempts else 0,
+            "delivered": int(per_attempt),
+            "attempts": attempts,
+            "window_s": window_s,
+        },
+        "failures": failures,
+        "passed": not failures,
+    }
+
+
+def _print_replay_expect(row: Any, result: dict[str, Any]) -> None:
+    measured = result["measured"]
+    status = "OK" if result["passed"] else "FAILED"
+    print(
+        f"Replay expect {status} ({row.id}): delivered {measured['delivered']} of "
+        f"{measured['expected']} over {measured['window_s']:g}s "
+        f"vs {result['bag']['public_example']} ({result['bag']['native_count']} msgs "
+        f"@ {result['bag']['native_hz']:g} Hz)"
+    )
+    for failure in result["failures"]:
+        print(f"  - {failure}")
+
+
 def benchmark_row(args: argparse.Namespace) -> int:
     """Handler for ``rosotacom benchmark row`` — run one benched row and gate it.
 
     Failure semantics (RFC 0007 §4): a run/setup failure raises and is red;
     ``REGRESSED`` exits 1; ``IMPROVED`` exits 2 with the exact ratchet command
-    (bank it, don't revert); a refusal (uncalibrated or foreign-runner bands,
-    missing band) exits 1. ``--monitor`` reports the same verdict but exits 0;
-    ``--no-compare`` skips gating entirely (calibration runs). The verdict is
-    also written as machine-readable JSON for downstream gates.
+    (bank it, don't revert); a replay row whose whole-bag ``expect`` fragment did
+    not hold exits 1 as ``EXPECT_FAILED``; a refusal (uncalibrated or
+    foreign-runner bands, missing band) exits 1. ``--monitor`` reports the same
+    verdict but exits 0; ``--no-compare`` skips gating entirely (calibration
+    runs). The verdict is also written as machine-readable JSON for downstream
+    gates.
+
+    A row with no banded metrics is not gate-less: replay rows assert their
+    bag-derived expect fragment from the day they land, and their bands follow
+    from a calibration run on the runner class.
     """
     from .benched_set import find_row, verdict_document, write_verdict
     from .benchmark import BandError, Verdict, metrics_from_result, result_fingerprint, result_sha
@@ -6280,7 +6372,10 @@ def benchmark_row(args: argparse.Namespace) -> int:
     exit_code = 0
     verdict = "RAN"
     gate = not (args.no_compare or args.monitor)
-    if not args.no_compare and refusal is None:
+    # An unbanded row has nothing to compare — asking the band store for bands it
+    # was never meant to have would refuse instead of running.
+    compare_bands = bool(row.metrics) and not args.no_compare
+    if compare_bands and refusal is None:
         try:
             comparisons = _compare_docs_to_bands(
                 [doc],
@@ -6293,11 +6388,15 @@ def benchmark_row(args: argparse.Namespace) -> int:
         except BandError as exc:
             refusal = str(exc)
 
+    # A refused run has no trustworthy counts, so there is nothing to judge the
+    # bag against either — the refusal is the finding.
+    replay_expect = _replay_expect_result(row, doc) if row.genre == "replay" and refusal is None else None
+
     if refusal is not None:
         print(f"REFUSED: {refusal}")
         verdict = "REFUSED"
         exit_code = 1
-    elif not args.no_compare:
+    elif compare_bands:
         _print_band_comparisons(comparisons)
         exit_code = _gate_exit_code(comparisons, budgets=args.budgets, ratchet_hint=ratchet_hint)
         verdicts = {c.verdict for c in comparisons}
@@ -6306,6 +6405,19 @@ def benchmark_row(args: argparse.Namespace) -> int:
         elif Verdict.IMPROVED in verdicts:
             verdict = Verdict.IMPROVED.value
         else:
+            verdict = Verdict.WITHIN.value
+
+    # The whole-bag expect fragment is bag-derived, not runner-derived, so it
+    # asserts on every gating run — including one that has no bands yet. A band
+    # verdict already red stays the reported one; the failures are printed either
+    # way and recorded in the verdict document.
+    if replay_expect is not None and not args.no_compare:
+        _print_replay_expect(row, replay_expect)
+        if not replay_expect["passed"]:
+            if exit_code == 0:
+                verdict = "EXPECT_FAILED"
+            exit_code = exit_code or 1
+        elif verdict == "RAN":
             verdict = Verdict.WITHIN.value
 
     verdict_doc = verdict_document(
@@ -6322,6 +6434,7 @@ def benchmark_row(args: argparse.Namespace) -> int:
         result_path=str(run_dir / BENCHMARK_RESULT_FILE),
         refusal=refusal,
         ratchet_command=ratchet_hint if verdict == Verdict.IMPROVED.value else None,
+        replay_expect=replay_expect,
     )
     verdict_path = Path(args.verdict_file) if args.verdict_file else run_dir / "verdict.json"
     write_verdict(verdict_path, verdict_doc)

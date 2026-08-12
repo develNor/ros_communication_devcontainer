@@ -866,6 +866,29 @@ def default_better(metric: str) -> Better:
     return better
 
 
+def probe_delivery_totals(doc: Mapping[str, Any]) -> tuple[int, int, int]:
+    """``(expected, delivered, attempts)`` summed over a probe/replay run.
+
+    The whole-bag expect assertion (RFC 0007 §4) needs the raw counts, not the
+    percentages a band compares, so both readers take them from here.
+    """
+    attempts = (doc.get("measurements") or {}).get("attempts") or []
+    expected = 0
+    lost = 0
+    counted_attempts = 0
+    for attempt in attempts:
+        contributed = False
+        for topic_row in attempt.get("topics") or []:
+            if topic_row.get("expected") is None:
+                continue
+            expected += int(topic_row["expected"])
+            lost += int(topic_row.get("lost") or 0)
+            contributed = True
+        if contributed:
+            counted_attempts += 1
+    return expected, expected - lost, counted_attempts
+
+
 def _probe_metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
     """Aggregate a probe run's per-attempt topic summaries into band metrics.
 
@@ -875,8 +898,6 @@ def _probe_metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
     shared runners, RFC 0007 §3).
     """
     attempts = (doc.get("measurements") or {}).get("attempts") or []
-    expected = 0
-    lost = 0
     p50s: list[float] = []
     p95s: list[float] = []
     bandwidth_by_bin: dict[tuple[int, float, float], float] = {}
@@ -884,13 +905,12 @@ def _probe_metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
         for topic_row in attempt.get("topics") or []:
             if topic_row.get("expected") is None:
                 continue
-            expected += int(topic_row["expected"])
-            lost += int(topic_row.get("lost") or 0)
             latency = topic_row.get("latency_ms") or {}
             if latency.get("p50") is not None:
                 p50s.append(float(latency["p50"]))
             if latency.get("p95") is not None:
                 p95s.append(float(latency["p95"]))
+    expected, delivered, _attempts = probe_delivery_totals(doc)
     for bin_row in (doc.get("measurements") or {}).get("time_bins") or []:
         bandwidth = bin_row.get("payload_bandwidth_bps")
         if bandwidth is None:
@@ -903,10 +923,9 @@ def _probe_metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
         bandwidth_by_bin[key] = bandwidth_by_bin.get(key, 0.0) + float(bandwidth)
     if expected <= 0:
         raise BandError("probe run carries no per-topic expected/lost counts — there is nothing to band")
-    delivered = expected - lost
     metrics = {
         "completeness_pct": 100.0 * delivered / expected,
-        "loss_pct": 100.0 * lost / expected,
+        "loss_pct": 100.0 * (expected - delivered) / expected,
     }
     if p50s:
         metrics["latency_p50_ms"] = _median(p50s)
@@ -917,17 +936,38 @@ def _probe_metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
     return metrics
 
 
+def _replay_metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
+    """A replay run's probe metrics plus the two the bag comparison is made of.
+
+    ``delivered_count`` and ``delivered_hz`` are per attempt, so a row with
+    repeats stays comparable to the bag's own single-pass count and rate.
+    """
+    metrics = _probe_metrics_from_result(doc)
+    _expected, delivered, attempts = probe_delivery_totals(doc)
+    if attempts <= 0:
+        raise BandError("replay run carries no measured attempt — there is nothing to band")
+    per_attempt = delivered / attempts
+    metrics["delivered_count"] = per_attempt
+    window_s = result_window_s(doc)
+    if window_s > 0.0:
+        metrics["delivered_hz"] = per_attempt / window_s
+    return metrics
+
+
 def metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
     """The band-comparable metrics of one self-contained ``result.json``.
 
     Covers the deterministic genres the gate bands today: ``capacity`` (the
-    breakpoint), ``probe`` (loss/completeness plus latency percentiles) and
-    ``recovery`` (the RFC 0005 recovery metric set). The benched-set registry
-    (RFC 0007 §4) picks which of these actually gate per row.
+    breakpoint), ``probe`` (loss/completeness plus latency percentiles),
+    ``replay`` (the probe set plus the delivered count/rate the bag comparison
+    is made of) and ``recovery`` (the RFC 0005 recovery metric set). The
+    benched-set registry (RFC 0007 §4) picks which of these actually gate per row.
     """
     genre = doc.get("genre")
     if genre == "probe":
         return _probe_metrics_from_result(doc)
+    if genre == "replay":
+        return _replay_metrics_from_result(doc)
     if genre == "capacity":
         knob = str((doc.get("configuration") or {}).get("knob") or "size")
         capacity = (doc.get("result") or {}).get("capacity")
@@ -945,7 +985,9 @@ def metrics_from_result(doc: Mapping[str, Any]) -> dict[str, float]:
         lost = result.get("lost_during_outage") or {}
         metrics["lost_during_outage_total"] = float(sum(int(count) for count in lost.values()))
         return metrics
-    raise BandError(f"genre {genre!r} has no band metrics yet — banded rows cover probe, capacity and recovery today")
+    raise BandError(
+        f"genre {genre!r} has no band metrics yet — banded rows cover probe, capacity, replay and recovery today"
+    )
 
 
 def result_row_id(doc: Mapping[str, Any]) -> str:

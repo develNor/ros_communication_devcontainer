@@ -123,7 +123,7 @@ links never gate; what changes is that deterministic rows now **block**:
 | Trigger | What runs | Verdict |
 |---|---|---|
 | per-PR (merge gate) | existing point-check suite **+ one minutes-scale regression row** (default RMW × one rate-limited profile, loss/capacity band) | **gate** |
-| nightly | the **regression matrix**: supported RMW variants × canonical profiles (nominal **and** tight) × loads (steady, GOP/a-b pattern, single-stream anonymized replay) + **boundary pairs** — all band-asserted | **gate** (red nightly = fix-first; promotion requires the candidate's nightly gate green) |
+| nightly | the **regression matrix**: supported RMW variants × canonical profiles (nominal **and** tight) × loads (steady, GOP/a-b pattern, single-stream anonymized replay) + **boundary pairs** — band-asserted, except replay rows awaiting calibration, which assert their bag's whole-bag expect fragment instead | **gate** (red nightly = fix-first; promotion requires the candidate's nightly gate green) |
 | nightly | long sweeps, ramps, frontier searches | monitor (unchanged) |
 | on-demand | real WLAN/cellular characterization | monitor; calibrates the emulation (unchanged) |
 
@@ -255,7 +255,30 @@ slices these into issues.
   `benchmark gate-summary`; setup failure, `REGRESSED`, and unbanked
   `IMPROVED` are all red. S2 anonymized costmap/camera replay rows now cover
   nominal and tight profiles, carrying whole-bag expect fragments and GOP-aware
-  metadata next to their committed bands.)*
+  metadata.)*
+- [x] **Replay genre**: `genre: replay` for rows whose load is a measurement of
+  a recording rather than a chosen number — the registry checks the load against
+  that recording's provenance (cadence, window, mean payload, interval jitter),
+  `benchmark row` asserts the whole-bag `expect` fragment on every gating run,
+  and `delivered_count` / `delivered_hz` join the genre's metric set.
+  *(`benched_set.GENRES`/`_validate_replay_load_matches_bag`/
+  `replay_expect_failures`, `cli_benchmark.drive_replay` and the `EXPECT_FAILED`
+  verdict, `benchmark._replay_metrics_from_result`. The four public S2 rows are
+  `genre: replay`.)*
+  **Why it is not `probe` with extra fields:** as probe rows the provenance was
+  decoration — nothing checked the load against the bag, and the `expect`
+  fragment was never read by anything that runs. The genre is what makes both
+  assertions exist.
+  **Public limit (honest):** the anonymized S2 bags are not public, so a public
+  row replays the bag's *measured shape*, not its bytes. Byte-faithful replay
+  stays in the operator harness (`_run_private_replay_rows`, harness #34).
+- [ ] **Replay row bands**: calibrate the four S2 rows on the runner class
+  (`.github/workflows/benchmark-calibrate.yml`, K repeats) and promote their
+  gated metrics out of `monitor` in the same change that commits the bands.
+  They land unbanded on purpose — a band is a measurement of the runner class
+  and must not be hand-written, while the bag-derived expect fragment gates from
+  day one. `tests/contract/test_benched_set_registry.py::test_public_s2_replay_rows_await_their_calibration`
+  fails the moment a band appears without the promotion.
 - [x] **Boundary must-fail rows**: oracle inversion (assert the failure
   signature) + happy-red messaging; seed with the documented 18 KB @ 20 Hz
   pairs. *(`GateRow.kind=boundary` + `benchmark row` now run good/bad sides,
@@ -322,11 +345,36 @@ slices these into issues.
   which cannot run is red, not silently green.)*
 - [x] **S2 anonymized replay rows** — contract and unit tests pin the public
   costmap/camera rows in the nightly lane, their whole-bag expect fragments, GOP
-  metadata, calibrated bands, and the probe metrics that turn replay loss into a
-  canary failure.
+  metadata, and the delivery metrics that turn replay loss into a canary failure.
   *(`tests/contract/test_benched_set_registry.py::test_public_s2_replay_rows_carry_whole_bag_expect_metadata`,
-  `tests/contract/test_benched_set_registry.py::test_every_gated_metric_has_a_calibrated_band`,
   `tests/unit/test_benchmark.py::test_probe_metrics_include_completeness_and_payload_bandwidth`.)*
+- [x] **Replay load stays the bag's shape** — the registry refuses a replay row
+  whose cadence, window, mean payload or interval jitter has drifted from the
+  provenance it commits, and refuses an `expect.min_count` the bag's own message
+  count does not justify.
+  *(`tests/unit/test_benched_set.py::test_replay_load_must_stay_the_bag_shape`,
+  `::test_replay_expect_min_count_must_come_from_the_bag`,
+  `::test_replay_metadata_is_refused_on_a_synthetic_probe_row`.)*
+- [x] **Replay expect gates without a band** — an unbanded replay row runs
+  against an empty band store instead of refusing, reports `WITHIN` when the
+  whole bag arrived, and `EXPECT_FAILED` (exit 1, per-threshold reasons in the
+  verdict) when it did not; `--monitor` reports the same verdict without
+  blocking.
+  *(`tests/unit/test_cli_benchmark.py::test_replay_row_gates_on_the_whole_bag_expect_without_any_band`,
+  `tests/unit/test_benched_set.py::test_replay_expect_names_every_threshold_that_did_not_hold`.
+  Exercised for real once against Docker on a dev laptop:
+  `replay-costmap-nominal-cyclone` on `gate-nominal` delivered 1386 msgs at
+  9.9 Hz with 0 % loss and 674 kbit/s payload bandwidth → `WITHIN`, exit 0,
+  `bands: {}`; the same row pointed at a copy of the profile carrying netem
+  `loss 40%` delivered 28 msgs at 0.20 Hz → `EXPECT_FAILED`, exit 1, all three
+  thresholds named in the log and in `verdict.json`. That is the whole claim of
+  landing before calibration: the row is already a gate.)*
+- [ ] **Replay bands reviewed** — the calibration evidence for the four S2 rows
+  (K repeats on the runner class) is reviewed and committed together with the
+  promotion out of `monitor`. Pending: no calibration run has been made for
+  them; `::test_public_s2_replay_rows_await_their_calibration` holds the step
+  open. The `--no-compare` + `benchmark calibrate` path they need is exercised
+  by `tests/unit/test_cli_benchmark.py::test_replay_calibration_run_reports_spread_for_the_metrics_a_band_would_take`.
 - [x] **Findings checker** — contract test: a finding without `Verification:`
   fails the ledger check.
 - [x] **Manual (explicit):** the first calibration is reviewed — band widths

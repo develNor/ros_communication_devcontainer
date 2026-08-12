@@ -6,14 +6,24 @@ reason to exist. Workflows and the ``benchmark`` CLI *read* this registry —
 adding an RMW variant or profile extends the matrix without editing CI, and a
 matrix nobody can afford to keep green is a monitor with extra steps.
 
-This module is pure and host-testable: loading, structural validation, and the
-machine-readable per-run verdict document. Cross-file checks (profiles exist,
-bands committed, workflows consume the registry) live in the contract tests.
+Three genres run here. ``probe`` and ``capacity`` are synthetic: the load is
+whatever the row says it is. ``replay`` is not — its load is derived from a named
+recording, so the row also carries that bag's provenance and its whole-bag
+``expect`` fragment, both of which are checked: the provenance against the load
+at load time (so the shape cannot drift away from the bag it claims), the expect
+fragment against the run (so a replay that did not arrive is red without waiting
+for a calibrated band).
+
+This module is pure and host-testable: loading, structural validation, the
+whole-bag expect evaluation, and the machine-readable per-run verdict document.
+Cross-file checks (profiles exist, bands committed, workflows consume the
+registry) live in the contract tests.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -26,7 +36,7 @@ REGISTRY_RESOURCE = "resources/benched-set.yaml"
 
 LANES = ("merge-gate", "nightly")
 ROW_KINDS = ("performance", "boundary")
-GENRES = ("probe", "capacity")
+GENRES = ("probe", "capacity", "replay")
 
 # The RFC 0003 metrics each genre can put under a band today. The metric policy
 # (RFC 0007 §3) prefers bottleneck-dominated metrics for tight public bands;
@@ -35,12 +45,29 @@ GENRES = ("probe", "capacity")
 GENRE_METRICS: dict[str, tuple[str, ...]] = {
     "probe": ("completeness_pct", "loss_pct", "latency_p50_ms", "latency_p95_ms", "payload_bandwidth_bps"),
     "capacity": ("capacity_size", "capacity_rate", "capacity_bandwidth"),
+    "replay": (
+        "completeness_pct",
+        "loss_pct",
+        "latency_p50_ms",
+        "latency_p95_ms",
+        "payload_bandwidth_bps",
+        "delivered_count",
+        "delivered_hz",
+    ),
 }
 
 PROBE_LOAD_KEYS = frozenset(
     {"size", "size_pattern", "rate_hz", "streams", "interval_jitter_ms", "interval_jitter_seed"}
 )
 CAPACITY_KNOBS = ("size", "rate", "bandwidth")
+
+# How far a replay row's committed load may drift from the bag provenance it
+# claims to reproduce. The cadence and the replay jitter are measured directly
+# and must match closely; the mean payload is looser because a GOP `size_pattern`
+# approximates a real frame-size distribution with two sizes (RFC 0007 §3).
+REPLAY_RATE_TOLERANCE = 0.02
+REPLAY_JITTER_TOLERANCE = 0.05
+REPLAY_SIZE_TOLERANCE = 0.10
 
 # A gated window must span >=2 CycloneDDS SPDP discovery periods (2 x 30 s,
 # RFC 0005 "discovery traffic is real load") or explicitly annotate why not.
@@ -211,7 +238,10 @@ def _parse_row(raw: Any) -> GateRow:
     duration_s = float(duration_raw)
 
     metrics = _string_tuple(row_id, raw, "metrics")
-    if not metrics:
+    # A replay row still gates without a band: its whole-bag `expect` fragment is
+    # bag-derived, not runner-derived, so it asserts from the day the row lands
+    # and the bands follow from a calibration run (RFC 0007 §4).
+    if not metrics and genre != "replay":
         raise RegistryError(f"row {row_id!r}: a gated row needs at least one banded metric")
     monitor = _string_tuple(row_id, raw, "monitor")
     producible = set(GENRE_METRICS[genre])
@@ -289,7 +319,7 @@ def _parse_row(raw: Any) -> GateRow:
 
 
 def _validate_genre_parameters(row: GateRow) -> None:
-    if row.genre == "probe":
+    if row.genre in ("probe", "replay"):
         if row.search or row.oracle:
             raise RegistryError(f"row {row.id!r}: 'search'/'oracle' belong to capacity rows")
         unknown = sorted(set(row.load) - PROBE_LOAD_KEYS)
@@ -304,12 +334,19 @@ def _validate_genre_parameters(row: GateRow) -> None:
             raise RegistryError(
                 f"row {row.id!r}: interval jitter without 'interval_jitter_seed' — gated rows commit their seeds"
             )
+        if row.genre == "probe":
+            # Replay provenance is what makes a row a replay row; carrying it on a
+            # synthetic probe row hides the difference the two genres exist to make.
+            if row.replay:
+                raise RegistryError(f"row {row.id!r}: replay metadata belongs to replay rows (genre: replay)")
+            return
         _validate_replay_metadata(row)
+        _validate_replay_load_matches_bag(row)
         return
 
     # capacity
     if row.replay:
-        raise RegistryError(f"row {row.id!r}: replay metadata belongs to probe rows")
+        raise RegistryError(f"row {row.id!r}: replay metadata belongs to replay rows")
     if row.load:
         raise RegistryError(f"row {row.id!r}: capacity rows configure 'search'/'oracle', not 'load'")
     knob = str(row.search.get("knob") or "")
@@ -332,7 +369,10 @@ def _validate_genre_parameters(row: GateRow) -> None:
 
 def _validate_replay_metadata(row: GateRow) -> None:
     if not row.replay:
-        return
+        raise RegistryError(
+            f"row {row.id!r}: a replay row needs 'replay' provenance naming the bag it reproduces "
+            "(source, public_example, bag_topic, native_*, size_basis, expect)"
+        )
     required = {
         "source",
         "public_example",
@@ -341,11 +381,16 @@ def _validate_replay_metadata(row: GateRow) -> None:
         "native_duration_s",
         "native_hz",
         "size_basis",
+        "size_mean_bytes",
         "expect",
     }
     missing = sorted(required - set(row.replay))
     if missing:
         raise RegistryError(f"row {row.id!r}: replay metadata missing {missing}")
+    for key in ("native_count", "native_duration_s", "native_hz", "size_mean_bytes"):
+        value = row.replay[key]
+        if not isinstance(value, int | float) or value <= 0:
+            raise RegistryError(f"row {row.id!r}: replay.{key} must be a positive number")
     expect = row.replay.get("expect")
     if not isinstance(expect, dict):
         raise RegistryError(f"row {row.id!r}: replay.expect must be a mapping")
@@ -358,6 +403,114 @@ def _validate_replay_metadata(row: GateRow) -> None:
         value = float(expect[key])
         if not 0.0 < value <= 1.0:
             raise RegistryError(f"row {row.id!r}: replay.expect.{key} must be in (0, 1]")
+    # The generator that mints these fragments takes `min_count` from the bag's own
+    # message count; a hand-edited one that no longer does is asserting a threshold
+    # the bag never justified.
+    native_count = int(row.replay["native_count"])
+    expected_min_count = int(math.floor(native_count * float(expect["completeness_min_ratio"])))
+    if int(expect["min_count"]) != expected_min_count:
+        raise RegistryError(
+            f"row {row.id!r}: replay.expect.min_count {int(expect['min_count'])} is not "
+            f"floor(native_count {native_count} x completeness_min_ratio "
+            f"{float(expect['completeness_min_ratio']):g}) = {expected_min_count}"
+        )
+
+
+def replay_load_mean_bytes(load: dict[str, Any]) -> float:
+    """Mean payload of one replay load cycle — `size`, or the pattern's mean."""
+    if "size" in load:
+        return float(load["size"])
+    from .benchmark import parse_size_pattern_load
+
+    sizes = parse_size_pattern_load(str(load["size_pattern"]))["sizes"]
+    return sum(float(size) for size in sizes) / len(sizes)
+
+
+def _relative_drift(value: float, reference: float) -> float:
+    return abs(value - reference) / reference
+
+
+def _validate_replay_load_matches_bag(row: GateRow) -> None:
+    """The committed load must still be the bag's shape.
+
+    Provenance nobody checks is decoration: without this, the `replay` block can
+    keep naming a 10 Hz, 8.3 KB stream while the load drifts to something else,
+    and every downstream claim about "the S2 shape" quietly becomes false.
+    """
+    replay = row.replay
+    native_hz = float(replay["native_hz"])
+    rate_hz = float(row.load["rate_hz"])
+    if _relative_drift(rate_hz, native_hz) > REPLAY_RATE_TOLERANCE:
+        raise RegistryError(
+            f"row {row.id!r}: load rate {rate_hz:g} Hz is more than "
+            f"{REPLAY_RATE_TOLERANCE:.0%} off the bag's native {native_hz:g} Hz"
+        )
+
+    native_duration_s = float(replay["native_duration_s"])
+    if row.duration_s < native_duration_s:
+        raise RegistryError(
+            f"row {row.id!r}: window {row.duration_s:g}s is shorter than the bag it replays "
+            f"({native_duration_s:g}s) — a whole-bag expect fragment needs the whole bag"
+        )
+
+    size_mean_bytes = float(replay["size_mean_bytes"])
+    load_mean_bytes = replay_load_mean_bytes(row.load)
+    if _relative_drift(load_mean_bytes, size_mean_bytes) > REPLAY_SIZE_TOLERANCE:
+        raise RegistryError(
+            f"row {row.id!r}: load mean payload {load_mean_bytes:.0f} B is more than "
+            f"{REPLAY_SIZE_TOLERANCE:.0%} off the bag's mean {size_mean_bytes:.0f} B"
+        )
+
+    interval_std_ms = replay.get("interval_std_ms")
+    jitter_ms = float(row.load.get("interval_jitter_ms") or 0.0)
+    if interval_std_ms is None:
+        if jitter_ms > 0.0:
+            raise RegistryError(
+                f"row {row.id!r}: load commits {jitter_ms:g} ms interval jitter but replay metadata "
+                "records no 'interval_std_ms' to justify it"
+            )
+        return
+    if _relative_drift(jitter_ms, float(interval_std_ms)) > REPLAY_JITTER_TOLERANCE:
+        raise RegistryError(
+            f"row {row.id!r}: load interval jitter {jitter_ms:g} ms is more than "
+            f"{REPLAY_JITTER_TOLERANCE:.0%} off the bag's measured {float(interval_std_ms):g} ms"
+        )
+
+
+def replay_expect_failures(row: GateRow, *, expected: int, delivered: int, duration_s: float) -> list[str]:
+    """Whole-bag expect fragment vs. one replay run — the reasons it did not hold.
+
+    Bag-derived, so it asserts on the runner class from the day the row lands:
+    unlike a band, none of these thresholds is a measurement of the runner.
+    """
+    expect = row.replay["expect"]
+    failures: list[str] = []
+
+    min_count = int(expect["min_count"])
+    if delivered < min_count:
+        failures.append(f"delivered {delivered} msgs < replay.expect.min_count {min_count}")
+
+    min_ratio = float(expect["completeness_min_ratio"])
+    if expected > 0:
+        completeness = delivered / expected
+        if completeness < min_ratio:
+            failures.append(f"completeness {completeness:.3f} < replay.expect.completeness_min_ratio {min_ratio:g}")
+    else:
+        failures.append("the run carries no expected message count — completeness cannot be asserted")
+
+    vs_bag_ratio = float(expect["vs_bag_ratio"])
+    native_hz = float(row.replay["native_hz"])
+    if duration_s > 0.0:
+        delivered_hz = delivered / duration_s
+        if delivered_hz < vs_bag_ratio * native_hz:
+            failures.append(
+                f"delivered {delivered_hz:.2f} Hz < replay.expect.vs_bag_ratio {vs_bag_ratio:g} "
+                f"x native {native_hz:g} Hz"
+            )
+    else:
+        failures.append("the run carries no window length — the bag-relative rate cannot be asserted")
+
+    return failures
 
 
 def load_registry(path: Path | None = None) -> list[GateRow]:
@@ -424,6 +577,7 @@ def verdict_document(
     refusal: str | None = None,
     ratchet_command: str | None = None,
     boundary: dict[str, Any] | None = None,
+    replay_expect: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The machine-readable per-run verdict a downstream gate can consume."""
     doc = {
@@ -450,6 +604,8 @@ def verdict_document(
     }
     if boundary is not None:
         doc["boundary"] = boundary
+    if replay_expect is not None:
+        doc["replay_expect"] = replay_expect
     return doc
 
 

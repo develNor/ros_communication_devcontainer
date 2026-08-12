@@ -74,6 +74,7 @@ rosotacom benchmark ratchet <run1> <run2> <run3> --budgets budgets.jsonl \
 
 Banded metrics today come from `probe` runs (`loss_pct`, plus
 `latency_p50_ms`/`latency_p95_ms` — monitor-only on shared runners),
+`replay` runs (the probe set plus `delivered_count` and `delivered_hz`),
 `capacity` runs (`capacity_<knob>`) and `recovery` runs (`t_recover_s`,
 `t_steady_s`, `recovery_burst`, `lost_during_outage_total`).
 
@@ -95,9 +96,28 @@ rosotacom benchmark row <id> \
 
 `benchmark row` runs the row's genre with its committed parameters, gates the
 result against `budgets.jsonl`, and writes a machine-readable
-`verdict.json` (`WITHIN` / `REGRESSED` / `IMPROVED` / `REFUSED`, metrics,
-bands, sha, runner fingerprint) for downstream tooling. `--monitor` reports
-without blocking; `--no-compare` is for calibration repeats.
+`verdict.json` (`WITHIN` / `REGRESSED` / `IMPROVED` / `EXPECT_FAILED` /
+`REFUSED`, metrics, bands, sha, runner fingerprint) for downstream tooling.
+`--monitor` reports without blocking; `--no-compare` is for calibration
+repeats.
+
+### Replay rows: gated by the bag, not only by a band
+
+A `genre: replay` row's load is not invented in the registry — every parameter
+(cadence, mean payload, interval jitter, window) is a measurement of the
+recording named in its `replay` block, and the loader refuses a row whose load
+has drifted away from it. The bags stay in the operator harness; what is public
+is their measured shape and the whole-bag `expect` fragment generated from them
+(`rosotacom expect from-bag`), which `benchmark row` asserts on every gating
+run: delivered count against `min_count`, delivered/expected against
+`completeness_min_ratio`, and delivered rate against `vs_bag_ratio × native_hz`.
+A run that misses any of them is `EXPECT_FAILED` and red, with the per-threshold
+reasons in `verdict.json` under `replay_expect`.
+
+That assertion is bag-derived rather than runner-derived, which is why replay is
+the one genre allowed to land a row with no banded metrics at all: it gates from
+the day it lands, and the bands follow from a calibration run on the runner
+class. Every other genre still needs at least one banded metric.
 
 Lanes (RFC 0007 §4):
 

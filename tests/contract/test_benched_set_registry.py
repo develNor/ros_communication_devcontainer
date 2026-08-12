@@ -120,7 +120,7 @@ def test_public_s2_replay_rows_carry_whole_bag_expect_metadata(rows: list[GateRo
     """Issue #185 / harness #34: the public nightly gate must keep the S2
     anonymized costmap and camera replay shapes under both nominal and tight
     profiles, with the generated whole-bag expect thresholds recorded next to
-    the row."""
+    the row and the delivery metrics kept in the verdict."""
     expected = {
         ("replay-costmap-nominal-cyclone", "gate-nominal", "15_remote_assist_anonymized_costmap"),
         ("replay-costmap-tight-cyclone", "gate-tight", "15_remote_assist_anonymized_costmap"),
@@ -134,9 +134,9 @@ def test_public_s2_replay_rows_carry_whole_bag_expect_metadata(rows: list[GateRo
     for row_id, profile, public_example in expected:
         row = by_id[row_id]
         assert row.lane == "nightly"
-        assert row.genre == "probe"
+        assert row.genre == "replay", "the S2 rows are bag-derived; the genre is what makes that checkable"
         assert row.profile == profile
-        assert set(row.metrics) == {"loss_pct", "completeness_pct"}
+        assert {"loss_pct", "completeness_pct", "delivered_count", "delivered_hz"} <= set(row.monitor)
         assert row.replay["public_example"] == public_example
         assert row.replay["bag_topic"] == "/topic1"
         assert row.replay["native_count"] == 1396
@@ -147,6 +147,24 @@ def test_public_s2_replay_rows_carry_whole_bag_expect_metadata(rows: list[GateRo
         }
     assert by_id["replay-camera-tight-cyclone"].replay["keyframes"] == 285
     assert by_id["replay-camera-tight-cyclone"].replay["gop_spacing_median_frames"] == 5
+
+
+def test_public_s2_replay_rows_await_their_calibration(rows: list[GateRow]) -> None:
+    """Step 2 of issue #185 is a calibration run on the runner class, so these
+    rows land unbanded on purpose. This is the reminder that the step exists: it
+    fails the moment a band appears, which is exactly when the row should also
+    move its gated metric out of `monitor`."""
+    replay_rows = [row for row in rows if row.genre == "replay"]
+    assert replay_rows, "the registry lost its replay rows"
+    banded = sorted(row.id for row in replay_rows if row.metrics)
+    if banded:
+        pytest.fail(
+            f"replay rows {banded} carry banded metrics now — promote them in the registry and "
+            "commit the calibrated bands in the same change (issue #185, step 2)"
+        )
+    bands = {band.key for band in load_bands(BUDGETS_PATH)}
+    stale = sorted(key for key in bands if key[0] in {row.id for row in replay_rows})
+    assert not stale, f"budgets.jsonl carries bands for unbanded replay rows: {stale}"
 
 
 def test_committed_bands_belong_to_registry_rows(rows: list[GateRow]) -> None:

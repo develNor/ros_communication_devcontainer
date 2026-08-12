@@ -17,6 +17,8 @@ from rosotacom.benched_set import (
     find_row,
     load_registry,
     packaged_registry_path,
+    replay_expect_failures,
+    replay_load_mean_bytes,
     rows_for_calibration,
     rows_for_lane,
     summarize_verdicts,
@@ -37,6 +39,35 @@ MINIMAL_PROBE_ROW = """
 {extra}
 """
 
+# A replay row is a load *plus* the recording it reproduces: cadence, window,
+# mean payload and interval jitter all have to match the `replay` block, which is
+# what keeps "the S2 shape" a true statement about the row.
+MINIMAL_REPLAY_ROW = """
+  - id: replay-x
+    kind: performance
+    lane: nightly
+    reason: because
+    rmw: cyclone
+    genre: replay
+    profile: gate-tight
+    duration_s: 140
+    load: {{ size: 8332, rate_hz: 10.0, interval_jitter_ms: 12.7, interval_jitter_seed: 1 }}
+    replay:
+      source: fixture replay
+      public_example: 15_remote_assist_anonymized_costmap
+      bag_topic: /topic1
+      native_count: 1396
+      native_duration_s: 139.492
+      native_hz: 10.001
+      size_basis: serialized_message_bytes
+      size_mean_bytes: 8331.505
+      interval_std_ms: 12.701
+      expect: {{ min_count: 1256, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }}
+    metrics: []
+    monitor: [loss_pct, completeness_pct, delivered_count, delivered_hz]
+{extra}
+"""
+
 
 def _write_registry(tmp_path: Path, rows_yaml: str) -> Path:
     path = tmp_path / "benched-set.yaml"
@@ -46,6 +77,14 @@ def _write_registry(tmp_path: Path, rows_yaml: str) -> Path:
 
 def _probe_row_yaml(extra: str = "") -> str:
     return MINIMAL_PROBE_ROW.format(extra=extra)
+
+
+def _replay_row_yaml(extra: str = "") -> str:
+    return MINIMAL_REPLAY_ROW.format(extra=extra)
+
+
+def _load_replay_row(tmp_path: Path, row_yaml: str) -> GateRow:
+    return load_registry(_write_registry(tmp_path, row_yaml))[0]
 
 
 def test_packaged_registry_loads_and_covers_both_lanes() -> None:
@@ -118,7 +157,51 @@ def test_registry_refuses_floors_for_unbanded_metrics(tmp_path: Path) -> None:
         load_registry(_write_registry(tmp_path, row))
 
 
-def test_registry_validates_replay_expect_metadata(tmp_path: Path) -> None:
+def test_replay_row_loads_with_its_bag_provenance(tmp_path: Path) -> None:
+    row = _load_replay_row(tmp_path, _replay_row_yaml())
+
+    assert row.genre == "replay"
+    assert row.replay["expect"]["vs_bag_ratio"] == 0.9
+    assert row.metrics == (), "a replay row may land unbanded — its expect fragment gates"
+
+
+def test_replay_row_requires_its_expect_fragment(tmp_path: Path) -> None:
+    missing_expect = _replay_row_yaml().replace(
+        "expect: { min_count: 1256, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }", "expect: {}"
+    )
+    with pytest.raises(RegistryError, match="min_count"):
+        load_registry(_write_registry(tmp_path, missing_expect))
+
+    no_replay = _replay_row_yaml()
+    no_replay = no_replay[: no_replay.index("    replay:")] + "    metrics: []\n"
+    with pytest.raises(RegistryError, match="replay' provenance"):
+        load_registry(_write_registry(tmp_path, no_replay))
+
+
+def test_replay_expect_min_count_must_come_from_the_bag(tmp_path: Path) -> None:
+    """A hand-edited threshold is one the bag never justified."""
+    doctored = _replay_row_yaml().replace("min_count: 1256", "min_count: 400")
+    with pytest.raises(RegistryError, match="floor\\(native_count"):
+        load_registry(_write_registry(tmp_path, doctored))
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        (("rate_hz: 10.0", "rate_hz: 20.0"), "off the bag's native"),
+        (("duration_s: 140", "duration_s: 120"), "shorter than the bag it replays"),
+        (("size: 8332", "size: 4000"), "off the bag's mean"),
+        (("interval_jitter_ms: 12.7", "interval_jitter_ms: 40.0"), "off the bag's measured"),
+    ],
+)
+def test_replay_load_must_stay_the_bag_shape(tmp_path: Path, replacement: tuple[str, str], message: str) -> None:
+    """Provenance nobody checks is decoration: drift from the recording refuses."""
+    drifted = _replay_row_yaml().replace(*replacement)
+    with pytest.raises(RegistryError, match=message):
+        load_registry(_write_registry(tmp_path, drifted))
+
+
+def test_replay_metadata_is_refused_on_a_synthetic_probe_row(tmp_path: Path) -> None:
     row = _probe_row_yaml(
         extra="""    replay:
       source: fixture replay
@@ -128,17 +211,45 @@ def test_registry_validates_replay_expect_metadata(tmp_path: Path) -> None:
       native_duration_s: 1.0
       native_hz: 10.0
       size_basis: serialized_message_bytes
+      size_mean_bytes: 12000.0
       expect: { min_count: 9, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }
 """
     )
-    loaded = load_registry(_write_registry(tmp_path, row))
-    assert loaded[0].replay["expect"]["vs_bag_ratio"] == 0.9
+    with pytest.raises(RegistryError, match="genre: replay"):
+        load_registry(_write_registry(tmp_path, row))
 
-    missing_expect = row.replace(
-        "expect: { min_count: 9, completeness_min_ratio: 0.9, vs_bag_ratio: 0.9 }", "expect: {}"
-    )
-    with pytest.raises(RegistryError, match="min_count"):
-        load_registry(_write_registry(tmp_path, missing_expect))
+
+def test_only_replay_rows_may_land_unbanded(tmp_path: Path) -> None:
+    row = _probe_row_yaml().replace("metrics: [loss_pct]", "metrics: []")
+    with pytest.raises(RegistryError, match="at least one banded metric"):
+        load_registry(_write_registry(tmp_path, row))
+
+
+def test_replay_load_mean_bytes_covers_both_load_shapes() -> None:
+    assert replay_load_mean_bytes({"size": 8332}) == 8332.0
+    # One 43 KB keyframe plus four 4 KB delta frames.
+    assert replay_load_mean_bytes({"size_pattern": "1x43KB+4x4KB"}) == pytest.approx(11800.0)
+
+
+def test_replay_expect_names_every_threshold_that_did_not_hold(tmp_path: Path) -> None:
+    row = _load_replay_row(tmp_path, _replay_row_yaml())
+
+    assert replay_expect_failures(row, expected=1400, delivered=1400, duration_s=140.0) == []
+
+    failures = replay_expect_failures(row, expected=1400, delivered=700, duration_s=140.0)
+    assert len(failures) == 3
+    assert "min_count 1256" in failures[0]
+    assert "completeness_min_ratio" in failures[1]
+    assert "vs_bag_ratio" in failures[2]
+
+    # Delivery that clears min_count can still miss the bag-relative rate: the
+    # same messages spread over twice the window is half the stream.
+    slow = replay_expect_failures(row, expected=1400, delivered=1300, duration_s=280.0)
+    assert [failure for failure in slow if "vs_bag_ratio" in failure]
+
+    empty = replay_expect_failures(row, expected=0, delivered=0, duration_s=0.0)
+    assert any("expected message count" in failure for failure in empty)
+    assert any("window length" in failure for failure in empty)
 
 
 def test_capacity_rows_band_exactly_their_knob_breakpoint(tmp_path: Path) -> None:

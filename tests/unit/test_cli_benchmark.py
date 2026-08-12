@@ -1770,6 +1770,137 @@ def test_row_refuses_without_bands_and_when_a_gated_band_is_missing(
     assert "loss_pct" in json.loads(verdict_path.read_text(encoding="utf-8"))["refusal"]
 
 
+def _make_stub_replay(*, expected: int, delivered: int, latency_p95: float = 50.0) -> Any:
+    """A run_point returning one replay-sized topic summary."""
+    lost = expected - delivered
+
+    def stub(*, profile: str | None, load: dict[str, Any], duration_s: float, out_dir: Path) -> dict[str, Any]:
+        return {
+            "topics": {
+                "/topic1": {
+                    "expected": expected,
+                    "delivered": delivered,
+                    "lost": lost,
+                    "loss_pct": 100.0 * lost / expected,
+                    "reordered": 0,
+                    "ota_hop_ms": {"p50": latency_p95 * 0.6, "p95": latency_p95},
+                    "jitter_ms": {"p50": 2.0, "p95": 5.0},
+                }
+            }
+        }
+
+    return stub
+
+
+def test_replay_row_gates_on_the_whole_bag_expect_without_any_band(
+    monkeypatch: pytest.MonkeyPatch, examples_project: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The point of the replay genre landing before its calibration: the row
+    already asserts something. With an empty band store a banded row refuses,
+    while a replay row runs, judges the bag's whole-bag expect fragment, and
+    keeps the delivery metrics as monitor evidence for the calibration."""
+    row_id = "replay-costmap-nominal-cyclone"
+    budgets = tmp_path / "budgets.jsonl"
+    budgets.write_text("", encoding="utf-8")
+
+    # 1400 messages over the row's 140 s window: the whole bag arrived.
+    verdict_path = tmp_path / "within.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "within",
+        row_id,
+        stub=_make_stub_replay(expected=1400, delivered=1400),
+        budgets=budgets,
+        verdict=verdict_path,
+    )
+    assert rc == 0, "an unbanded replay row must run, not refuse for want of bands"
+    doc = json.loads(verdict_path.read_text(encoding="utf-8"))
+    assert doc["verdict"] == "WITHIN"
+    assert doc["genre"] == "replay"
+    assert doc["metrics"] == {}
+    assert doc["replay_expect"]["passed"] is True
+    assert doc["replay_expect"]["bag"]["public_example"] == "15_remote_assist_anonymized_costmap"
+    assert doc["monitor_metrics"]["delivered_count"] == 1400.0
+    assert doc["monitor_metrics"]["delivered_hz"] == pytest.approx(10.0)
+    assert doc["monitor_metrics"]["loss_pct"] == 0.0
+
+    # Half the bag: min_count, completeness and the bag-relative rate all fail.
+    capsys.readouterr()
+    failed_path = tmp_path / "failed.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "failed",
+        row_id,
+        stub=_make_stub_replay(expected=1400, delivered=700),
+        budgets=budgets,
+        verdict=failed_path,
+    )
+    assert rc == 1
+    failed = json.loads(failed_path.read_text(encoding="utf-8"))
+    assert failed["verdict"] == "EXPECT_FAILED"
+    assert len(failed["replay_expect"]["failures"]) == 3
+    out = capsys.readouterr().out
+    assert "Replay expect FAILED" in out
+    assert "min_count 1256" in out
+
+    # --monitor reports the same verdict without blocking.
+    monitor_path = tmp_path / "monitor.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "monitor",
+        row_id,
+        stub=_make_stub_replay(expected=1400, delivered=700),
+        budgets=budgets,
+        verdict=monitor_path,
+        extra=["--monitor"],
+    )
+    assert rc == 0
+    monitored = json.loads(monitor_path.read_text(encoding="utf-8"))
+    assert monitored["verdict"] == "EXPECT_FAILED"
+    assert monitored["gate"] is False
+
+
+def test_replay_calibration_run_reports_spread_for_the_metrics_a_band_would_take(
+    monkeypatch: pytest.MonkeyPatch, examples_project: Path, tmp_path: Path
+) -> None:
+    """Step 2 of issue #185 needs evidence, not bands: `--no-compare` runs the
+    row ungated and `calibrate` reports the per-metric spread even though the
+    row bands nothing yet."""
+    row_id = "replay-camera-tight-cyclone"
+    budgets = tmp_path / "budgets.jsonl"
+    verdict_path = tmp_path / "calib.json"
+    rc = _run_row(
+        monkeypatch,
+        examples_project,
+        tmp_path / "calib",
+        row_id,
+        stub=_make_stub_replay(expected=1400, delivered=1390),
+        budgets=budgets,
+        verdict=verdict_path,
+        extra=["--no-compare"],
+    )
+    assert rc == 0
+    calib_verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+    assert calib_verdict["verdict"] == "RAN"
+    assert calib_verdict["gate"] is False
+    calib_run = Path(calib_verdict["result"]).parent
+
+    report = tmp_path / "report.json"
+    rc = cli.main(
+        ["benchmark", "calibrate", row_id, str(calib_run), "--budgets", str(budgets), "--report", str(report)]
+    )
+    assert rc == 0
+    assert not budgets.exists() or budgets.read_text(encoding="utf-8").strip() == "", (
+        "a row that bands nothing must not mint bands"
+    )
+    metrics = json.loads(report.read_text(encoding="utf-8"))["metrics"]
+    assert metrics["loss_pct"]["banded"] is False
+    assert metrics["delivered_count"]["median"] == 1390.0
+
+
 def test_capacity_row_gates_the_breakpoint(
     monkeypatch: pytest.MonkeyPatch, examples_project: Path, tmp_path: Path
 ) -> None:

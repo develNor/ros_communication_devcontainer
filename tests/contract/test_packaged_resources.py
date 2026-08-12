@@ -83,7 +83,9 @@ def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
     default_build_args = default_config["build_args"]
     example_build_args = example_config["build_args"]
 
-    assert default_build_args["BASE_IMAGE"] == "osrf/ros:kilted-desktop-full-noble"
+    # EXPERIMENT (issue 240): ros:kilted-ros-base instead of
+    # osrf/ros:kilted-desktop-full-noble. Do not merge this branch.
+    assert default_build_args["BASE_IMAGE"] == "ros:kilted-ros-base"
     assert default_build_args["DIGEST"].startswith("@sha256:")
     assert default_build_args["BASE_IMAGE"] == example_build_args["BASE_IMAGE"]
     assert default_build_args["DIGEST"] == example_build_args["DIGEST"]

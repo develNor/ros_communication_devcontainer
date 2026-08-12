@@ -278,31 +278,52 @@ def test_workflow_matrices_expand_the_slices_that_exist() -> None:
     )
 
 
-def test_e2e_slices_stay_balanced() -> None:
+def test_e2e_slices_stay_close_to_the_floor() -> None:
     """Balance is a number now, so it can be kept rather than rediscovered.
 
     Themed slices drifted to a 2.4x spread (7m39s against 18m31s) with nobody
     noticing, because the only place a per-test cost existed was a `pytest -q`
-    total that nothing compared. The recorded costs make the next imbalance a
-    red contract test instead of a hand-diff of job durations.
+    total that nothing compared.
 
-    The wall-clock ceiling is a tripwire, not the target: a suite that grows
-    past it wants either a rebalance or more slices, and the fixed
-    RUNNER_SETUP_SECONDS + IMAGE_BUILD_SECONDS per job is what makes that a
-    trade rather than a free win.
+    Measured against the floor rather than the spread, which is what this test
+    asserted at six slices and what stopped meaning anything at thirteen. The
+    fixed cost per job compresses spread toward 1.0 as N grows, so a suite could
+    go badly wrong while spread still read 1.1; and past N=12 the spread is set
+    by tests too small to split rather than by imbalance. Distance to
+    `floor_seconds()` says the one thing worth asserting at any N — the gate is
+    near the fastest it could possibly be — and needs no retuning when a test is
+    added.
+
+    1.25x, not 1.0x, because the floor assumes tests can be divided arbitrarily
+    and they cannot. At thirteen slices the partition sits at 1.09x.
     """
     module = _e2e_conftest()
     predicted = {name: module.predicted_slice_seconds(name) for name in module.E2E_SLICES}
-    slowest, fastest = max(predicted.values()), min(predicted.values())
+    slowest = max(predicted.values())
+    floor = module.floor_seconds()
 
-    assert slowest / fastest < 1.5, (
-        f"e2e slices are unbalanced ({slowest / fastest:.2f}x spread); move tests "
-        f"between slices in tests/e2e/conftest.py:\n{module.slice_cost_report()}"
+    assert slowest <= 1.25 * floor, (
+        f"the slowest e2e slice is predicted at {slowest / 60:.2f}m against a "
+        f"{floor / 60:.2f}m floor ({slowest / floor:.2f}x). Move tests between slices, "
+        f"or split the slowest one, in tests/e2e/conftest.py:\n{module.slice_cost_report()}"
     )
-    assert slowest <= 15 * 60, (
-        f"the slowest e2e slice is predicted at {slowest / 60:.1f} minutes; rebalance "
-        f"or add a slice:\n{module.slice_cost_report()}"
-    )
+
+
+def test_the_floor_is_a_single_test_not_a_slice() -> None:
+    """`floor_seconds()` has to stay the *suite's* floor, not the current
+    partition's. It reads the slowest single test out of E2E_SLICES, so it
+    would silently follow a bad partition if it summed a slice instead — and
+    then the test above would be comparing the gate against itself.
+    """
+    module = _e2e_conftest()
+    slowest_test = max(cost for tests in module.E2E_SLICES.values() for cost in tests.values())
+    expected = module.RUNNER_SETUP_SECONDS + module.IMAGE_BUILD_SECONDS + slowest_test
+
+    assert module.floor_seconds() == expected
+    # The floor bounds the critical path, not every slice: a slice that does not
+    # own the slowest test is free to be quicker than it.
+    slowest_slice = max(module.predicted_slice_seconds(name) for name in module.E2E_SLICES)
+    assert module.floor_seconds() <= slowest_slice, "the floor is above the critical path, so it is not a floor"
 
 
 def test_slice_recipe_selects_by_slice_not_by_k() -> None:

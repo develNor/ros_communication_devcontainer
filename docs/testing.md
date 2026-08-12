@@ -125,17 +125,24 @@ from one-host smoke.
 
 `just test-e2e-smoke` runs the entire set of local-checkable curated examples. In CI and for local convenience, you can run specific E2E test slices or nodes:
 
-- `just test-e2e-slice core`: heartbeat and native chatter.
-- `just test-e2e-slice transforms`: transport transforms (compression, payload sizes).
-- `just test-e2e-slice remote-assist`: the anonymized remote-assist rig and its two single-stream cuts.
-- `just test-e2e-slice runtime-tools`: link latency, live timeline stepping, and the two benchmark verdicts.
-- `just test-e2e-slice benchmark-capacity`: the band-asserted capacity probes.
-- `just test-e2e-slice media-concurrency`: anonymization, video quality, and the concurrency/isolation gate.
+- `just test-e2e-slice heartbeat`: the heartbeat matrix (and the opt-in RMW matrix).
+- `just test-e2e-slice chatter`: the native chatter scenario, smoke, and debug rig.
+- `just test-e2e-slice occupancy-grid`: compressed occupancy grid over both transports.
+- `just test-e2e-slice sized-payload`: sized payload over both transports.
+- `just test-e2e-slice remote-assist`: the full anonymized remote-assist rig.
+- `just test-e2e-slice remote-assist-streams`: its costmap and camera single-stream cuts.
+- `just test-e2e-slice runtime-tools`: link latency and live timeline stepping.
+- `just test-e2e-slice media`: anonymization and video quality.
+- `just test-e2e-slice concurrency`: the concurrency/isolation gate.
+- `just test-e2e-slice benchmark-ab`: the A/B reliability verdict.
+- `just test-e2e-slice benchmark-replay`: loss boundaries against costmap replay.
+- `just test-e2e-slice benchmark-capacity`: the band-asserted capacity rows.
+- `just test-e2e-slice benchmark-capacity-cases`: the capacity good/bad-case verdicts.
 - `just test-e2e-node <nodeid>`: Reruns a specific pytest node ID directly.
 - `just e2e-slice-costs`: prints what each slice costs and how balanced the six are.
 
-The slices are balanced by measured cost rather than grouped by theme, which is
-why two of them carry a compound name. `E2E_SLICES` in `tests/e2e/conftest.py`
+The slices are chosen by measured cost, and split where the tests already
+differ so a red job names an area. `E2E_SLICES` in `tests/e2e/conftest.py`
 decides which slice owns which test; see
 [ci.md](ci.md#balancing-the-e2e-slices) before moving one.
 

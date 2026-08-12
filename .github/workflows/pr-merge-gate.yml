@@ -201,9 +201,11 @@ jobs:
     # tests/contract/test_workflow_contracts.py keeps the three workflows and
     # the justfile agreeing.
     #
-    # The six slices are balanced by measured cost, not grouped by theme
-    # (#226): themed slices spanned 7m39s to 18m31s, and one test ran in two of
-    # them. Which tests a slice owns and what each costs is E2E_SLICES in
+    # The slices are chosen by measured cost, not grouped by theme (#226):
+    # themed slices spanned 7m39s to 18m31s, and one test ran in two of them.
+    # Thirteen rather than six because the model that predicted the balanced
+    # six within 25s also says twelve reaches the floor and more buys nothing
+    # (#235). Which tests a slice owns and what each costs is E2E_SLICES in
     # tests/e2e/conftest.py — change that, not this line, to move a test.
     name: e2e-${{ matrix.slice }}
     runs-on: ubuntu-latest
@@ -213,7 +215,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slice: [core, transforms, remote-assist, runtime-tools, benchmark-capacity, media-concurrency]
+        slice: [heartbeat, chatter, occupancy-grid, sized-payload, remote-assist, remote-assist-streams, runtime-tools, media, concurrency, benchmark-ab, benchmark-replay, benchmark-capacity, benchmark-capacity-cases]
 
     steps:
       - name: Check out repository

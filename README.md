@@ -733,6 +733,26 @@ performance bands in `budgets.jsonl` via `rosotacom benchmark compare`, and
 bands move only through `rosotacom benchmark ratchet` — see
 [docs/performance-bands.md](docs/performance-bands.md) for the band schema,
 verdicts, and the ratchet workflow (RFC 0007).
+
+Two result sets taken in **different environments** — emulated versus a real
+link, or shaped versus unshaped — are compared with `rosotacom benchmark delta`:
+
+```bash
+rosotacom benchmark delta emulated/ ota/ \
+  --label-reference emulated --label-measured ota \
+  --out delta.json --markdown delta.md
+```
+
+It pairs runs on genre, profile, RMW and session name, so a row that ran in one
+environment and not the other is reported as unmatched rather than silently
+dropped — "it got faster" and "it did not run" must not look the same. Every
+report is labelled `monitor_only` and carries each side's command and profile
+file, so a table pasted into a paper or an issue can be traced back without the
+directory it came from.
+
+It exits 0 whatever the numbers say, and non-zero only when the two sets share
+no rows at all — a delta is an observation to explain, and an exit code would
+turn "explain this" into "re-run until it is quiet".
 For live benchmark probes, `--duration` is the shaped publish window; after that
 rosotacom stops synthetic publishers and waits `--drain-s` seconds before
 tearing down shaping, so delayed in-flight messages are not miscounted as loss.

@@ -290,6 +290,24 @@ once `optional` are all fixed:
       end-to-end by remote_assist (`/tf` local→global, `/move_base_free/goal`
       global→local, both delivered to `native_in`); ffmpeg video is n/a -- there is no
       video/ffmpeg feature anywhere in the codebase, so there is nothing to test.
+- [x] The third latched "not delivering" state is named (issue #231, Option A).
+      A latched topic that has a publisher but holds no value now reads distinctly
+      ("has a publisher but holds no retained latched value") from "no publisher"
+      and "stopped", so a broken/empty latch is no longer indistinguishable from a
+      silent producer (`classify_stage` carries a `latched` flag; `_stage_diagnosis`
+      names it). The transient_local read Option A asks for was **not** forced per
+      declared role: a first attempt did (`collect_latched_stage_topics` ->
+      forced QoS) and broke `e2e-remote-assist`, because a latched topic's *native
+      source* stage is published VOLATILE (the ROS 1 bridge offers no durability)
+      and a TRANSIENT_LOCAL reader is incompatible with a VOLATILE writer -- it
+      received nothing and reported a false STALLED. The correct, per-stage form
+      is the existing publisher-matched `_observation_qos`, which already requests
+      transient_local on the delivered stages that offer it (com_in/app_in); that
+      matched subscription is observable on the graph (it raises the subscriber
+      count). Validation:
+      `tests/unit/test_status_overview.py::test_observation_qos_does_not_force_transient_local_for_latched_roles`,
+      `::test_stage_diagnosis_names_the_three_latched_states`,
+      `::test_classify_stage_marks_latched_role`.
 
 ### Replay-only (ground-truth) assertions — from "Live vs replay" above
 

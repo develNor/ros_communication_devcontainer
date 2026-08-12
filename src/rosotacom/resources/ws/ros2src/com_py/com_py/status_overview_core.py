@@ -497,6 +497,7 @@ class StatusAggregator:
             "quality_reason": None,
             "observation": "graph" if obs is not None and obs.graph_only else "payload",
             "inferred_from": None,
+            "latched": str((expect or {}).get("mode", "")).strip().lower() == "latched",
         }
         if obs is None:
             return result
@@ -743,6 +744,16 @@ class StatusAggregator:
                 return (
                     f"{topic} has a publisher; payload is intentionally not "
                     "subscribed and adjacent local flow is not observed"
+                )
+            if stage_result.get("latched"):
+                # The third state issue #231 names: distinct from "no publisher"
+                # (ABSENT) and "stopped" (STALE). The observation subscribes
+                # transient_local for latched roles, so a value published before
+                # it matched would have been replayed; holding none means nothing
+                # was ever latched (empty/broken latch), not a late-joining reader.
+                return (
+                    f"{topic} has a publisher but holds no retained latched "
+                    "value (nothing was latched, or the latch was lost)"
                 )
             return f"{topic} has a publisher but no messages observed yet"
         if st == STALE:

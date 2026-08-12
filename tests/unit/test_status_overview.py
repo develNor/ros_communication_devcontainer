@@ -179,6 +179,20 @@ def test_observation_qos_matches_publisher_durability() -> None:
     assert "qos = self._observation_qos(topic)" in source
 
 
+def test_observation_qos_does_not_force_transient_local_for_latched_roles() -> None:
+    """#231 regression: the observer must NOT force TRANSIENT_LOCAL for every
+    stage of a latched topic. A latched topic's native source stage is published
+    VOLATILE (the ROS 1 bridge offers no durability), and a TRANSIENT_LOCAL
+    reader is incompatible with a VOLATILE writer -- forcing it made the native
+    stage receive nothing and read a false STALLED (broke e2e-remote-assist).
+    The per-publisher QoS match already requests transient_local on the delivered
+    stages that offer it, which is the correct per-stage form of Option A.
+    """
+    source = STATUS_NODE_PY.read_text(encoding="utf-8")
+    assert "self._latched_topics" not in source
+    assert "collect_latched_stage_topics" not in source
+
+
 # ---------------------------------------------------------------------------
 # state classification + rollup
 # ---------------------------------------------------------------------------
@@ -292,6 +306,40 @@ def test_rollup_latched_never_delivered_still_stalled(tmp_path: Path) -> None:
     spec = {"direction": "inbound", "expect": {"mode": "latched"}}
     stages = [_sr("ota_recv", "/ota/b/site/latched", core.IDLE), _sr("app_in", "/b/site/latched", core.IDLE)]
     assert agg.rollup(spec, stages)["overall"] == core.STALLED
+
+
+def test_stage_diagnosis_names_the_three_latched_states(tmp_path: Path) -> None:
+    """#231: a latched topic that is not delivering reads as one of three
+    distinct states. The new one -- a publisher present but no retained value
+    held -- must not collapse into 'no publisher', which is the difference
+    between a broken latch and a genuinely silent producer."""
+    agg = _build({}, tmp_path)
+    topic = "/b/site/latched"
+    no_publisher = agg._stage_diagnosis({"state": core.ABSENT, "topic": topic, "produced_by": "relay"})
+    stopped = agg._stage_diagnosis({"state": core.STALE, "topic": topic, "produced_by": "relay"})
+    no_retained = agg._stage_diagnosis({"state": core.IDLE, "topic": topic, "produced_by": "relay", "latched": True})
+    plain_idle = agg._stage_diagnosis({"state": core.IDLE, "topic": "/heartbeat_a", "produced_by": "relay"})
+    assert "no publisher" in no_publisher
+    assert "stopped" in stopped
+    assert "retained latched" in no_retained
+    # all three name-distinct, and the latched case is not the plain-idle text
+    assert len({no_publisher, stopped, no_retained}) == 3
+    assert no_retained != plain_idle
+
+
+def test_classify_stage_marks_latched_role(tmp_path: Path) -> None:
+    """classify_stage carries the latched flag so _stage_diagnosis can name the
+    third state without re-reading the spec."""
+    agg = _build({}, tmp_path)
+    latched = agg.classify_stage(
+        {"stage": "app_in", "topic": "/b/site/latched"},
+        None,
+        0.0,
+        {"mode": "latched"},
+    )
+    streamed = agg.classify_stage({"stage": "native", "topic": "/b/twist"}, None, 0.0, {"mode": "stream"})
+    assert latched["latched"] is True
+    assert streamed["latched"] is False
 
 
 def test_rollup_latched_outbound_produced_is_ok(tmp_path: Path) -> None:

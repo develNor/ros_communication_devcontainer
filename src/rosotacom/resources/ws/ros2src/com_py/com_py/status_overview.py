@@ -161,6 +161,18 @@ class StageObserver(Node):
         value. Adopting the publisher's offered durability/reliability (request ==
         offered) is always compatible and replays the durable history. Falls back
         to best-effort/volatile when no publisher QoS is available.
+
+        Adopting the *publisher's* offered durability (rather than forcing
+        TRANSIENT_LOCAL for every stage of a declared latched topic) is
+        deliberate: a latched topic's own source stage -- the vehicle's native
+        publish -- is VOLATILE (the ROS 1 bridge offers no durability), and a
+        TRANSIENT_LOCAL reader is incompatible with a VOLATILE writer and would
+        receive nothing, turning a healthy native stage into a false STALLED.
+        Only the delivered stages (com_in/app_in) offer TRANSIENT_LOCAL, and the
+        per-publisher match already requests it there -- which is the
+        "subscribe transient_local on latched roles" of issue #231, made
+        per-stage-correct. The matched subscription is observable on the graph
+        (it raises the topic's subscriber count).
         """
         durability = DurabilityPolicy.VOLATILE
         reliability = ReliabilityPolicy.BEST_EFFORT

@@ -58,13 +58,24 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     # are, and that they add up to the whole suite, is
     # tests/contract/test_workflow_contracts.py's job.
     assert "just test-e2e-slice" in merge_gate
+    # Named individually rather than compared to E2E_SLICES, so that dropping a
+    # slice from the manifest and the matrix together still fails here. Which
+    # slices exist is a balance decision (#226, #235); that the gate runs the
+    # Docker smoke suite at all is what this file is about.
     assert set(jobs["e2e"]["strategy"]["matrix"]["slice"]) >= {
-        "core",
-        "transforms",
+        "heartbeat",
+        "chatter",
+        "occupancy-grid",
+        "sized-payload",
         "remote-assist",
+        "remote-assist-streams",
         "runtime-tools",
+        "media",
+        "concurrency",
+        "benchmark-ab",
+        "benchmark-replay",
         "benchmark-capacity",
-        "media-concurrency",
+        "benchmark-capacity-cases",
     }
 
 

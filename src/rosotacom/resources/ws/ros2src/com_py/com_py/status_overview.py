@@ -73,6 +73,7 @@ from com_py.status_overview_core import (
     ClockOffsetEstimator,
     StageObservation,
     StatusAggregator,
+    collect_latched_stage_topics,
     collect_stage_metadata,
     collect_stage_topics,
 )
@@ -99,6 +100,7 @@ class StageObserver(Node):
                  topics: Dict[str, Optional[str]], refresh_interval_s: float,
                  *, subscribe_to_messages: bool = True,
                  stage_metadata: Optional[Dict[str, list[dict]]] = None,
+                 latched_topics: Optional[set] = None,
                  clock_estimator: Optional[ClockOffsetEstimator] = None):
         super().__init__(node_name, context=context)
         self.observations: Dict[str, StageObservation] = {
@@ -108,6 +110,7 @@ class StageObserver(Node):
         self._refresh_interval_s = refresh_interval_s
         self._subscribe_to_messages = subscribe_to_messages
         self._stage_metadata = stage_metadata or {}
+        self._latched_topics = latched_topics or set()
         self.clock_estimator = clock_estimator or ClockOffsetEstimator()
         self.create_timer(self._refresh_interval_s, self._refresh)
         self._refresh()
@@ -161,7 +164,22 @@ class StageObserver(Node):
         value. Adopting the publisher's offered durability/reliability (request ==
         offered) is always compatible and replays the durable history. Falls back
         to best-effort/volatile when no publisher QoS is available.
+
+        A declared latched role (issue #231, Option A) does not wait for that
+        fallback: its publisher offers TRANSIENT_LOCAL by contract and retains
+        the value, so the subscription requests TRANSIENT_LOCAL/RELIABLE from the
+        role rather than racing a live-publisher probe that may run before the
+        single publish is visible. This matching subscription is itself
+        observable on the graph (it raises the topic's subscriber count), which
+        is the price Option A pays over a purely passive volatile reader.
         """
+        if topic in self._latched_topics:
+            return QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10,
+            )
         durability = DurabilityPolicy.VOLATILE
         reliability = ReliabilityPolicy.BEST_EFFORT
         try:
@@ -327,6 +345,7 @@ class StatusOverview(Node):
 
         by_domain = collect_stage_topics(self.spec)
         metadata_by_domain = collect_stage_metadata(self.spec)
+        latched_by_domain = collect_latched_stage_topics(self.spec)
         clock_estimator = ClockOffsetEstimator()
 
         self._ota_context: Optional[Context] = None
@@ -344,6 +363,7 @@ class StatusOverview(Node):
             local_topics,
             self.refresh_interval_s,
             stage_metadata=metadata_by_domain.get("local"),
+            latched_topics=latched_by_domain.get("local"),
             clock_estimator=clock_estimator,
         )
         observers["local"] = self._local_observer

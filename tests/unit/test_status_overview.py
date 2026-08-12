@@ -179,6 +179,18 @@ def test_observation_qos_matches_publisher_durability() -> None:
     assert "qos = self._observation_qos(topic)" in source
 
 
+def test_observation_qos_forces_transient_local_for_latched_role() -> None:
+    """#231 Option A: a declared latched role subscribes TRANSIENT_LOCAL from the
+    role, not only when a live-publisher probe happens to see the offered QoS
+    before the single latched publish -- otherwise the read races that publish.
+    """
+    source = STATUS_NODE_PY.read_text(encoding="utf-8")
+    assert "self._latched_topics" in source
+    assert "if topic in self._latched_topics:" in source
+    # The latched set is threaded into the local observer from the spec.
+    assert "latched_topics=latched_by_domain.get" in source
+
+
 # ---------------------------------------------------------------------------
 # state classification + rollup
 # ---------------------------------------------------------------------------
@@ -292,6 +304,64 @@ def test_rollup_latched_never_delivered_still_stalled(tmp_path: Path) -> None:
     spec = {"direction": "inbound", "expect": {"mode": "latched"}}
     stages = [_sr("ota_recv", "/ota/b/site/latched", core.IDLE), _sr("app_in", "/b/site/latched", core.IDLE)]
     assert agg.rollup(spec, stages)["overall"] == core.STALLED
+
+
+def test_collect_latched_stage_topics_keys_off_expect_mode() -> None:
+    """#231: the latched set is derived from the declared expect.mode, covering
+    every stage of a latched topic and nothing of a streamed one."""
+    spec = {
+        "topics": [
+            {
+                "expect": {"mode": "latched"},
+                "stages": [
+                    {"stage": "app_in", "topic": "/b/site/latched", "domain": "local"},
+                    {"stage": "ota_recv", "topic": "/ota/b/site/latched", "domain": "ota"},
+                ],
+            },
+            {
+                "expect": {"mode": "stream"},
+                "stages": [{"stage": "native", "topic": "/b/twist", "domain": "local"}],
+            },
+        ]
+    }
+    latched = core.collect_latched_stage_topics(spec)
+    assert latched["local"] == {"/b/site/latched"}
+    assert latched["ota"] == {"/ota/b/site/latched"}
+    assert "/b/twist" not in latched["local"]
+
+
+def test_stage_diagnosis_names_the_three_latched_states(tmp_path: Path) -> None:
+    """#231: a latched topic that is not delivering reads as one of three
+    distinct states. The new one -- a publisher present but no retained value
+    held -- must not collapse into 'no publisher', which is the difference
+    between a broken latch and a genuinely silent producer."""
+    agg = _build({}, tmp_path)
+    topic = "/b/site/latched"
+    no_publisher = agg._stage_diagnosis({"state": core.ABSENT, "topic": topic, "produced_by": "relay"})
+    stopped = agg._stage_diagnosis({"state": core.STALE, "topic": topic, "produced_by": "relay"})
+    no_retained = agg._stage_diagnosis({"state": core.IDLE, "topic": topic, "produced_by": "relay", "latched": True})
+    plain_idle = agg._stage_diagnosis({"state": core.IDLE, "topic": "/heartbeat_a", "produced_by": "relay"})
+    assert "no publisher" in no_publisher
+    assert "stopped" in stopped
+    assert "retained latched" in no_retained
+    # all three name-distinct, and the latched case is not the plain-idle text
+    assert len({no_publisher, stopped, no_retained}) == 3
+    assert no_retained != plain_idle
+
+
+def test_classify_stage_marks_latched_role(tmp_path: Path) -> None:
+    """classify_stage carries the latched flag so _stage_diagnosis can name the
+    third state without re-reading the spec."""
+    agg = _build({}, tmp_path)
+    latched = agg.classify_stage(
+        {"stage": "app_in", "topic": "/b/site/latched"},
+        None,
+        0.0,
+        {"mode": "latched"},
+    )
+    streamed = agg.classify_stage({"stage": "native", "topic": "/b/twist"}, None, 0.0, {"mode": "stream"})
+    assert latched["latched"] is True
+    assert streamed["latched"] is False
 
 
 def test_rollup_latched_outbound_produced_is_ok(tmp_path: Path) -> None:

@@ -497,6 +497,7 @@ class StatusAggregator:
             "quality_reason": None,
             "observation": "graph" if obs is not None and obs.graph_only else "payload",
             "inferred_from": None,
+            "latched": str((expect or {}).get("mode", "")).strip().lower() == "latched",
         }
         if obs is None:
             return result
@@ -744,6 +745,16 @@ class StatusAggregator:
                     f"{topic} has a publisher; payload is intentionally not "
                     "subscribed and adjacent local flow is not observed"
                 )
+            if stage_result.get("latched"):
+                # The third state issue #231 names: distinct from "no publisher"
+                # (ABSENT) and "stopped" (STALE). The observation subscribes
+                # transient_local for latched roles, so a value published before
+                # it matched would have been replayed; holding none means nothing
+                # was ever latched (empty/broken latch), not a late-joining reader.
+                return (
+                    f"{topic} has a publisher but holds no retained latched "
+                    "value (nothing was latched, or the latch was lost)"
+                )
             return f"{topic} has a publisher but no messages observed yet"
         if st == STALE:
             return f"{topic} stopped receiving messages"
@@ -986,4 +997,25 @@ def collect_stage_metadata(spec: Dict[str, Any]) -> Dict[str, Dict[str, List[Dic
                     "type": stage.get("type") or topic_spec.get("type"),
                 }
             )
+    return by_domain
+
+
+def collect_latched_stage_topics(spec: Dict[str, Any]) -> Dict[str, set]:
+    """Return {domain: {topic}} for every stage of a latched-mode topic.
+
+    A latched role's publisher offers TRANSIENT_LOCAL and retains its value, so
+    the observation subscription must request TRANSIENT_LOCAL to read the held
+    sample instead of racing the single publish. This is keyed off the declared
+    ``expect.mode == "latched"`` rather than off a live-publisher QoS probe, so
+    the read is correct even when the observer subscribes before the publisher
+    is visible on the graph (issue #231, Option A).
+    """
+    by_domain: Dict[str, set] = {"local": set(), "ota": set()}
+    for topic_spec in spec.get("topics", []):
+        expect = topic_spec.get("expect") or {}
+        if str(expect.get("mode", "")).strip().lower() != "latched":
+            continue
+        for stage in topic_spec.get("stages", []):
+            domain = stage.get("domain", "local")
+            by_domain.setdefault(domain, set()).add(stage["topic"])
     return by_domain

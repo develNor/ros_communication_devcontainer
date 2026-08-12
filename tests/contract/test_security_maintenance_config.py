@@ -63,8 +63,8 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
         "transforms",
         "remote-assist",
         "runtime-tools",
-        "concurrency",
-        "media",
+        "benchmark-capacity",
+        "media-concurrency",
     }
 
 

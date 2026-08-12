@@ -303,7 +303,8 @@ slices these into issues.
 - [x] **Merge-gate row** — exercised by the merge gate itself (band-asserted
   benchmark-capacity E2E), runtime bounded by the workflow timeout.
   *(`test_benchmark_capacity.py::test_merge_gate_row_is_band_asserted` in the
-  `e2e-runtime-tools` lane of `pr-merge-gate.yml`; a 60 s probe window plus
+  `e2e-benchmark-capacity` lane of `pr-merge-gate.yml` — the `e2e-runtime-tools`
+  lane until #226 split the capacity probes out of it; a 60 s probe window plus
   session setup keeps it minutes-scale.)*
 - [x] **Nightly matrix** — one deliberately injected regression (canary
   branch) turns the lane red end-to-end; documented one-off exercise.

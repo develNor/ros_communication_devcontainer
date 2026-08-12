@@ -125,12 +125,19 @@ from one-host smoke.
 
 `just test-e2e-smoke` runs the entire set of local-checkable curated examples. In CI and for local convenience, you can run specific E2E test slices or nodes:
 
-- `just test-e2e-core`: Runs core communication smoke tests.
-- `just test-e2e-transforms`: Runs transport transforms (compression, payload sizes).
-- `just test-e2e-remote-assist`: Runs anonymized remote assist streams.
-- `just test-e2e-runtime-tools`: Runs runtime utility/metrics E2E checks.
-- `just test-e2e-concurrency`: Runs concurrency/isolation gate checks.
+- `just test-e2e-slice core`: heartbeat and native chatter.
+- `just test-e2e-slice transforms`: transport transforms (compression, payload sizes).
+- `just test-e2e-slice remote-assist`: the anonymized remote-assist rig and its two single-stream cuts.
+- `just test-e2e-slice runtime-tools`: link latency, live timeline stepping, and the two benchmark verdicts.
+- `just test-e2e-slice benchmark-capacity`: the band-asserted capacity probes.
+- `just test-e2e-slice media-concurrency`: anonymization, video quality, and the concurrency/isolation gate.
 - `just test-e2e-node <nodeid>`: Reruns a specific pytest node ID directly.
+- `just e2e-slice-costs`: prints what each slice costs and how balanced the six are.
+
+The slices are balanced by measured cost rather than grouped by theme, which is
+why two of them carry a compound name. `E2E_SLICES` in `tests/e2e/conftest.py`
+decides which slice owns which test; see
+[ci.md](ci.md#balancing-the-e2e-slices) before moving one.
 
 The generated RMW matrix is available as an opt-in full local slice:
 

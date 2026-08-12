@@ -25,6 +25,19 @@ CALIBRATE_WORKFLOW = WORKFLOWS_DIR / "benchmark-calibrate.yml"
 JUSTFILE = PACKAGE_ROOT / "justfile"
 
 
+def _e2e_slices() -> dict[str, dict[str, float]]:
+    """E2E_SLICES, loaded from tests/e2e/conftest.py by path (not importable)."""
+    import importlib.util
+
+    path = PACKAGE_ROOT / "tests" / "e2e" / "conftest.py"
+    spec = importlib.util.spec_from_file_location("rosotacom_e2e_conftest", path)
+    assert spec and spec.loader, f"cannot load {path}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    slices: dict[str, dict[str, float]] = module.E2E_SLICES
+    return slices
+
+
 @pytest.fixture(scope="module")
 def rows() -> list[GateRow]:
     return load_registry()
@@ -174,19 +187,26 @@ def test_gate_workflows_exist_and_consume_the_registry(rows: list[GateRow]) -> N
 
 
 def test_merge_gate_lane_actually_selects_the_benchmark_e2e() -> None:
-    """Regression contract for the silent deselection this work found: the
-    runtime-tools recipe must run both benchmark E2E files
-    (tests/e2e/test_benchmark_capacity.py and tests/e2e/test_benchmark_ab.py) in a
-    pytest invocation that carries no `-k` filter (a `-k` from another file's
-    selection would deselect every benchmark test without failing)."""
-    recipe = re.search(
-        r"^test-e2e-runtime-tools:\n((?:\t.*\n?)+)",
+    """Regression contract for the silent deselection this work found: a
+    `-k` filter meant for one file used to deselect every test in another, so
+    the benchmark E2E could vanish from the gate without failing anything.
+
+    The slice runner carries no `-k` at all now — it deselects by node id
+    against E2E_SLICES — so the contract is that both benchmark E2E files are
+    owned by a slice. Which slice is a balance decision (#226 split the
+    capacity probes out of `runtime-tools`); that they run at all is not.
+    """
+    slice_recipe = re.search(
+        r"^test-e2e-slice[^\n:]*:\n((?:\t.*\n?)+)",
         JUSTFILE.read_text(encoding="utf-8"),
         re.MULTILINE,
     )
-    assert recipe, "justfile recipe test-e2e-runtime-tools is missing"
+    assert slice_recipe, "justfile recipe test-e2e-slice is missing"
+    poisoned = [line for line in slice_recipe.group(1).splitlines() if re.search(r"\s-k\s", line)]
+    assert not poisoned, f"a -k filter would silently deselect tests from a slice: {poisoned}"
+
+    owned = {nodeid for tests in _e2e_slices().values() for nodeid in tests}
     for e2e_file in ("test_benchmark_capacity.py", "test_benchmark_ab.py"):
-        benchmark_lines = [line for line in recipe.group(1).splitlines() if e2e_file in line]
-        assert benchmark_lines, f"test-e2e-runtime-tools no longer runs tests/e2e/{e2e_file}"
-        poisoned = [line for line in benchmark_lines if re.search(r"\s-k\s", line)]
-        assert not poisoned, f"a -k filter would silently deselect the benchmark E2E {e2e_file}: {poisoned}"
+        assert any(nodeid.startswith(f"tests/e2e/{e2e_file}::") for nodeid in owned), (
+            f"no e2e slice owns tests/e2e/{e2e_file}, so no merge-gate lane runs it"
+        )

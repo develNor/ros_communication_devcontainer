@@ -103,8 +103,8 @@ Lanes (RFC 0007 §4):
 
 - **merge gate** — the `merge-gate` rows run inside the benchmark-capacity E2E
   (`tests/e2e/test_benchmark_capacity.py::test_merge_gate_row_is_band_asserted`,
-  lane `just test-e2e-runtime-tools`): minutes-scale, default RMW, one
-  rate-limited profile.
+  lane `just test-e2e-slice benchmark-capacity`): minutes-scale, default RMW,
+  one rate-limited profile.
 - **nightly** — `.github/workflows/benchmark-gate.yml` runs every `nightly`
   row on schedule (and on dispatch), uploads per-row verdicts plus the
   aggregated `benchmark-gate-summary` artifact (`benchmark gate-summary`), and

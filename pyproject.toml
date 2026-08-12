@@ -103,6 +103,12 @@ select = ["B", "E", "F", "I", "UP"]
 [tool.ruff.lint.isort]
 known-first-party = ["rosotacom"]
 
+[tool.ruff.lint.per-file-ignores]
+# The e2e slice partition is a table of pytest node ids, which have to be
+# verbatim to select anything and run past 120 characters on their own. Folding
+# them would make the table neither readable nor greppable.
+"tests/e2e/conftest.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.12"
 mypy_path = "src"

@@ -42,39 +42,16 @@ test-e2e-smoke:
 
 test-e2e-fast: test-e2e-smoke
 
-test-e2e-core:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "heartbeat or chatter"
-
-test-e2e-transforms:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "occupancy_grid or sized_payload"
-
-test-e2e-remote-assist:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "remote_assist"
-
-# Two invocations on purpose: a shared `-k` filter would silently deselect
-# every test in the other files (contract-tested in test_benched_set_registry).
-test-e2e-runtime-tools:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "link_latency"
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_timeline_stepping.py tests/e2e/test_benchmark_capacity.py tests/e2e/test_benchmark_ab.py tests/e2e/test_benchmark_replay.py
-
-# The remaining e2e files. Without this slice the partition is not one: the
-# monolithic `test-e2e-smoke` collects 28 tests, the other five collect 25, and
-# anonymization/video-quality/replay ran only in nightly and the release.
-test-e2e-media:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_anonymize_e2e.py tests/e2e/test_video_quality_e2e.py
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_smoke.py -k "anonymized"
-
-test-e2e-concurrency:
-	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/test_parallel_smoke.py
-
-# The five slices partition `test-e2e-smoke`; the merge gate and the release
-# both run them in parallel. This wrapper exists so a workflow matrix can select
-# a slice while the recipe name in the `run:` line stays a literal — a name
-# assembled by matrix interpolation is invisible to
-# tests/contract/test_workflow_contracts.py::test_referenced_just_recipes_exist.
-# Run one named slice of the e2e suite.
+# Run one named slice of the e2e suite. Same collection as `test-e2e-smoke`,
+# with everything the slice does not own deselected — so a slice cannot miss a
+# test or run one twice, which per-slice file lists and `-k` filters both did.
+# Which tests a slice owns, and what each costs, is E2E_SLICES in
+# tests/e2e/conftest.py; `just e2e-slice-costs` prints the balance.
 test-e2e-slice slice:
-	just test-e2e-{{slice}}
+	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/ -m e2e --e2e-slice={{slice}}
+
+e2e-slice-costs:
+	{{python}} tests/e2e/conftest.py
 
 test-e2e-node nodeid:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 "{{nodeid}}"

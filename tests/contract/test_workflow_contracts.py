@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from types import ModuleType
 
+import pytest
 import yaml
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
@@ -178,7 +181,8 @@ def _recipe_pytest_invocations(recipe: str) -> list[list[str]]:
     import shlex
 
     text = JUSTFILE_PATH.read_text(encoding="utf-8")
-    match = re.search(rf"^{re.escape(recipe)}\s*:[^\n]*\n(?P<body>(?:[ \t]+[^\n]*\n?)+)", text, re.MULTILINE)
+    # `[^\n:]*` so a parameterised recipe (`test-e2e-slice slice:`) matches too.
+    match = re.search(rf"^{re.escape(recipe)}[^\n:]*:[^\n]*\n(?P<body>(?:[ \t]+[^\n]*\n?)+)", text, re.MULTILINE)
     assert match, f"recipe {recipe!r} not found in the justfile"
 
     invocations: list[list[str]] = []
@@ -208,31 +212,161 @@ def _collect_e2e_ids(args: list[str]) -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.startswith("tests/e2e/")}
 
 
+def _e2e_conftest() -> ModuleType:
+    """The slice manifest, loaded from tests/e2e/conftest.py by path.
+
+    By path because `tests` is not an importable package and only pytest's own
+    collection puts `tests/e2e` on `sys.path`; a contract test in a sibling
+    directory cannot rely on that.
+    """
+    path = PACKAGE_ROOT / "tests" / "e2e" / "conftest.py"
+    spec = importlib.util.spec_from_file_location("rosotacom_e2e_conftest", path)
+    assert spec and spec.loader, f"cannot load {path}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_e2e_slices_partition_the_whole_suite() -> None:
-    """The parallel slices must collect exactly what the monolith collects.
+    """The slices must own exactly what the monolith collects, once each.
 
     `test-e2e-smoke` is `pytest tests/e2e/ -m e2e`, so it picks up any new file
-    automatically; the slices name files and `-k` expressions by hand and do
-    not. When the merge gate was split into slices, three files
-    (anonymize, video-quality, benchmark-replay) and the two
-    `[remote-assist-anonymized-*]` parameters silently stopped being covered
-    there — `-k "remote_assist"` misses the latter because the parameter id
-    spells it with hyphens. Nothing failed, because nightly and the release
-    still ran the monolith. This test is what makes that drift loud.
+    automatically; E2E_SLICES names node ids by hand and does not. Both halves
+    have failed in production. Three files (anonymize, video-quality,
+    benchmark-replay) and the two `[remote-assist-anonymized-*]` parameters
+    once ran in no slice at all, because `-k "remote_assist"` misses a
+    parameter id that spells it with hyphens. And
+    `test_local_remote_assist_anonymized_smoke_from_copied_example_project` ran
+    in *two* slices for as long as slices existed, because `-k "remote_assist"`
+    and `-k "anonymized"` both match it — 262s of duplicated work per run that
+    the old version of this test could not see, since it compared a union of
+    the slices against the monolith and a union hides an overlap.
     """
     monolith = _collect_e2e_ids(["tests/e2e/", "-m", "e2e"])
     assert monolith, "collected no e2e tests; the monolith invocation changed"
 
-    covered: set[str] = set()
-    for slice_name in _release_e2e_slices():
-        for args in _recipe_pytest_invocations(f"test-e2e-{slice_name}"):
-            covered |= _collect_e2e_ids(args)
+    slices = _e2e_conftest().E2E_SLICES
+    owned: set[str] = set()
+    duplicated: dict[str, list[str]] = {}
+    for name, tests in slices.items():
+        for nodeid in tests:
+            if nodeid in owned:
+                duplicated.setdefault(nodeid, []).append(name)
+            owned.add(nodeid)
 
-    assert not monolith - covered, (
+    assert not duplicated, (
+        "These e2e tests are owned by more than one slice, so the gate runs "
+        "them twice:\n" + "\n".join(f"{nodeid} -> {names}" for nodeid, names in sorted(duplicated.items()))
+    )
+    assert not monolith - owned, (
         "These e2e tests run in `just test-e2e-smoke` but in no slice, so the "
-        "merge gate and the release would not run them:\n" + "\n".join(sorted(monolith - covered))
+        "merge gate and the release would not run them:\n" + "\n".join(sorted(monolith - owned))
     )
-    assert not covered - monolith, (
-        "These tests are selected by a slice but not by the monolith, so the "
-        "two definitions disagree:\n" + "\n".join(sorted(covered - monolith))
+    assert not owned - monolith, (
+        "These tests are owned by a slice but not collected by the monolith, "
+        "so the two definitions disagree:\n" + "\n".join(sorted(owned - monolith))
     )
+
+
+def test_workflow_matrices_expand_the_slices_that_exist() -> None:
+    """The matrix names slices; E2E_SLICES defines them. A name in one and not
+    the other is either a job that fails on an unknown `--e2e-slice` value or a
+    set of tests nothing runs."""
+    module = _e2e_conftest()
+    assert sorted(_release_e2e_slices()) == sorted(module.E2E_SLICES), (
+        f"the release matrix expands {sorted(_release_e2e_slices())} but E2E_SLICES defines {sorted(module.E2E_SLICES)}"
+    )
+
+
+def test_e2e_slices_stay_balanced() -> None:
+    """Balance is a number now, so it can be kept rather than rediscovered.
+
+    Themed slices drifted to a 2.4x spread (7m39s against 18m31s) with nobody
+    noticing, because the only place a per-test cost existed was a `pytest -q`
+    total that nothing compared. The recorded costs make the next imbalance a
+    red contract test instead of a hand-diff of job durations.
+
+    The wall-clock ceiling is a tripwire, not the target: a suite that grows
+    past it wants either a rebalance or more slices, and the fixed
+    RUNNER_SETUP_SECONDS + IMAGE_BUILD_SECONDS per job is what makes that a
+    trade rather than a free win.
+    """
+    module = _e2e_conftest()
+    predicted = {name: module.predicted_slice_seconds(name) for name in module.E2E_SLICES}
+    slowest, fastest = max(predicted.values()), min(predicted.values())
+
+    assert slowest / fastest < 1.5, (
+        f"e2e slices are unbalanced ({slowest / fastest:.2f}x spread); move tests "
+        f"between slices in tests/e2e/conftest.py:\n{module.slice_cost_report()}"
+    )
+    assert slowest <= 15 * 60, (
+        f"the slowest e2e slice is predicted at {slowest / 60:.1f} minutes; rebalance "
+        f"or add a slice:\n{module.slice_cost_report()}"
+    )
+
+
+def test_slice_recipe_selects_by_slice_not_by_k() -> None:
+    """One invocation, no `-k`. Every slice-shaped bug this repository has had
+    came from a filter that was not the collection: a `-k` that missed a
+    hyphenated parameter id, a `-k` that matched two slices' tests, and a `-k`
+    from one file's selection deselecting every test in another file."""
+    invocations = _recipe_pytest_invocations("test-e2e-slice")
+    assert len(invocations) == 1, f"test-e2e-slice should run pytest once, runs {len(invocations)} times"
+    args = invocations[0]
+    assert "-k" not in args, f"test-e2e-slice must not filter with -k: {args}"
+    assert "--e2e-slice={{slice}}" in args, f"test-e2e-slice must pass the slice through: {args}"
+
+
+def test_each_slice_collects_exactly_what_it_owns() -> None:
+    """The manifest is the intent; this is what pytest actually selects.
+
+    Checked per slice rather than as a union, because a union is precisely what
+    could not see one test being collected by two slices.
+    """
+    slices = _e2e_conftest().E2E_SLICES
+    for name, tests in slices.items():
+        collected = _collect_e2e_ids(["tests/e2e/", "-m", "e2e", f"--e2e-slice={name}"])
+        assert collected == set(tests), f"slice {name!r} collects {sorted(collected)} but owns {sorted(tests)}"
+
+
+class _FakeItem:
+    """Enough of a pytest item for the collection hook."""
+
+    def __init__(self, nodeid: str) -> None:
+        self.nodeid = nodeid
+        self.keywords = {"e2e"}
+
+    def add_marker(self, marker: object) -> None:
+        pass
+
+
+class _FakeConfig:
+    def __init__(self, slice_name: str) -> None:
+        self._slice_name = slice_name
+        self.deselected: list[object] = []
+        self.hook = self
+
+    def getoption(self, name: str) -> str:
+        assert name == "--e2e-slice"
+        return self._slice_name
+
+    def pytest_deselected(self, items: list[object]) -> None:
+        self.deselected.extend(items)
+
+
+def test_an_unowned_e2e_test_fails_every_slice_job() -> None:
+    """An e2e test in no slice must stop the run, not quietly not run.
+
+    Three e2e files once sat outside every slice for a release cycle and
+    nothing went red, because the gate only ran what the slices named. Failing
+    here means all six jobs say so on the first PR that adds a test.
+    """
+    module = _e2e_conftest()
+    config = _FakeConfig("core")
+    items = [_FakeItem("tests/e2e/test_smoke.py::test_a_test_nobody_assigned")]
+
+    with pytest.raises(pytest.UsageError) as excinfo:
+        module.pytest_collection_modifyitems(config, items)
+
+    assert "test_a_test_nobody_assigned" in str(excinfo.value)
+    assert "E2E_SLICES" in str(excinfo.value)

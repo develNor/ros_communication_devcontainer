@@ -27,7 +27,10 @@ jobs:
           ACTIONLINT_VERSION="1.7.12"
           CHECKSUM="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
           URL="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -sSL -o actionlint.tar.gz "$URL"
+          # --fail, or a transient HTTP error body is saved as the tarball and
+          # reported as "computed checksum did NOT match" — which reads like a
+          # tampered release. That cost this PR a full gate run.
+          curl -sSLf --retry 3 --retry-all-errors -o actionlint.tar.gz "$URL"
           echo "${CHECKSUM}  actionlint.tar.gz" | sha256sum --check
           tar -xzf actionlint.tar.gz actionlint
           sudo mv actionlint /usr/local/bin/actionlint
@@ -197,6 +200,11 @@ jobs:
     # paragraph. The slice list is the same one release.yml expands, and
     # tests/contract/test_workflow_contracts.py keeps the three workflows and
     # the justfile agreeing.
+    #
+    # The six slices are balanced by measured cost, not grouped by theme
+    # (#226): themed slices spanned 7m39s to 18m31s, and one test ran in two of
+    # them. Which tests a slice owns and what each costs is E2E_SLICES in
+    # tests/e2e/conftest.py — change that, not this line, to move a test.
     name: e2e-${{ matrix.slice }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -205,7 +213,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slice: [core, transforms, remote-assist, runtime-tools, concurrency, media]
+        slice: [core, transforms, remote-assist, runtime-tools, benchmark-capacity, media-concurrency]
 
     steps:
       - name: Check out repository

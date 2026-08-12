@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slice: [core, transforms, remote-assist, runtime-tools, concurrency, media]
+        slice: [core, transforms, remote-assist, runtime-tools, benchmark-capacity, media-concurrency]
 
     steps:
       - name: Check out repository

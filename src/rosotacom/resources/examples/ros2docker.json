@@ -27,15 +27,23 @@
   // The base is ros-base, not desktop-full: 299 MB compressed against 1422 MB,
   // and nothing here runs a GUI (enable_gui_forwarding is false above). The
   // e2e suite was run against both to find out what desktop-full had been
-  // providing without anyone declaring it — one package, ros-kilted-gps-msgs,
-  // which the anonymized remote-assist session needs for gps_msgs/msg/GPSFix.
-  // It is declared below. Add rviz2 or a simulator here if you want them; that
-  // is a project's decision, not a default.
+  // providing without anyone declaring it. It named ros-kilted-gps-msgs, for
+  // the gps_msgs/msg/GPSFix the anonymized remote-assist session publishes.
+  //
+  // It could not name ros-kilted-compressed-image-transport, and that one is
+  // why this list is not just an inventory: no e2e session has a /compressed
+  // input topic, so the suite never loaded compressed_sub. A vehicle camera
+  // does, on both ends of the link — the sender republishes compressed to
+  // ffmpeg, the receiver decodes back to the CompressedImage twin. Declaring
+  // ros-kilted-image-transport alone gets you raw and nothing else.
+  //
+  // Add rviz2 or a simulator here if you want them; that is a project's
+  // decision, not a default.
   "build_args": {
     "BASE_IMAGE": "ros:kilted-ros-base-noble",
     "DIGEST": "@sha256:4ca53d5b084bdbe92a7a7d7186f56db6a716a6c7c33ad401ddb0ec82d6e9e479",
     "INSTALL_ZENOH":                 "1",
-    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp iw nload iftop iproute2 tshark ros-kilted-domain-bridge ros-kilted-rmw-cyclonedds-cpp ros-kilted-rmw-zenoh-cpp ros-kilted-topic-tools ros-kilted-image-transport ros-kilted-ffmpeg-image-transport ros-kilted-ffmpeg-image-transport-msgs ros-kilted-gps-msgs",
+    "APT_PACKAGES":                  "iputils-ping psmisc net-tools snmp iw nload iftop iproute2 tshark ros-kilted-domain-bridge ros-kilted-rmw-cyclonedds-cpp ros-kilted-rmw-zenoh-cpp ros-kilted-topic-tools ros-kilted-image-transport ros-kilted-compressed-image-transport ros-kilted-ffmpeg-image-transport ros-kilted-ffmpeg-image-transport-msgs ros-kilted-gps-msgs",
     "PIP_PACKAGES":                  "numpy>=1.26,<2 lz4 pysnmp speedtest-cli psutil zstandard opencv-python"
   }
 }

@@ -26,10 +26,15 @@ import os
 
 import pytest
 
-#: Seconds a job spends before pytest starts: checkout, Python, `just setup`,
-#: `docker info`. Measured across the e2e jobs of merge-gate runs 31597657446
-#: and 31634604888 (43-60s).
-RUNNER_SETUP_SECONDS = 55.0
+#: Seconds a job spends outside the tests: checkout, Python, `just setup`,
+#: `docker info`, plus pytest's own setup and teardown phases.
+#:
+#: 46.0 as `job wall − Σ call` over the thirteen e2e jobs of run 31687149587,
+#: median 45.3s, mean 49.3s. It was 55.0, measured the same way on runs
+#: 31597657446 and 31634604888; #248 then replaced `apt-get update &&
+#: apt-get install -y just` with a pinned release binary, which is most of the
+#: difference.
+RUNNER_SETUP_SECONDS = 46.0
 
 #: Seconds the first test in a job pays to get the rosotacom project image.
 #: Every job pays it exactly once, whichever test runs first, so it is a
@@ -43,19 +48,19 @@ RUNNER_SETUP_SECONDS = 55.0
 #: release and nightly lanes still build from scratch, deliberately, as the
 #: check that a published image and a fresh build still agree.
 #:
-#: 70.0 from run 31678648935, two estimators agreeing. Per slice, (sum of
-#: measured `call` durations − sum of the warm costs below) has a median of
-#: 67.2s over the twelve slices that behaved (43.8–77.8s). Per test, the twelve
-#: tests that run first in their job each dropped 74–119s against their median
-#: over three earlier runs, median −84s, i.e. 154 − 84 = 70.
+#: 70.0 was that pull with a `desktop-full` base. #245 rebased the image on
+#: `ros-base`, taking the published project image from 1640 MB to 957 MB, and a
+#: pull costs what it moves.
 #:
-#: `media` is the thirteenth and did not behave: it got 57s *slower*, all of it
-#: in `test_synthetic_camera_pipeline_records_quality_metrics` (+72s) while its
-#: sibling moved +2s. Its two recorded costs below do not reproduce either —
-#: they sum ~24s short of what the job actually spends — so that slice needs a
-#: measurement of its own rather than a number derived from one anomalous run.
-#: It is currently the critical path.
-IMAGE_BUILD_SECONDS = 70.0
+#: 33.0 from three estimators on runs 31681061779 (before) and 31687149587
+#: (after), which ran the same partition on either side of #245. The paired
+#: difference is the cleanest of them, because the tests are unchanged and only
+#: one test per job pays this: per-slice Σ `call` fell by a median of 37.4s
+#: (mean 37.6s) across all thirteen, i.e. 70 − 37 = 33. The three single-test
+#: slices give it directly as `call − recorded cost`: 34.0s (`benchmark-ab`),
+#: 40.4s (`benchmark-replay`), 22.5s (`remote-assist`). And the resulting model
+#: predicts the measured critical path to within 0.14 min.
+IMAGE_BUILD_SECONDS = 33.0
 
 #: Every e2e test, the slice that owns it, and its *warm* pytest `call` duration
 #: in seconds — the median over seven runs of the invocations where the project

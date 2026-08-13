@@ -71,9 +71,7 @@ jobs:
           cache: pip
 
       - name: Install just
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just
+        uses: ./.github/actions/setup-just
 
       - name: Set up local environment
         run: just setup
@@ -102,9 +100,7 @@ jobs:
           cache: pip
 
       - name: Install just
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just
+        uses: ./.github/actions/setup-just
 
       - name: Set up local environment
         run: just setup
@@ -152,9 +148,7 @@ jobs:
           cache: pip
 
       - name: Install just
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just
+        uses: ./.github/actions/setup-just
 
       - name: Set up local environment
         run: just setup
@@ -162,35 +156,46 @@ jobs:
       - name: Validate package
         run: just package
 
-  preflight-success:
-    name: preflight-success
+  quick-gate:
+    # Everything `e2e` waits for that is not the image, and deliberately no
+    # more. It exists to answer one question — is the tree obviously broken,
+    # such that thirteen slices would burn seventy runner-minutes to say so.
+    #
+    # It replaced a `needs: preflight-success` edge that made e2e wait for the
+    # whole five-version matrix. That barrier cost 2.15 min of every gate run
+    # and had fired once in sixty runs, on `workflow-lint`, which takes 0.12
+    # min; the 2.0 min of `merge-lightweight` that set its height has never
+    # stopped an e2e round, and its expensive part is `test-nondocker-cov`
+    # (38s of 45s), which is a test suite rather than a tripwire.
+    #
+    # `lint` and `typecheck` are 4s together. The rest of this job is the fixed
+    # cost every job pays, which is also what `image` pays — so sizing the
+    # tripwire this way makes it free: e2e could not start before `image`
+    # finished anyway. Nothing merges on a weaker check than before, because
+    # `ci-success` still requires every preflight job.
+    name: quick-gate
     runs-on: ubuntu-latest
-    needs: [workflow-lint, dependency-review, build-lint, merge-lightweight, package]
-    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
-      - name: Check preflight jobs
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just
+        uses: ./.github/actions/setup-just
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Is the tree obviously broken
         run: |
-          if [[ "${{ needs.workflow-lint.result }}" != "success" ]]; then
-            echo "workflow-lint failed: ${{ needs.workflow-lint.result }}"
-            exit 1
-          fi
-          if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.dependency-review.result }}" != "success" ]]; then
-            echo "dependency-review failed: ${{ needs.dependency-review.result }}"
-            exit 1
-          fi
-          if [[ "${{ needs.build-lint.result }}" != "success" ]]; then
-            echo "build-lint failed: ${{ needs.build-lint.result }}"
-            exit 1
-          fi
-          if [[ "${{ needs.merge-lightweight.result }}" != "success" ]]; then
-            echo "merge-lightweight failed: ${{ needs.merge-lightweight.result }}"
-            exit 1
-          fi
-          if [[ "${{ needs.package.result }}" != "success" ]]; then
-            echo "package failed: ${{ needs.package.result }}"
-            exit 1
-          fi
-          echo "All preflight checks passed"
+          just lint
+          just typecheck
 
   image:
     # Publish the images the e2e suite builds, once per set of build inputs,
@@ -208,8 +213,9 @@ jobs:
     # is stale" is not a state this can reach — which is the objection #226
     # raised against caching the image inline.
     #
-    # Runs beside preflight rather than after it: on a hit it inspects two
-    # manifests and stops, so it is never on the critical path.
+    # Runs beside the preflight jobs rather than after them: on a hit it
+    # inspects two manifests and stops. It is what sets when `e2e` can
+    # start, which is why `quick-gate` is sized to finish inside it.
     name: image
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -231,9 +237,7 @@ jobs:
           cache: pip
 
       - name: Install just
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just
+        uses: ./.github/actions/setup-just
 
       - name: Set up local environment
         run: just setup
@@ -300,8 +304,8 @@ jobs:
     name: e2e-${{ matrix.slice }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    needs: [preflight-success, image]
-    if: always() && !cancelled() && needs.preflight-success.result == 'success' && needs.image.result == 'success'
+    needs: [quick-gate, image]
+    if: always() && !cancelled() && needs.quick-gate.result == 'success' && needs.image.result == 'success'
     permissions:
       contents: read
       packages: read
@@ -322,10 +326,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install just and tmux
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just tmux
+      - name: Install just
+        uses: ./.github/actions/setup-just
+
+      - name: Ensure tmux
+        # Preinstalled on the GitHub-hosted image, so this is a probe
+        # rather than an install — but the dependency is named, so a
+        # runner image that drops it fails here instead of inside a
+        # session.
+        run: command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; }
 
       - name: Set up local environment
         run: just setup
@@ -364,7 +373,7 @@ jobs:
       - build-lint
       - merge-lightweight
       - package
-      - preflight-success
+      - quick-gate
       - image
       - e2e
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
@@ -392,8 +401,8 @@ jobs:
             echo "package failed or was skipped: ${{ needs.package.result }}"
             exit 1
           fi
-          if [[ "${{ needs.preflight-success.result }}" != "success" ]]; then
-            echo "preflight-success failed or was skipped: ${{ needs.preflight-success.result }}"
+          if [[ "${{ needs.quick-gate.result }}" != "success" ]]; then
+            echo "quick-gate failed or was skipped: ${{ needs.quick-gate.result }}"
             exit 1
           fi
           if [[ "${{ needs.image.result }}" != "success" ]]; then

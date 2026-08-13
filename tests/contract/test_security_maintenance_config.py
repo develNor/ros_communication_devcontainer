@@ -92,7 +92,7 @@ def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
         "build-lint",
         "merge-lightweight",
         "package",
-        "preflight-success",
+        "quick-gate",
         "image",
         "e2e",
     }
@@ -101,9 +101,9 @@ def test_merge_gate_requires_new_ci_jobs_and_no_masking() -> None:
     # Both gates the e2e slices wait on have to be green before any slice runs,
     # and the `if` has to say so job by job: `needs` alone does not stop a
     # dependency's failure from reaching a job that runs with `always()`.
-    assert set(jobs["e2e"]["needs"]) == {"preflight-success", "image"}
+    assert set(jobs["e2e"]["needs"]) == {"quick-gate", "image"}
     assert jobs["e2e"]["if"] == (
-        "always() && !cancelled() && needs.preflight-success.result == 'success' && needs.image.result == 'success'"
+        "always() && !cancelled() && needs.quick-gate.result == 'success' && needs.image.result == 'success'"
     )
 
     # Every needed job's result must be turned into an exit code by hand,

@@ -83,6 +83,61 @@ config, catmux pane logs, Docker logs when available, and the smoke verification
 log under `session-instances/`; collect that directory as the first debugging
 artifact when an E2E job fails.
 
+### The e2e image is published once, not rebuilt per job
+
+Every e2e job used to build the project image from scratch. #236 measured that
+at 154s per job — 57s pulling the multi-GB ROS base from Docker Hub, 40s
+exporting layers, 47s of apt and pip — which at thirteen slices is 33 minutes of
+runner time and thirteen Hub pulls on the critical path of every merge gate.
+
+The `image` job now publishes those images to
+`ghcr.io/<owner>/rosotacom-e2e` and each slice pulls instead of building. GHCR
+is co-located with the runners and has no Hub rate limit, so this is one
+transfer where there used to be a transfer plus a build.
+
+The tag is the whole safety argument. It is a SHA-256 of everything that decides
+what the image contains — the `docker build` command ros2docker renders from a
+config (base image and its pinned digest, `APT_PACKAGES`, `PIP_PACKAGES`, the
+build UID) and every file in the context it stages (Dockerfile, entrypoint, any
+baked packages). Change any of them and the name changes, so "the published
+image is stale" is not a state this can reach, which is the objection #226
+raised against caching the image inline.
+
+Nothing ever *accepts* a reference. `rosotacom image references` derives them;
+the publisher builds and pushes only what is missing, and only under the name
+its own inputs hash to (`rosotacom image build --reference`). A consumer is told
+a repository, in `ROSOTACOM_IMAGE_CACHE`, and derives the tag itself:
+
+```bash
+# What this project's build inputs are called
+rosotacom image references --repository ghcr.io/owner/rosotacom-e2e
+
+# Adopt them instead of building, anywhere rosotacom would build
+ROSOTACOM_IMAGE_CACHE=ghcr.io/owner/rosotacom-e2e just test-e2e-slice heartbeat
+```
+
+With the variable unset, nothing changes: rosotacom builds as it always did. Set
+and the image absent, the job fails rather than falling back — a miss means the
+publisher did not run or did not agree with this tree, and a silent rebuild
+would hide both while costing exactly what this removes. The one place that
+decision is made is the `image` job, which reports its repository only after
+confirming every reference resolves; a read-only `GITHUB_TOKEN` (a fork PR,
+Dependabot) therefore leaves the slices building as before.
+
+Two properties are worth keeping in mind when changing this:
+
+- **Publisher and consumer read one list.** `2_native_chatter` builds a second
+  image from a different package list, so `rosotacom image references` walks the
+  project config *and* every scenario application. Publishing only the project
+  image would leave that slice adopting something nobody published.
+- **The release and nightly lanes still build from scratch**, as does the
+  nightly `image-scan`. That is deliberate: they are what would notice if a
+  published image and a fresh build ever stopped agreeing.
+
+Content-addressed tags accumulate in the GHCR package — one per distinct set of
+build inputs, so roughly one per change to the base digest or package lists.
+Nothing prunes them yet.
+
 ### Balancing the e2e slices
 
 A slice is not its own pytest invocation. `just test-e2e-slice <name>` runs the

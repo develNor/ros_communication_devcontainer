@@ -199,6 +199,32 @@ example to bake `com_msgs` into its own container image. Ask for the resource by
 name rather than reconstructing a path: the names are part of the CLI contract,
 the layout behind them is not.
 
+### Reusing an image instead of rebuilding it
+
+Somewhere that starts many rosotacom sessions from the same tree — CI above all
+— can build each image once, publish it, and have every later run pull it:
+
+```bash
+# What this project's images are called: <repository>:<hash of the build inputs>
+rosotacom image references --repository ghcr.io/owner/rosotacom-e2e
+
+# Build the one a reference names, then push it
+rosotacom image build --reference ghcr.io/owner/rosotacom-e2e:<hash>
+docker push ghcr.io/owner/rosotacom-e2e:<hash>
+
+# Adopt published images anywhere rosotacom would otherwise build
+export ROSOTACOM_IMAGE_CACHE=ghcr.io/owner/rosotacom-e2e
+```
+
+The tag is a hash of everything that decides the image — base image and its
+pinned digest, apt and pip packages, the Dockerfile and entrypoint ros2docker
+stages, the build UID — so a build-input change is a different tag and a
+published image can never be stale for the tree that adopts it. Nothing accepts
+a reference: rosotacom derives the one its own inputs allow and pulls exactly
+that, and fails rather than quietly rebuilding if it is not there. With
+`ROSOTACOM_IMAGE_CACHE` unset, nothing changes. See
+[docs/ci.md](docs/ci.md) for how the merge gate uses this.
+
 See the [example project README](src/rosotacom/resources/examples/README.md)
 for the copyable example layout, the
 [session configuration reference](session-configuration.md) for the session

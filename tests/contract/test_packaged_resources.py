@@ -83,7 +83,11 @@ def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
     default_build_args = default_config["build_args"]
     example_build_args = example_config["build_args"]
 
-    assert default_build_args["BASE_IMAGE"] == "osrf/ros:kilted-desktop-full-noble"
+    # ros-base rather than desktop-full: nothing rosotacom ships runs a GUI, and
+    # the difference is 299 MB compressed against 1422 MB — bytes every peer
+    # transfers on a cold build and every e2e slice pulls from the published
+    # image.
+    assert default_build_args["BASE_IMAGE"] == "ros:kilted-ros-base-noble"
     assert default_build_args["DIGEST"].startswith("@sha256:")
     assert default_build_args["BASE_IMAGE"] == example_build_args["BASE_IMAGE"]
     assert default_build_args["DIGEST"] == example_build_args["DIGEST"]
@@ -98,6 +102,10 @@ def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
         # the -msgs package alone only provides FFMPEGPacket definitions.
         assert "ros-kilted-ffmpeg-image-transport" in apt_packages
         assert "ros-kilted-ffmpeg-image-transport-msgs" in apt_packages
+        # gps_msgs/msg/GPSFix, published by the anonymized remote-assist
+        # session. desktop-full carried it, so nothing declared it; on ros-base
+        # its absence is a missing type at runtime, not a build error.
+        assert "ros-kilted-gps-msgs" in apt_packages
 
 
 def test_external_ros2docker_configs_install_selected_rmw_implementations() -> None:

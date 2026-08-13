@@ -15,6 +15,6 @@
   ],
 
   "build_args": {
-    "BASE_IMAGE":                    "osrf/ros:kilted-desktop-full-noble"
+    "BASE_IMAGE":                    "ros:kilted-ros-base-noble"
   }
 }

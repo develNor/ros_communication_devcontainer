@@ -148,6 +148,33 @@ class ClockOffsetEstimator:
             }
 
 
+#: Plausibility window (seconds) for a latency derived from a message header
+#: stamp. Outside it the number is not a latency but an unset stamp (epoch 0) or
+#: a clock difference no offset estimate explains.
+STAMP_DELAY_MIN_S = -1.0
+STAMP_DELAY_MAX_S = 1000.0
+
+
+def stamp_delay(raw_delay_s: float, clock_offset_s: Optional[float] = None) -> Optional[float]:
+    """Latency from a header stamp, corrected by the estimated peer clock offset.
+
+    ``raw_delay_s`` is ``local_now - stamp``. ``clock_offset_s`` is peer clock
+    minus local clock (as ``ClockOffsetEstimator`` reports it), so the corrected
+    delay is their sum -- the same arithmetic the OtaStamped path uses on its
+    ``t_wrap``.
+
+    Returns ``None`` when the result falls outside the plausibility window. The
+    guard is applied to the corrected value on purpose: a topic whose stamp is
+    written by the peer used to be dropped for an offset this node has already
+    measured, which reads as "no latency available" instead of "latency, once
+    the clocks are reconciled".
+    """
+    corrected = raw_delay_s if clock_offset_s is None else raw_delay_s + clock_offset_s
+    if STAMP_DELAY_MIN_S < corrected < STAMP_DELAY_MAX_S:
+        return corrected
+    return None
+
+
 # --- Link overhead (session-level) -----------------------------------------
 
 def _payload_kbps(stage: Optional[Dict[str, Any]]) -> float:

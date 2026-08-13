@@ -75,6 +75,7 @@ from com_py.status_overview_core import (
     StatusAggregator,
     collect_stage_metadata,
     collect_stage_topics,
+    stamp_delay,
 )
 
 ECHO_HEARTBEAT_TYPE = "com_msgs/msg/EchoHeartbeat"
@@ -274,12 +275,26 @@ class StageObserver(Node):
                 stamp = getattr(header, "stamp", None) if header is not None else None
                 if stamp is not None:
                     try:
-                        msg_time = rclpy.time.Time.from_msg(stamp)
-                        d = (now_ros - msg_time).nanoseconds / 1e9
-                        if -1.0 < d < 1000.0:  # guard unsynced clocks / zero stamps
-                            delay_s = d
+                        stamp_s = _stamp_seconds(stamp)
                     except Exception:
-                        delay_s = None
+                        stamp_s = None
+                    if stamp_s is not None:
+                        d = now_ros_s - stamp_s
+                        # An inbound stage carries a stamp written by the peer's
+                        # clock, so it is comparable to ours only once the offset
+                        # the heartbeat measures is applied -- exactly what the
+                        # OtaStamped branch above does with `t_wrap`. A local
+                        # stage was stamped by this machine and must stay raw.
+                        contexts = self._stage_metadata.get(topic, [])
+                        peer_stamped = any(
+                            context.get("direction") == "inbound" for context in contexts
+                        )
+                        estimate = self.clock_estimator.estimate() if peer_stamped else None
+                        if estimate is not None:
+                            clock_offset_s = estimate["offset_s"]
+                            rtt_s = estimate["rtt_s"]
+                            raw_delay_s = d
+                        delay_s = stamp_delay(d, clock_offset_s)
 
             obs.record(
                 size,

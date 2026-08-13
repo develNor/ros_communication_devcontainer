@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 from importlib import resources
 from pathlib import Path
@@ -106,6 +107,61 @@ def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
         # session. desktop-full carried it, so nothing declared it; on ros-base
         # its absence is a missing type at runtime, not a build error.
         assert "ros-kilted-gps-msgs" in apt_packages
+
+
+# `image_transport republish` resolves a transport name to a pluginlib class at
+# runtime, so a transport nobody installed is not a build failure — it is a
+# container that starts fine and aborts on the first image message. `raw` ships
+# with image_transport itself; every other transport needs its own package.
+IMAGE_TRANSPORT_APT_PACKAGES = {
+    "raw": "ros-kilted-image-transport",
+    "compressed": "ros-kilted-compressed-image-transport",
+    "ffmpeg": "ros-kilted-ffmpeg-image-transport",
+}
+
+
+def _packaged_session_plugin() -> dict:
+    return yaml.safe_load(
+        (cli.WS_DIR / "session" / "content" / "base" / "session_plugin_base.yaml").read_text(encoding="utf-8")
+    )
+
+
+def test_every_image_transport_the_session_plugin_can_select_is_installed() -> None:
+    """The packaged image must carry every transport the packaged session can ask for.
+
+    This is the guard that was missing when the base image moved from
+    desktop-full to ros-base: compressed_image_transport had arrived with
+    desktop-full's perception variant, nothing in this repository declared it,
+    and no e2e session has a /compressed input topic — so the suite stayed green
+    while a vehicle camera link could no longer start. Deriving the transport set
+    from the plugin rather than restating it means a new transport, or a thinner
+    base image, fails here instead of on a vehicle.
+    """
+    plugin = _packaged_session_plugin()
+
+    # Incoming republish: the transport the receiving peer decodes back to.
+    selected = {
+        str(value)
+        for key, value in plugin["parameters"].items()
+        if key.startswith("irt_") and key.endswith("_out_transport") and value
+    }
+    # Outgoing republish: the in-transport is chosen from the source topic name.
+    it_window = next(window for window in plugin["windows"] if window["name"] == "IT")
+    for split in it_window["splits"]:
+        for command in split["commands"]:
+            selected.update(re.findall(r'it_in_transport="([a-z]+)"', command))
+
+    # Both branches of that choice, so a rewrite that drops one is visible here.
+    assert {"raw", "compressed"} <= selected
+
+    unknown = selected - set(IMAGE_TRANSPORT_APT_PACKAGES)
+    assert not unknown, f"no apt package recorded for image transport(s): {sorted(unknown)}"
+
+    required = {IMAGE_TRANSPORT_APT_PACKAGES[transport] for transport in selected}
+    for config_path in (cli.DEFAULT_ROS2DOCKER_CONFIG, cli.EXAMPLE_PROJECT_DIR / "ros2docker.json"):
+        apt_packages = set(str(cli.load_config(config_path)["build_args"]["APT_PACKAGES"]).split())
+        missing = required - apt_packages
+        assert not missing, f"{config_path.name} does not install {sorted(missing)}"
 
 
 def test_external_ros2docker_configs_install_selected_rmw_implementations() -> None:

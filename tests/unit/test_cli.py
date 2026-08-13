@@ -1085,6 +1085,48 @@ def test_ota_bounded_wait_script_succeeds_once_the_container_runs(tmp_path: Path
     assert f"[INFO] found running container: {container}" in result.stdout
 
 
+def _runtime_with_prefix(tmp_path: Path, prefix_line: str = "") -> rosotacom.RuntimeConfig:
+    (tmp_path / "ros2docker.json").write_text('{"image_name": "test"}\n', encoding="utf-8")
+    config = tmp_path / "rosotacom.yaml"
+    config.write_text(f"ros2docker_config: ros2docker.json\n{prefix_line}", encoding="utf-8")
+    return rosotacom._load_runtime_config(argparse.Namespace(rosotacom_config=str(config)))
+
+
+def test_ota_application_wait_matches_the_name_the_start_gives(tmp_path: Path) -> None:
+    """The wait and the start must make the same naming decision, in both modes.
+
+    When `com_container_prefix` was introduced (#247), the start named the com
+    container `<prefix>_com-to-<peer>` while the application windows kept
+    waiting for the instance-scoped `_com_to_<peer>` suffix — so every scenario
+    application waited forever on a healthy machine (#254).
+    """
+    for prefix_line in ("", "com_container_prefix: remote-assist\n"):
+        runtime = _runtime_with_prefix(tmp_path, prefix_line)
+        actual_name = rosotacom._container_name("center", runtime, "run1")
+        suffix = rosotacom._ota_communication_wait_suffix(runtime, "center")
+        assert actual_name.endswith(suffix), (
+            f"wait suffix {suffix!r} does not match the started container {actual_name!r}"
+        )
+
+
+def test_ota_application_wait_script_finds_the_prefixed_container(tmp_path: Path) -> None:
+    runtime = _runtime_with_prefix(tmp_path, "com_container_prefix: remote-assist\n")
+    container = rosotacom._container_name("center", runtime, "run1")
+    assert container == "remote-assist_com-to-center"
+
+    script = rosotacom._ota_wait_for_running_container_suffix_script(
+        rosotacom._ota_communication_wait_suffix(runtime, "center"),
+        "vehicle:communication",
+        timeout_s=2,
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], env=_wait_script_env(tmp_path, container), text=True, capture_output=True
+    )
+
+    assert result.returncode == 0
+    assert f"[INFO] found running container: {container}" in result.stdout
+
+
 def test_ota_wait_for_scenario_applications_waits_per_declared_application(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

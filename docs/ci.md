@@ -83,6 +83,63 @@ config, catmux pane logs, Docker logs when available, and the smoke verification
 log under `session-instances/`; collect that directory as the first debugging
 artifact when an E2E job fails.
 
+### The e2e image is published once, not rebuilt per job
+
+Every e2e job used to build the project image from scratch. #236 measured that
+at 154s per job — 57s pulling the multi-GB ROS base from Docker Hub, 40s
+exporting layers, 47s of apt and pip — which at thirteen slices is 33 minutes of
+runner time and thirteen Hub pulls on the critical path of every merge gate.
+
+The `image` job now publishes those images to
+`ghcr.io/<owner>/rosotacom-e2e` and each slice pulls instead of building. GHCR
+is co-located with the runners and has no Hub rate limit, so this is one
+transfer where there used to be a transfer plus a build. Measured on run
+31678648935: **154s → 70s per job**, and the slowest slice's pytest run fell
+from 8m19s to 6m50s.
+
+The tag is the whole safety argument. It is a SHA-256 of everything that decides
+what the image contains — the `docker build` command ros2docker renders from a
+config (base image and its pinned digest, `APT_PACKAGES`, `PIP_PACKAGES`, the
+build UID) and every file in the context it stages (Dockerfile, entrypoint, any
+baked packages). Change any of them and the name changes, so "the published
+image is stale" is not a state this can reach, which is the objection #226
+raised against caching the image inline.
+
+Nothing ever *accepts* a reference. `rosotacom image references` derives them;
+the publisher builds and pushes only what is missing, and only under the name
+its own inputs hash to (`rosotacom image build --reference`). A consumer is told
+a repository, in `ROSOTACOM_IMAGE_CACHE`, and derives the tag itself:
+
+```bash
+# What this project's build inputs are called
+rosotacom image references --repository ghcr.io/owner/rosotacom-e2e
+
+# Adopt them instead of building, anywhere rosotacom would build
+ROSOTACOM_IMAGE_CACHE=ghcr.io/owner/rosotacom-e2e just test-e2e-slice heartbeat
+```
+
+With the variable unset, nothing changes: rosotacom builds as it always did. Set
+and the image absent, the job fails rather than falling back — a miss means the
+publisher did not run or did not agree with this tree, and a silent rebuild
+would hide both while costing exactly what this removes. The one place that
+decision is made is the `image` job, which reports its repository only after
+confirming every reference resolves; a read-only `GITHUB_TOKEN` (a fork PR,
+Dependabot) therefore leaves the slices building as before.
+
+Two properties are worth keeping in mind when changing this:
+
+- **Publisher and consumer read one list.** `2_native_chatter` builds a second
+  image from a different package list, so `rosotacom image references` walks the
+  project config *and* every scenario application. Publishing only the project
+  image would leave that slice adopting something nobody published.
+- **The release and nightly lanes still build from scratch**, as does the
+  nightly `image-scan`. That is deliberate: they are what would notice if a
+  published image and a fresh build ever stopped agreeing.
+
+Content-addressed tags accumulate in the GHCR package — one per distinct set of
+build inputs, so roughly one per change to the base digest or package lists.
+Nothing prunes them yet.
+
 ### Balancing the e2e slices
 
 A slice is not its own pytest invocation. `just test-e2e-slice <name>` runs the
@@ -102,18 +159,24 @@ with a usage error, and a test owned twice fails
 
 The costs are warm pytest `call` durations — medians over seven merge-gate runs
 of 2026-08-11/12. On top of them each job pays a fixed
-`RUNNER_SETUP_SECONDS + IMAGE_BUILD_SECONDS` (3m29s: 55s of runner setup, then the
-project image built inside whichever test runs first). Because that constant is
-per job and not per test, balancing warm costs balances wall clock.
+`RUNNER_SETUP_SECONDS + IMAGE_BUILD_SECONDS` (2m05s: 55s of runner setup, then
+the project image obtained inside whichever test runs first). Because that
+constant is per job and not per test, balancing warm costs balances wall clock.
+
+`IMAGE_BUILD_SECONDS` models the merge gate, where that image is pulled rather
+than built (see above); the release and nightly lanes still build and pay the
+older 154s. One slice does not currently reproduce its recorded split: `media`
+spends about 24s more than its two costs predict, and it is the critical path,
+so it is the first thing to remeasure.
 
 ### How many slices
 
 `floor_seconds()` is `fixed + slowest single test` — the fastest any partition
 of this suite could be, because one job has to run that test and pays the fixed
-cost like every other. It is currently **7m56s**, of which 2m34s is the image
-build (#236 is about removing it).
+cost like every other. It is currently **6m32s**, of which 1m10s is the image
+(7m56s before #236 published it instead of rebuilding it per job).
 
-Thirteen slices sit at 8m38s, 1.09x the floor. That is the point of choosing N
+Thirteen slices sit at 7m14s, 1.11x the floor. That is the point of choosing N
 from the numbers rather than from taste: six balanced slices were 13m37s,
 twelve reach the floor, and past twelve every extra job is pure cost. The
 contract test asserts distance to the floor rather than the spread between

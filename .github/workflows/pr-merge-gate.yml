@@ -192,6 +192,96 @@ jobs:
           fi
           echo "All preflight checks passed"
 
+  image:
+    # Publish the images the e2e suite builds, once per set of build inputs,
+    # instead of rebuilding them in each of thirteen jobs. #236 measured that
+    # build at 154s per job: 57s pulling the multi-GB ROS base from Docker Hub,
+    # 40s exporting layers, 47s of apt and pip. A pull from GHCR — co-located
+    # with the runners, no Hub rate limit, one transfer instead of a transfer
+    # plus a build — replaces all of it, and takes twelve of the thirteen Hub
+    # pulls off the merge gate's critical path.
+    #
+    # The tag is a hash of everything that decides the image (base digest,
+    # package lists, Dockerfile, entrypoint, ros2docker version, build UID):
+    # `rosotacom image references` derives it, nothing here chooses it. A
+    # build-input change is therefore a different tag, so "the published image
+    # is stale" is not a state this can reach — which is the objection #226
+    # raised against caching the image inline.
+    #
+    # Runs beside preflight rather than after it: on a hit it inspects two
+    # manifests and stops, so it is never on the critical path.
+    name: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      repository: ${{ steps.publish.outputs.repository }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install just
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y just
+
+      - name: Set up local environment
+        run: just setup
+
+      - name: Log in to GHCR
+        run: echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Publish every image the e2e suite builds
+        id: publish
+        run: |
+          set -euo pipefail
+          repository="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/rosotacom-e2e"
+          # The packaged example project, because that is the one the e2e tests
+          # copy. The repository's own rosotacom.yaml points at profiles and
+          # artifacts that live beside the checkout in the private harness, so it
+          # does not resolve here.
+          project="$(.venv/bin/rosotacom resources path examples)/rosotacom.yaml"
+          .venv/bin/rosotacom image references --project "$project" --repository "$repository" > references.txt
+          cat references.txt
+
+          while read -r reference; do
+            if docker manifest inspect "$reference" >/dev/null 2>&1; then
+              echo "present: $reference"
+              continue
+            fi
+            echo "missing, building: $reference"
+            .venv/bin/rosotacom image build --project "$project" --reference "$reference"
+            docker push "$reference" || echo "::warning::could not push $reference"
+          done < references.txt
+
+          # Report the repository only when every reference resolves. A
+          # read-only GITHUB_TOKEN (a fork PR, Dependabot) can log in and pull
+          # but not push, and the slices must then build as they always did
+          # rather than fail on a pull that was never going to work. Probed
+          # rather than predicted from the event, so it stays right when
+          # GitHub's token rules change.
+          available=true
+          while read -r reference; do
+            docker manifest inspect "$reference" >/dev/null 2>&1 || available=false
+          done < references.txt
+
+          if [[ "$available" == "true" ]]; then
+            echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          else
+            echo "repository=" >> "$GITHUB_OUTPUT"
+            echo "::warning::published images unavailable; each e2e slice will build its own"
+          fi
+
   e2e:
     # One matrix job, not six near-identical copies. The copies were how
     # `e2e-media` ended up listed in ci-success's `needs` with no check on its
@@ -210,8 +300,11 @@ jobs:
     name: e2e-${{ matrix.slice }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    needs: preflight-success
-    if: always() && !cancelled() && needs.preflight-success.result == 'success'
+    needs: [preflight-success, image]
+    if: always() && !cancelled() && needs.preflight-success.result == 'success' && needs.image.result == 'success'
+    permissions:
+      contents: read
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -240,7 +333,18 @@ jobs:
       - name: Show Docker environment
         run: docker info
 
+      - name: Log in to GHCR
+        if: needs.image.outputs.repository != ''
+        run: echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
       - name: Run E2E slice
+        env:
+          # Empty when the `image` job could not publish, and then rosotacom
+          # builds exactly as before. Set, and each image build becomes a pull
+          # of the tag this tree's own build inputs hash to — rosotacom derives
+          # that tag itself and never accepts one, so it cannot be pointed at an
+          # image built from something else.
+          ROSOTACOM_IMAGE_CACHE: ${{ needs.image.outputs.repository }}
         run: just test-e2e-slice ${{ matrix.slice }}
 
       - name: Upload session artifacts
@@ -261,6 +365,7 @@ jobs:
       - merge-lightweight
       - package
       - preflight-success
+      - image
       - e2e
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
 
@@ -289,6 +394,10 @@ jobs:
           fi
           if [[ "${{ needs.preflight-success.result }}" != "success" ]]; then
             echo "preflight-success failed or was skipped: ${{ needs.preflight-success.result }}"
+            exit 1
+          fi
+          if [[ "${{ needs.image.result }}" != "success" ]]; then
+            echo "image failed or was skipped: ${{ needs.image.result }}"
             exit 1
           fi
           if [[ "${{ needs.e2e.result }}" != "success" ]]; then

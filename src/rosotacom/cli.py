@@ -55,6 +55,15 @@ from .deployment import (
     parse_assignments,
     resolve_peer_bindings,
 )
+from .image_cache import (
+    IMAGE_CACHE_ENV,
+    ImageCacheError,
+    adopt_cached_image,
+    cache_repository,
+    cached_reference,
+    image_fingerprint,
+    reference_tag,
+)
 
 anonymize_lib = importlib.import_module("rosotacom.anonymize")
 
@@ -595,6 +604,53 @@ def _scoped_image_name_from_base(base: str, suffix: str) -> str:
         prefix, tag = base.rsplit(":", 1)
         return f"{prefix}-{suffix}:{tag}"
     return f"{base}-{suffix}"
+
+
+def _build_image(config_file: Path, override: Mapping[str, object]) -> None:
+    """Build the image these inputs describe, or adopt the published one.
+
+    With ``ROSOTACOM_IMAGE_CACHE`` unset this is exactly ``ros2docker build``.
+    With it set, the build is replaced by a pull of ``<repository>:<hash of
+    these build inputs>`` — see `rosotacom.image_cache` for why that name is
+    the whole safety argument.
+
+    The fingerprint deliberately ignores ``override``: it carries the container
+    name, the scoped image name, and sometimes isolated-network run args, none
+    of which reach ``docker build``. Feeding them in would give the same image
+    a different name per session.
+    """
+    repository = cache_repository()
+    if repository is None:
+        ros2docker_build(config_file=config_file, override=override)
+        return
+
+    image_name = str(override["image_name"])
+    reference = cached_reference(repository, image_fingerprint(config_file))
+    print(f"Adopting published image {reference} as {image_name} (build skipped)")
+    adopt_cached_image(reference, image_name)
+
+
+def _project_build_inputs(runtime: RuntimeConfig) -> list[tuple[str, Path]]:
+    """Every ``(label, ros2docker config)`` this project can build an image from.
+
+    The project image is one of several: each scenario application names its own
+    config, and `2_native_chatter` builds a second image from a different
+    package list. Publishing only the project image would leave the adopt path
+    strict about an image nobody published, so the publisher and the consumer
+    read the same list.
+    """
+    inputs: list[tuple[str, Path]] = [("project", runtime.ros2docker_config)]
+    seen = {runtime.ros2docker_config.resolve()}
+    for scenario_name in _scenario_names(runtime):
+        definition = _load_scenario_definition(_resolve_scenario(scenario_name, runtime))
+        for identity, applications in sorted(definition.applications.items()):
+            for application in applications:
+                config = application.ros2docker_config.resolve()
+                if config in seen:
+                    continue
+                seen.add(config)
+                inputs.append((f"{scenario_name}/{identity}/{application.name}", config))
+    return inputs
 
 
 def _instance_name_token(instance_id: str) -> str:
@@ -4911,7 +4967,7 @@ def start_session(args: argparse.Namespace) -> str:
 
     common_override = {"container_name": container_name, "image_name": image_name}
     if mode == "detached":
-        ros2docker_build(config_file=runtime.ros2docker_config, override=common_override)
+        _build_image(runtime.ros2docker_config, common_override)
         ros2docker_run(
             config_file=runtime.ros2docker_config,
             override={**common_override, "run_type": "up", **run_override},
@@ -4926,7 +4982,7 @@ def start_session(args: argparse.Namespace) -> str:
         )
         _write_docker_log(container_name, instance, identity)
     else:
-        ros2docker_build(config_file=runtime.ros2docker_config, override=common_override)
+        _build_image(runtime.ros2docker_config, common_override)
         ros2docker_run(
             config_file=runtime.ros2docker_config,
             override={
@@ -5258,7 +5314,7 @@ def run_scenario_application(args: argparse.Namespace) -> int:
             network_name,
             getattr(args, "network_ip", None),
         )
-    ros2docker_build(config_file=application.ros2docker_config, override=override)
+    _build_image(application.ros2docker_config, override)
     ros2docker_run(config_file=application.ros2docker_config, override=override)
     return 0
 
@@ -5330,6 +5386,55 @@ def examples_create_command(args: argparse.Namespace) -> int:
     print(f"Use it by entering the directory (auto-discovered):  cd {shlex.quote(str(target))}")
     print(f"Or pin it everywhere:  rosotacom config set project {shlex.quote(str(target / 'rosotacom.yaml'))} --global")
     return 0
+
+
+def image_references_command(args: argparse.Namespace) -> int:
+    """Print the content-addressed reference of every image this project builds.
+
+    The publisher's whole job is this list: build and push what is missing. It
+    never chooses a tag, so it cannot publish an image under a name that
+    describes different inputs.
+    """
+    _require_ros2docker()
+    runtime = _load_runtime_config(args)
+    repository = args.repository or cache_repository()
+    if not repository:
+        raise RuntimeError(f"Pass --repository or set {IMAGE_CACHE_ENV} to the repository that holds published images.")
+
+    printed: set[str] = set()
+    for _label, config in _project_build_inputs(runtime):
+        reference = cached_reference(repository, image_fingerprint(config))
+        # Two scenario applications with the same build inputs are one image.
+        if reference in printed:
+            continue
+        printed.add(reference)
+        print(reference)
+    return 0
+
+
+def image_build_command(args: argparse.Namespace) -> int:
+    """Build the image whose build inputs hash to the tag in ``--reference``.
+
+    Taking a reference rather than a config keeps the publisher honest: the only
+    thing it can push is an image whose inputs actually hash to the name it is
+    pushing under.
+    """
+    _require_ros2docker()
+    runtime = _load_runtime_config(args)
+    reference = args.reference
+    wanted = reference_tag(reference)
+
+    for label, config in _project_build_inputs(runtime):
+        if image_fingerprint(config) != wanted:
+            continue
+        print(f"Building {label} ({config}) as {reference}")
+        ros2docker_build(config_file=config, override={"image_name": reference})
+        return 0
+
+    raise ImageCacheError(
+        f"No image this project builds has the fingerprint {wanted}. Take the reference from "
+        f"`rosotacom image references`; it changes whenever the build inputs do."
+    )
 
 
 def resources_path_command(args: argparse.Namespace) -> int:
@@ -8648,6 +8753,7 @@ TOP_LEVEL_COMMANDS = {
     "list-sessions",
     "scenario",
     "examples",
+    "image",
     "resources",
     "config",
     "bundle",
@@ -9375,6 +9481,30 @@ def main(argv: list[str] | None = None) -> int:
     examples_create_parser.add_argument("target", help="Directory to create.")
     examples_create_parser.add_argument("--force", action="store_true", help="Replace the target if it exists.")
     examples_create_parser.set_defaults(func=examples_create_command)
+
+    image_parser = subparsers.add_parser("image", help="Publish and consume the project's container images.")
+    image_subparsers = image_parser.add_subparsers(dest="image_action", required=True)
+
+    image_references_parser = image_subparsers.add_parser(
+        "references", help="Print the content-addressed reference of every image this project builds."
+    )
+    _add_common_config_args(image_references_parser)
+    image_references_parser.add_argument(
+        "--repository",
+        help=f"Repository holding published images, e.g. ghcr.io/owner/name. Defaults to {IMAGE_CACHE_ENV}.",
+    )
+    image_references_parser.set_defaults(func=image_references_command)
+
+    image_build_parser = image_subparsers.add_parser(
+        "build", help="Build the image whose build inputs hash to the tag in --reference."
+    )
+    _add_common_config_args(image_build_parser)
+    image_build_parser.add_argument(
+        "--reference",
+        required=True,
+        help="Full reference from `rosotacom image references`. Its tag decides which image is built.",
+    )
+    image_build_parser.set_defaults(func=image_build_command)
 
     resources_parser = subparsers.add_parser("resources", help="Locate resources packaged with rosotacom.")
     resources_subparsers = resources_parser.add_subparsers(dest="resources_action", required=True)

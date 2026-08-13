@@ -176,6 +176,29 @@ def test_ci_success_checks_every_job_it_waits_for() -> None:
     )
 
 
+def test_e2e_slices_take_the_image_repository_from_the_publisher() -> None:
+    """A slice may only consume images the `image` job confirmed are there.
+
+    That job publishes what is missing and then reports its repository *only*
+    if every content-addressed reference resolves, so a read-only
+    `GITHUB_TOKEN` leaves the value empty and the slices build as they always
+    did. Writing the repository into the e2e job directly would skip that
+    probe: the slices would then fail on a pull that was never going to work,
+    which is worse than the build this replaces.
+    """
+    workflow = yaml.safe_load((WORKFLOWS_DIR / "pr-merge-gate.yml").read_text(encoding="utf-8"))
+    e2e = workflow["jobs"]["e2e"]
+
+    assert "image" in e2e["needs"], "the e2e slices must wait for the image job"
+
+    steps = [step for step in e2e["steps"] if "ROSOTACOM_IMAGE_CACHE" in (step.get("env") or {})]
+    assert len(steps) == 1, "exactly one e2e step consumes the published images"
+    assert steps[0]["env"]["ROSOTACOM_IMAGE_CACHE"] == "${{ needs.image.outputs.repository }}", (
+        "ROSOTACOM_IMAGE_CACHE must come from the image job's output, not from a literal repository"
+    )
+    assert workflow["jobs"]["image"]["outputs"]["repository"], "the image job must publish its repository as an output"
+
+
 def _recipe_pytest_invocations(recipe: str) -> list[list[str]]:
     """Every pytest argument list a recipe runs, with just's substitutions applied."""
     import shlex

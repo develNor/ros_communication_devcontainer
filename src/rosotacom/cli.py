@@ -4398,7 +4398,13 @@ def _load_scenario_definition(resolved: ResolvedScenario) -> ScenarioDefinition:
             assert config_path is not None
             if not config_path.is_file():
                 raise RuntimeError(f"{context}.ros2docker_config must resolve to a file: {config_path}")
-            load_config(config_path)
+            # Structural validation only. A definition names applications for
+            # every peer, and a `-v` host path (a staged replay bag, a local
+            # workspace) is only required to exist on the machine that starts
+            # that application — which validates it in `_run-application`.
+            # Resolving run args here would make every peer demand every other
+            # peer's machine-local artifacts (#249).
+            load_config(config_path, resolve_run_args=False)
             seen_names.add(name)
             parsed_entries.append(ScenarioApplication(name=name, ros2docker_config=config_path))
         applications[identity] = tuple(parsed_entries)

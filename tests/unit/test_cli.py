@@ -158,6 +158,31 @@ def test_rosotacom_yaml_rejects_removed_data_dict_key(tmp_path: Path) -> None:
         rosotacom._load_runtime_config(argparse.Namespace(rosotacom_config=str(config)))
 
 
+def test_rosotacom_yaml_accepts_com_container_prefix(tmp_path: Path) -> None:
+    (tmp_path / "ros2docker.json").write_text('{"image_name": "test"}\n', encoding="utf-8")
+    config = tmp_path / "rosotacom.yaml"
+    config.write_text(
+        "ros2docker_config: ros2docker.json\ncom_container_prefix: remote-assist\n",
+        encoding="utf-8",
+    )
+
+    runtime = rosotacom._load_runtime_config(argparse.Namespace(rosotacom_config=str(config)))
+
+    assert runtime.com_container_prefix == "remote-assist"
+
+
+def test_rosotacom_yaml_rejects_invalid_com_container_prefix(tmp_path: Path) -> None:
+    (tmp_path / "ros2docker.json").write_text('{"image_name": "test"}\n', encoding="utf-8")
+    config = tmp_path / "rosotacom.yaml"
+    config.write_text(
+        "ros2docker_config: ros2docker.json\ncom_container_prefix: 'has space'\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="com_container_prefix must be a valid docker name"):
+        rosotacom._load_runtime_config(argparse.Namespace(rosotacom_config=str(config)))
+
+
 def test_session_definition_rejects_physical_address_field() -> None:
     with pytest.raises(RuntimeError, match="Unsupported keys in peers.a.*address"):
         rosotacom.session_gen._validate_session_template_cfg({"peers": {"a": {"address": "10.0.0.1"}, "b": {}}})

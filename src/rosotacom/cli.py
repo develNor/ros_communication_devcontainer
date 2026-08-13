@@ -181,6 +181,7 @@ class RuntimeConfig:
     scenario_configs_dir: tuple[Path, ...] = ()
     profiles_file: Path | None = None
     benchmarks_dir: Path | None = None
+    com_container_prefix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -485,6 +486,22 @@ def _resolve_project_config_source(args: argparse.Namespace) -> tuple[str | None
     return None, None
 
 
+_DOCKER_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+
+def _validated_com_container_prefix(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    if not _DOCKER_NAME_RE.match(value):
+        raise RuntimeError(
+            f"com_container_prefix must be a valid docker name ([a-zA-Z0-9][a-zA-Z0-9_.-]*), got: {raw!r}"
+        )
+    return value
+
+
 def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfig:
     args = args or argparse.Namespace()
     rosotacom_config_raw, project_source = _resolve_project_config_source(args)
@@ -499,6 +516,7 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         "deployment",
         "profiles",
         "benchmarks_dir",
+        "com_container_prefix",
     }
     unknown_project_keys = sorted(set(cfg) - allowed_project_keys)
     if unknown_project_keys:
@@ -543,6 +561,10 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         os.environ.get("ROSOTACOM_BENCHMARKS_DIR"),
         cfg.get("benchmarks_dir"),
     )
+    com_container_prefix_raw = _first_value(
+        os.environ.get("ROSOTACOM_COM_CONTAINER_PREFIX"),
+        cfg.get("com_container_prefix"),
+    )
 
     ros2docker_config = _resolve_path(ros2docker_config_raw, config_base, must_exist=True)
     if ros2docker_config is None:
@@ -575,6 +597,7 @@ def _load_runtime_config(args: argparse.Namespace | None = None) -> RuntimeConfi
         ),
         profiles_file=_resolve_path(profiles_raw, config_base, must_exist=True),
         benchmarks_dir=_resolve_path(benchmarks_dir_raw, config_base, must_exist=False),
+        com_container_prefix=_validated_com_container_prefix(com_container_prefix_raw),
     )
 
 
@@ -663,7 +686,23 @@ def _workspace_container_prefix(runtime: RuntimeConfig) -> str:
     return f"rosotacom_{runtime.install_id}_"
 
 
+def _fixed_com_container_name(runtime: RuntimeConfig, remote_peer_name: str) -> str | None:
+    """The stable, human-readable com container name, when the project opts in.
+
+    A project sets ``com_container_prefix`` when people read ``docker ps`` on its
+    machines (demos, operations). The price is concurrency: two instances of the
+    same session cannot run side by side on one host, which is why test/CI
+    projects leave the key unset and keep the instance-scoped names.
+    """
+    if not runtime.com_container_prefix:
+        return None
+    return _sanitize_docker_name(f"{runtime.com_container_prefix}_com-to-{remote_peer_name}")
+
+
 def _container_name(remote_peer_name: str, runtime: RuntimeConfig, instance_id: str) -> str:
+    fixed = _fixed_com_container_name(runtime, remote_peer_name)
+    if fixed is not None:
+        return fixed
     return _sanitize_docker_name(
         f"rosotacom_{runtime.install_id}_{_instance_name_token(instance_id)}_com_to_{remote_peer_name}"
     )
@@ -697,10 +736,19 @@ def _list_docker_containers(*, all_states: bool = False) -> list[tuple[str, list
 
 
 def _matching_com_containers(runtime: RuntimeConfig, remote_peer_name: str, *, all_states: bool = False) -> list[str]:
-    """Workspace communication containers for `remote_peer_name`, any instance."""
+    """Workspace communication containers for `remote_peer_name`, any instance.
+
+    Matches both naming schemes — the instance-scoped default and the fixed
+    ``com_container_prefix`` name — so a leftover container from the other mode
+    is still found after a project toggles the key.
+    """
     suffix = _sanitize_docker_name(f"com_to_{remote_peer_name}")
+    fixed = _fixed_com_container_name(runtime, remote_peer_name)
     names = []
     for name, _networks in _list_docker_containers(all_states=all_states):
+        if fixed is not None and name == fixed:
+            names.append(name)
+            continue
         parts = _split_workspace_container(name, runtime)
         if parts is not None and parts[1] == suffix:
             names.append(name)
@@ -4900,7 +4948,13 @@ def start_session(args: argparse.Namespace) -> str:
     container_name = _container_name(remote_name, runtime, instance.instance_id)
     network_isolated = bool(getattr(args, "network_name", None))
     if not network_isolated and not getattr(args, "skip_conflict_check", False):
-        conflicts = [name for name in _matching_com_containers(runtime, remote_name) if name != container_name]
+        matching = _matching_com_containers(runtime, remote_name)
+        if _fixed_com_container_name(runtime, remote_name) is not None:
+            # A fixed name cannot coexist with itself: a running container with
+            # this exact name is a conflict too, not a rejoinable instance.
+            conflicts = matching
+        else:
+            conflicts = [name for name in matching if name != container_name]
         if conflicts and args.force:
             for conflict in conflicts:
                 _stop_container_name(conflict, runtime, quiet_missing=True)
@@ -5616,15 +5670,20 @@ def ps_command(args: argparse.Namespace) -> int:
     """Answer "can I start something?" by classifying active rosotacom containers."""
     runtime = _load_runtime_config(args)
     prefix = _workspace_container_prefix(runtime)
+    fixed_com_prefix = (
+        f"{_sanitize_docker_name(runtime.com_container_prefix)}_com-to-" if runtime.com_container_prefix else None
+    )
     smoke_isolated: list[tuple[str, str]] = []
     host_shared: list[str] = []
     other_workspaces: list[str] = []
     for name, networks in _list_docker_containers():
-        if not name.startswith("rosotacom_"):
-            continue
-        if not name.startswith(prefix):
-            other_workspaces.append(name)
-            continue
+        fixed_named = fixed_com_prefix is not None and name.startswith(fixed_com_prefix)
+        if not fixed_named:
+            if not name.startswith("rosotacom_"):
+                continue
+            if not name.startswith(prefix):
+                other_workspaces.append(name)
+                continue
         smoke_nets = [net for net in networks if net.startswith("rosotacom_smoke_") or net == SMOKE_NETWORK_NAME]
         if smoke_nets:
             smoke_isolated.append((name, smoke_nets[0]))

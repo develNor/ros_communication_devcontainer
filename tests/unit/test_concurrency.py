@@ -17,8 +17,20 @@ import rosotacom.cli as rosotacom
 from rosotacom import cli_benchmark
 
 
-def _runtime(tmp_path: Path, install_id: str = "abc") -> rosotacom.RuntimeConfig:
-    return rosotacom.RuntimeConfig(None, tmp_path / "ros2docker.json", (), None, install_id, tmp_path / "instances")
+def _runtime(
+    tmp_path: Path,
+    install_id: str = "abc",
+    com_container_prefix: str | None = None,
+) -> rosotacom.RuntimeConfig:
+    return rosotacom.RuntimeConfig(
+        None,
+        tmp_path / "ros2docker.json",
+        (),
+        None,
+        install_id,
+        tmp_path / "instances",
+        com_container_prefix=com_container_prefix,
+    )
 
 
 def test_container_name_is_instance_scoped(tmp_path: Path) -> None:
@@ -32,6 +44,42 @@ def test_container_name_is_instance_scoped(tmp_path: Path) -> None:
     # Underscores in user-provided instance ids are folded away so the instance
     # component of a name stays parseable.
     assert rosotacom._container_name("remote", runtime, "my_run") == "rosotacom_abc_my-run_com_to_remote"
+
+
+def test_container_name_is_fixed_with_com_container_prefix(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path, com_container_prefix="remote-assist")
+    first = rosotacom._container_name("center", runtime, "run1")
+    second = rosotacom._container_name("center", runtime, "run2")
+
+    # No install id, no instance token: the name is stable across runs and
+    # readable next to colleagues' containers in `docker ps`.
+    assert first == "remote-assist_com-to-center"
+    assert second == first
+    assert rosotacom._container_name("ella", runtime, "run1") == "remote-assist_com-to-ella"
+
+
+def test_matching_com_containers_includes_fixed_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, com_container_prefix="remote-assist")
+    monkeypatch.setattr(
+        rosotacom,
+        "_list_docker_containers",
+        lambda all_states=False: [
+            ("remote-assist_com-to-remote", ["bridge"]),
+            ("remote-assist_com-to-other", ["bridge"]),
+            ("rosotacom_abc_run1_com_to_remote", ["bridge"]),
+            ("unrelated", ["bridge"]),
+        ],
+    )
+
+    # Both schemes match, so a leftover instance-scoped container is still
+    # found after the project switched to fixed names (and vice versa).
+    assert rosotacom._matching_com_containers(runtime, "remote") == [
+        "remote-assist_com-to-remote",
+        "rosotacom_abc_run1_com_to_remote",
+    ]
 
 
 def test_scenario_container_name_is_instance_scoped(tmp_path: Path) -> None:
@@ -209,6 +257,58 @@ def test_start_session_force_replaces_conflicting_identity_container(
     assert [name for name, _ in calls] == ["build", "run", "exec"]
 
 
+def test_start_session_fixed_name_conflicts_with_itself_without_force(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, install_id="id", com_container_prefix="remote-assist")
+    session = rosotacom.ResolvedSession(tmp_path, "/session/current", "absolute")
+    cfg = {"peers": {"a": {}, "b": {"com-name": "remote"}}}
+    calls: list[tuple[str, dict[str, object]]] = []
+    _patch_start_session_collaborators(monkeypatch, runtime, session, cfg, calls)
+    monkeypatch.setattr(
+        rosotacom,
+        "_list_docker_containers",
+        lambda all_states=False: [("remote-assist_com-to-remote", ["bridge"])],
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        rosotacom.start_session(_start_session_args())
+
+    # A fixed name cannot coexist with itself, so the running container is a
+    # conflict rather than a rejoinable instance.
+    assert "remote-assist_com-to-remote" in str(excinfo.value)
+    assert calls == []
+
+
+def test_start_session_fixed_name_force_replaces_running_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, install_id="id", com_container_prefix="remote-assist")
+    session = rosotacom.ResolvedSession(tmp_path, "/session/current", "absolute")
+    cfg = {"peers": {"a": {}, "b": {"com-name": "remote"}}}
+    calls: list[tuple[str, dict[str, object]]] = []
+    stopped: list[str] = []
+    _patch_start_session_collaborators(monkeypatch, runtime, session, cfg, calls)
+    monkeypatch.setattr(
+        rosotacom,
+        "_list_docker_containers",
+        lambda all_states=False: [("remote-assist_com-to-remote", ["bridge"])],
+    )
+    monkeypatch.setattr(
+        rosotacom,
+        "_stop_container_name",
+        lambda name, runtime, **kwargs: stopped.append(name) or True,
+    )
+
+    container = rosotacom.start_session(_start_session_args(force=True))
+
+    assert container == "remote-assist_com-to-remote"
+    assert stopped[0] == "remote-assist_com-to-remote"
+    assert [name for name, _ in calls] == ["build", "run", "exec"]
+
+
 def test_start_session_skips_identity_conflicts_on_isolated_networks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -315,6 +415,32 @@ def test_ps_command_classifies_active_containers(
     assert "Host-shared" in output
     assert "rosotacom_abc_run2_com_to_b" in output
     assert "other rosotacom workspaces: 1" in output
+    assert "onedrive" not in output
+
+
+def test_ps_command_lists_fixed_named_com_containers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = _runtime(tmp_path, com_container_prefix="remote-assist")
+    monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
+    monkeypatch.setattr(
+        rosotacom,
+        "_list_docker_containers",
+        lambda all_states=False: [
+            ("remote-assist_com-to-center", ["bridge"]),
+            ("rosotacom_abc_run2_com_to_b", ["bridge"]),
+            ("onedrive", ["bridge"]),
+        ],
+    )
+
+    assert rosotacom.ps_command(argparse.Namespace()) == 0
+    output = capsys.readouterr().out
+
+    assert "Host-shared" in output
+    assert "remote-assist_com-to-center" in output
+    assert "rosotacom_abc_run2_com_to_b" in output
     assert "onedrive" not in output
 
 

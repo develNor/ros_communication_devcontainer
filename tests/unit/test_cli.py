@@ -411,6 +411,40 @@ def test_scenario_definition_resolves_and_validates_strictly(tmp_path: Path) -> 
         rosotacom._load_scenario_definition(resolved)
 
 
+def test_scenario_definition_ignores_foreign_peers_host_paths(tmp_path: Path) -> None:
+    """Loading a definition must not require other peers' machine-local mounts.
+
+    Application b mounts a host path that exists only on b's machine (a staged
+    replay bag). Peer a still has to be able to parse the definition and start
+    its own applications; the mount is validated where b actually starts
+    (#249).
+    """
+    runtime, resolved = _write_test_scenario_project(tmp_path)
+    foreign_config = tmp_path / "apps" / "b.json"
+    foreign_config.write_text(
+        "\n".join(
+            [
+                "{",
+                '  "container_name": "b_app",',
+                '  "run_type": "command",',
+                '  "command": ["true"],',
+                '  "run_args": ["-v", "./only-on-machine-b:/bag:ro"]',
+                "}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    definition = rosotacom._load_scenario_definition(resolved)
+    assert definition.applications["b"][0].name == "local_app"
+
+    # The start path still refuses the missing mount on the machine that runs
+    # the application: full resolution stays where it is meaningful.
+    with pytest.raises(FileNotFoundError, match="Host path does not exist"):
+        rosotacom.load_config(foreign_config)
+
+
 def test_scenario_name_completion_uses_active_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

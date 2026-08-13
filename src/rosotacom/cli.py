@@ -3661,14 +3661,29 @@ def _ota_wait_for_running_container_suffix_script(suffix: str, label: str, timeo
     )
 
 
+def _ota_communication_wait_suffix(runtime: RuntimeConfig, remote_peer_name: str) -> str:
+    """What the application windows wait for, following `_container_name`.
+
+    The wait must make the same naming decision the start makes, or it waits
+    forever for a name that will never exist: a project with
+    `com_container_prefix` names its com container `<prefix>_com-to-<peer>`,
+    and the instance-scoped `_com_to_<peer>` suffix matches nothing (#254).
+    """
+    fixed = _fixed_com_container_name(runtime, remote_peer_name)
+    if fixed is not None:
+        return fixed
+    return _sanitize_docker_name(f"_com_to_{remote_peer_name}")
+
+
 def _ota_application_run_script(
     plan: OtaSmokePlan,
     target: InteractiveSmokeTarget,
     peer_name: str,
     application: ScenarioApplication,
     instance_id: str,
+    runtime: RuntimeConfig,
 ) -> str:
-    communication_suffix = _sanitize_docker_name(f"_com_to_{_remote_peer_name(target.cfg, peer_name)}")
+    communication_suffix = _ota_communication_wait_suffix(runtime, _remote_peer_name(target.cfg, peer_name))
     label = f"{peer_name}:{application.name}"
     command = _ota_rosotacom_command(
         plan, _ota_application_parts(target, peer_name, application, instance_id), plan.peers[peer_name]
@@ -3825,7 +3840,7 @@ def _ota_create_tmux(
         for peer in peers:
             for application in target.scenario_definition.applications.get(peer.name, ()):
                 application_script = _ota_application_run_script(
-                    plan, target, peer.name, application, instance.instance_id
+                    plan, target, peer.name, application, instance.instance_id, runtime
                 )
                 created_application = subprocess.run(
                     _tmux_command(

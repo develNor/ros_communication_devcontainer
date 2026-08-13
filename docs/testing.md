@@ -127,24 +127,29 @@ from one-host smoke.
 
 - `just test-e2e-slice heartbeat`: the heartbeat matrix (and the opt-in RMW matrix).
 - `just test-e2e-slice chatter`: the native chatter scenario, smoke, and debug rig.
-- `just test-e2e-slice occupancy-grid`: compressed occupancy grid over both transports.
-- `just test-e2e-slice sized-payload`: sized payload over both transports.
+- `just test-e2e-slice occupancy-grid-dds`: compressed occupancy grid over direct DDS.
+- `just test-e2e-slice occupancy-grid-zenoh`: compressed occupancy grid over Zenoh.
+- `just test-e2e-slice sized-payload-fastdds`: sized payload over Fast DDS.
+- `just test-e2e-slice sized-payload-zenoh`: sized payload over Zenoh.
 - `just test-e2e-slice remote-assist`: the full anonymized remote-assist rig.
-- `just test-e2e-slice remote-assist-streams`: its costmap and camera single-stream cuts.
+- `just test-e2e-slice remote-assist-costmap`: its costmap single-stream cut.
+- `just test-e2e-slice remote-assist-camera`: its camera single-stream cut.
 - `just test-e2e-slice runtime-tools`: link latency and live timeline stepping.
 - `just test-e2e-slice media`: anonymization and video quality.
-- `just test-e2e-slice concurrency`: the concurrency/isolation gate.
+- `just test-e2e-slice concurrency-parallel`: independent smoke runs coexist.
+- `just test-e2e-slice concurrency-conflict`: a conflicting smoke run is rejected safely.
 - `just test-e2e-slice benchmark-ab`: the A/B reliability verdict.
 - `just test-e2e-slice benchmark-replay`: loss boundaries against costmap replay.
 - `just test-e2e-slice benchmark-capacity`: the band-asserted capacity rows.
 - `just test-e2e-slice benchmark-capacity-cases`: the capacity good/bad-case verdicts.
 - `just test-e2e-node <nodeid>`: Reruns a specific pytest node ID directly.
-- `just e2e-slice-costs`: prints what each slice costs and how balanced the six are.
+- `just e2e-slice-costs`: prints what each slice costs and its distance to the floor.
 
-The slices are chosen by measured cost, and split where the tests already
-differ so a red job names an area. `E2E_SLICES` in `tests/e2e/conftest.py`
-decides which slice owns which test; see
-[ci.md](ci.md#balancing-the-e2e-slices) before moving one.
+The slices are grouped by diagnostic theme and split where transport, stream,
+or behavior gives a useful first failure distinction. Measured cost decides
+when a theme needs another runner, not which unrelated tests should share one.
+`E2E_SLICES` in `tests/e2e/conftest.py` decides which slice owns which test;
+see [ci.md](ci.md#diagnostic-e2e-slices) before changing one.
 
 The generated RMW matrix is available as an opt-in full local slice:
 

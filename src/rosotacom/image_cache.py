@@ -1,10 +1,10 @@
 """Content-addressed names for the images this project builds.
 
-Every e2e job rebuilds the same project image from scratch, and #236 measured
-what that costs: 154s per job, thirteen jobs per merge-gate run. Publishing the
-built image once and adopting it in each job removes the build — but only if
-"adopt" can never mean "adopt something else". A cached image that no longer
-matches its build inputs is a silent wrong-result machine, which is why #226
+Every e2e job used to rebuild the same project image from scratch, and #236
+measured what that cost: 154s per job across the thirteen jobs in that run.
+Publishing the built image once and adopting it in each job removes the build —
+but only if "adopt" can never mean "adopt something else". A cached image that
+no longer matches its build inputs is a silent wrong-result machine, which is why #226
 declined to do this inline.
 
 So the name of a published image is a hash of everything that determines it:

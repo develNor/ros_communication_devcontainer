@@ -43,23 +43,22 @@ check is:
 ci-success
 ```
 
-The merge gate runs workflow lint, dependency/security review, runtime/build asset lint, Python 3.10 through 3.14 non-Docker checks, package validation, and the Docker single-machine smoke matrix (one matrix job per slice, thirteen in parallel):
+The merge gate runs workflow lint, dependency/security review, runtime/build asset lint, Python 3.10 through 3.14 non-Docker checks, package validation, and the Docker single-machine smoke matrix (one matrix job per slice, seventeen in parallel):
 
 Python 3.10–3.14 are supported for the host CLI; Python 3.12 is the reference
 interpreter for packaging and Docker E2E jobs.
 
 ### What the e2e slices wait for
 
-Every job in the gate starts at once — there is no runner contention — so the
-only thing that decides when the thirteen slices start is their `needs`. They
+The only explicit barriers before the seventeen slices are their `needs`. They
 wait for exactly two jobs:
 
 - **`image`**, because a slice adopts the published image rather than building
   it, so it cannot start before that image is known to exist. On a hit this is
   two manifest inspections, and it is what sets the floor.
 - **`quick-gate`**, `just lint && just typecheck` on one interpreter: the
-  cheapest signal that the tree is not obviously broken, so thirteen runners do
-  not spend seventy minutes discovering a syntax error. Four seconds of work,
+  cheapest signal that the tree is not obviously broken, so seventeen runners
+  do not spend roughly 73 minutes discovering a syntax error. Four seconds of work,
   sized to finish inside `image` and therefore free.
 
 They used to wait for `preflight-success`, which meant the whole five-version
@@ -84,13 +83,17 @@ just package
 # Parallel E2E lanes, one per slice:
 just test-e2e-slice heartbeat
 just test-e2e-slice chatter
-just test-e2e-slice occupancy-grid
-just test-e2e-slice sized-payload
+just test-e2e-slice occupancy-grid-dds
+just test-e2e-slice occupancy-grid-zenoh
+just test-e2e-slice sized-payload-fastdds
+just test-e2e-slice sized-payload-zenoh
 just test-e2e-slice remote-assist
-just test-e2e-slice remote-assist-streams
+just test-e2e-slice remote-assist-costmap
+just test-e2e-slice remote-assist-camera
 just test-e2e-slice runtime-tools
 just test-e2e-slice media
-just test-e2e-slice concurrency
+just test-e2e-slice concurrency-parallel
+just test-e2e-slice concurrency-conflict
 just test-e2e-slice benchmark-ab
 just test-e2e-slice benchmark-replay
 just test-e2e-slice benchmark-capacity
@@ -102,7 +105,7 @@ Docker E2E is not collected for coverage.
 
 ## Docker E2E
 
-`just test-e2e-smoke` runs the entire local single-machine smoke matrix through Docker. In the CI merge gate, the same collection runs as thirteen parallel
+`just test-e2e-smoke` runs the entire local single-machine smoke matrix through Docker. In the CI merge gate, the same collection runs as seventeen parallel
 jobs, one per slice, named `e2e-<slice>`. Each smoke run writes generated
 config, catmux pane logs, Docker logs when available, and the smoke verification
 log under `session-instances/`; collect that directory as the first debugging
@@ -112,8 +115,9 @@ artifact when an E2E job fails.
 
 Every e2e job used to build the project image from scratch. #236 measured that
 at 154s per job — 57s pulling the multi-GB ROS base from Docker Hub, 40s
-exporting layers, 47s of apt and pip — which at thirteen slices is 33 minutes of
-runner time and thirteen Hub pulls on the critical path of every merge gate.
+exporting layers, 47s of apt and pip — which was 33 minutes of runner time and
+thirteen Hub pulls with the matrix at that time. The image is still published
+only once now that the diagnostic matrix has seventeen jobs.
 
 The `image` job now publishes those images to
 `ghcr.io/<owner>/rosotacom-e2e` and each slice pulls instead of building. GHCR
@@ -165,14 +169,13 @@ Content-addressed tags accumulate in the GHCR package — one per distinct set o
 build inputs, so roughly one per change to the base digest or package lists.
 Nothing prunes them yet.
 
-### Balancing the e2e slices
+### Diagnostic e2e slices
 
 A slice is not its own pytest invocation. `just test-e2e-slice <name>` runs the
 monolith's collection with `--e2e-slice=<name>`, and everything the named slice
 does not own is deselected. Which tests a slice owns, and what each one costs,
 is `E2E_SLICES` in `tests/e2e/conftest.py`; `just e2e-slice-costs` prints the
-resulting balance. Moving a test between slices is one line there — the
-workflow matrices only name slices.
+resulting costs. The workflow matrices only name slices.
 
 That shape exists because the previous one, per-slice file lists and `-k`
 filters, could not say what it ran. `-k "remote_assist"` silently missed the
@@ -182,11 +185,17 @@ twice a run. A partition can do neither: an unowned test fails every slice job
 with a usage error, and a test owned twice fails
 `test_e2e_slices_partition_the_whole_suite`.
 
+The slice name is an advisor: it states the subsystem and, where that is the
+useful first distinction, the transport, stream, or behavior that failed.
+Costs decide when one such theme needs another runner. They do not justify
+moving a test behind an unrelated name just because its duration fits there.
+
 The costs are warm pytest `call` durations — medians over seven merge-gate runs
 of 2026-08-11/12. On top of them each job pays a fixed
 `RUNNER_SETUP_SECONDS + IMAGE_BUILD_SECONDS` (1m19s: 46s outside the tests, then
 the project image obtained inside whichever test runs first). Because that
-constant is per job and not per test, balancing warm costs balances wall clock.
+constant is per job and not per test, the cost model predicts wall clock and
+shows when a diagnostic group has become too large.
 
 `IMAGE_BUILD_SECONDS` models the merge gate, where that image is pulled rather
 than built (see above); the release and nightly lanes still build and pay the
@@ -206,26 +215,25 @@ cost like every other. It is currently **5m47s**, of which 33s is the image
 (7m56s before #236 published it instead of rebuilding it per job, 6m32s before
 #245 shrank it).
 
-Thirteen slices sit at 6m26s, **1.12x** the floor. That is the point of choosing
-N from the numbers rather than from taste: six balanced slices were 13m37s,
-twelve reach the floor, and past twelve every extra job is pure cost. Note that
-1.12x is now a partition problem rather than a count problem — thirteen slices
-*can* reach 1.00x, and the current assignment does not, because `occupancy-grid`
-holds two 150s tests. The fixed cost falling twice is what exposed it: the same
-partition was 1.11x of a floor that was a minute and a half higher. The
-contract test asserts distance to the floor rather than the spread between
-slices — spread is compressed toward 1.0 by the fixed cost as N grows, so it
-keeps reading fine while the gate stops improving.
+Thirteen diagnostic slices sat at 6m26s, **1.12x** the floor. Four groups were
+over the 267s warm target: occupancy grid, sized payload, the two remote-assist
+single-stream cuts, and the two concurrency guarantees. Each has a real seam —
+transport, stream, or behavior — so each became two explicitly named jobs.
 
-Runner minutes are not the constraint here (this repository is public, so
-standard GitHub-hosted runners are free); the concurrent-job cap is, and
-thirteen stays under it.
+The resulting seventeen slices reach **1.00x**, without cross-theme packing.
+Seventeen is also the smallest theme-preserving count that can do so: each of
+the four overloaded groups needs at least one additional runner. Splitting
+every test into its own job would add runner cost without improving the critical
+path; keeping thirteen would save runner setup but leave 42s on every gate run.
+This is the balance: use the fewest runners that preserve diagnostic ownership
+and reach the floor, rather than optimizing either runner count or time alone.
 
 To refresh the numbers, read a merge-gate run: every e2e invocation runs
 `--durations=0`, so each job prints the cost of every test it ran. A test that
 ran first in its job carries the image build and needs `IMAGE_BUILD_SECONDS`
 subtracted. `tests/contract/test_workflow_contracts.py::test_e2e_slices_stay_close_to_the_floor`
-fails when the slowest slice passes 1.25x the floor.
+fails as soon as a grouped slice becomes slower than the floor. Split that
+slice on a diagnostic boundary; do not fill spare time with unrelated tests.
 
 ## Performance Regression Gate
 

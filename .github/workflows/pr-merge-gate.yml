@@ -159,7 +159,7 @@ jobs:
   quick-gate:
     # Everything `e2e` waits for that is not the image, and deliberately no
     # more. It exists to answer one question — is the tree obviously broken,
-    # such that thirteen slices would burn seventy runner-minutes to say so.
+    # such that seventeen slices would burn roughly 73 runner-minutes to say so.
     #
     # It replaced a `needs: preflight-success` edge that made e2e wait for the
     # whole five-version matrix. That barrier cost 2.15 min of every gate run
@@ -199,12 +199,12 @@ jobs:
 
   image:
     # Publish the images the e2e suite builds, once per set of build inputs,
-    # instead of rebuilding them in each of thirteen jobs. #236 measured that
-    # build at 154s per job: 57s pulling the multi-GB ROS base from Docker Hub,
-    # 40s exporting layers, 47s of apt and pip. A pull from GHCR — co-located
-    # with the runners, no Hub rate limit, one transfer instead of a transfer
-    # plus a build — replaces all of it, and takes twelve of the thirteen Hub
-    # pulls off the merge gate's critical path.
+    # instead of rebuilding them in every job. #236 measured that build at
+    # 154s per job when the matrix had thirteen jobs: 57s pulling the multi-GB
+    # ROS base from Docker Hub, 40s exporting layers, 47s of apt and pip. A pull
+    # from GHCR — co-located with the runners, no Hub rate limit, one transfer
+    # instead of a transfer plus a build — replaces all of it. The benefit
+    # grows with the diagnostic matrix; seventeen jobs still build only once.
     #
     # The tag is a hash of everything that decides the image (base digest,
     # package lists, Dockerfile, entrypoint, ros2docker version, build UID):
@@ -295,12 +295,12 @@ jobs:
     # tests/contract/test_workflow_contracts.py keeps the three workflows and
     # the justfile agreeing.
     #
-    # The slices are chosen by measured cost, not grouped by theme (#226):
-    # themed slices spanned 7m39s to 18m31s, and one test ran in two of them.
-    # Thirteen rather than six because the model that predicted the balanced
-    # six within 25s also says twelve reaches the floor and more buys nothing
-    # (#235). Which tests a slice owns and what each costs is E2E_SLICES in
-    # tests/e2e/conftest.py — change that, not this line, to move a test.
+    # Slice names are diagnostic boundaries, not cost buckets. Costs tell us
+    # when a theme needs another runner; they never justify packing unrelated
+    # tests together. Seventeen is the smallest theme-preserving partition that
+    # reaches the measured floor: #253 split the four overloaded themes along
+    # transport, stream, or concurrency semantics. Which tests a slice owns and
+    # what each costs is E2E_SLICES in tests/e2e/conftest.py.
     name: e2e-${{ matrix.slice }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -312,7 +312,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slice: [heartbeat, chatter, occupancy-grid, sized-payload, remote-assist, remote-assist-streams, runtime-tools, media, concurrency, benchmark-ab, benchmark-replay, benchmark-capacity, benchmark-capacity-cases]
+        slice:
+          - heartbeat
+          - chatter
+          - occupancy-grid-dds
+          - occupancy-grid-zenoh
+          - sized-payload-fastdds
+          - sized-payload-zenoh
+          - remote-assist
+          - remote-assist-costmap
+          - remote-assist-camera
+          - runtime-tools
+          - media
+          - concurrency-parallel
+          - concurrency-conflict
+          - benchmark-ab
+          - benchmark-replay
+          - benchmark-capacity
+          - benchmark-capacity-cases
 
     steps:
       - name: Check out repository

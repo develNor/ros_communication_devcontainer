@@ -302,33 +302,32 @@ def test_workflow_matrices_expand_the_slices_that_exist() -> None:
 
 
 def test_e2e_slices_stay_close_to_the_floor() -> None:
-    """Balance is a number now, so it can be kept rather than rediscovered.
+    """Diagnostic slices reach the floor without cross-theme packing.
 
     Themed slices drifted to a 2.4x spread (7m39s against 18m31s) with nobody
     noticing, because the only place a per-test cost existed was a `pytest -q`
     total that nothing compared.
 
-    Measured against the floor rather than the spread, which is what this test
-    asserted at six slices and what stopped meaning anything at thirteen. The
-    fixed cost per job compresses spread toward 1.0 as N grows, so a suite could
-    go badly wrong while spread still read 1.1; and past N=12 the spread is set
-    by tests too small to split rather than by imbalance. Distance to
-    `floor_seconds()` says the one thing worth asserting at any N — the gate is
-    near the fastest it could possibly be — and needs no retuning when a test is
-    added.
+    The cost model remains useful, but #253 makes the slice name the stronger
+    constraint: costs can require another runner inside a theme, never move a
+    test behind an unrelated name. The four groups above the floor all had a
+    diagnostic seam (transport, stream, or concurrency behavior), so seventeen
+    named slices reach 1.00x without arbitrary packing.
 
-    1.25x, not 1.0x, because the floor assumes tests can be divided arbitrarily
-    and they cannot. At thirteen slices the partition sits at 1.09x.
+    Exact distance to the floor keeps that choice durable. A new grouped slice
+    above it must be split on a useful diagnostic boundary; spare seconds in an
+    unrelated slice are not capacity to fill.
     """
     module = _e2e_conftest()
     predicted = {name: module.predicted_slice_seconds(name) for name in module.E2E_SLICES}
     slowest = max(predicted.values())
     floor = module.floor_seconds()
 
-    assert slowest <= 1.25 * floor, (
+    assert slowest <= floor, (
         f"the slowest e2e slice is predicted at {slowest / 60:.2f}m against a "
-        f"{floor / 60:.2f}m floor ({slowest / floor:.2f}x). Move tests between slices, "
-        f"or split the slowest one, in tests/e2e/conftest.py:\n{module.slice_cost_report()}"
+        f"{floor / 60:.2f}m floor ({slowest / floor:.2f}x). Split the slowest "
+        "slice on a diagnostic boundary; do not move tests into an unrelated "
+        f"slice:\n{module.slice_cost_report()}"
     )
 
 
@@ -446,7 +445,7 @@ def test_e2e_waits_only_for_the_cheap_gate_and_the_image() -> None:
     `needs: preflight-success` made every gate run wait 2.15 min for the
     five-version `merge-lightweight` matrix. It had stopped an e2e round once
     in sixty runs — on `workflow-lint`, which takes 0.12 min. `ci-success`
-    still requires every preflight job, so this is a change to when thirteen
+    still requires every preflight job, so this is a change to when seventeen
     runners start, not to what may merge.
     """
     workflow = yaml.safe_load((WORKFLOWS_DIR / "pr-merge-gate.yml").read_text(encoding="utf-8"))

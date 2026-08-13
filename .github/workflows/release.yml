@@ -110,7 +110,7 @@ jobs:
           retention-days: 30
 
   e2e:
-    # The same five slices the merge gate runs, in parallel, instead of one
+    # The same diagnostic slices the merge gate runs, in parallel, instead of one
     # sequential `just test-e2e-smoke` over the whole suite. That target is
     # identical to nightly-e2e.yml's smoke-e2e job, so the release used to be
     # the third sequential run of the same tests against the same tree; it
@@ -121,7 +121,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slice: [heartbeat, chatter, occupancy-grid, sized-payload, remote-assist, remote-assist-streams, runtime-tools, media, concurrency, benchmark-ab, benchmark-replay, benchmark-capacity, benchmark-capacity-cases]
+        slice:
+          - heartbeat
+          - chatter
+          - occupancy-grid-dds
+          - occupancy-grid-zenoh
+          - sized-payload-fastdds
+          - sized-payload-zenoh
+          - remote-assist
+          - remote-assist-costmap
+          - remote-assist-camera
+          - runtime-tools
+          - media
+          - concurrency-parallel
+          - concurrency-conflict
+          - benchmark-ab
+          - benchmark-replay
+          - benchmark-capacity
+          - benchmark-capacity-cases
 
     steps:
       - name: Check out repository

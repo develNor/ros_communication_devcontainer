@@ -46,7 +46,7 @@ test-e2e-fast: test-e2e-smoke
 # with everything the slice does not own deselected — so a slice cannot miss a
 # test or run one twice, which per-slice file lists and `-k` filters both did.
 # Which tests a slice owns, and what each costs, is E2E_SLICES in
-# tests/e2e/conftest.py; `just e2e-slice-costs` prints the balance.
+# tests/e2e/conftest.py; `just e2e-slice-costs` prints the cost model.
 test-e2e-slice slice:
 	ROSOTACOM_RUN_E2E=1 {{python}} -m pytest -q --durations=0 tests/e2e/ -m e2e --e2e-slice={{slice}}
 

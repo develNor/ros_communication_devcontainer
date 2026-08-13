@@ -211,8 +211,9 @@ def test_merge_gate_lane_actually_selects_the_benchmark_e2e() -> None:
 
     The slice runner carries no `-k` at all now — it deselects by node id
     against E2E_SLICES — so the contract is that both benchmark E2E files are
-    owned by a slice. Which slice is a balance decision (#226 split the
-    capacity probes out of `runtime-tools`); that they run at all is not.
+    owned by a slice. Which diagnostic slice owns them is a partition decision
+    (#226 split the capacity probes out of `runtime-tools`, #253 rejects
+    cross-theme cost packing); that they run at all is not.
     """
     slice_recipe = re.search(
         r"^test-e2e-slice[^\n:]*:\n((?:\t.*\n?)+)",

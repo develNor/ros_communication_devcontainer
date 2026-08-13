@@ -31,17 +31,31 @@ import pytest
 #: and 31634604888 (43-60s).
 RUNNER_SETUP_SECONDS = 55.0
 
-#: Seconds the first test in a job pays to build the rosotacom project image.
+#: Seconds the first test in a job pays to get the rosotacom project image.
 #: Every job pays it exactly once, whichever test runs first, so it is a
-#: constant no partition can remove — see #236, which is about removing it.
-#: Because it is per job and not per test, it is also what makes more slices
-#: cost more: at thirteen, 33 minutes of every gate run is this.
+#: constant no partition can remove. Because it is per job and not per test, it
+#: is also what makes more slices cost more.
 #:
-#: Measured over 21 cold/warm pairs across seven runs: median 153.7s. A pair is
-#: one test's duration as its job's first test against its median duration when
-#: something else went first. Run 31634604888 supplied five of them at once,
-#: because rebalancing changed which test each slice starts with.
-IMAGE_BUILD_SECONDS = 154.0
+#: It was 154.0 — a `docker build`, measured over 21 cold/warm pairs across
+#: seven runs (median 153.7s). #236 replaced that build with a pull of a
+#: content-addressed image the merge gate's `image` job publishes, and this is
+#: what the pull costs instead. So the number models the *merge gate*: the
+#: release and nightly lanes still build from scratch, deliberately, as the
+#: check that a published image and a fresh build still agree.
+#:
+#: 70.0 from run 31678648935, two estimators agreeing. Per slice, (sum of
+#: measured `call` durations − sum of the warm costs below) has a median of
+#: 67.2s over the twelve slices that behaved (43.8–77.8s). Per test, the twelve
+#: tests that run first in their job each dropped 74–119s against their median
+#: over three earlier runs, median −84s, i.e. 154 − 84 = 70.
+#:
+#: `media` is the thirteenth and did not behave: it got 57s *slower*, all of it
+#: in `test_synthetic_camera_pipeline_records_quality_metrics` (+72s) while its
+#: sibling moved +2s. Its two recorded costs below do not reproduce either —
+#: they sum ~24s short of what the job actually spends — so that slice needs a
+#: measurement of its own rather than a number derived from one anomalous run.
+#: It is currently the critical path.
+IMAGE_BUILD_SECONDS = 70.0
 
 #: Every e2e test, the slice that owns it, and its *warm* pytest `call` duration
 #: in seconds — the median over seven runs of the invocations where the project

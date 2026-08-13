@@ -93,7 +93,9 @@ runner time and thirteen Hub pulls on the critical path of every merge gate.
 The `image` job now publishes those images to
 `ghcr.io/<owner>/rosotacom-e2e` and each slice pulls instead of building. GHCR
 is co-located with the runners and has no Hub rate limit, so this is one
-transfer where there used to be a transfer plus a build.
+transfer where there used to be a transfer plus a build. Measured on run
+31678648935: **154s → 70s per job**, and the slowest slice's pytest run fell
+from 8m19s to 6m50s.
 
 The tag is the whole safety argument. It is a SHA-256 of everything that decides
 what the image contains — the `docker build` command ros2docker renders from a
@@ -157,18 +159,24 @@ with a usage error, and a test owned twice fails
 
 The costs are warm pytest `call` durations — medians over seven merge-gate runs
 of 2026-08-11/12. On top of them each job pays a fixed
-`RUNNER_SETUP_SECONDS + IMAGE_BUILD_SECONDS` (3m29s: 55s of runner setup, then the
-project image built inside whichever test runs first). Because that constant is
-per job and not per test, balancing warm costs balances wall clock.
+`RUNNER_SETUP_SECONDS + IMAGE_BUILD_SECONDS` (2m05s: 55s of runner setup, then
+the project image obtained inside whichever test runs first). Because that
+constant is per job and not per test, balancing warm costs balances wall clock.
+
+`IMAGE_BUILD_SECONDS` models the merge gate, where that image is pulled rather
+than built (see above); the release and nightly lanes still build and pay the
+older 154s. One slice does not currently reproduce its recorded split: `media`
+spends about 24s more than its two costs predict, and it is the critical path,
+so it is the first thing to remeasure.
 
 ### How many slices
 
 `floor_seconds()` is `fixed + slowest single test` — the fastest any partition
 of this suite could be, because one job has to run that test and pays the fixed
-cost like every other. It is currently **7m56s**, of which 2m34s is the image
-build (#236 is about removing it).
+cost like every other. It is currently **6m32s**, of which 1m10s is the image
+(7m56s before #236 published it instead of rebuilding it per job).
 
-Thirteen slices sit at 8m38s, 1.09x the floor. That is the point of choosing N
+Thirteen slices sit at 7m14s, 1.11x the floor. That is the point of choosing N
 from the numbers rather than from taste: six balanced slices were 13m37s,
 twelve reach the floor, and past twelve every extra job is pure cost. The
 contract test asserts distance to the floor rather than the spread between

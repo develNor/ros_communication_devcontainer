@@ -164,6 +164,28 @@ def test_every_image_transport_the_session_plugin_can_select_is_installed() -> N
         assert not missing, f"{config_path.name} does not install {sorted(missing)}"
 
 
+def test_packaged_configs_do_not_fetch_rosdep_on_container_start() -> None:
+    """Readiness must cover the workspace build, not a third-party index fetch.
+
+    The packaged workspace dependencies come from the pinned base image and
+    explicit image package lists, then Docker smoke exercises the real build.
+    Enabling ros2docker's runtime check would run ``rosdep update`` for every
+    communication container before that small build and make readiness depend
+    on raw.githubusercontent.com.
+    """
+    configs = (
+        cli.DEFAULT_ROS2DOCKER_CONFIG,
+        cli.EXAMPLE_PROJECT_DIR / "ros2docker.json",
+    )
+
+    for config_path in configs:
+        config = cli.load_config(config_path)
+        run_args = [str(value) for value in config["run_args"]]
+
+        assert "BUILD_ROS2WS=1" in run_args
+        assert not any(arg.startswith("CHECK_ROS2WS_DEPENDENCIES=") for arg in run_args)
+
+
 def test_external_ros2docker_configs_install_selected_rmw_implementations() -> None:
     configs = sorted(cli.EXAMPLE_PROJECT_DIR.glob("scripts/**/external.ros2docker.json"))
     assert configs

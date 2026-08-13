@@ -48,6 +48,31 @@ The merge gate runs workflow lint, dependency/security review, runtime/build ass
 Python 3.10–3.14 are supported for the host CLI; Python 3.12 is the reference
 interpreter for packaging and Docker E2E jobs.
 
+### What the e2e slices wait for
+
+Every job in the gate starts at once — there is no runner contention — so the
+only thing that decides when the thirteen slices start is their `needs`. They
+wait for exactly two jobs:
+
+- **`image`**, because a slice adopts the published image rather than building
+  it, so it cannot start before that image is known to exist. On a hit this is
+  two manifest inspections, and it is what sets the floor.
+- **`quick-gate`**, `just lint && just typecheck` on one interpreter: the
+  cheapest signal that the tree is not obviously broken, so thirteen runners do
+  not spend seventy minutes discovering a syntax error. Four seconds of work,
+  sized to finish inside `image` and therefore free.
+
+They used to wait for `preflight-success`, which meant the whole five-version
+`merge-lightweight` matrix, and that cost **2.15 min of every gate run**.
+Measured against the sixty runs before #248, it had stopped an e2e round once,
+on `workflow-lint` — 0.12 min of the 2.15. Nothing about what may merge
+changed: `ci-success` still requires `workflow-lint`, `build-lint`,
+`merge-lightweight`, `package`, `quick-gate`, `image`, and `e2e`, and it is the
+only required check in branch protection.
+
+`tests/contract/test_workflow_contracts.py::test_e2e_waits_only_for_the_cheap_gate_and_the_image`
+keeps the barrier from growing back.
+
 ```bash
 just lint-workflows
 just lint-build
@@ -159,26 +184,35 @@ with a usage error, and a test owned twice fails
 
 The costs are warm pytest `call` durations — medians over seven merge-gate runs
 of 2026-08-11/12. On top of them each job pays a fixed
-`RUNNER_SETUP_SECONDS + IMAGE_BUILD_SECONDS` (2m05s: 55s of runner setup, then
+`RUNNER_SETUP_SECONDS + IMAGE_BUILD_SECONDS` (1m19s: 46s outside the tests, then
 the project image obtained inside whichever test runs first). Because that
 constant is per job and not per test, balancing warm costs balances wall clock.
 
 `IMAGE_BUILD_SECONDS` models the merge gate, where that image is pulled rather
 than built (see above); the release and nightly lanes still build and pay the
-older 154s. One slice does not currently reproduce its recorded split: `media`
-spends about 24s more than its two costs predict, and it is the critical path,
-so it is the first thing to remeasure.
+older 154s. It has now been re-measured twice, because both changes that made
+it smaller were changes to what a job moves rather than to what it runs: 154 →
+70 when #236 replaced the build with a pull, and 70 → 33 when #245 rebased the
+image on `ros-base` and the published project image went 1640 MB → 957 MB.
+Runs 31681061779 and 31687149587 ran the same partition either side of that, so
+the paired per-slice difference measures it directly: median −37.4s over all
+thirteen.
 
 ### How many slices
 
 `floor_seconds()` is `fixed + slowest single test` — the fastest any partition
 of this suite could be, because one job has to run that test and pays the fixed
-cost like every other. It is currently **6m32s**, of which 1m10s is the image
-(7m56s before #236 published it instead of rebuilding it per job).
+cost like every other. It is currently **5m47s**, of which 33s is the image
+(7m56s before #236 published it instead of rebuilding it per job, 6m32s before
+#245 shrank it).
 
-Thirteen slices sit at 7m14s, 1.11x the floor. That is the point of choosing N
-from the numbers rather than from taste: six balanced slices were 13m37s,
-twelve reach the floor, and past twelve every extra job is pure cost. The
+Thirteen slices sit at 6m26s, **1.12x** the floor. That is the point of choosing
+N from the numbers rather than from taste: six balanced slices were 13m37s,
+twelve reach the floor, and past twelve every extra job is pure cost. Note that
+1.12x is now a partition problem rather than a count problem — thirteen slices
+*can* reach 1.00x, and the current assignment does not, because `occupancy-grid`
+holds two 150s tests. The fixed cost falling twice is what exposed it: the same
+partition was 1.11x of a floor that was a minute and a half higher. The
 contract test asserts distance to the floor rather than the spread between
 slices — spread is compressed toward 1.0 by the fixed cost as N grows, so it
 keeps reading fine while the gate stops improving.

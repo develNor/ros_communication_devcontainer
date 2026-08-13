@@ -1,0 +1,34 @@
+name: Set up just
+description: >
+  Install a pinned just release, verified by checksum.
+
+  Nineteen jobs used to reach it with `apt-get update && apt-get install -y
+  just`, and almost all of that step's 9-15s was the index refresh — in every
+  job, including all thirteen e2e slices, where it sat on the merge gate's
+  critical path. A release tarball is ~2s.
+
+  It also stops the CI toolchain drifting: apt gave whatever noble currently
+  ships (1.21.0 at the time of writing), which changes without anything here
+  saying so.
+
+runs:
+  using: composite
+  steps:
+    - name: Install just
+      shell: bash
+      run: |
+        set -euo pipefail
+        JUST_VERSION="1.58.0"
+        CHECKSUM="4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d"
+        URL="https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+        # Unpacked outside the checkout: a stray tarball in the working tree is
+        # a thing every later step has to not trip over.
+        workdir="$(mktemp -d)"
+        # --fail, or a transient HTTP error body is saved as the tarball and
+        # reported as a checksum mismatch, which reads like a tampered release.
+        curl -sSLf --retry 3 --retry-all-errors -o "$workdir/just.tar.gz" "$URL"
+        echo "${CHECKSUM}  $workdir/just.tar.gz" | sha256sum --check
+        tar -xzf "$workdir/just.tar.gz" -C "$workdir" just
+        sudo mv "$workdir/just" /usr/local/bin/just
+        rm -rf "$workdir"
+        just --version

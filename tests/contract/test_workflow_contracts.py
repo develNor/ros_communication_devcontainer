@@ -414,3 +414,57 @@ def test_an_unowned_e2e_test_fails_every_slice_job() -> None:
 
     assert "test_a_test_nobody_assigned" in str(excinfo.value)
     assert "E2E_SLICES" in str(excinfo.value)
+
+
+def test_every_workflow_installs_just_the_same_pinned_way() -> None:
+    """`apt-get update` cost 9-15s in nineteen jobs to install one binary.
+
+    It was also the only unpinned tool in CI: apt gave whatever noble shipped
+    that week, so the `just` the gate ran changed without any commit saying so.
+    Both are fixed by the shared action, and both come back the moment one
+    workflow reintroduces the apt line — which is what this asserts.
+    """
+    offenders = [
+        path.name
+        for path in sorted(WORKFLOWS_DIR.glob("*.yml"))
+        if "install -y just" in path.read_text(encoding="utf-8")
+    ]
+    assert not offenders, "these workflows install just from apt instead of ./.github/actions/setup-just: " + ", ".join(
+        offenders
+    )
+
+    action = PACKAGE_ROOT / ".github" / "actions" / "setup-just" / "action.yml"
+    assert action.is_file(), "the shared setup-just action every workflow refers to does not exist"
+    body = action.read_text(encoding="utf-8")
+    assert "sha256sum --check" in body, "setup-just must verify the release it downloads"
+
+
+def test_e2e_waits_only_for_the_cheap_gate_and_the_image() -> None:
+    """The barrier `e2e` waits on has to stay cheaper than the image it also
+    waits on, or it starts costing wall clock again.
+
+    `needs: preflight-success` made every gate run wait 2.15 min for the
+    five-version `merge-lightweight` matrix. It had stopped an e2e round once
+    in sixty runs — on `workflow-lint`, which takes 0.12 min. `ci-success`
+    still requires every preflight job, so this is a change to when thirteen
+    runners start, not to what may merge.
+    """
+    workflow = yaml.safe_load((WORKFLOWS_DIR / "pr-merge-gate.yml").read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
+
+    assert set(jobs["e2e"]["needs"]) == {"quick-gate", "image"}, (
+        f"e2e must wait for the cheap tripwire and the image, and nothing else: {jobs['e2e']['needs']}"
+    )
+
+    quick_gate_work = "\n".join(_workflow_run_blocks(jobs["quick-gate"]))
+    expensive = [
+        recipe for recipe in ("test-nondocker-cov", "test", "docs", "package") if f"just {recipe}" in quick_gate_work
+    ]
+    assert not expensive, "quick-gate exists to be cheaper than the image job, so it must not run: " + ", ".join(
+        expensive
+    )
+
+    # And the jobs it stopped gating are still required to merge.
+    ci_success = jobs["ci-success"]
+    for name in ("workflow-lint", "build-lint", "merge-lightweight", "package"):
+        assert name in ci_success["needs"], f"{name} no longer gates the merge at all"

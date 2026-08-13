@@ -50,9 +50,7 @@ jobs:
           cache: pip
 
       - name: Install just
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just
+        uses: ./.github/actions/setup-just
 
       - name: Set up local environment
         run: just setup
@@ -87,10 +85,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install just and tmux
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just tmux
+      - name: Install just
+        uses: ./.github/actions/setup-just
+
+      - name: Ensure tmux
+        # Preinstalled on the GitHub-hosted image, so this is a probe
+        # rather than an install — but the dependency is named, so a
+        # runner image that drops it fails here instead of inside a
+        # session.
+        run: command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; }
 
       - name: Set up local environment
         run: just setup
@@ -142,9 +145,7 @@ jobs:
           cache: pip
 
       - name: Install just
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y just
+        uses: ./.github/actions/setup-just
 
       - name: Set up local environment
         run: just setup

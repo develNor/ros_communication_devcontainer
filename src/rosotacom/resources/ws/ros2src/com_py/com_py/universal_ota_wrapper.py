@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import array
 import re
 from threading import Lock
 
@@ -139,7 +140,12 @@ class UniversalOtaWrapperNode(Node):
                 out_msg.header.frame_id = header.frame_id
             out_msg.seq = self._next_sequence(source_topic)
             out_msg.msg_type = msg_type_str
-            out_msg.serialized_msg = list(serialized)
+            # array('B', ...) hits the generated setter's fast path and stores the
+            # buffer as-is. A list would allocate one Python int per payload byte,
+            # inside the interval that `header.stamp` above is meant to measure --
+            # and rule out wrapping anything large (a ~100 kB encoded video packet
+            # at 10 Hz is 1M allocations per second).
+            out_msg.serialized_msg = array.array('B', serialized)
 
             publisher.publish(out_msg)
         except Exception as exc:

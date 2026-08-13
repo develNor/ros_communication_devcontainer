@@ -19,25 +19,43 @@ concurrency:
 
 jobs:
   smoke-e2e:
-    # The same six slices the merge gate and the release run, instead of one
+    # The same diagnostic slices the merge gate and the release run, instead of one
     # sequential `just test-e2e-smoke` over the whole suite (#198). Keeping the
     # monolith here was deliberate while the slices were hand-maintained `-k`
     # expressions that had silently stopped covering three files; #197's
     # test_e2e_slices_partition_the_whole_suite closed that, so the union is
     # now guaranteed to be the monolith.
     #
-    # The gain is diagnosis: a red monolith says "e2e broke", six slices say
-    # which area did. It also removes a load-induced flake. On 2026-08-11 the
+    # The gain is diagnosis: a red monolith says "e2e broke"; a named slice says
+    # which area and, where relevant, which transport or behavior failed. It
+    # also removes a load-induced flake. On 2026-08-11 the
     # nightly failed with nine "Timed out waiting for container readiness"
     # errors after 1h12m on one runner, while the same tests on the same commit
-    # passed in the merge gate — where they are spread over six.
+    # passed in the merge gate — where they were spread over six at the time.
     name: smoke-e2e-${{ matrix.slice }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        slice: [heartbeat, chatter, occupancy-grid, sized-payload, remote-assist, remote-assist-streams, runtime-tools, media, concurrency, benchmark-ab, benchmark-replay, benchmark-capacity, benchmark-capacity-cases]
+        slice:
+          - heartbeat
+          - chatter
+          - occupancy-grid-dds
+          - occupancy-grid-zenoh
+          - sized-payload-fastdds
+          - sized-payload-zenoh
+          - remote-assist
+          - remote-assist-costmap
+          - remote-assist-camera
+          - runtime-tools
+          - media
+          - concurrency-parallel
+          - concurrency-conflict
+          - benchmark-ab
+          - benchmark-replay
+          - benchmark-capacity
+          - benchmark-capacity-cases
 
     steps:
       - name: Check out repository

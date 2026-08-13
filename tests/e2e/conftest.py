@@ -1,7 +1,7 @@
 """Collection rules for the Docker-backed e2e suite, and the CI slice partition.
 
 `just test-e2e-smoke` runs the whole suite in one process; CI runs the same
-collection as thirteen parallel slices, selected with `--e2e-slice=<name>`. A
+collection as seventeen parallel slices, selected with `--e2e-slice=<name>`. A
 slice is a deselection of one shared collection, not a separate pytest
 invocation with its own file list — which is what it used to be, and that shape
 got two things wrong that a partition cannot get wrong:
@@ -16,8 +16,10 @@ got two things wrong that a partition cannot get wrong:
 
 The number next to each test is what it costs. #226 balanced six themed slices
 on those numbers and the run came back within 25s of every prediction, so #235
-used the same model to choose N instead of guessing it: thirteen slices, split
-where the tests already differ, is 1.09x the fastest any partition could be.
+used the same model to choose N instead of guessing it. #253 makes diagnosis
+the stronger constraint: costs decide when a theme needs another runner, but
+unrelated tests are never packed together merely because their durations fit.
+Seventeen is the smallest theme-preserving partition that reaches the floor.
 """
 
 from __future__ import annotations
@@ -97,16 +99,20 @@ E2E_SLICES: dict[str, dict[str, float]] = {
         "tests/e2e/test_smoke.py::test_interactive_native_chatter_smoke_starts_full_local_debug_rig": 74.4,
     },
     # `transforms` was one slice over two unrelated questions. Compression and
-    # payload size each keep their RMW pair together, because the pair is the
-    # comparison: a red job here means "this transform, both transports" or
-    # "this transform, one transport", which is the first thing you ask.
-    "occupancy-grid": {
+    # payload size were then kept as transport pairs, but both pairs grew past
+    # the floor. A job per transport now names both the transform and the
+    # transport that failed instead of hiding that distinction in pytest output.
+    "occupancy-grid-dds": {
         "tests/e2e/test_smoke.py::test_local_compressed_occupancy_grid_smoke_from_copied_example_project[compressed-occupancy-grid]": 158.3,  # derived
+    },
+    "occupancy-grid-zenoh": {
         "tests/e2e/test_smoke.py::test_local_zenoh_compressed_occupancy_grid_smoke_from_copied_example_project[compressed-occupancy-grid-zenoh]": 150.4,
     },
-    "sized-payload": {
-        "tests/e2e/test_smoke.py::test_local_zenoh_sized_payload_smoke_from_copied_example_project[sized-payload-zenoh]": 172.5,
+    "sized-payload-fastdds": {
         "tests/e2e/test_smoke.py::test_local_wrapped_sized_payload_smoke_from_copied_example_project[sized-payload-fastdds]": 117.4,
+    },
+    "sized-payload-zenoh": {
+        "tests/e2e/test_smoke.py::test_local_zenoh_sized_payload_smoke_from_copied_example_project[sized-payload-zenoh]": 172.5,
     },
     # The full anonymized rig, alone: at 267s warm it is the slowest single test
     # in the suite and therefore sets the floor every other slice is measured
@@ -114,9 +120,12 @@ E2E_SLICES: dict[str, dict[str, float]] = {
     "remote-assist": {
         "tests/e2e/test_smoke.py::test_local_remote_assist_anonymized_smoke_from_copied_example_project[remote-assist-anonymized]": 267.0,
     },
-    # Its two single-stream cuts, which share a trace with the rig above.
-    "remote-assist-streams": {
+    # Its two single-stream cuts share a trace with the rig above, but exercise
+    # different processing paths and should name which stream failed.
+    "remote-assist-costmap": {
         "tests/e2e/test_smoke.py::test_local_single_stream_anonymized_smoke_from_copied_example_project[remote-assist-anonymized-costmap]": 145.2,
+    },
+    "remote-assist-camera": {
         "tests/e2e/test_smoke.py::test_local_single_stream_anonymized_smoke_from_copied_example_project[remote-assist-anonymized-camera]": 145.1,
     },
     # What a live session exposes and what can be changed under it.
@@ -128,8 +137,12 @@ E2E_SLICES: dict[str, dict[str, float]] = {
         "tests/e2e/test_video_quality_e2e.py::test_synthetic_camera_pipeline_records_quality_metrics": 161.8,
         "tests/e2e/test_anonymize_e2e.py::test_anonymize_headless_end_to_end_preserves_keyframe_structure": 10.4,  # derived
     },
-    "concurrency": {
+    # These are complementary concurrency guarantees, but a failure in safe
+    # parallel execution says something different from a rejected conflict.
+    "concurrency-parallel": {
         "tests/e2e/test_parallel_smoke.py::test_independent_local_smoke_tests_run_in_parallel": 146.6,
+    },
+    "concurrency-conflict": {
         "tests/e2e/test_parallel_smoke.py::test_second_same_target_smoke_aborts_and_leaves_first_intact": 125.0,
     },
     # The two benchmark verdicts, one job each: at 202s and 174s neither fits

@@ -60,18 +60,22 @@ def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
     assert "just test-e2e-slice" in merge_gate
     # Named individually rather than compared to E2E_SLICES, so that dropping a
     # slice from the manifest and the matrix together still fails here. Which
-    # slices exist is a balance decision (#226, #235); that the gate runs the
-    # Docker smoke suite at all is what this file is about.
+    # slices exist is a diagnostic/cost decision (#226, #235, #253); that the
+    # gate runs the Docker smoke suite at all is what this file is about.
     assert set(jobs["e2e"]["strategy"]["matrix"]["slice"]) >= {
         "heartbeat",
         "chatter",
-        "occupancy-grid",
-        "sized-payload",
+        "occupancy-grid-dds",
+        "occupancy-grid-zenoh",
+        "sized-payload-fastdds",
+        "sized-payload-zenoh",
         "remote-assist",
-        "remote-assist-streams",
+        "remote-assist-costmap",
+        "remote-assist-camera",
         "runtime-tools",
         "media",
-        "concurrency",
+        "concurrency-parallel",
+        "concurrency-conflict",
         "benchmark-ab",
         "benchmark-replay",
         "benchmark-capacity",

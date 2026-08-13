@@ -1255,10 +1255,14 @@ def _final_topic_type(entry: TopicEntry, pipe: Dict[str, Any]) -> str:
                 f"Unsupported transport type '{transport.type}' for topic '{entry.base}'. "
                 f"Known output type mappings: {sorted(TRANSPORT_OUTPUT_TYPES)}"
             )
-        return TRANSPORT_OUTPUT_TYPES[transport.type]
 
+    # Same order as the pipeline stages themselves: whatever is applied last
+    # decides the type of what crosses the link, and the wrapper is always last.
     if pipe.get("ota_wrap"):
         return OTA_STAMPED_MSG_TYPE
+
+    if transport is not None:
+        return TRANSPORT_OUTPUT_TYPES[transport.type]
 
     if pipe.get("compress"):
         return COMPRESSED_MSG_TYPE
@@ -1269,6 +1273,49 @@ def _final_topic_type(entry: TopicEntry, pipe: Dict[str, Any]) -> str:
             f"Topic '{entry.base}' requires a 'type' when peer_settings.<peer>.domain_id/shared.ota_domain_id are used."
         )
     return msg_type
+
+
+def _delivered_topic(pipe: Dict[str, Any], final: str) -> str:
+    """The topic the receiver's post-processing chain ends on, before trickle.
+
+    The receiver undoes the sender's stages in reverse order, so this walks the
+    same chain backwards rather than picking one branch: unwrap, decode a
+    transport, decompress, framebridge down.
+    """
+    topic = final
+    if pipe.get("ota_wrap"):
+        # The unwrapper republishes on the pre-wrap name, which is why wrapping
+        # renames nothing downstream of it.
+        topic = str(pipe["ota_in"])
+    transport = pipe.get("transport")
+    if isinstance(transport, TransportSpec) and transport.local_republish:
+        # image_transport reverse republish decodes the encoded topic into
+        # `<encoded>/raw`; PSNR/SSIM and application-level checks need that
+        # decoded sensor_msgs/Image stage, not the encoded packet.
+        topic = str(pipe["irt_in"]) + "/raw"
+    elif pipe.get("compress"):
+        topic = str(pipe["comp_in"])
+    if pipe.get("framebridge") == "global_to_local":
+        # global_to_local runs on the receiver: the OTA `final` is the global
+        # (globalframe) topic, and the framebridge transforms it down to the
+        # local base topic -- that base is the post-framebridge native_in.
+        topic = str(pipe["fb_g2l_base"])
+    return topic
+
+
+def _postprocessed_topic(pipe: Dict[str, Any], final: str) -> str:
+    """The topic the receiving application actually reads."""
+    topic = _delivered_topic(pipe, final)
+    if pipe.get("trickle_hz") is not None:
+        # Receiver-side trickle re-publishes the delivered topic at a fixed rate
+        # to `<delivered>/trickle` (the trickle node's trickle_topic_suffix).
+        # That republished topic is the real delivered output, so it is the
+        # monitored native_in stage -- otherwise the trickle re-publish is an
+        # observability blind spot (its rate cannot be asserted). It republishes
+        # what the application would read, not the envelope: on a wrapped topic
+        # that is the unwrapped one.
+        topic = topic + "/trickle"
+    return topic
 
 
 def _heartbeat_monitor_overrides(heartbeat_expect: Optional[Dict[str, Any]]) -> List[Tuple[str, Any]]:
@@ -1341,31 +1388,6 @@ def _build_status_pipeline_spec(
         if pipe.get("trickle_hz") is not None:
             return float(pipe["trickle_hz"])
         return None
-
-    def _postprocessed_topic(pipe: Dict[str, Any], final: str) -> str:
-        if pipe.get("trickle_hz") is not None:
-            # Receiver-side trickle re-publishes the delivered OTA `final` at a fixed
-            # rate to `<final>/trickle` (the trickle node's trickle_topic_suffix). That
-            # republished topic is the real delivered output, so it is the monitored
-            # native_in stage -- otherwise the trickle re-publish is an observability
-            # blind spot (its rate cannot be asserted).
-            return final + "/trickle"
-        if pipe.get("compress"):
-            return str(pipe["comp_in"])
-        if pipe.get("ota_wrap"):
-            return str(pipe["ota_in"])
-        if pipe.get("framebridge") == "global_to_local":
-            # global_to_local runs on the receiver: the OTA `final` is the global
-            # (globalframe) topic, and the framebridge transforms it down to the
-            # local base topic -- that base is the post-framebridge native_in.
-            return str(pipe["fb_g2l_base"])
-        transport = pipe.get("transport")
-        if isinstance(transport, TransportSpec) and transport.local_republish:
-            # image_transport reverse republish decodes `<final>` into
-            # `<final>/raw`; PSNR/SSIM and application-level checks need that
-            # decoded sensor_msgs/Image stage, not the encoded packet.
-            return final + "/raw"
-        return final
 
     def _relay_in_local_topic(topic: str) -> str:
         if inbound_keep_source_prefix:
@@ -1714,11 +1736,6 @@ def _compute_pipeline(
         comp_in = topic
         topic = topic + comp_alg_suffix
 
-    ota_in = None
-    if ota_wrap:
-        ota_in = topic
-        topic = topic + ota_suffix
-
     it_in = None
     irt_in = None
     if transport:
@@ -1726,6 +1743,15 @@ def _compute_pipeline(
         topic = topic + f"/{transport.type}"
         if transport.local_republish:
             irt_in = topic
+
+    # The wrapper is last, always. Its `seq` and send stamp describe whatever it
+    # wraps, so anything applied after it would be measured by an envelope that
+    # never carried it -- and would append its own suffix to the wrapped name,
+    # renaming the delivered topic under a receiver that subscribes by name.
+    ota_in = None
+    if ota_wrap:
+        ota_in = topic
+        topic = topic + ota_suffix
 
     return {
         "final": topic,
@@ -2546,8 +2572,16 @@ def func(
         # Trickle: local-only periodic republisher (receiver side only).
         # Subscribes to inbound final topics (with source-name prefix when applicable)
         # and republishes at a fixed rate for visualization software.
+        # Trickle runs at the very end of the receiver chain, so it republishes
+        # what the local post-processing produced -- not the OTA `final`, which
+        # on a wrapped topic is still the envelope. `_delivered_topic` is the
+        # same computation the status pipeline spec uses for `native_in`, so the
+        # two cannot drift apart.
         trickle_in_items = [
-            (_prefix_with_source_name_if_needed(local, remote, p["final"]), p["trickle_hz"])
+            (
+                _prefix_with_source_name_if_needed(local, remote, _delivered_topic(p, p["final"])),
+                p["trickle_hz"],
+            )
             for p in in_pipes
             if p["trickle_hz"] is not None
         ]
@@ -2599,7 +2633,10 @@ def func(
             if not p["normalize"]:
                 continue
             base = e.base.lstrip("/")
-            suffix_source = p["comp_in"] if p["comp_in"] else p["final"]
+            # Normalization is receiver-side too, so it works on the delivered
+            # topic rather than the OTA `final` (identical unless something is
+            # wrapped, where `final` is still the envelope).
+            suffix_source = _delivered_topic(p, p["final"])
             suffix = suffix_source[len(e.base) :]
             nor_items.append((base, suffix))
 

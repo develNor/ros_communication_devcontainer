@@ -477,15 +477,31 @@ Given a base topic like `/tf`, stages are applied in this order:
 
 1) base topic (e.g. `/tf`)
 2) restamp → `+ shared.processing_suffixes.restamped` (default `/restamped`)
-3) drop → `+ /drop{drop_count}of{window_size}` (e.g. `/drop2of3`)
-4) throttle → `+ /max{hz}hz`
-5) pixel cap → `+ /{preset}`
-6) framebridge:
+3) latch → `+ shared.processing_suffixes.latched` (default `/latched`)
+4) drop → `+ /drop{drop_count}of{window_size}` (e.g. `/drop2of3`)
+5) throttle → `+ /max{hz}hz`
+6) pixel cap → `+ /{preset}`
+7) framebridge:
    - `local_to_global`: appended to the current topic state via `+ /globalframe`
    - `global_to_local`: appended to the base topic via `+ /globalframe` (configured inbound-side)
-7) compress → `+ /<algorithm>` (default `/bz2`)
-8) transport → `+ /<type>` (e.g. `/ffmpeg`, `/foxglove`, `/compressed`)
-9) optional `local_republish: true` triggers reverse-transport configuration.
+8) compress → `+ /<algorithm>` (default `/bz2`)
+9) transport → `+ /<type>` (e.g. `/ffmpeg`, `/foxglove`, `/compressed`)
+10) OTA wrapper → `+ /ota_stamped`
+
+The wrapper is **always last**. Its `seq` and send stamp are read as a statement
+about the traffic on the link, so it has to wrap exactly what crosses it — an
+encoded stream is wrapped as `<base>/<type>/ota_stamped`, not the other way
+round. Nothing may append a suffix after it, or the delivered topic would be
+renamed under a receiver that subscribes by a fixed name.
+
+The receiver undoes the chain in reverse, and every stage there is computed from
+the delivered topic rather than from the OTA topic:
+
+1) unwrap → republishes on the pre-wrap name (so wrapping renames nothing)
+2) `local_republish: true` → reverse transport decodes into `+ /raw`
+3) decompress → republishes on the pre-compress name
+4) framebridge `global_to_local` → the local base topic
+5) trickle → `+ /trickle`, the only receiver-side stage that adds a suffix
 
 #### Transport parameters
 `type: ffmpeg` supports:

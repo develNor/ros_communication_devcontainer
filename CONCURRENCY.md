@@ -39,6 +39,26 @@ commands *discover* the matching containers from Docker instead of recomputing
 fixed names — they clean up every instance for the requested identity/target,
 including leftovers from crashed runs.
 
+## Opting out: fixed, human-readable names
+
+A project whose machines are read by people rather than by CI — a demo or
+operations project — can set `com_container_prefix` in its `rosotacom.yaml`:
+
+```yaml
+com_container_prefix: remote-assist
+```
+
+Session communication containers are then named
+`<prefix>_com-to-<remote-peer>` (e.g. `remote-assist_com-to-center`): stable
+across runs and legible in `docker ps`, at the price of parallelism — a second
+start of the same session on the same host is a name conflict. That conflict is
+detected in the same preflight as everything else: `--force` (the session
+default) replaces the running container, `--no-force` aborts with its name.
+Conflict discovery matches **both** naming schemes, so a leftover
+instance-scoped container is still found and replaced after a project switches
+modes. Test and CI projects should leave the key unset and keep the
+collision-free instance-scoped names.
+
 ## How conflicts are detected (fail-safe preflight)
 
 Each start command checks Docker before it allocates anything, and aborts with

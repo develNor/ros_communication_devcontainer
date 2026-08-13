@@ -182,6 +182,15 @@ scripts/
 project-local directories first and shared/example directories later when one
 project should discover both.
 
+`com_container_prefix` (optional) trades concurrency for readability: when set,
+session communication containers get the stable name
+`<prefix>_com-to-<remote-peer>` (e.g. `remote-assist_com-to-center`) instead of
+the default workspace- and instance-scoped unique name. Set it in projects whose
+machines are read by people (`docker ps` during a demo, next to colleagues'
+containers); leave it unset in test/CI projects, where concurrent instances must
+never collide on a name. [CONCURRENCY.md](CONCURRENCY.md) has the exact
+conflict semantics.
+
 ### Locating packaged resources
 
 rosotacom is installed in an isolated environment (pipx, or a project venv), so

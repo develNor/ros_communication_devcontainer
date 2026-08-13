@@ -52,6 +52,17 @@ topics:
           local_republish: true
           gop_size: 4
           bit_rate: 2000000
+        # Wrapping an encoded stream: the wrapper runs after the encoder, so the
+        # envelope carries the FFMPEGPacket that actually crosses the link, and
+        # the unwrapper republishes onto `/camera/image/ffmpeg` -- the name the
+        # reverse republish already decodes from. Nothing downstream is renamed,
+        # which is what this example proves end to end.
+        use_ota_wrapper: true
       expect:
         hz: { min: 3, max: 8 }
         latency_ms: { max: 1000 }
+        # The bound is the same 30% the video-quality check tolerates on this
+        # synthetic link; the assertion's purpose is that the number exists at
+        # all. Without the wrapper an encoded stream has no per-message
+        # accounting, and `loss_pct` on a topic that cannot report it fails.
+        loss_pct: { max: 30 }

@@ -175,6 +175,128 @@ def stamp_delay(raw_delay_s: float, clock_offset_s: Optional[float] = None) -> O
     return None
 
 
+#: How long a peer is given to bring its own publishers up before their absence
+#: is called a defect. Node start, DDS discovery and the first `refresh_interval`
+#: of the observers all happen inside it; 20 s is roughly four times what a
+#: healthy bring-up needs.
+STARTUP_GRACE_S = 20.0
+
+
+#: Stage producers rosotacom starts itself, and can therefore promise. The
+#: application that feeds a link is the user's, and a session that declares a
+#: topic says nothing about whether its publisher is running right now -- a
+#: smoke run legitimately exercises the peers without the data source.
+ROSOTACOM_STAGE_PRODUCERS = frozenset({"heartbeat_echo", "preprocessing", "relay_out", "bridge_out"})
+
+
+def outbound_startup_gaps(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Where each outbound topic first has no publisher at all, and whose fault it is.
+
+    Only outbound topics: their stages are produced on this machine. Inbound
+    stages depend on the peer and the link, which the per-topic rollup already
+    diagnoses.
+
+    Only the *first* absent stage per topic, because the ones behind it are
+    absent for the trivial reason that nothing reached them, and reporting a
+    cascade as four findings buries the one that matters.
+
+    `owner` is what makes the finding actionable, and it takes three values that
+    look identical in the graph:
+
+    * ``rosotacom`` -- a stage this peer starts itself, whose input is arriving.
+      It had something to forward and forwarded nothing. This is the defect.
+    * ``application`` -- the native stage of a topic the user's application (or a
+      replay) publishes. Not this peer's promise.
+    * ``upstream`` -- a stage this peer starts whose input has not delivered a
+      message yet. Its publisher appears on discovery of the input, so there is
+      nothing wrong: `universal_ota_wrapper` has no `…/ota_stamped` publisher
+      until something publishes the topic it wraps.
+
+    This exists because of a failure that produced no error anywhere. On
+    2026-08-13 the centre's `heartbeat_echo` and one `topic_monitor` died two
+    seconds after start -- Cyclone had no free participant index left on the
+    local domain -- and catmux left both panes sitting at a shell prompt. The
+    session ran for two hours with no heartbeat publisher, so the run has no RTT
+    and no clock-offset measurement, and the far side reported `status=LOST
+    reason=age hz=0.00` about a peer that was otherwise healthy. The heartbeat is
+    the one outbound topic rosotacom publishes itself, which is why the
+    generator marks its native stage `heartbeat_echo` rather than `application`.
+    """
+    gaps: List[Dict[str, Any]] = []
+    for topic in snapshot.get("topics", []):
+        if topic.get("direction") != "outbound":
+            continue
+        upstream: Optional[Dict[str, Any]] = None
+        for stage in topic.get("stages", []):
+            if stage.get("state") != ABSENT:
+                upstream = stage
+                continue
+            producer = stage.get("produced_by")
+            if producer not in ROSOTACOM_STAGE_PRODUCERS:
+                owner = "application"
+                reason = "the application that publishes this topic is not running"
+            elif upstream is not None and upstream.get("state") not in (FLOWING, STALE):
+                owner = "upstream"
+                reason = (
+                    f"nothing has arrived on {upstream.get('topic')} "
+                    f"(stage {upstream.get('stage')}), so there is nothing to publish yet"
+                )
+            else:
+                owner = "rosotacom"
+                reason = f"{producer} did not come up"
+            gaps.append(
+                {
+                    "base": topic.get("base"),
+                    "stage": stage.get("stage"),
+                    "topic": stage.get("topic"),
+                    "domain": stage.get("domain"),
+                    "produced_by": producer,
+                    "owner": owner,
+                    "reason": reason,
+                }
+            )
+            break
+    return gaps
+
+
+#: How far back a sequence number may jump and still be called reordering.
+#: `universal_ota_wrapper` counts per topic from zero and increments by one, so
+#: a receiver sees a backward jump only when the wire reordered a message or
+#: when the publishing peer restarted. Reordering is bounded by the transport's
+#: history depth (single digits for the QoS this stack uses); a restart lands
+#: thousands of sequence numbers back. 64 sits between the two by two orders of
+#: magnitude on both sides.
+SEQUENCE_REORDER_TOLERANCE = 64
+
+
+def is_sequence_epoch_reset(
+    seq: int,
+    expected_next_seq: Optional[int],
+    tolerance: int = SEQUENCE_REORDER_TOLERANCE,
+) -> bool:
+    """Does ``seq`` begin a new sequence epoch (the peer's wrapper restarted)?
+
+    Zero is unambiguous and was the only case handled before. It is also the
+    case that almost never arrives: DDS discovery takes long enough that the
+    first tens of messages of a fresh publisher are written before the reader
+    has matched. In the 2026-08-13 field instance the peer restarted four times
+    and the first arrival after each restart carried seq 37, 39, 39 and 41 --
+    never 0. Every one of them was therefore counted as `reordered`, and
+    because the baseline was never reset, so was every message after it: 26,453
+    of 55,437 transits on one 10 Hz topic, for the rest of the instance.
+
+    So a large backward jump counts as a restart too. It is corroborated by an
+    arrival gap (105 s, 32 s, 44 s and 195 s in that instance), but the gap is
+    not required: a fast restart is still a restart, and the jump alone already
+    separates the two causes by orders of magnitude.
+    """
+    if expected_next_seq is None or seq >= expected_next_seq:
+        return False
+    if seq == 0:
+        return True
+    return (expected_next_seq - seq) > tolerance
+
+
 # --- Link overhead (session-level) -----------------------------------------
 
 def _payload_kbps(stage: Optional[Dict[str, Any]]) -> float:
@@ -258,6 +380,8 @@ class StageObservation:
     expected_next_seq: Optional[int] = None
     last_seq: Optional[int] = None
     tracks_sequence: bool = False
+    epoch: int = 0
+    epoch_resets: int = 0
     total_expected: int = 0
     total_missing: int = 0
     total_reordered: int = 0
@@ -302,11 +426,15 @@ class StageObservation:
                 if self.expected_next_seq is None:
                     expected_delta = 1
                     self.expected_next_seq = seq + 1
-                elif seq == 0 and self.expected_next_seq > 1:
-                    # A publisher restart begins a new sequence epoch. Without
-                    # an explicit boot id, zero is the only unambiguous reset.
+                elif is_sequence_epoch_reset(seq, self.expected_next_seq):
+                    # A publisher restart begins a new sequence epoch: the
+                    # wrapper counts from zero again. See
+                    # `is_sequence_epoch_reset` for why the first arrival after
+                    # a restart is almost never seq 0, and what that cost.
+                    self.epoch += 1
+                    self.epoch_resets += 1
                     expected_delta = 1
-                    self.expected_next_seq = 1
+                    self.expected_next_seq = seq + 1
                 elif seq >= self.expected_next_seq:
                     missing = seq - self.expected_next_seq
                     missing_start = self.expected_next_seq if missing else None
@@ -331,6 +459,10 @@ class StageObservation:
                     "topic": transit.get("topic"),
                     "direction": transit.get("direction"),
                     "stage": transit.get("stage"),
+                    # Which run of the peer's wrapper produced this sequence
+                    # number. Without it the offline join collapses seq 0..N of
+                    # every epoch after the first onto the first epoch's rows.
+                    "epoch": self.epoch,
                 }
                 if missing_start is not None:
                     for missing_seq in range(missing_start, int(seq)):
@@ -421,6 +553,8 @@ class StageObservation:
             total_missing = self.total_missing
             total_reordered = self.total_reordered
             total_max_burst = self.max_burst_missing
+            epoch = self.epoch
+            epoch_resets = self.epoch_resets
         hz = count / window_s if window_s > 0 else 0.0
         mean_size = (total_bytes / count) if count > 0 else 0.0
         age = (now_mono - last_recv_mono) if last_recv_mono is not None else None
@@ -441,6 +575,8 @@ class StageObservation:
             "loss_total_pct": _pct(total_missing, total_expected) if tracks_sequence else None,
             "reordered_total": total_reordered if tracks_sequence else None,
             "max_burst_missing_total": total_max_burst if tracks_sequence else None,
+            "epoch": epoch if tracks_sequence else None,
+            "epoch_resets": epoch_resets if tracks_sequence else None,
         }
 
     def drain_transit_records(self) -> List[Dict[str, Any]]:
@@ -464,7 +600,9 @@ class StatusAggregator:
                  *, liveness_window_s: float = 3.0, stale_after_s: float = 3.0,
                  delay_good_ms: float = 100.0, delay_bad_ms: float = 200.0,
                  link_sampler: Any = None, clock_estimator: Any = None,
-                 link_trace_recorder: Any = None):
+                 link_trace_recorder: Any = None,
+                 startup_grace_s: float = STARTUP_GRACE_S,
+                 started_mono: Optional[float] = None):
         self._log = logger
         self._spec = spec
         self._output_dir = output_dir
@@ -484,6 +622,17 @@ class StatusAggregator:
         self._json_path = os.path.join(self._output_dir, "status.json")
         self._txt_path = os.path.join(self._output_dir, "status.txt")
         self._events_path = os.path.join(self._output_dir, "events.jsonl")
+        self._startup_path = os.path.join(self._output_dir, "startup_check.json")
+        # `pane_failures.log` is written by catmux_log_setup.sh one level up, in
+        # logs/<peer>/. The verdict quotes it because a pane that exited is the
+        # most common reason a promised publisher never appears, and the two
+        # facts are useless apart.
+        self._pane_failure_path = os.path.join(
+            os.path.dirname(os.path.abspath(self._output_dir)), "pane_failures.log"
+        )
+        self._startup_grace_s = startup_grace_s
+        self._started_mono = time.monotonic() if started_mono is None else started_mono
+        self._startup_check: Optional[Dict[str, Any]] = None
 
     # -- observation lookup --
     def _obs_for(self, stage: Dict[str, Any]) -> Optional[StageObservation]:
@@ -516,6 +665,8 @@ class StatusAggregator:
             "reordered_total": None,
             "max_burst_missing": None,
             "max_burst_missing_total": None,
+            "epoch": None,
+            "epoch_resets": None,
             "age_s": None,
             "last_message_wall": None,
             "messages_total": 0,
@@ -551,6 +702,8 @@ class StatusAggregator:
             "reordered_total",
             "max_burst_missing",
             "max_burst_missing_total",
+            "epoch",
+            "epoch_resets",
         ):
             result[key] = m[key]
         if m["last_recv_wall"] is not None:
@@ -589,6 +742,8 @@ class StatusAggregator:
             "reordered_total",
             "max_burst_missing",
             "max_burst_missing_total",
+            "epoch",
+            "epoch_resets",
             "age_s",
             "last_message_wall",
             "messages_total",
@@ -838,6 +993,7 @@ class StatusAggregator:
             "summary": counts,
             "link": compute_link_overview(topics_out, link_sample),
             "clock_sync": self._clock_snapshot(now_mono),
+            "startup_check": self._startup_check,
             "topics": topics_out,
         }
 
@@ -915,6 +1071,20 @@ class StatusAggregator:
             f"summary: OK={s.get('OK', 0)} PARTIAL={s.get('PARTIAL', 0)} "
             f"STALLED={s.get('STALLED', 0)} ABSENT={s.get('ABSENT', 0)}   (Phase 1: local observation)"
         )
+        # The STAT watcher pane shows this file, so a failed startup check has to
+        # be readable here or it is not surfaced where anybody looks.
+        check = snapshot.get("startup_check")
+        if check and check.get("verdict") != "ok":
+            gaps = check.get("missing_outbound_stages") or []
+            panes = check.get("pane_failures") or []
+            lines.append(
+                f"STARTUP CHECK FAILED after {check.get('checked_after_s')}s: "
+                f"{len(gaps)} outbound stage(s) without a publisher, {len(panes)} pane(s) exited"
+            )
+            for gap in gaps:
+                lines.append(f"    no publisher: {gap.get('topic')} ({gap.get('produced_by')})")
+            for line in panes:
+                lines.append(f"    pane exited: {line}")
         lines.append("")
         for t in snapshot["topics"]:
             arrow = "->" if t["direction"] == "outbound" else "<-"
@@ -962,6 +1132,83 @@ class StatusAggregator:
             fp.write(text)
         os.replace(tmp, path)
 
+    def _read_pane_failures(self) -> List[str]:
+        try:
+            with open(self._pane_failure_path, "r", encoding="utf-8", errors="replace") as fp:
+                return [line.rstrip("\n") for line in fp if line.strip()]
+        except OSError:
+            return []
+
+    def _maybe_run_startup_check(
+        self, snapshot: Dict[str, Any], now_mono: Optional[float]
+    ) -> None:
+        """Once, after the grace period: did this peer bring up what it promised?
+
+        Written as a verdict at a defined moment rather than left implicit in a
+        table that is refreshed every two seconds. `status.json` already carried
+        the evidence on 2026-08-13 -- 13 stages STALLED, `clock_sync: null` --
+        and nobody read it, because nothing said "this is wrong now".
+        """
+        if self._startup_check is not None or self._startup_grace_s <= 0.0:
+            return
+        now = time.monotonic() if now_mono is None else now_mono
+        if now - self._started_mono < self._startup_grace_s:
+            return
+
+        gaps = outbound_startup_gaps(snapshot)
+        mine = [gap for gap in gaps if gap["owner"] == "rosotacom"]
+        theirs = [gap for gap in gaps if gap["owner"] != "rosotacom"]
+        pane_failures = self._read_pane_failures()
+        verdict = "ok" if not mine and not pane_failures else "incomplete"
+        self._startup_check = {
+            "verdict": verdict,
+            "checked_after_s": round(now - self._started_mono, 1),
+            "generated_at": snapshot.get("generated_at"),
+            "peer": snapshot.get("peer"),
+            "missing_outbound_stages": mine,
+            "waiting_for_input": theirs,
+            "pane_failures": pane_failures,
+        }
+        snapshot["startup_check"] = self._startup_check
+        try:
+            self._atomic_write(
+                self._startup_path, json.dumps(self._startup_check, indent=2) + "\n"
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._log is not None:
+                self._log.warning(f"status_overview: failed to write startup check: {exc}")
+        if self._log is None:
+            return
+        if theirs:
+            # Not a defect and deliberately not an error: whether the data source
+            # is publishing is the application's business, not this peer's, and a
+            # stage with no input has nothing to publish.
+            self._log.info(
+                f"status_overview: startup check -- {len(theirs)} outbound topic(s) are "
+                "waiting for input: "
+                + ", ".join(gap["topic"] for gap in theirs[:8])
+                + (" ..." if len(theirs) > 8 else "")
+            )
+        if verdict == "ok":
+            self._log.info(
+                "status_overview: startup check OK -- every stage this peer produces "
+                f"for {snapshot.get('peer')} has a publisher"
+            )
+            return
+        self._log.error(
+            f"status_overview: STARTUP CHECK FAILED for peer {snapshot.get('peer')} "
+            f"after {self._startup_check['checked_after_s']}s -- "
+            f"{len(mine)} stage(s) this peer produces have no publisher, "
+            f"{len(pane_failures)} pane(s) exited. See {self._startup_path}"
+        )
+        for gap in mine:
+            self._log.error(
+                f"status_overview:   no publisher on {gap['topic']} "
+                f"(stage {gap['stage']}, produced_by {gap['produced_by']})"
+            )
+        for line in pane_failures:
+            self._log.error(f"status_overview:   pane exited: {line}")
+
     def write(self, now_mono: Optional[float] = None) -> int:
         """Build a snapshot, write artifacts, and return number of transition events."""
         link_sample = None
@@ -972,6 +1219,7 @@ class StatusAggregator:
                 if self._log is not None:
                     self._log.warning(f"status_overview: link sampling failed: {exc}")
         snapshot = self.build_snapshot(now_mono, link_sample=link_sample)
+        self._maybe_run_startup_check(snapshot, now_mono)
         if self._link_trace_recorder is not None:
             try:
                 self._link_trace_recorder.maybe_write(snapshot, link_sample)

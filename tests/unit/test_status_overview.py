@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -219,7 +220,7 @@ def _outbound_spec() -> dict:
                 "type": "com_msgs/msg/EchoHeartbeat",
                 "expected_hz": None,
                 "stages": [
-                    {"stage": "native", "topic": "/heartbeat_a", "domain": "local", "produced_by": "application"},
+                    {"stage": "native", "topic": "/heartbeat_a", "domain": "local", "produced_by": "heartbeat_echo"},
                     {
                         "stage": "com_out",
                         "topic": "/com/out/a/heartbeat_a",
@@ -929,6 +930,55 @@ def test_sequence_zero_starts_new_epoch_after_publisher_restart() -> None:
     metrics = obs.metrics(4.0, 10.0)
     assert metrics["reordered"] == 0
     assert metrics["loss_pct"] == 0.0
+    assert metrics["epoch"] == 1
+    assert metrics["epoch_resets"] == 1
+
+
+def test_restart_is_recognised_when_seq_zero_never_arrives() -> None:
+    """The field case: the reader matches after the first tens of messages.
+
+    ``/can/twist`` on 2026-08-13 restarted at seq 28983 and the first arrival of
+    the new run carried seq 37. Under the seq==0 rule that was `reordered`, and
+    so was every message for the remaining 105 minutes of the instance.
+    """
+    obs = core.StageObservation()
+    obs.record(1, None, now_mono=1.0, seq=28982)
+    obs.record(1, None, now_mono=2.0, seq=28983)
+    obs.record(1, None, now_mono=110.0, seq=37)
+    obs.record(1, None, now_mono=110.1, seq=38)
+
+    metrics = obs.metrics(111.0, 200.0)
+    assert metrics["reordered"] == 0
+    assert metrics["epoch_resets"] == 1
+    assert metrics["loss_pct"] == 0.0
+
+
+def test_a_small_backward_jump_is_still_reordering() -> None:
+    """Restart detection must not swallow the reordering it exists next to."""
+    obs = core.StageObservation()
+    obs.record(1, None, now_mono=1.0, seq=1000)
+    obs.record(1, None, now_mono=2.0, seq=1002)
+    obs.record(1, None, now_mono=2.1, seq=1001)
+
+    metrics = obs.metrics(3.0, 10.0)
+    assert metrics["reordered"] == 1
+    assert metrics["epoch_resets"] == 0
+
+
+def test_transit_records_carry_the_epoch_they_were_counted_in() -> None:
+    obs = core.StageObservation(type_str="com_msgs/msg/OtaStamped")
+    transit = {
+        "topic": "/wrapped",
+        "direction": "inbound",
+        "stage": "com_in",
+        "t_wrap": 1.01,
+        "t_com_in": 1.05,
+    }
+    obs.record(100, 0.04, now_mono=10.0, now_wall=1.05, seq=5000, transit=transit)
+    obs.record(100, 0.04, now_mono=200.0, now_wall=2.05, seq=40, transit=transit)
+
+    records = obs.drain_transit_records()
+    assert [(record["seq"], record["epoch"]) for record in records] == [(5000, 0), (40, 1)]
 
 
 def test_loss_expect_classifies_wrapped_stage_bad(tmp_path: Path) -> None:
@@ -947,3 +997,241 @@ def test_metric_stage_bag_is_generated_from_local_pipeline(tmp_path: Path) -> No
     plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
     assert "metric_stage_bag: true" in plugin
     assert "metric_stage_topics: /heartbeat_a,/com/out/a/heartbeat_a" in plugin
+
+
+# ---------------------------------------------------------------------------
+# Startup check (#266): a peer that did not bring up its own publishers
+# ---------------------------------------------------------------------------
+
+
+def _startup_aggregator(observers: dict, output_dir: Path, *, started_mono: float) -> core.StatusAggregator:
+    return core.StatusAggregator(
+        logger=None,
+        spec=_outbound_spec(),
+        output_dir=str(output_dir / "status"),
+        observers_by_domain=observers,
+        liveness_window_s=3.0,
+        stale_after_s=3.0,
+        startup_grace_s=20.0,
+        started_mono=started_mono,
+    )
+
+
+def test_no_startup_verdict_before_the_grace_period(tmp_path: Path) -> None:
+    """Nothing publishes yet at t+5s, and that is not news."""
+    agg = _startup_aggregator({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=5.0)
+
+    assert json.loads((tmp_path / "status" / "status.json").read_text())["startup_check"] is None
+    assert not (tmp_path / "status" / "startup_check.json").exists()
+
+
+def test_a_peer_that_publishes_nothing_fails_its_startup_check(tmp_path: Path) -> None:
+    """The 2026-08-13 centre: heartbeat_echo died, so /heartbeat_a never existed."""
+    agg = _startup_aggregator({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=25.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["verdict"] == "incomplete"
+    assert verdict["checked_after_s"] == 25.0
+    # Only the first break, not the cascade behind it.
+    assert [gap["topic"] for gap in verdict["missing_outbound_stages"]] == ["/heartbeat_a"]
+    assert verdict["missing_outbound_stages"][0]["produced_by"] == "heartbeat_echo"
+    assert "STARTUP CHECK FAILED" in (tmp_path / "status" / "status.txt").read_text()
+
+
+def test_a_healthy_peer_passes_its_startup_check(tmp_path: Path) -> None:
+    local = _FakeObserver()
+    local.observations = {
+        "/heartbeat_a": _obs(pub=1, last_msg_at=24.9),
+        "/com/out/a/heartbeat_a": _obs(pub=1, last_msg_at=24.9),
+    }
+    ota = _FakeObserver()
+    ota.observations = {"/ota/a/heartbeat_a": _obs(pub=1, last_msg_at=24.9, graph_only=True)}
+    agg = _startup_aggregator({"local": local, "ota": ota}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=25.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["verdict"] == "ok"
+    assert verdict["missing_outbound_stages"] == []
+    assert "STARTUP CHECK FAILED" not in (tmp_path / "status" / "status.txt").read_text()
+
+
+def test_the_verdict_quotes_the_panes_that_exited(tmp_path: Path) -> None:
+    """A dead pane and a missing publisher are the same fact seen twice."""
+    local = _FakeObserver()
+    local.observations = {
+        "/heartbeat_a": _obs(pub=1, last_msg_at=24.9),
+        "/com/out/a/heartbeat_a": _obs(pub=1, last_msg_at=24.9),
+    }
+    ota = _FakeObserver()
+    ota.observations = {"/ota/a/heartbeat_a": _obs(pub=1, last_msg_at=24.9, graph_only=True)}
+    (tmp_path / "pane_failures.log").write_text(
+        "2026-08-13T14:49:50+02:00\tpane=05-BEAT/0\texit=1\tcommand=ros2 run com_py heartbeat_echo\n",
+        encoding="utf-8",
+    )
+    agg = _startup_aggregator({"local": local, "ota": ota}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=25.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["verdict"] == "incomplete"
+    assert verdict["pane_failures"] == [
+        "2026-08-13T14:49:50+02:00\tpane=05-BEAT/0\texit=1\tcommand=ros2 run com_py heartbeat_echo"
+    ]
+
+
+def test_the_verdict_is_computed_once(tmp_path: Path) -> None:
+    agg = _startup_aggregator({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=25.0)
+    agg.write(now_mono=99.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["checked_after_s"] == 25.0
+
+
+def test_inbound_gaps_are_not_this_peers_startup_problem() -> None:
+    snapshot = {
+        "topics": [
+            {
+                "base": "/camera",
+                "direction": "inbound",
+                "stages": [{"stage": "ota_recv", "topic": "/ota/b/camera", "state": core.ABSENT}],
+            }
+        ]
+    }
+    assert core.outbound_startup_gaps(snapshot) == []
+
+
+def _application_spec() -> dict:
+    """An outbound topic whose publisher is the user's application, not ours."""
+    spec = _outbound_spec()
+    topic = spec["topics"][0]
+    topic["base"] = "/costmap"
+    topic["stages"] = [
+        {"stage": "native", "topic": "/costmap", "domain": "local", "produced_by": "application"},
+        {"stage": "com_out", "topic": "/com/out/a/costmap", "domain": "local", "produced_by": "relay_out"},
+        {"stage": "ota_sent", "topic": "/ota/a/costmap", "domain": "ota", "produced_by": "bridge_out"},
+    ]
+    return spec
+
+
+def test_an_application_that_is_not_publishing_is_not_a_peer_failure(tmp_path: Path) -> None:
+    """A smoke run exercises the peers without the data source, and that is fine.
+
+    The session declares the topic; whether the AD stack (or a replay) is
+    publishing right now is not something this peer promised. Reporting it as a
+    peer defect would make the verdict fire on every partial run, which is how a
+    check stops being read.
+    """
+    agg = core.StatusAggregator(
+        logger=None,
+        spec=_application_spec(),
+        output_dir=str(tmp_path / "status"),
+        observers_by_domain={"local": _FakeObserver(), "ota": _FakeObserver()},
+        liveness_window_s=3.0,
+        stale_after_s=3.0,
+        startup_grace_s=20.0,
+        started_mono=0.0,
+    )
+
+    agg.write(now_mono=25.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["verdict"] == "ok"
+    assert verdict["missing_outbound_stages"] == []
+    assert [gap["topic"] for gap in verdict["waiting_for_input"]] == ["/costmap"]
+    assert "STARTUP CHECK FAILED" not in (tmp_path / "status" / "status.txt").read_text()
+
+
+def test_only_the_first_break_of_a_topic_is_reported() -> None:
+    """A cascade is one finding: relay_out is running, it just has no input."""
+    snapshot = {
+        "topics": [
+            {
+                "base": "/x",
+                "direction": "outbound",
+                "stages": [
+                    {"stage": "native", "topic": "/x", "state": core.FLOWING, "produced_by": "application"},
+                    {"stage": "com_out", "topic": "/com/out/a/x", "state": core.ABSENT, "produced_by": "relay_out"},
+                    {"stage": "ota_sent", "topic": "/ota/a/x", "state": core.ABSENT, "produced_by": "bridge_out"},
+                ],
+            }
+        ]
+    }
+
+    gaps = core.outbound_startup_gaps(snapshot)
+
+    assert [(gap["stage"], gap["owner"]) for gap in gaps] == [("com_out", "rosotacom")]
+
+
+def test_the_heartbeat_native_stage_is_owned_by_rosotacom(tmp_path: Path) -> None:
+    """The generator must mark it, or the startup check blames the application."""
+    _generate(_heartbeat_cfg(), tmp_path)
+
+    spec = yaml.safe_load((tmp_path / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
+    outbound = next(t for t in spec["topics"] if t["direction"] == "outbound" and t["base"] == "/heartbeat_a")
+    native = next(s for s in outbound["stages"] if s["stage"] == "native")
+    assert native["produced_by"] == "heartbeat_echo"
+
+
+def test_a_stage_with_no_input_yet_is_waiting_not_broken() -> None:
+    """`5_sized_payload`: the wrapper's publisher appears when its input does.
+
+    `universal_ota_wrapper` creates `…/ota_stamped` on discovering the topic it
+    wraps, so before anything publishes `/size_test_a` the absence is the order
+    of events, not a defect. Calling it one made the check fire on a smoke that
+    starts its payload publisher after the peers — which is how a check stops
+    being read.
+    """
+    snapshot = {
+        "topics": [
+            {
+                "base": "/size_test_a",
+                "direction": "outbound",
+                "stages": [
+                    {"stage": "native", "topic": "/size_test_a", "state": core.IDLE, "produced_by": "application"},
+                    {
+                        "stage": "processed",
+                        "topic": "/size_test_a/ota_stamped",
+                        "state": core.ABSENT,
+                        "produced_by": "preprocessing",
+                    },
+                ],
+            }
+        ]
+    }
+
+    (gap,) = core.outbound_startup_gaps(snapshot)
+
+    assert gap["owner"] == "upstream"
+    assert "nothing has arrived on /size_test_a" in gap["reason"]
+
+
+def test_a_stage_whose_input_is_flowing_and_publishes_nothing_is_broken() -> None:
+    snapshot = {
+        "topics": [
+            {
+                "base": "/size_test_a",
+                "direction": "outbound",
+                "stages": [
+                    {"stage": "native", "topic": "/size_test_a", "state": core.FLOWING, "produced_by": "application"},
+                    {
+                        "stage": "processed",
+                        "topic": "/size_test_a/ota_stamped",
+                        "state": core.ABSENT,
+                        "produced_by": "preprocessing",
+                    },
+                ],
+            }
+        ]
+    }
+
+    (gap,) = core.outbound_startup_gaps(snapshot)
+
+    assert gap["owner"] == "rosotacom"
+    assert gap["reason"] == "preprocessing did not come up"

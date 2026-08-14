@@ -52,6 +52,50 @@ fi
 tmux pipe-pane -o -t "${TMUX_PANE}" \
   "${__rosotacom_pipe_filter} >> '${__rosotacom_pane_log_file//\'/\'\\\'\'}'"
 
+# --- a pane whose command dies must say so -----------------------------------
+#
+# A pane log is only read by somebody who already suspects the pane. On
+# 2026-08-13 the centre's `heartbeat_echo` and one `topic_monitor` exited two
+# seconds after start (Cyclone had no free participant index left on domain 46),
+# catmux left both panes at a shell prompt, and the session ran for two hours
+# with no heartbeat publisher. Nothing anywhere said so: `docker ps` showed a
+# healthy container, the other panes worked, and the far side blamed the link.
+#
+# So every non-zero exit of a pane command is appended to one file per peer,
+# which the status overview's startup check reads and quotes. 130 (Ctrl-C) is
+# excluded: that is an operator stopping a pane on purpose.
+ROSOTACOM_PANE_FAILURE_LOG="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR}")/pane_failures.log"
+ROSOTACOM_PANE_LABEL="${__rosotacom_window_prefix}-${__rosotacom_window_safe}/${__rosotacom_pane}"
+export ROSOTACOM_PANE_FAILURE_LOG ROSOTACOM_PANE_LABEL
+
+__rosotacom_note_exit() {
+  local __status=$?
+  if [ "${__status}" -ne 0 ] && [ "${__status}" -ne 130 ]; then
+    local __cmd
+    __cmd="$(HISTTIMEFORMAT='' builtin history 1 2>/dev/null | sed 's/^[[:space:]]*[0-9]*[[:space:]]*//')"
+    printf '%s\tpane=%s\texit=%s\tcommand=%s\n' \
+      "$(date -Iseconds)" "${ROSOTACOM_PANE_LABEL}" "${__status}" "${__cmd}" \
+      >> "${ROSOTACOM_PANE_FAILURE_LOG}" 2>/dev/null
+    printf '\n[rosotacom] pane %s: command exited %s -- this pane is no longer doing its job.\n' \
+      "${ROSOTACOM_PANE_LABEL}" "${__status}" >&2
+    printf '[rosotacom] recorded in %s\n\n' "${ROSOTACOM_PANE_FAILURE_LOG}" >&2
+  fi
+  return "${__status}"
+}
+
+case "$-" in
+  *i*)
+    # Deliberately not exported: a child shell would inherit the hook without
+    # the function and complain at every prompt.
+    if [[ ";${PROMPT_COMMAND:-};" != *";__rosotacom_note_exit;"* ]]; then
+      PROMPT_COMMAND="__rosotacom_note_exit;${PROMPT_COMMAND:+${PROMPT_COMMAND}}"
+    fi
+    ;;
+  *)
+    echo "[rosotacom_catmux_log] non-interactive shell; pane-exit reporting disabled" >&2
+    ;;
+esac
+
 {
   printf '\n--- rosotacom catmux pipe-pane started %s ---\n' "$(date -Iseconds)"
   printf '    window=%s (#%s) pane=%s\n' \

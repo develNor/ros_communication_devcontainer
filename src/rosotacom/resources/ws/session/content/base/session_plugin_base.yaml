@@ -62,6 +62,9 @@ parameters:
   status_write_interval_s: 2.0
   status_liveness_window_s: 3.0
   status_stale_after_s: 3.0
+  # One-shot verdict N seconds after start: does every outbound stage this peer
+  # promises actually have a publisher, and did any pane exit? 0 disables it.
+  status_startup_grace_s: 20.0
   link_trace: false
   link_trace_interval_s: 1.0
   link_trace_modem_command: ""
@@ -330,12 +333,16 @@ windows:
   - name: TM
     if: topic_monitor
     splits:
+      # No `interface=` line: the node resolves the OTA interface from ip_local
+      # itself (com_py.link_bytes.find_interface_for_ip), exactly as the STAT
+      # window's status_overview does. The line that used to stand here expanded
+      # a catmux parameter with bash substring-replace syntax, which catmux does
+      # not substitute -- so it resolved `lo` on every machine and reported this
+      # host's own ROS traffic as link bandwidth (#267).
       - commands:
-        - interface=$(ip -o addr | awk '/'${ip_local//./\\.}'\/[0-9]+/ {print $2; exit}')
-        - ros2 run com_py topic_monitor --ros-args -p sourcename:=${remote_name} -p direction:=in -p to_adressant:='${tm_in_to_adressant}' -p ip_local:=${ip_local} -p ip_remote:=${ip_remote} -p interface:=${interface} -p link_duration_buffer_s:=${tm_link_duration_buffer_s}
+        - ros2 run com_py topic_monitor --ros-args -p sourcename:=${remote_name} -p direction:=in -p to_adressant:='${tm_in_to_adressant}' -p ip_local:=${ip_local} -p ip_remote:=${ip_remote} -p link_duration_buffer_s:=${tm_link_duration_buffer_s}
       - commands:
-        - interface=$(ip -o addr | awk '/'${ip_local//./\\.}'\/[0-9]+/ {print $2; exit}')
-        - ros2 run com_py topic_monitor --ros-args -p sourcename:=${local_name} -p direction:=out -p to_adressant:='${tm_out_to_adressant}' -p ip_local:=${ip_local} -p ip_remote:=${ip_remote} -p interface:=${interface} -p link_duration_buffer_s:=${tm_link_duration_buffer_s}
+        - ros2 run com_py topic_monitor --ros-args -p sourcename:=${local_name} -p direction:=out -p to_adressant:='${tm_out_to_adressant}' -p ip_local:=${ip_local} -p ip_remote:=${ip_remote} -p link_duration_buffer_s:=${tm_link_duration_buffer_s}
   - name: STAT
     if: status_overview
     layout: even-vertical
@@ -352,6 +359,7 @@ windows:
             -p write_interval_s:=${status_write_interval_s}
             -p liveness_window_s:=${status_liveness_window_s}
             -p stale_after_s:=${status_stale_after_s}
+            -p startup_grace_s:=${status_startup_grace_s}
             -p ota_local_ip:=${ip_local}
             -p link_trace:=${link_trace}
             -p link_trace_interval_s:=${link_trace_interval_s}
@@ -360,12 +368,15 @@ windows:
       - commands:
         - status_out_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/status"
         - status_txt="$status_out_dir/status.txt"
-        - 'while true; do clear; echo "[INFO] watching status overview file: $status_txt"; if [ -f "$status_txt" ]; then cat "$status_txt"; else echo "[INFO] waiting for status_overview to write status.txt"; fi; sleep "${status_write_interval_s:-2.0}"; done'
+        - 'while true; do clear; echo "[INFO] watching status overview file: $status_txt"; if [ -f "$status_txt" ]; then cat "$status_txt"; else echo "[INFO] waiting for status_overview to write status.txt"; fi; sleep "${status_write_interval_s}"; done'
   - name: NET
     if: network_monitor
     splits:
       - commands:
-        - interface=$(ip -o addr | awk '/'${ip_local//./\\.}'\/[0-9]+/ {print $2; exit}')
+        # Exact match on the address column, with the address passed in through
+        # awk -v: no shell pattern expansion, so nothing here depends on catmux
+        # substituting a form it does not know (#267).
+        - interface=$(ip -o -4 addr show | awk -v ip='${ip_local}' '{split($4, a, "/"); if (a[1] == ip) {print $2; exit}}')
         - sudo iftop -i "$interface" -f "host ${ip_local} and host ${ip_remote}"
   - name: METRIC_BAG
     if: metric_stage_bag

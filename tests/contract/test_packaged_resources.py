@@ -38,6 +38,7 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
         "resources/ws/session/creation/catmux_log_setup.sh",
         "resources/ws/session/creation/strip_ansi.py",
         "resources/ws/ota_configs/cyclonedds_tuned.xml.template",
+        "resources/ws/ota_configs/cyclonedds_local_participants.xml.template",
         "resources/ws/ota_configs/fastdds_unicast.xml.template",
         "resources/ws/ros2src/com_msgs/msg/EchoHeartbeat.msg",
     )

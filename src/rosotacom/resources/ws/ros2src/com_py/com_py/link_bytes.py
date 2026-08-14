@@ -78,6 +78,19 @@ def parse_ip_addr_for_ip(text: str, ip: str) -> Optional[str]:
     return None
 
 
+#: Interface names that carry intra-host traffic only. Sampling one of these and
+#: calling the result "link bandwidth" is the failure of issue #267: the number
+#: is real, it is just not the link. On a machine that also runs a `-a` recorder
+#: it reads ~28 Gbit/s next to a 6 Mbit/s OTA link.
+LOOPBACK_INTERFACES = frozenset({"lo", "lo0"})
+
+
+def is_loopback_address(ip: str) -> bool:
+    """Is ``ip`` a loopback address (so a loopback interface would be correct)?"""
+    ip = (ip or "").strip()
+    return ip.startswith("127.") or ip in {"::1", "0:0:0:0:0:0:0:1"}
+
+
 def find_interface_for_ip(ip: str) -> Optional[str]:
     """The interface owning ``ip``, via `ip -o addr show` (None if not found)."""
     if not ip:
@@ -89,6 +102,40 @@ def find_interface_for_ip(ip: str) -> Optional[str]:
     except (OSError, subprocess.SubprocessError):
         return None
     return parse_ip_addr_for_ip(out, ip)
+
+
+def resolve_link_interface(
+    explicit: str,
+    host_ip: str,
+    finder=find_interface_for_ip,
+) -> Tuple[str, str]:
+    """The OTA link interface and where it came from, or raise.
+
+    ``explicit`` wins when given; otherwise the interface is the one owning
+    ``host_ip`` (the peer's own OTA address). A loopback interface for a
+    non-loopback address is refused rather than reported: loopback carries this
+    host's own ROS traffic, which on a machine running an ``-a`` recorder is
+    three orders of magnitude above the link and looks like a working
+    measurement. That mistake is issue #267; it survived a field session and an
+    offline analysis before anyone doubted the number.
+    """
+    interface = (explicit or "").strip()
+    provenance = "given explicitly"
+    if not interface:
+        interface = (finder(host_ip) or "").strip()
+        provenance = f"resolved from {host_ip}"
+    if not interface:
+        raise ValueError(
+            f"no interface owns the OTA address '{host_ip}'; "
+            "pass ip_local (preferred) or interface"
+        )
+    if interface in LOOPBACK_INTERFACES and not is_loopback_address(host_ip):
+        raise ValueError(
+            f"refusing to report loopback interface '{interface}' as the link for OTA "
+            f"address '{host_ip}' ({provenance}). Loopback carries this host's own ROS "
+            "traffic, not the link."
+        )
+    return interface, provenance
 
 
 def read_iface_counters(iface: str, proc_path: str = PROC_NET_DEV) -> Optional[Tuple[int, int]]:

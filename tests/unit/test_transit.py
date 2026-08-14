@@ -161,3 +161,64 @@ def test_summarize_arrival_spacing_without_timestamps_has_no_bunching_verdict() 
     assert spacing["nominal_period_ms"] is None
     assert spacing["bunched_pct"] is None
     assert spacing["stall_then_bunch_pct"] is None
+
+
+def test_join_keeps_sequence_numbers_from_different_epochs_apart() -> None:
+    """A peer restart replays seq 0..N; the join must not collapse the second run.
+
+    Field shape (2026-08-13): one centre instance outlived four vehicle
+    restarts, and joining on ``(source, topic, seq)`` dropped 123,253 of
+    304,876 raw lines -- silently, and concentrated in the mission window.
+    """
+    before = [{**_record(seq, "delivered", 10.0, t_wrap=float(seq)), "epoch": 0} for seq in range(5)]
+    after = [{**_record(seq, "delivered", 12.0, t_wrap=100.0 + seq), "epoch": 1} for seq in range(5)]
+
+    joined = join_transit_records(before + after)
+
+    assert len(joined) == 10
+    assert [record["epoch"] for record in joined] == [0] * 5 + [1] * 5
+    assert summarize_transit_records(before + after)["topics"]["/x"]["epochs"] == 2
+
+
+def test_records_without_an_epoch_are_one_epoch() -> None:
+    """Instances recorded before the field learned this carry no epoch field."""
+    records = [_record(seq, "delivered", 10.0, t_wrap=float(seq)) for seq in range(3)]
+
+    assert len(join_transit_records(records)) == 3
+    assert summarize_transit_records(records)["topics"]["/x"]["epochs"] == 1
+
+
+def test_lost_records_are_bounded_within_their_own_epoch() -> None:
+    """A post-restart seq must not vouch for a pre-restart seq's loss.
+
+    Both epochs number their messages 0..3. Only epoch 1 publishes inside the
+    window, so only epoch 1's gap may be kept.
+    """
+    epoch0 = [
+        {**_record(0, "delivered", 10.0, t_wrap=1.0), "epoch": 0},
+        {**_record(1, "lost"), "epoch": 0},
+        {**_record(2, "delivered", 10.0, t_wrap=3.0), "epoch": 0},
+    ]
+    epoch1 = [
+        {**_record(0, "delivered", 10.0, t_wrap=101.0), "epoch": 1},
+        {**_record(1, "lost"), "epoch": 1},
+        {**_record(2, "delivered", 10.0, t_wrap=103.0), "epoch": 1},
+    ]
+
+    kept = filter_transit_records_by_publish_window(epoch0 + epoch1, start_s=100.0, end_s=110.0)
+
+    assert [(record["epoch"], record["seq"], record["status"]) for record in kept] == [
+        (1, 0, "delivered"),
+        (1, 1, "lost"),
+        (1, 2, "delivered"),
+    ]
+
+
+def test_nominal_send_period_ignores_the_step_across_a_restart() -> None:
+    """10 Hz before and after a 100 s outage is still a 10 Hz stream."""
+    from rosotacom.transit import _nominal_send_period_ms
+
+    records = [{**_record(seq, "delivered", 5.0, t_wrap=seq * 0.1), "epoch": 0} for seq in range(10)]
+    records += [{**_record(seq, "delivered", 5.0, t_wrap=100.0 + seq * 0.1), "epoch": 1} for seq in range(10)]
+
+    assert _nominal_send_period_ms(records) == 100.0

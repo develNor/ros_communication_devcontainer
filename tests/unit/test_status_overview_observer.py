@@ -117,7 +117,11 @@ def node_module() -> Iterator[ModuleType]:
     _stub_module("rosidl_runtime_py", utilities=None)
     _stub_module("rosidl_runtime_py.utilities", get_message=lambda type_str: None)
     _stub_module("com_py", link_bytes=None)
-    _stub_module("com_py.link_bytes", LinkByteSampler=object, find_interface_for_ip=lambda *a: None)
+    _stub_module(
+        "com_py.link_bytes",
+        LinkByteSampler=object,
+        resolve_link_interface=lambda explicit, host_ip: (explicit or "tun0", "stubbed"),
+    )
     _stub_module("com_py.link_trace", LinkTraceRecorder=object)
     sys.modules["com_py.status_overview_core"] = core
 

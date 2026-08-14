@@ -32,15 +32,34 @@ def load_transit_records(paths: Iterable[Path]) -> list[dict[str, Any]]:
     return records
 
 
+def record_epoch(record: dict[str, Any]) -> int:
+    """Which run of the publishing peer's wrapper produced this record.
+
+    A peer restart resets ``seq`` to zero mid-instance, so ``(source, topic,
+    seq)`` is not unique over an instance that outlived one. Records written
+    before the field learned this carry no ``epoch``; they are all epoch 0,
+    which is what a single-epoch instance produces anyway.
+    """
+    value = record.get("epoch")
+    return 0 if value is None else int(value)
+
+
 def join_transit_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Join duplicate observations by ``(topic, seq)`` and keep the richest row."""
-    joined: dict[tuple[str, str, int], dict[str, Any]] = {}
+    """Join duplicate observations by ``(source, topic, epoch, seq)``.
+
+    Keeps the richest row per key. ``epoch`` is part of the key because it is
+    what makes the key unique: on 2026-08-13 the vehicle restarted four times
+    inside one centre instance, and joining on ``(source, topic, seq)`` alone
+    silently dropped 123,253 of 304,876 raw transit lines -- 40% of the run,
+    concentrated in exactly the mission window the analysis was about.
+    """
+    joined: dict[tuple[str, str, int, int], dict[str, Any]] = {}
     status_rank = {"lost": 0, "reordered": 1, "delivered": 2}
     for record in records:
         topic = str(record.get("topic") or "")
         source = str(record.get("source") or "")
         seq = int(record["seq"])
-        key = (source, topic, seq)
+        key = (source, topic, record_epoch(record), seq)
         current = joined.get(key)
         if current is None:
             joined[key] = dict(record)
@@ -67,19 +86,26 @@ def filter_transit_records_by_publish_window(
 ) -> list[dict[str, Any]]:
     """Keep records whose publish time falls inside a measurement window.
 
-    Lost records do not carry timestamps. For each source/topic/target stream,
-    keep lost sequence records only when they are bounded by delivered/reordered
-    records inside the window. This excludes startup and teardown sequence gaps
-    without hiding losses that happened during the measured interval.
+    Lost records do not carry timestamps. For each source/target/topic/epoch
+    stream, keep lost sequence records only when they are bounded by
+    delivered/reordered records inside the window. This excludes startup and
+    teardown sequence gaps without hiding losses that happened during the
+    measured interval.
+
+    The epoch belongs in the grouping key for the same reason it belongs in the
+    join key: sequence numbers only order messages within one run of the
+    publishing wrapper, so a post-restart seq 40 must not bound a pre-restart
+    seq 40's loss.
     """
     if end_s < start_s:
         raise ValueError("end_s must be >= start_s")
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str, str, int], list[dict[str, Any]]] = {}
     for record in join_transit_records(records):
         key = (
             str(record.get("source") or ""),
             str(record.get("target") or ""),
             str(record.get("topic") or ""),
+            record_epoch(record),
         )
         grouped.setdefault(key, []).append(record)
 
@@ -111,6 +137,7 @@ def filter_transit_records_by_publish_window(
             str(record.get("source") or ""),
             str(record.get("target") or ""),
             str(record.get("topic") or ""),
+            record_epoch(record),
             int(record["seq"]),
         ),
     )
@@ -173,15 +200,24 @@ def _latency_trend_ms(
 
 
 def _nominal_send_period_ms(topic_records: list[dict[str, Any]], *, time_field: str = "t_wrap") -> float | None:
-    """Median publish spacing per sequence step — the send cadence of the stream."""
-    stamped = sorted(
-        (int(record["seq"]), float(record[time_field]))
-        for record in topic_records
-        if record.get(time_field) is not None
-    )
-    periods = [
-        (t1 - t0) / (s1 - s0) for (s0, t0), (s1, t1) in zip(stamped, stamped[1:], strict=False) if s1 > s0 and t1 >= t0
-    ]
+    """Median publish spacing per sequence step — the send cadence of the stream.
+
+    Per epoch: a sequence step only means "one message" inside one run of the
+    publishing wrapper. Across a restart the step is a reset, and dividing the
+    wall-clock gap by it produces a period that describes nothing.
+    """
+    periods: list[float] = []
+    for epoch in {record_epoch(record) for record in topic_records}:
+        stamped = sorted(
+            (int(record["seq"]), float(record[time_field]))
+            for record in topic_records
+            if record.get(time_field) is not None and record_epoch(record) == epoch
+        )
+        periods.extend(
+            (t1 - t0) / (s1 - s0)
+            for (s0, t0), (s1, t1) in zip(stamped, stamped[1:], strict=False)
+            if s1 > s0 and t1 >= t0
+        )
     if not periods:
         return None
     ordered = sorted(periods)
@@ -239,6 +275,10 @@ def summarize_transit_records(records: Iterable[dict[str, Any]]) -> dict[str, An
             "expected": len(topic_records),
             "delivered": delivered,
             "lost": lost,
+            # >1 means the publishing peer restarted inside this instance. Kept
+            # in the summary because it changes how every rate-like number
+            # below should be read, and because it is otherwise invisible.
+            "epochs": len({record_epoch(record) for record in topic_records}),
             "loss_pct": round(100.0 * lost / len(topic_records), 3) if topic_records else 0.0,
             "reordered": reordered,
             "ota_hop_ms": _distribution_ms(ota),

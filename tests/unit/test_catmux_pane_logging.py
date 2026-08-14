@@ -111,3 +111,77 @@ def test_the_hook_is_installed_once_even_if_sourced_twice(pane_env: tuple[Path, 
 
     (line,) = [ln for ln in result.stdout.splitlines() if ln.startswith("PC=")]
     assert line.count("__rosotacom_note_exit") == 1
+
+
+# What the recorder cannot know, and why the session template has to care.
+#
+# The hook runs from PROMPT_COMMAND, so it sees every line a pane shell runs --
+# including the lines that only assemble an argument list before the node
+# starts. A line of the form `[[ cond ]] && args+=(...)` exits 1 whenever the
+# condition is false, which is the normal case for every option a session leaves
+# unset, so each one recorded itself as a dead pane. A peer then reported four
+# exited panes at every start while nothing was wrong.
+
+_UNSET_OPTION = '[[ "None" != "None" ]]'
+_SET_OPTION = '[[ "22" != "None" ]]'
+
+
+def _failure_log(catmux_dir: Path) -> Path:
+    return catmux_dir.parent / "pane_failures.log"
+
+
+def test_the_short_circuit_form_records_a_false_failure(pane_env: tuple[Path, dict[str, str]]) -> None:
+    """The shape that was in the template: correct behaviour, status 1."""
+    catmux_dir, env = pane_env
+
+    _run(f'args=(); {_UNSET_OPTION} && args+=(-p "bit_rate:=None")', env)
+
+    assert _failure_log(catmux_dir).is_file()
+    assert "exit=1" in _failure_log(catmux_dir).read_text(encoding="utf-8")
+
+
+def test_the_if_form_leaves_an_unset_option_silent(pane_env: tuple[Path, dict[str, str]]) -> None:
+    """The shape it was replaced with: same behaviour, status 0."""
+    catmux_dir, env = pane_env
+
+    _run(f'args=(); if {_UNSET_OPTION}; then args+=(-p "bit_rate:=None"); fi', env)
+
+    assert not _failure_log(catmux_dir).exists()
+
+
+def test_the_if_form_still_appends_a_set_option(pane_env: tuple[Path, dict[str, str]]) -> None:
+    """Silencing the status must not silence the argument."""
+    catmux_dir, env = pane_env
+
+    result = _run(
+        f'args=(); if {_SET_OPTION}; then args+=(-p "bit_rate:=22"); fi\necho "ARGS=${{args[*]}}"',
+        env,
+    )
+
+    assert "ARGS=-p bit_rate:=22" in result.stdout
+    assert not _failure_log(catmux_dir).exists()
+
+
+def test_no_session_template_line_uses_the_short_circuit_form() -> None:
+    """The template is where this reaches a running session, so it is checked there."""
+    template = (
+        REPO_ROOT
+        / "src"
+        / "rosotacom"
+        / "resources"
+        / "ws"
+        / "session"
+        / "content"
+        / "base"
+        / "session_plugin_base.yaml"
+    )
+    offenders = [
+        line.strip()
+        for line in template.read_text(encoding="utf-8").splitlines()
+        if line.lstrip().startswith("- '[[") and "&&" in line
+    ]
+
+    assert offenders == [], (
+        "these lines exit non-zero when their option is unset and land in "
+        f"pane_failures.log; use `if ...; then ...; fi`: {offenders}"
+    )

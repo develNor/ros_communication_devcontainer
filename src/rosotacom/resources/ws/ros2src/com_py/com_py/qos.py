@@ -139,7 +139,13 @@ def get_topic_qos(logger, qos_config: dict, topic_name: str, role_name: str):
     Additionally supports a fallback lookup: if no exact match for topic_name exists
     in qos_config['topics'], we look for the most specific configured base topic key
     that matches as a path segment within topic_name (e.g. '/tf' for
-    '/shuttle_ella/tf/restamped'). If such a fallback is used, it is always logged.
+    '/shuttle_ella/tf/restamped'). Such a fallback is logged at debug level: it is
+    the designed path, not a degradation. Every processing stage appends a suffix,
+    so a session that uses framebridge, latching or a transport reaches it for most
+    of its topics, and a definition that declares QoS on the base topic and lets the
+    processed names inherit it is doing exactly what the schema intends. Logged as a
+    warning it was two lines per topic per peer at every start — enough noise around
+    a bring-up to bury an actual fault.
     """
     default = qos_config.get('default', {})
 
@@ -151,7 +157,7 @@ def get_topic_qos(logger, qos_config: dict, topic_name: str, role_name: str):
     if topic_name not in topics_cfg:
         base_match = _find_best_base_topic_match(topics_cfg, topic_name)
         if base_match is not None:
-            logger.warning(
+            logger.debug(
                 f"[dds_qos] No exact QoS match for topic='{topic_name}'. "
                 f"Falling back to base topic='{base_match}'."
             )

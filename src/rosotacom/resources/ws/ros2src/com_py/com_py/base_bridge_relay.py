@@ -61,8 +61,8 @@ class BaseBridgeRelay(Node, PairRefreshMixin):
         self.qos_config_file = self.declare_parameter('qos_config_file', '').value
 
         # Optional parameters with defaults
-        self.source_names = self.declare_parameter('source_names', rclpy.Parameter.Type.STRING_ARRAY).value or []
-        self.target_names = self.declare_parameter('target_names', rclpy.Parameter.Type.STRING_ARRAY).value or []
+        self.source_names = self.declare_optional_string_array('source_names')
+        self.target_names = self.declare_optional_string_array('target_names')
 
         # Derived classes can declare additional parameters here (must happen before initialize_node()).
         self.declare_additional_parameters()
@@ -72,6 +72,36 @@ class BaseBridgeRelay(Node, PairRefreshMixin):
 
         # Create timer for periodic refresh of invalid pairs
         self.init_pair_refresh(period_s=5.0, log_prefix=self.node_role)
+
+    def declare_optional_string_array(self, name: str) -> list:
+        """Declare an optional STRING_ARRAY that reads as [] rather than as unset.
+
+        Declaring a type without a value leaves the parameter
+        PARAMETER_NOT_SET. This node never notices — it reads the value once,
+        here, and an unset parameter simply yields None. Everything *else*
+        notices: reading a not-set parameter raises, and rclpy's parameter
+        service logs one warning per read against this node,
+
+            [WARN] [ota_relay_out]: Failed to get parameters: The parameter
+            'source_names' is not initialized: source_names
+
+        which anything that enumerates parameters then produces on a timer. A
+        Foxglove bridge with a parameter panel open put 107 of those lines into
+        a single pane in one session — the kind of noise that hides the message
+        somebody actually needs to see.
+
+        A plain default cannot express this: `declare_parameter(name, [])`
+        infers the type from the value, and an empty list satisfies the
+        BYTE_ARRAY test first (`all(...)` is true for an empty sequence). The
+        parameter would be typed BYTE_ARRAY and the real string array refused
+        later with "Wrong parameter type, expected '5' got '9'". Declaring the
+        type and then setting the empty value keeps it STRING_ARRAY, so a wrong
+        type is still rejected and an override still wins.
+        """
+        self.declare_parameter(name, rclpy.Parameter.Type.STRING_ARRAY)
+        if self.get_parameter_or(name).type_ == rclpy.Parameter.Type.NOT_SET:
+            self.set_parameters([rclpy.Parameter(name, rclpy.Parameter.Type.STRING_ARRAY, [])])
+        return self.get_parameter(name).value
 
     def initialize_node(self):
         """Initialize node with resolved topics and QoS configuration."""

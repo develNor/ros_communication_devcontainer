@@ -175,6 +175,44 @@ def stamp_delay(raw_delay_s: float, clock_offset_s: Optional[float] = None) -> O
     return None
 
 
+#: How far back a sequence number may jump and still be called reordering.
+#: `universal_ota_wrapper` counts per topic from zero and increments by one, so
+#: a receiver sees a backward jump only when the wire reordered a message or
+#: when the publishing peer restarted. Reordering is bounded by the transport's
+#: history depth (single digits for the QoS this stack uses); a restart lands
+#: thousands of sequence numbers back. 64 sits between the two by two orders of
+#: magnitude on both sides.
+SEQUENCE_REORDER_TOLERANCE = 64
+
+
+def is_sequence_epoch_reset(
+    seq: int,
+    expected_next_seq: Optional[int],
+    tolerance: int = SEQUENCE_REORDER_TOLERANCE,
+) -> bool:
+    """Does ``seq`` begin a new sequence epoch (the peer's wrapper restarted)?
+
+    Zero is unambiguous and was the only case handled before. It is also the
+    case that almost never arrives: DDS discovery takes long enough that the
+    first tens of messages of a fresh publisher are written before the reader
+    has matched. In the 2026-08-13 field instance the peer restarted four times
+    and the first arrival after each restart carried seq 37, 39, 39 and 41 --
+    never 0. Every one of them was therefore counted as `reordered`, and
+    because the baseline was never reset, so was every message after it: 26,453
+    of 55,437 transits on one 10 Hz topic, for the rest of the instance.
+
+    So a large backward jump counts as a restart too. It is corroborated by an
+    arrival gap (105 s, 32 s, 44 s and 195 s in that instance), but the gap is
+    not required: a fast restart is still a restart, and the jump alone already
+    separates the two causes by orders of magnitude.
+    """
+    if expected_next_seq is None or seq >= expected_next_seq:
+        return False
+    if seq == 0:
+        return True
+    return (expected_next_seq - seq) > tolerance
+
+
 # --- Link overhead (session-level) -----------------------------------------
 
 def _payload_kbps(stage: Optional[Dict[str, Any]]) -> float:
@@ -258,6 +296,8 @@ class StageObservation:
     expected_next_seq: Optional[int] = None
     last_seq: Optional[int] = None
     tracks_sequence: bool = False
+    epoch: int = 0
+    epoch_resets: int = 0
     total_expected: int = 0
     total_missing: int = 0
     total_reordered: int = 0
@@ -302,11 +342,15 @@ class StageObservation:
                 if self.expected_next_seq is None:
                     expected_delta = 1
                     self.expected_next_seq = seq + 1
-                elif seq == 0 and self.expected_next_seq > 1:
-                    # A publisher restart begins a new sequence epoch. Without
-                    # an explicit boot id, zero is the only unambiguous reset.
+                elif is_sequence_epoch_reset(seq, self.expected_next_seq):
+                    # A publisher restart begins a new sequence epoch: the
+                    # wrapper counts from zero again. See
+                    # `is_sequence_epoch_reset` for why the first arrival after
+                    # a restart is almost never seq 0, and what that cost.
+                    self.epoch += 1
+                    self.epoch_resets += 1
                     expected_delta = 1
-                    self.expected_next_seq = 1
+                    self.expected_next_seq = seq + 1
                 elif seq >= self.expected_next_seq:
                     missing = seq - self.expected_next_seq
                     missing_start = self.expected_next_seq if missing else None
@@ -331,6 +375,10 @@ class StageObservation:
                     "topic": transit.get("topic"),
                     "direction": transit.get("direction"),
                     "stage": transit.get("stage"),
+                    # Which run of the peer's wrapper produced this sequence
+                    # number. Without it the offline join collapses seq 0..N of
+                    # every epoch after the first onto the first epoch's rows.
+                    "epoch": self.epoch,
                 }
                 if missing_start is not None:
                     for missing_seq in range(missing_start, int(seq)):
@@ -421,6 +469,8 @@ class StageObservation:
             total_missing = self.total_missing
             total_reordered = self.total_reordered
             total_max_burst = self.max_burst_missing
+            epoch = self.epoch
+            epoch_resets = self.epoch_resets
         hz = count / window_s if window_s > 0 else 0.0
         mean_size = (total_bytes / count) if count > 0 else 0.0
         age = (now_mono - last_recv_mono) if last_recv_mono is not None else None
@@ -441,6 +491,8 @@ class StageObservation:
             "loss_total_pct": _pct(total_missing, total_expected) if tracks_sequence else None,
             "reordered_total": total_reordered if tracks_sequence else None,
             "max_burst_missing_total": total_max_burst if tracks_sequence else None,
+            "epoch": epoch if tracks_sequence else None,
+            "epoch_resets": epoch_resets if tracks_sequence else None,
         }
 
     def drain_transit_records(self) -> List[Dict[str, Any]]:
@@ -516,6 +568,8 @@ class StatusAggregator:
             "reordered_total": None,
             "max_burst_missing": None,
             "max_burst_missing_total": None,
+            "epoch": None,
+            "epoch_resets": None,
             "age_s": None,
             "last_message_wall": None,
             "messages_total": 0,
@@ -551,6 +605,8 @@ class StatusAggregator:
             "reordered_total",
             "max_burst_missing",
             "max_burst_missing_total",
+            "epoch",
+            "epoch_resets",
         ):
             result[key] = m[key]
         if m["last_recv_wall"] is not None:
@@ -589,6 +645,8 @@ class StatusAggregator:
             "reordered_total",
             "max_burst_missing",
             "max_burst_missing_total",
+            "epoch",
+            "epoch_resets",
             "age_s",
             "last_message_wall",
             "messages_total",

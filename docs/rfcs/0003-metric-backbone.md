@@ -46,7 +46,8 @@ It **feeds** the existing verdict layer (unlocks `expect.loss_pct`; sharpens
 Every metric on the wishlist is a projection of one recorded object per message:
 
 ```
-(topic, seq):
+(topic, epoch, seq):
+  epoch       (receiver-derived)  — which run of the sender's wrapper this seq belongs to
   t_wrap      (sender clock)     — OtaStamped.header.stamp
   t_com_in    (receiver clock)   — arrival immediately after bridge_in
   status      — delivered | lost | reordered                        [from seq gap]
@@ -54,6 +55,21 @@ Every metric on the wishlist is a projection of one recorded object per message:
     ota_hop   = (t_com_in + θ) − t_wrap          (θ = sender/peer − receiver/local)
   inter_arrival / jitter         — receiver-local regularity
 ```
+
+**Why `epoch` is part of the key.** `universal_ota_wrapper` counts per topic
+from zero, so a peer that restarts inside an instance replays sequence numbers
+the receiver has already seen. The receiver detects the restart from the
+sequence stream itself (a backward jump larger than any reordering the
+transport can produce — `is_sequence_epoch_reset`) and counts epochs from 0.
+Without it, two things break at once and neither announces itself: live
+accounting calls every arrival after the restart `reordered`, and the offline
+join collapses the second run onto the first. On the 2026-08-13 field instance
+that was 124,572 of 304,876 records misclassified and 123,253 dropped from the
+joined output — 40% of the run, concentrated in the mission window.
+
+Epochs are receiver-local numbering, not an identifier the peers agree on:
+each side counts the restarts it observes on its own inbound stream. That is
+enough for both consumers, because both key within one receiver's records.
 
 The envelope carries only what the cross-host **OTA hop** needs (`t_wrap` +
 `seq`). Local / per-stage latency — including the message's pre-OTA pipeline cost —
@@ -210,6 +226,11 @@ in-order.
   restamp/latch/drop/throttle/pixel/frame transforms before compression and
   wrapping. Therefore `com_in` sequence gaps exclude intended pre-wrap shaping
   and measure failure after the wrap point.
+- **A restart costs the epoch's head, not the run.** The receiver cannot know
+  how many messages the peer published before DDS discovery matched the reader,
+  so the messages before the first arrival of a new epoch are not counted as
+  lost. In the 2026-08-13 instance that head was 37 to 41 messages per restart.
+  Counting them would report a loss the link never caused.
 - **`θ` drifts.** Re-estimate continuously; fine for short runs, relevant for
   hour-long sessions.
 - **Head-of-line blocking is the real failure mode.** Field data: a heavy message
@@ -275,9 +296,18 @@ PR; the e2e row runs in the single-machine smoke matrix (`just test-e2e-smoke`);
 the cross-host rows are the operator OTA gate.
 
 - [x] **Sequence loss / reorder / burst / epoch reset** — host:
-  `test_status_overview.py::test_sequence_loss_reorder_and_transit_records` and
-  `::test_sequence_zero_starts_new_epoch_after_publisher_restart`. Live: the e2e
+  `test_status_overview.py::test_sequence_loss_reorder_and_transit_records`,
+  `::test_sequence_zero_starts_new_epoch_after_publisher_restart`,
+  `::test_restart_is_recognised_when_seq_zero_never_arrives` (the field shape:
+  the first arrival of a new epoch is seq 37, not 0),
+  `::test_a_small_backward_jump_is_still_reordering` and
+  `::test_transit_records_carry_the_epoch_they_were_counted_in`. Live: the e2e
   row asserts delivered transit records on a running pipeline.
+- [x] **Epoch-keyed offline join** — host:
+  `test_transit.py::test_join_keeps_sequence_numbers_from_different_epochs_apart`,
+  `::test_records_without_an_epoch_are_one_epoch`,
+  `::test_lost_records_are_bounded_within_their_own_epoch` and
+  `::test_nominal_send_period_ignores_the_step_across_a_restart`.
 - [x] **`expect.loss_pct { max, stage? }` evaluation** — host:
   `test_status_eval.py::test_loss_pct_uses_first_sequence_aware_stage`,
   `::test_loss_pct_exceeded_fails`,

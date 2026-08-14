@@ -929,6 +929,55 @@ def test_sequence_zero_starts_new_epoch_after_publisher_restart() -> None:
     metrics = obs.metrics(4.0, 10.0)
     assert metrics["reordered"] == 0
     assert metrics["loss_pct"] == 0.0
+    assert metrics["epoch"] == 1
+    assert metrics["epoch_resets"] == 1
+
+
+def test_restart_is_recognised_when_seq_zero_never_arrives() -> None:
+    """The field case: the reader matches after the first tens of messages.
+
+    ``/can/twist`` on 2026-08-13 restarted at seq 28983 and the first arrival of
+    the new run carried seq 37. Under the seq==0 rule that was `reordered`, and
+    so was every message for the remaining 105 minutes of the instance.
+    """
+    obs = core.StageObservation()
+    obs.record(1, None, now_mono=1.0, seq=28982)
+    obs.record(1, None, now_mono=2.0, seq=28983)
+    obs.record(1, None, now_mono=110.0, seq=37)
+    obs.record(1, None, now_mono=110.1, seq=38)
+
+    metrics = obs.metrics(111.0, 200.0)
+    assert metrics["reordered"] == 0
+    assert metrics["epoch_resets"] == 1
+    assert metrics["loss_pct"] == 0.0
+
+
+def test_a_small_backward_jump_is_still_reordering() -> None:
+    """Restart detection must not swallow the reordering it exists next to."""
+    obs = core.StageObservation()
+    obs.record(1, None, now_mono=1.0, seq=1000)
+    obs.record(1, None, now_mono=2.0, seq=1002)
+    obs.record(1, None, now_mono=2.1, seq=1001)
+
+    metrics = obs.metrics(3.0, 10.0)
+    assert metrics["reordered"] == 1
+    assert metrics["epoch_resets"] == 0
+
+
+def test_transit_records_carry_the_epoch_they_were_counted_in() -> None:
+    obs = core.StageObservation(type_str="com_msgs/msg/OtaStamped")
+    transit = {
+        "topic": "/wrapped",
+        "direction": "inbound",
+        "stage": "com_in",
+        "t_wrap": 1.01,
+        "t_com_in": 1.05,
+    }
+    obs.record(100, 0.04, now_mono=10.0, now_wall=1.05, seq=5000, transit=transit)
+    obs.record(100, 0.04, now_mono=200.0, now_wall=2.05, seq=40, transit=transit)
+
+    records = obs.drain_transit_records()
+    assert [(record["seq"], record["epoch"]) for record in records] == [(5000, 0), (40, 1)]
 
 
 def test_loss_expect_classifies_wrapped_stage_bad(tmp_path: Path) -> None:

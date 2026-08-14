@@ -13,9 +13,15 @@ A change is complete only if:
 
 ## Compatibility Policy
 
-Preserve documented CLI behavior and the legacy `start_rosotacom` and
-`stop_rosotacom` entry points. Do not add silent aliases for removed behavior
+Preserve documented CLI behavior. Do not add silent aliases for removed behavior
 unless a migration explicitly requires them.
+
+`rosotacom` is the only console script this package installs. The
+`start_rosotacom` / `stop_rosotacom` entry points were the one standing
+exception to rule 6 above; they were removed on 2026-08-14 because they were
+nothing but `rosotacom start` and `rosotacom stop` under a second name, and a
+second name is what makes a stale shim on a machine indistinguishable from a
+live command. `rosotacom doctor` reports one that is still lying around.
 
 ## Testing Policy
 

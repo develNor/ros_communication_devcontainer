@@ -15,12 +15,20 @@ def test_package_version_is_derived_from_scm_metadata() -> None:
     assert '__version__ = "0.1.0"' not in package_init
 
 
-def test_console_scripts_target_package_cli() -> None:
+def test_rosotacom_is_the_only_console_script() -> None:
+    """One installed command, so a shim in ~/.local/bin cannot be mistaken for it.
+
+    `start_rosotacom` / `stop_rosotacom` were removed on 2026-08-14: they were
+    `rosotacom start` / `rosotacom stop` under a second name (see
+    DEVELOPMENT_PRINCIPLES.md, Compatibility Policy). This pins that no second
+    name comes back.
+    """
     pyproject = (PACKAGE_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    scripts = pyproject.split("[project.scripts]", 1)[1].split("\n[", 1)[0]
+    entries = [line.split("=", 1)[0].strip() for line in scripts.splitlines() if "=" in line]
 
     assert 'rosotacom = "rosotacom.cli:main"' in pyproject
-    assert 'start_rosotacom = "rosotacom.cli:start_compat_main"' in pyproject
-    assert 'stop_rosotacom = "rosotacom.cli:stop_compat_main"' in pyproject
+    assert entries == ["rosotacom"], entries
 
 
 def test_videoquality_reader_dependencies_are_packaged() -> None:

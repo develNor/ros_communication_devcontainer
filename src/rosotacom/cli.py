@@ -5676,18 +5676,21 @@ def doctor(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - doctor reports all setup failures.
         line("ERROR", "config", str(exc))
 
-    stale = Path.home() / ".local" / "bin" / "start_rosotacom"
-    if stale.exists() or stale.is_symlink():
-        try:
-            target = stale.resolve(strict=False)
-        except OSError:
-            target = Path(os.readlink(stale))
-        if PROJECT_DIR not in [target, *target.parents]:
-            line("WARN", "legacy start_rosotacom", f"{stale} points to {target}, outside this checkout")
-        else:
-            line("OK", "legacy start_rosotacom", f"{stale} points to this checkout")
+    # `start_rosotacom` / `stop_rosotacom` were entry points of this package until
+    # 2026-08-14; `rosotacom start` and `rosotacom stop` are the command. A shim
+    # left behind keeps dispatching through whichever venv it points at, which is
+    # exactly the stale-install confusion this check used to report — so it is a
+    # leftover to delete now, not a second way to run this.
+    retired = [Path.home() / ".local" / "bin" / name for name in ("start_rosotacom", "stop_rosotacom")]
+    leftovers = [p for p in retired if p.exists() or p.is_symlink()]
+    if leftovers:
+        line(
+            "WARN",
+            "retired entry points",
+            f"{', '.join(str(p) for p in leftovers)} — remove; `rosotacom start` / `rosotacom stop` replaced them",
+        )
     else:
-        line("INFO", "legacy start_rosotacom", "no global legacy symlink found")
+        line("OK", "retired entry points", "no start_rosotacom/stop_rosotacom shim left")
 
     tmux = shutil.which("tmux")
     if tmux:
@@ -9755,14 +9758,6 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - CLI should be concise.
         print(f"rosotacom: error: {exc}", file=sys.stderr)
         return 1
-
-
-def start_compat_main() -> int:
-    return main(["start", *sys.argv[1:]])
-
-
-def stop_compat_main() -> int:
-    return main(["stop", *sys.argv[1:]])
 
 
 if __name__ == "__main__":

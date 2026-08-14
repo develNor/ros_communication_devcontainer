@@ -182,12 +182,35 @@ def stamp_delay(raw_delay_s: float, clock_offset_s: Optional[float] = None) -> O
 STARTUP_GRACE_S = 20.0
 
 
-def outbound_startup_gaps(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Stages this peer promised to publish and did not, once past the grace.
+#: Stage producers rosotacom starts itself, and can therefore promise. The
+#: application that feeds a link is the user's, and a session that declares a
+#: topic says nothing about whether its publisher is running right now -- a
+#: smoke run legitimately exercises the peers without the data source.
+ROSOTACOM_STAGE_PRODUCERS = frozenset({"heartbeat_echo", "preprocessing", "relay_out", "bridge_out"})
 
-    Only outbound topics: every stage of one is produced on this machine, so its
-    absence is this peer's problem. Inbound stages depend on the peer and the
-    link, which the per-topic rollup already diagnoses.
+
+def outbound_startup_gaps(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Where each outbound topic first has no publisher at all, and whose fault it is.
+
+    Only outbound topics: their stages are produced on this machine. Inbound
+    stages depend on the peer and the link, which the per-topic rollup already
+    diagnoses.
+
+    Only the *first* absent stage per topic, because the ones behind it are
+    absent for the trivial reason that nothing reached them, and reporting a
+    cascade as four findings buries the one that matters.
+
+    `owner` is what makes the finding actionable, and it takes three values that
+    look identical in the graph:
+
+    * ``rosotacom`` -- a stage this peer starts itself, whose input is arriving.
+      It had something to forward and forwarded nothing. This is the defect.
+    * ``application`` -- the native stage of a topic the user's application (or a
+      replay) publishes. Not this peer's promise.
+    * ``upstream`` -- a stage this peer starts whose input has not delivered a
+      message yet. Its publisher appears on discovery of the input, so there is
+      nothing wrong: `universal_ota_wrapper` has no `…/ota_stamped` publisher
+      until something publishes the topic it wraps.
 
     This exists because of a failure that produced no error anywhere. On
     2026-08-13 the centre's `heartbeat_echo` and one `topic_monitor` died two
@@ -195,24 +218,44 @@ def outbound_startup_gaps(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
     local domain -- and catmux left both panes sitting at a shell prompt. The
     session ran for two hours with no heartbeat publisher, so the run has no RTT
     and no clock-offset measurement, and the far side reported `status=LOST
-    reason=age hz=0.00` about a peer that was otherwise healthy.
+    reason=age hz=0.00` about a peer that was otherwise healthy. The heartbeat is
+    the one outbound topic rosotacom publishes itself, which is why the
+    generator marks its native stage `heartbeat_echo` rather than `application`.
     """
     gaps: List[Dict[str, Any]] = []
     for topic in snapshot.get("topics", []):
         if topic.get("direction") != "outbound":
             continue
+        upstream: Optional[Dict[str, Any]] = None
         for stage in topic.get("stages", []):
             if stage.get("state") != ABSENT:
+                upstream = stage
                 continue
+            producer = stage.get("produced_by")
+            if producer not in ROSOTACOM_STAGE_PRODUCERS:
+                owner = "application"
+                reason = "the application that publishes this topic is not running"
+            elif upstream is not None and upstream.get("state") not in (FLOWING, STALE):
+                owner = "upstream"
+                reason = (
+                    f"nothing has arrived on {upstream.get('topic')} "
+                    f"(stage {upstream.get('stage')}), so there is nothing to publish yet"
+                )
+            else:
+                owner = "rosotacom"
+                reason = f"{producer} did not come up"
             gaps.append(
                 {
                     "base": topic.get("base"),
                     "stage": stage.get("stage"),
                     "topic": stage.get("topic"),
                     "domain": stage.get("domain"),
-                    "produced_by": stage.get("produced_by"),
+                    "produced_by": producer,
+                    "owner": owner,
+                    "reason": reason,
                 }
             )
+            break
     return gaps
 
 
@@ -1113,14 +1156,17 @@ class StatusAggregator:
             return
 
         gaps = outbound_startup_gaps(snapshot)
+        mine = [gap for gap in gaps if gap["owner"] == "rosotacom"]
+        theirs = [gap for gap in gaps if gap["owner"] != "rosotacom"]
         pane_failures = self._read_pane_failures()
-        verdict = "ok" if not gaps and not pane_failures else "incomplete"
+        verdict = "ok" if not mine and not pane_failures else "incomplete"
         self._startup_check = {
             "verdict": verdict,
             "checked_after_s": round(now - self._started_mono, 1),
             "generated_at": snapshot.get("generated_at"),
             "peer": snapshot.get("peer"),
-            "missing_outbound_stages": gaps,
+            "missing_outbound_stages": mine,
+            "waiting_for_input": theirs,
             "pane_failures": pane_failures,
         }
         snapshot["startup_check"] = self._startup_check
@@ -1133,19 +1179,29 @@ class StatusAggregator:
                 self._log.warning(f"status_overview: failed to write startup check: {exc}")
         if self._log is None:
             return
+        if theirs:
+            # Not a defect and deliberately not an error: whether the data source
+            # is publishing is the application's business, not this peer's, and a
+            # stage with no input has nothing to publish.
+            self._log.info(
+                f"status_overview: startup check -- {len(theirs)} outbound topic(s) are "
+                "waiting for input: "
+                + ", ".join(gap["topic"] for gap in theirs[:8])
+                + (" ..." if len(theirs) > 8 else "")
+            )
         if verdict == "ok":
             self._log.info(
-                "status_overview: startup check OK -- every outbound stage of "
-                f"{snapshot.get('peer')} has a publisher"
+                "status_overview: startup check OK -- every stage this peer produces "
+                f"for {snapshot.get('peer')} has a publisher"
             )
             return
         self._log.error(
             f"status_overview: STARTUP CHECK FAILED for peer {snapshot.get('peer')} "
             f"after {self._startup_check['checked_after_s']}s -- "
-            f"{len(gaps)} outbound stage(s) have no publisher, "
+            f"{len(mine)} stage(s) this peer produces have no publisher, "
             f"{len(pane_failures)} pane(s) exited. See {self._startup_path}"
         )
-        for gap in gaps:
+        for gap in mine:
             self._log.error(
                 f"status_overview:   no publisher on {gap['topic']} "
                 f"(stage {gap['stage']}, produced_by {gap['produced_by']})"

@@ -1413,6 +1413,12 @@ def _build_status_pipeline_spec(
             outbound_items.insert(0, (hb_entry, hb_pipe))
 
         for e, p in outbound_items:
+            # Who publishes the native stage decides who is answerable when it is
+            # missing. The heartbeat is the one outbound topic rosotacom publishes
+            # itself (`heartbeat_echo`), so its absence is a defect here rather
+            # than an application that has not started -- which is exactly the
+            # 2026-08-13 failure the startup check exists for.
+            native_produced_by = "heartbeat_echo" if e.index == -1 else "application"
             base = e.base
             final = p.get("final", base)
             forward_final = f"/to_{remote_name}{final}" if use_target_prefix else final
@@ -1441,7 +1447,7 @@ def _build_status_pipeline_spec(
                     "topic": native_topic,
                     "type": native_type,
                     "domain": "local",
-                    "produced_by": "application",
+                    "produced_by": native_produced_by,
                 },
             ]
             if final != base and not is_g2l:

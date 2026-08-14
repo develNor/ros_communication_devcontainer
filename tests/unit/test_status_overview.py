@@ -1028,14 +1028,21 @@ def test_no_startup_verdict_before_the_grace_period(tmp_path: Path) -> None:
 
 
 def test_a_peer_that_publishes_nothing_fails_its_startup_check(tmp_path: Path) -> None:
-    """The 2026-08-13 centre: heartbeat_echo died, so /heartbeat_a never existed."""
+    """The 2026-08-13 centre: heartbeat_echo died, so /heartbeat_a never existed.
+
+    Two writes: the verdict is only committed once the same defect has survived
+    a second look one grace period later. A node that exited never recovers, so
+    this costs the report 20 s and nothing else.
+    """
     agg = _startup_aggregator({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path, started_mono=0.0)
 
     agg.write(now_mono=25.0)
+    assert not (tmp_path / "status" / "startup_check.json").exists()
+    agg.write(now_mono=46.0)
 
     verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
     assert verdict["verdict"] == "incomplete"
-    assert verdict["checked_after_s"] == 25.0
+    assert verdict["checked_after_s"] == 46.0
     # Only the first break, not the cascade behind it.
     assert [gap["topic"] for gap in verdict["missing_outbound_stages"]] == ["/heartbeat_a"]
     assert verdict["missing_outbound_stages"][0]["produced_by"] == "heartbeat_echo"
@@ -1089,9 +1096,36 @@ def test_the_verdict_is_computed_once(tmp_path: Path) -> None:
 
     agg.write(now_mono=25.0)
     agg.write(now_mono=99.0)
+    agg.write(now_mono=140.0)
 
     verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
-    assert verdict["checked_after_s"] == 25.0
+    assert verdict["checked_after_s"] == 99.0
+
+
+def test_a_stage_that_was_only_late_does_not_fail_the_check(tmp_path: Path) -> None:
+    """CI, 2026-08-14: `relay_out` had no publisher for /topic13 at t+20 s.
+
+    It creates one on discovering its input, and the input had just started.
+    Seconds later the relay was working. The first version of this check called
+    that a peer failure and turned the smoke red -- a check that fires on the
+    order of events is a check that gets ignored.
+    """
+    observers = {"local": _FakeObserver(), "ota": _FakeObserver()}
+    agg = _startup_aggregator(observers, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=25.0)
+    assert not (tmp_path / "status" / "startup_check.json").exists()
+
+    observers["local"].observations = {
+        "/heartbeat_a": _obs(pub=1, last_msg_at=45.9),
+        "/com/out/a/heartbeat_a": _obs(pub=1, last_msg_at=45.9),
+    }
+    observers["ota"].observations = {"/ota/a/heartbeat_a": _obs(pub=1, last_msg_at=45.9, graph_only=True)}
+    agg.write(now_mono=46.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["verdict"] == "ok"
+    assert verdict["missing_outbound_stages"] == []
 
 
 def test_inbound_gaps_are_not_this_peers_startup_problem() -> None:

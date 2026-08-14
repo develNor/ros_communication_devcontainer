@@ -11,6 +11,7 @@ from rosidl_runtime_py.utilities import get_message
 
 from com_msgs.msg import OtaStamped
 from com_py.qos import get_topic_qos, load_qos_config
+from com_py.status_overview_core import is_sequence_epoch_reset
 
 
 class UniversalOtaUnwrapperNode(Node):
@@ -142,20 +143,35 @@ class UniversalOtaUnwrapperNode(Node):
             return publisher, typed_cls
 
     def _check_sequence(self, wrapped_topic: str, seq: int):
+        """Say which of the three things a sequence break is.
+
+        A backward jump is either reordering or the sending peer restarting, and
+        this pane log was the last place still calling both "reordering". Three
+        consumers now agree that a jump larger than the transport can reorder is
+        a new epoch -- the live accounting, the transit join and the offline bag
+        join -- and a breadcrumb that disagrees with them costs exactly the time
+        it takes to trust it.
+        """
         last_seq = self._last_seq.get(wrapped_topic)
         self._last_seq[wrapped_topic] = seq
         if last_seq is None:
             return
         expected = last_seq + 1
-        if seq != expected:
-            if seq < last_seq:
-                self.get_logger().warning(
-                    f"[{wrapped_topic}] Sequence reordering detected: received {seq} after {last_seq}"
-                )
-            else:
-                self.get_logger().warning(
-                    f"[{wrapped_topic}] Sequence jump detected: expected {expected}, received {seq}"
-                )
+        if seq == expected:
+            return
+        if is_sequence_epoch_reset(seq, expected):
+            self.get_logger().warning(
+                f"[{wrapped_topic}] Sending peer restarted: sequence begins again at {seq} "
+                f"after {last_seq}. Counts and delays are per epoch from here."
+            )
+        elif seq < last_seq:
+            self.get_logger().warning(
+                f"[{wrapped_topic}] Sequence reordering detected: received {seq} after {last_seq}"
+            )
+        else:
+            self.get_logger().warning(
+                f"[{wrapped_topic}] Sequence jump detected: expected {expected}, received {seq}"
+            )
 
     def unwrapper_callback(self, wrapped_msg: OtaStamped, wrapped_topic: str, out_topic: str):
         try:

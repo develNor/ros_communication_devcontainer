@@ -47,7 +47,7 @@ from rosidl_runtime_py.utilities import get_message
 from rclpy.serialization import serialize_message
 from std_msgs.msg import Float64
 
-from com_py.link_bytes import LinkByteSampler
+from com_py.link_bytes import LinkByteSampler, resolve_link_interface
 
 
 def is_internal_transport_topic(topic_name: str) -> bool:
@@ -99,7 +99,9 @@ class TopicMonitor(Node):
         self.declare_parameter('to_adressant', '')  # optional, e.g., 'shuttle_ella' for /to_shuttle_ella
         self.declare_parameter("ip_local", "")
         self.declare_parameter("ip_remote", "")
-        self.declare_parameter("interface", "")      # OTA link interface (e.g. the VPN tunnel)
+        # Explicit override for the OTA link interface. Normally left empty:
+        # it is resolved from ip_local below.
+        self.declare_parameter("interface", "")
         # Accepted for launch compatibility; the /proc/net/dev sampler needs no
         # capture window, so this tshark-era buffer is no longer used.
         self.declare_parameter("link_duration_buffer_s", 1.0)
@@ -109,9 +111,9 @@ class TopicMonitor(Node):
         self.sourcename = self.get_parameter('sourcename').value
         self.direction = self.get_parameter('direction').value
         self.to_adressant = self.get_parameter('to_adressant').value
-        self.host_ip = self.get_parameter("ip_local").value
-        self.peer_ip = self.get_parameter("ip_remote").value
-        self.interface = self.get_parameter("interface").value
+        self.host_ip = str(self.get_parameter("ip_local").value or "").strip()
+        self.peer_ip = str(self.get_parameter("ip_remote").value or "").strip()
+        self.interface = str(self.get_parameter("interface").value or "")
 
         # Track actual elapsed time between prints (avoid timer drift issues)
         self._last_print_t = time.monotonic()
@@ -131,8 +133,22 @@ class TopicMonitor(Node):
         else:
             self.topic_prefix = f"/com/{self.direction}/{self.sourcename}/"
 
-        if not self.interface:
-            raise ValueError("Parameter 'interface' is required for link bandwidth measurement")
+        # The OTA link interface. `ip_local` is the peer's own OTA address, so
+        # the interface follows from it -- the same resolution status_overview
+        # does, in the same place, from the same helper. `interface` stays an
+        # explicit override for a setup the address cannot describe.
+        #
+        # It used to be resolved in the session template instead, by a shell
+        # line that expanded a catmux parameter with bash's substring-replace
+        # syntax. catmux substitutes `${name}` and nothing else, so the pattern
+        # stayed literal, bash expanded an unset variable to nothing, and the
+        # awk program collapsed to "first address line with a prefix length" --
+        # `lo`, on every machine. See docs/link-bandwidth.md.
+        try:
+            self.interface, provenance = resolve_link_interface(self.interface, self.host_ip)
+        except ValueError as exc:
+            raise ValueError(f"topic_monitor: {exc}") from exc
+        self.get_logger().info(f"OTA link interface '{self.interface}' ({provenance})")
 
         # Link bandwidth is measured from the kernel's own interface byte counters
         # (/proc/net/dev) via the shared link_bytes sampler -- no tshark, no sudo,
@@ -163,8 +179,14 @@ class TopicMonitor(Node):
         )
 
         self.get_logger().info(f"topic_monitor node started. Searching for topics with prefix: {self.topic_prefix}")
-        self.get_logger().info(f"Publishing ROS topic bandwidth to: {self.ros_topic_bandwidth_topic}")
-        self.get_logger().info(f"Publishing link bandwidth to: {self.link_bandwidth_topic}")
+        self.get_logger().info(
+            f"Publishing ROS topic bandwidth to: {self.ros_topic_bandwidth_topic} "
+            f"(serialized payload of {self.topic_prefix}*, Kibit/s)"
+        )
+        self.get_logger().info(
+            f"Publishing link bandwidth to: {self.link_bandwidth_topic} "
+            f"(wire bytes on '{self.interface}', {'tx' if self.direction == 'out' else 'rx'}, Kibit/s)"
+        )
 
         # Prime the link sampler so the first print reports a real delta.
         self._link_sampler.sample()

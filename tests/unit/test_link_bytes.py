@@ -124,3 +124,58 @@ def test_parse_ip_addr_resolves_interface_by_address() -> None:
 def test_parse_ip_addr_unknown_or_empty() -> None:
     assert lb.parse_ip_addr_for_ip(IP_ADDR_OUT, "10.0.0.99") is None
     assert lb.parse_ip_addr_for_ip(IP_ADDR_OUT, "") is None
+
+
+# --- OTA link interface resolution (#267) ----------------------------------
+
+
+def test_explicit_interface_wins_and_says_so() -> None:
+    assert lb.resolve_link_interface("tun3", "10.254.0.39", finder=lambda ip: "tun1") == (
+        "tun3",
+        "given explicitly",
+    )
+
+
+def test_interface_is_resolved_from_the_ota_address() -> None:
+    interface, provenance = lb.resolve_link_interface("", "10.254.0.39", finder=lambda ip: "tun1")
+    assert interface == "tun1"
+    assert provenance == "resolved from 10.254.0.39"
+
+
+def test_an_address_no_interface_owns_is_an_error() -> None:
+    try:
+        lb.resolve_link_interface("", "10.254.0.39", finder=lambda ip: None)
+    except ValueError as exc:
+        assert "10.254.0.39" in str(exc)
+    else:  # pragma: no cover - the call must raise
+        raise AssertionError("expected a ValueError")
+
+
+def test_loopback_is_refused_for_a_real_ota_address() -> None:
+    """The #267 defect, as the number that made it visible.
+
+    The session template's interface lookup collapsed to `lo` on both peers.
+    Loopback carries this host's own ROS traffic, so on the vehicle -- which
+    also ran a 36 GB `-a` recording -- `link_bandwidth_kbps` read ~28,000,000
+    (~28 Gbit/s) for an OTA link delivering ~6 Mbit/s, near-constant, on both
+    directions at once (rx and tx are the same bytes on loopback).
+    """
+    try:
+        lb.resolve_link_interface("", "10.254.0.38", finder=lambda ip: "lo")
+    except ValueError as exc:
+        assert "loopback" in str(exc)
+    else:  # pragma: no cover - the call must raise
+        raise AssertionError("expected a ValueError")
+
+
+def test_loopback_is_fine_when_the_ota_address_is_loopback() -> None:
+    """Single-machine smoke sessions really do run both peers over loopback."""
+    assert lb.resolve_link_interface("", "127.0.0.1", finder=lambda ip: "lo")[0] == "lo"
+
+
+def test_is_loopback_address() -> None:
+    assert lb.is_loopback_address("127.0.0.1")
+    assert lb.is_loopback_address("127.0.1.1")
+    assert lb.is_loopback_address("::1")
+    assert not lb.is_loopback_address("10.254.0.39")
+    assert not lb.is_loopback_address("")

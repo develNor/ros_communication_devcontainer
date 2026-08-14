@@ -532,9 +532,15 @@ The running session writes, under
 - `status.json` — machine-readable snapshot (source of truth) for tools/agents,
   refreshed on a short interval and on every state transition,
 - `status.txt` — a human-rendered table, and
-- `events.jsonl` — state transitions plus per-`(topic, seq)` transit records for
-  wrapped topics (delivered/lost/reordered, section latency, size, inter-arrival,
-  and jitter).
+- `events.jsonl` — state transitions plus per-`(topic, epoch, seq)` transit
+  records for wrapped topics (delivered/lost/reordered, section latency, size,
+  inter-arrival, and jitter). `epoch` counts the restarts of the sending peer's
+  wrapper: sequence numbers start at zero again after one, so it is what keeps
+  the numbering unique over an instance that outlived a restart.
+
+Which of the bandwidth numbers a session publishes answers which question —
+per-stream payload, whole-interface wire traffic, and the overhead ratio
+between them — is in [link bandwidth](docs/link-bandwidth.md).
 
 For fixed-interval network-condition samples alongside the same session, enable
 the [link trace recorder](docs/link-trace.md). It writes

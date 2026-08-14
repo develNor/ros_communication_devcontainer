@@ -67,7 +67,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from rclpy.serialization import serialize_message
 from rosidl_runtime_py.utilities import get_message
 
-from com_py.link_bytes import LinkByteSampler, find_interface_for_ip
+from com_py.link_bytes import LinkByteSampler, resolve_link_interface
 from com_py.link_trace import LinkTraceRecorder
 from com_py.status_overview_core import (
     ClockOffsetEstimator,
@@ -410,20 +410,23 @@ class StatusOverview(Node):
 
         ota_interface = str(self.get_parameter("ota_interface").value or "").strip()
         ota_local_ip = str(self.get_parameter("ota_local_ip").value or "").strip()
-        if not ota_interface and ota_local_ip:
-            ota_interface = find_interface_for_ip(ota_local_ip) or ""
-            if not ota_interface:
-                self.get_logger().info(
-                    f"status_overview: no interface found for OTA address '{ota_local_ip}'; "
-                    "link-overhead measurement disabled"
-                )
         link_sampler = None
-        if ota_interface:
-            link_sampler = LinkByteSampler(ota_interface)
-            self.get_logger().info(
-                f"status_overview: link-overhead sampling on interface '{ota_interface}'"
-                + (f" (resolved from {ota_local_ip})" if ota_local_ip else "")
-            )
+        if ota_interface or ota_local_ip:
+            # Same resolution and the same loopback refusal as topic_monitor: a
+            # link number nobody can tell apart from loopback traffic is worse
+            # than no link number, so this reports nothing rather than that.
+            try:
+                ota_interface, provenance = resolve_link_interface(ota_interface, ota_local_ip)
+            except ValueError as exc:
+                self.get_logger().warning(
+                    f"status_overview: {exc}; link-overhead measurement disabled"
+                )
+            else:
+                link_sampler = LinkByteSampler(ota_interface)
+                self.get_logger().info(
+                    f"status_overview: link-overhead sampling on interface "
+                    f"'{ota_interface}' ({provenance})"
+                )
 
         link_trace_recorder = None
         if bool(self.get_parameter("link_trace").value):

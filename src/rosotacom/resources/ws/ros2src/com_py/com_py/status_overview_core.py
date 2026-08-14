@@ -633,6 +633,10 @@ class StatusAggregator:
         self._startup_grace_s = startup_grace_s
         self._started_mono = time.monotonic() if started_mono is None else started_mono
         self._startup_check: Optional[Dict[str, Any]] = None
+        #: (when, topics) of the first evaluation that found a defect. A verdict
+        #: is only committed once the same defect survives a second look; see
+        #: `_maybe_run_startup_check`.
+        self._startup_pending: Optional[Tuple[float, set]] = None
 
     # -- observation lookup --
     def _obs_for(self, stage: Dict[str, Any]) -> Optional[StageObservation]:
@@ -1159,6 +1163,24 @@ class StatusAggregator:
         mine = [gap for gap in gaps if gap["owner"] == "rosotacom"]
         theirs = [gap for gap in gaps if gap["owner"] != "rosotacom"]
         pane_failures = self._read_pane_failures()
+
+        # A stage can be late rather than dead. `relay_out` and the wrapper
+        # create their publisher on *discovering* their input, on a refresh
+        # interval, so an input that started publishing shortly before this
+        # moment leaves a gap that is about to close on its own. Waiting a
+        # second grace period and reporting only what is still missing
+        # separates the two without weakening either: a node that exited never
+        # recovers. CI found this the way it should be found -- the smoke that
+        # starts its payload publisher last failed on a topic whose relay was
+        # working seconds later.
+        if mine and self._startup_pending is None:
+            self._startup_pending = (now, {gap["topic"] for gap in mine})
+            return
+        if mine and self._startup_pending is not None:
+            first_seen_at, first_seen = self._startup_pending
+            if now - first_seen_at < self._startup_grace_s:
+                return
+            mine = [gap for gap in mine if gap["topic"] in first_seen]
         verdict = "ok" if not mine and not pane_failures else "incomplete"
         self._startup_check = {
             "verdict": verdict,

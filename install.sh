@@ -85,8 +85,18 @@ echo "  just setup"
 if [[ "$INSTALL_GLOBAL_SYMLINKS" == true ]]; then
   mkdir -p "$BIN_DIR"
   ln -sf "$VENV_DIR/bin/rosotacom" "$BIN_DIR/rosotacom"
-  ln -sf "$VENV_DIR/bin/start_rosotacom" "$BIN_DIR/start_rosotacom"
-  ln -sf "$VENV_DIR/bin/stop_rosotacom" "$BIN_DIR/stop_rosotacom"
   echo
-  echo "Installed legacy global symlinks into: $BIN_DIR"
+  echo "Installed global symlink into: $BIN_DIR"
+  # `start_rosotacom` / `stop_rosotacom` were entry points until 2026-08-14. A
+  # machine that ran an older install.sh still has their symlinks, and they now
+  # point into a venv whose package no longer provides them. Only links this
+  # script could have written are touched — into THIS checkout's venv, never a
+  # file or a link belonging to something else.
+  for retired in start_rosotacom stop_rosotacom; do
+    link="$BIN_DIR/$retired"
+    if [[ -L "$link" && "$(readlink -- "$link")" == "$VENV_DIR/bin/$retired" ]]; then
+      rm -- "$link"
+      echo "Removed retired symlink: $link  (use 'rosotacom start' / 'rosotacom stop')"
+    fi
+  done
 fi

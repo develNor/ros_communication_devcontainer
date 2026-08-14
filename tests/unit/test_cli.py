@@ -1990,20 +1990,14 @@ rosbag2_bagfile_information:
     assert "TEST OK" in capsys.readouterr().out
 
 
-def test_start_and_stop_compat_entrypoints_prefix_commands(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[list[str]] = []
+def test_the_retired_compat_entrypoints_are_gone() -> None:
+    """Removed on 2026-08-14 — they were `start`/`stop` under a second name.
 
-    def fake_main(argv: list[str] | None = None) -> int:
-        calls.append(list(argv or []))
-        return 0
-
-    monkeypatch.setattr(rosotacom, "main", fake_main)
-    monkeypatch.setattr(sys, "argv", ["start_rosotacom", "1_heartbeat"])
-    assert rosotacom.start_compat_main() == 0
-    monkeypatch.setattr(sys, "argv", ["stop_rosotacom", "1_heartbeat"])
-    assert rosotacom.stop_compat_main() == 0
-
-    assert calls == [["start", "1_heartbeat"], ["stop", "1_heartbeat"]]
+    Asserting their absence is the point: a re-added alias would otherwise pass
+    every other test in this file silently.
+    """
+    assert not hasattr(rosotacom, "start_compat_main")
+    assert not hasattr(rosotacom, "stop_compat_main")
 
 
 def test_path_yaml_and_network_helpers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

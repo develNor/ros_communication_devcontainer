@@ -19,7 +19,7 @@ format:
 lint:
 	{{python}} -m ruff check .
 	{{python}} -m ruff format --check .
-	{{python}} -m py_compile src/rosotacom/*.py run_session_in_container.py stop_session_in_container.py
+	{{python}} -m py_compile src/rosotacom/*.py
 
 typecheck:
 	{{python}} -m mypy

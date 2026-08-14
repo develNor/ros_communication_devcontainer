@@ -175,6 +175,47 @@ def stamp_delay(raw_delay_s: float, clock_offset_s: Optional[float] = None) -> O
     return None
 
 
+#: How long a peer is given to bring its own publishers up before their absence
+#: is called a defect. Node start, DDS discovery and the first `refresh_interval`
+#: of the observers all happen inside it; 20 s is roughly four times what a
+#: healthy bring-up needs.
+STARTUP_GRACE_S = 20.0
+
+
+def outbound_startup_gaps(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Stages this peer promised to publish and did not, once past the grace.
+
+    Only outbound topics: every stage of one is produced on this machine, so its
+    absence is this peer's problem. Inbound stages depend on the peer and the
+    link, which the per-topic rollup already diagnoses.
+
+    This exists because of a failure that produced no error anywhere. On
+    2026-08-13 the centre's `heartbeat_echo` and one `topic_monitor` died two
+    seconds after start -- Cyclone had no free participant index left on the
+    local domain -- and catmux left both panes sitting at a shell prompt. The
+    session ran for two hours with no heartbeat publisher, so the run has no RTT
+    and no clock-offset measurement, and the far side reported `status=LOST
+    reason=age hz=0.00` about a peer that was otherwise healthy.
+    """
+    gaps: List[Dict[str, Any]] = []
+    for topic in snapshot.get("topics", []):
+        if topic.get("direction") != "outbound":
+            continue
+        for stage in topic.get("stages", []):
+            if stage.get("state") != ABSENT:
+                continue
+            gaps.append(
+                {
+                    "base": topic.get("base"),
+                    "stage": stage.get("stage"),
+                    "topic": stage.get("topic"),
+                    "domain": stage.get("domain"),
+                    "produced_by": stage.get("produced_by"),
+                }
+            )
+    return gaps
+
+
 #: How far back a sequence number may jump and still be called reordering.
 #: `universal_ota_wrapper` counts per topic from zero and increments by one, so
 #: a receiver sees a backward jump only when the wire reordered a message or
@@ -516,7 +557,9 @@ class StatusAggregator:
                  *, liveness_window_s: float = 3.0, stale_after_s: float = 3.0,
                  delay_good_ms: float = 100.0, delay_bad_ms: float = 200.0,
                  link_sampler: Any = None, clock_estimator: Any = None,
-                 link_trace_recorder: Any = None):
+                 link_trace_recorder: Any = None,
+                 startup_grace_s: float = STARTUP_GRACE_S,
+                 started_mono: Optional[float] = None):
         self._log = logger
         self._spec = spec
         self._output_dir = output_dir
@@ -536,6 +579,17 @@ class StatusAggregator:
         self._json_path = os.path.join(self._output_dir, "status.json")
         self._txt_path = os.path.join(self._output_dir, "status.txt")
         self._events_path = os.path.join(self._output_dir, "events.jsonl")
+        self._startup_path = os.path.join(self._output_dir, "startup_check.json")
+        # `pane_failures.log` is written by catmux_log_setup.sh one level up, in
+        # logs/<peer>/. The verdict quotes it because a pane that exited is the
+        # most common reason a promised publisher never appears, and the two
+        # facts are useless apart.
+        self._pane_failure_path = os.path.join(
+            os.path.dirname(os.path.abspath(self._output_dir)), "pane_failures.log"
+        )
+        self._startup_grace_s = startup_grace_s
+        self._started_mono = time.monotonic() if started_mono is None else started_mono
+        self._startup_check: Optional[Dict[str, Any]] = None
 
     # -- observation lookup --
     def _obs_for(self, stage: Dict[str, Any]) -> Optional[StageObservation]:
@@ -896,6 +950,7 @@ class StatusAggregator:
             "summary": counts,
             "link": compute_link_overview(topics_out, link_sample),
             "clock_sync": self._clock_snapshot(now_mono),
+            "startup_check": self._startup_check,
             "topics": topics_out,
         }
 
@@ -973,6 +1028,20 @@ class StatusAggregator:
             f"summary: OK={s.get('OK', 0)} PARTIAL={s.get('PARTIAL', 0)} "
             f"STALLED={s.get('STALLED', 0)} ABSENT={s.get('ABSENT', 0)}   (Phase 1: local observation)"
         )
+        # The STAT watcher pane shows this file, so a failed startup check has to
+        # be readable here or it is not surfaced where anybody looks.
+        check = snapshot.get("startup_check")
+        if check and check.get("verdict") != "ok":
+            gaps = check.get("missing_outbound_stages") or []
+            panes = check.get("pane_failures") or []
+            lines.append(
+                f"STARTUP CHECK FAILED after {check.get('checked_after_s')}s: "
+                f"{len(gaps)} outbound stage(s) without a publisher, {len(panes)} pane(s) exited"
+            )
+            for gap in gaps:
+                lines.append(f"    no publisher: {gap.get('topic')} ({gap.get('produced_by')})")
+            for line in panes:
+                lines.append(f"    pane exited: {line}")
         lines.append("")
         for t in snapshot["topics"]:
             arrow = "->" if t["direction"] == "outbound" else "<-"
@@ -1020,6 +1089,70 @@ class StatusAggregator:
             fp.write(text)
         os.replace(tmp, path)
 
+    def _read_pane_failures(self) -> List[str]:
+        try:
+            with open(self._pane_failure_path, "r", encoding="utf-8", errors="replace") as fp:
+                return [line.rstrip("\n") for line in fp if line.strip()]
+        except OSError:
+            return []
+
+    def _maybe_run_startup_check(
+        self, snapshot: Dict[str, Any], now_mono: Optional[float]
+    ) -> None:
+        """Once, after the grace period: did this peer bring up what it promised?
+
+        Written as a verdict at a defined moment rather than left implicit in a
+        table that is refreshed every two seconds. `status.json` already carried
+        the evidence on 2026-08-13 -- 13 stages STALLED, `clock_sync: null` --
+        and nobody read it, because nothing said "this is wrong now".
+        """
+        if self._startup_check is not None or self._startup_grace_s <= 0.0:
+            return
+        now = time.monotonic() if now_mono is None else now_mono
+        if now - self._started_mono < self._startup_grace_s:
+            return
+
+        gaps = outbound_startup_gaps(snapshot)
+        pane_failures = self._read_pane_failures()
+        verdict = "ok" if not gaps and not pane_failures else "incomplete"
+        self._startup_check = {
+            "verdict": verdict,
+            "checked_after_s": round(now - self._started_mono, 1),
+            "generated_at": snapshot.get("generated_at"),
+            "peer": snapshot.get("peer"),
+            "missing_outbound_stages": gaps,
+            "pane_failures": pane_failures,
+        }
+        snapshot["startup_check"] = self._startup_check
+        try:
+            self._atomic_write(
+                self._startup_path, json.dumps(self._startup_check, indent=2) + "\n"
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._log is not None:
+                self._log.warning(f"status_overview: failed to write startup check: {exc}")
+        if self._log is None:
+            return
+        if verdict == "ok":
+            self._log.info(
+                "status_overview: startup check OK -- every outbound stage of "
+                f"{snapshot.get('peer')} has a publisher"
+            )
+            return
+        self._log.error(
+            f"status_overview: STARTUP CHECK FAILED for peer {snapshot.get('peer')} "
+            f"after {self._startup_check['checked_after_s']}s -- "
+            f"{len(gaps)} outbound stage(s) have no publisher, "
+            f"{len(pane_failures)} pane(s) exited. See {self._startup_path}"
+        )
+        for gap in gaps:
+            self._log.error(
+                f"status_overview:   no publisher on {gap['topic']} "
+                f"(stage {gap['stage']}, produced_by {gap['produced_by']})"
+            )
+        for line in pane_failures:
+            self._log.error(f"status_overview:   pane exited: {line}")
+
     def write(self, now_mono: Optional[float] = None) -> int:
         """Build a snapshot, write artifacts, and return number of transition events."""
         link_sample = None
@@ -1030,6 +1163,7 @@ class StatusAggregator:
                 if self._log is not None:
                     self._log.warning(f"status_overview: link sampling failed: {exc}")
         snapshot = self.build_snapshot(now_mono, link_sample=link_sample)
+        self._maybe_run_startup_check(snapshot, now_mono)
         if self._link_trace_recorder is not None:
             try:
                 self._link_trace_recorder.maybe_write(snapshot, link_sample)

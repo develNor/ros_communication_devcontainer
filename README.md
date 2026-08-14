@@ -266,6 +266,25 @@ rosotacom start 1_heartbeat --identity b \
 
 `rosotacom` reads the static session input and creates generated files under `session-instances/<date>/<session>_<timestamp>_<id>/config/`, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`. Catmux pane output is logged under the same instance in `logs/<peer>/catmux/`.
 
+What else a run leaves under `logs/<peer>/`, and which file to open first when a
+peer looked healthy but did nothing:
+
+| File | Written by | Read it for |
+|---|---|---|
+| `catmux/<NN>-<WINDOW>/<pane>.log` | `catmux_log_setup.sh` (`tmux pipe-pane`) | everything a node printed, including the traceback it died with |
+| `pane_failures.log` | the same script's prompt hook | one line per non-zero pane exit — **the file that answers "is any pane dead?"** |
+| `status/startup_check.json` | `status_overview`, once, `status_startup_grace_s` after start | the verdict: which outbound stages this peer promised and never published, plus the pane failures above |
+| `status/status.{json,txt}` and `status/events.jsonl` | `status_overview`, continuously | live per-stage state and the transit records |
+| `scenario/<component>.log` | `rosotacom start <scenario>` | each scenario application's own output |
+| `launcher.log`, `docker.log` | `rosotacom start` | the exact command, and the container's own stdout where it has one |
+
+A pane whose command exits drops back to a shell prompt and keeps looking alive
+— `docker ps` shows a healthy container and the other panes keep working. That
+is how a control centre ran for two hours on 2026-08-13 with no heartbeat
+publisher, because Cyclone had no free participant index left on the local
+domain and `heartbeat_echo` died two seconds after start. The last two rows of
+that table exist so the next one announces itself.
+
 ### Complete use cases with scenarios
 
 A session intentionally describes only the communication contract. When a use

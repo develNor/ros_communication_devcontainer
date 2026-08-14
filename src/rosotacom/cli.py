@@ -1083,9 +1083,29 @@ def _mark_interactive_smoke_stopped(instance_dir: Path, target_type: str, target
 
 
 def _write_docker_log(container_name: str, instance: SessionInstance, identity: str) -> None:
+    """Snapshot the peer container's own stdout into ``logs/<peer>/docker.log``.
+
+    In `attach` mode the container is `--rm` and already gone by the time this
+    runs, so `docker logs` answers "No such container". That answer used to be
+    written verbatim, which produced a 75-byte file that reads like the record
+    of the run and says nothing -- it was the whole of `logs/<peer>/` besides
+    `launcher.log` when a field session had to be diagnosed after the fact
+    (#266). The catmux per-pane logs under `catmux/` are the actual record, so
+    say that instead of pretending this file is one.
+    """
     try:
         result = subprocess.run(["docker", "logs", container_name], text=True, capture_output=True, check=False)
     except Exception:
+        return
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        _append_log(
+            _peer_docker_log(instance, identity),
+            f"[rosotacom] docker logs {container_name}: {stderr or 'unavailable'}\n"
+            "[rosotacom] The container is not (or no longer) present -- in attach mode it is\n"
+            "[rosotacom] `--rm` and exits with the foreground command. What each pane inside\n"
+            f"[rosotacom] it printed is under {_peer_docker_log(instance, identity).parent / 'catmux'}.",
+        )
         return
     logs = (result.stdout or "") + (result.stderr or "")
     if logs:

@@ -169,6 +169,15 @@ Per-side config blocks:
 - DDS implementations (`cyclone`, `fastdds`) accept:
   - `config: <template>` — template file under `ws/ota_configs/` (e.g. `fastdds_v1.xml`, `cyclonedds.xml`, `fastdds_easy_mode.xml`). Omit to use the RMW's built-in defaults.
   - `easy_mode_ip: <string>` — only honored by `fastdds_easy_mode.xml`; defaults to the first resolved peer address.
+
+  On the **local** side of a busy machine, set
+  `config: cyclonedds_local_participants.xml`. Cyclone allows 33 participants
+  per domain per host by default, and a control centre running its own
+  application next to the communication peer exceeds that: the processes that
+  start last fail with `Failed to find a free participant index for domain N`
+  and exit. That template raises the limit and changes nothing else — it pins no
+  interface and sets no peer list, because local discovery must keep working.
+  The OTA templates are not usable on the local side for exactly that reason.
 - `zenoh_connect_endpoints` (native, OTA side only; `zenoh` is still accepted as a legacy OTA alias) accepts:
   - `main_peer: <peer_key>` — the peer whose zenoh router listens. Defaults to the first peer declared under `peers:`.
   - `main_port: 7447` — listening port. Default `7447`.

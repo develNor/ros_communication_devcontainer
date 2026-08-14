@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -996,3 +997,113 @@ def test_metric_stage_bag_is_generated_from_local_pipeline(tmp_path: Path) -> No
     plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
     assert "metric_stage_bag: true" in plugin
     assert "metric_stage_topics: /heartbeat_a,/com/out/a/heartbeat_a" in plugin
+
+
+# ---------------------------------------------------------------------------
+# Startup check (#266): a peer that did not bring up its own publishers
+# ---------------------------------------------------------------------------
+
+
+def _startup_aggregator(observers: dict, output_dir: Path, *, started_mono: float) -> core.StatusAggregator:
+    return core.StatusAggregator(
+        logger=None,
+        spec=_outbound_spec(),
+        output_dir=str(output_dir / "status"),
+        observers_by_domain=observers,
+        liveness_window_s=3.0,
+        stale_after_s=3.0,
+        startup_grace_s=20.0,
+        started_mono=started_mono,
+    )
+
+
+def test_no_startup_verdict_before_the_grace_period(tmp_path: Path) -> None:
+    """Nothing publishes yet at t+5s, and that is not news."""
+    agg = _startup_aggregator({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=5.0)
+
+    assert json.loads((tmp_path / "status" / "status.json").read_text())["startup_check"] is None
+    assert not (tmp_path / "status" / "startup_check.json").exists()
+
+
+def test_a_peer_that_publishes_nothing_fails_its_startup_check(tmp_path: Path) -> None:
+    """The 2026-08-13 centre: heartbeat_echo died, so /heartbeat_a never existed."""
+    agg = _startup_aggregator({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=25.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["verdict"] == "incomplete"
+    assert verdict["checked_after_s"] == 25.0
+    assert [gap["topic"] for gap in verdict["missing_outbound_stages"]] == [
+        "/heartbeat_a",
+        "/com/out/a/heartbeat_a",
+        "/ota/a/heartbeat_a",
+    ]
+    assert "STARTUP CHECK FAILED" in (tmp_path / "status" / "status.txt").read_text()
+
+
+def test_a_healthy_peer_passes_its_startup_check(tmp_path: Path) -> None:
+    local = _FakeObserver()
+    local.observations = {
+        "/heartbeat_a": _obs(pub=1, last_msg_at=24.9),
+        "/com/out/a/heartbeat_a": _obs(pub=1, last_msg_at=24.9),
+    }
+    ota = _FakeObserver()
+    ota.observations = {"/ota/a/heartbeat_a": _obs(pub=1, last_msg_at=24.9, graph_only=True)}
+    agg = _startup_aggregator({"local": local, "ota": ota}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=25.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["verdict"] == "ok"
+    assert verdict["missing_outbound_stages"] == []
+    assert "STARTUP CHECK FAILED" not in (tmp_path / "status" / "status.txt").read_text()
+
+
+def test_the_verdict_quotes_the_panes_that_exited(tmp_path: Path) -> None:
+    """A dead pane and a missing publisher are the same fact seen twice."""
+    local = _FakeObserver()
+    local.observations = {
+        "/heartbeat_a": _obs(pub=1, last_msg_at=24.9),
+        "/com/out/a/heartbeat_a": _obs(pub=1, last_msg_at=24.9),
+    }
+    ota = _FakeObserver()
+    ota.observations = {"/ota/a/heartbeat_a": _obs(pub=1, last_msg_at=24.9, graph_only=True)}
+    (tmp_path / "pane_failures.log").write_text(
+        "2026-08-13T14:49:50+02:00\tpane=05-BEAT/0\texit=1\tcommand=ros2 run com_py heartbeat_echo\n",
+        encoding="utf-8",
+    )
+    agg = _startup_aggregator({"local": local, "ota": ota}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=25.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["verdict"] == "incomplete"
+    assert verdict["pane_failures"] == [
+        "2026-08-13T14:49:50+02:00\tpane=05-BEAT/0\texit=1\tcommand=ros2 run com_py heartbeat_echo"
+    ]
+
+
+def test_the_verdict_is_computed_once(tmp_path: Path) -> None:
+    agg = _startup_aggregator({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path, started_mono=0.0)
+
+    agg.write(now_mono=25.0)
+    agg.write(now_mono=99.0)
+
+    verdict = json.loads((tmp_path / "status" / "startup_check.json").read_text())
+    assert verdict["checked_after_s"] == 25.0
+
+
+def test_inbound_gaps_are_not_this_peers_startup_problem() -> None:
+    snapshot = {
+        "topics": [
+            {
+                "base": "/camera",
+                "direction": "inbound",
+                "stages": [{"stage": "ota_recv", "topic": "/ota/b/camera", "state": core.ABSENT}],
+            }
+        ]
+    }
+    assert core.outbound_startup_gaps(snapshot) == []

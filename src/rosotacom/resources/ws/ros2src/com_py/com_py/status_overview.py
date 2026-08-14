@@ -70,6 +70,7 @@ from rosidl_runtime_py.utilities import get_message
 from com_py.link_bytes import LinkByteSampler, resolve_link_interface
 from com_py.link_trace import LinkTraceRecorder
 from com_py.status_overview_core import (
+    STARTUP_GRACE_S,
     ClockOffsetEstimator,
     StageObservation,
     StatusAggregator,
@@ -334,6 +335,8 @@ class StatusOverview(Node):
         self.declare_parameter("link_trace_interval_s", 1.0)
         self.declare_parameter("link_trace_modem_command", "")
         self.declare_parameter("link_trace_modem_timeout_s", 2.0)
+        # Grace before the one-shot startup verdict (#266). 0 disables it.
+        self.declare_parameter("startup_grace_s", STARTUP_GRACE_S)
 
         spec_file = str(self.get_parameter("status_spec_file").value or "").strip()
         output_dir = str(self.get_parameter("output_dir").value or "").strip()
@@ -453,6 +456,7 @@ class StatusOverview(Node):
             link_sampler=link_sampler,
             clock_estimator=clock_estimator,
             link_trace_recorder=link_trace_recorder,
+            startup_grace_s=float(self.get_parameter("startup_grace_s").value),
         )
 
         self.create_timer(self.write_interval_s, self._on_write)

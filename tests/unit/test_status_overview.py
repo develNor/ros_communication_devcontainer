@@ -720,7 +720,8 @@ def test_pipeline_spec_exposes_decoded_reverse_transport_stage(tmp_path: Path) -
                 "processing": {
                     "transport": {
                         "type": "ffmpeg",
-                        "local_republish": True,
+                        "local_republish": "raw",
+                        "remote_republish": "raw",
                         "gop_size": 4,
                         "bit_rate": 500000,
                     }
@@ -744,6 +745,86 @@ def test_pipeline_spec_exposes_decoded_reverse_transport_stage(tmp_path: Path) -
     assert "metric_stage_topics: /com/in/b/camera/image/ffmpeg,/camera/image/ffmpeg,/camera/image/ffmpeg/raw" in plugin
 
 
+def test_a_compressed_receiver_decode_names_the_stage_and_its_type(tmp_path: Path) -> None:
+    """#276: the decoded twin follows `remote_republish`, on the name and the type.
+
+    An uncompressed `sensor_msgs/Image` twin is ~3 MB per frame at 1280x800 and
+    dominates any `record -a` on the receiving machine; a session that asks for
+    `compressed` must get a `CompressedImage` under `.../ffmpeg/compressed`, and
+    the status overview has to report that stage, not the one it used to assume.
+    """
+    cfg = _heartbeat_cfg()
+    cfg["shared"]["use_heartbeat"] = False
+    cfg["topics"] = {
+        "b_to_a": [
+            {
+                "topic": "/camera/image",
+                "type": "sensor_msgs/msg/Image",
+                "processing": {
+                    "transport": {
+                        "type": "ffmpeg",
+                        # Deliberately asymmetric: the sender keeps pixels for a
+                        # local look, the receiver takes the small copy.
+                        "local_republish": "raw",
+                        "remote_republish": "compressed",
+                        "gop_size": 4,
+                        "bit_rate": 500000,
+                    }
+                },
+            }
+        ]
+    }
+
+    _generate(cfg, tmp_path)
+
+    spec = yaml.safe_load((tmp_path / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
+    inbound = next(topic for topic in spec["topics"] if topic["base"] == "/camera/image")
+    stages = {stage["stage"]: stage for stage in inbound["stages"]}
+    assert stages["native_in"]["topic"] == "/camera/image/ffmpeg/compressed"
+    assert stages["native_in"]["type"] == "sensor_msgs/msg/CompressedImage"
+
+    receiver_plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert "irt_1_out_transport: compressed" in receiver_plugin
+
+    # The sender's own preview is a separate decision and keeps its own format.
+    sender_plugin = (tmp_path / "b" / "plugin.yaml").read_text(encoding="utf-8")
+    assert "irt_1_out_transport: raw" in sender_plugin
+
+
+def test_a_receiver_without_a_decode_gets_no_reverse_transport(tmp_path: Path) -> None:
+    """A sender-side preview must not put a decoder on the receiving peer."""
+    cfg = _heartbeat_cfg()
+    cfg["shared"]["use_heartbeat"] = False
+    cfg["topics"] = {
+        "b_to_a": [
+            {
+                "topic": "/camera/image",
+                "type": "sensor_msgs/msg/Image",
+                "processing": {
+                    "transport": {
+                        "type": "ffmpeg",
+                        "local_republish": "raw",
+                        "gop_size": 4,
+                        "bit_rate": 500000,
+                    }
+                },
+            }
+        ]
+    }
+
+    _generate(cfg, tmp_path)
+
+    receiver_plugin = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    assert "irt_1_topic" not in receiver_plugin
+    sender_plugin = (tmp_path / "b" / "plugin.yaml").read_text(encoding="utf-8")
+    assert "irt_1_out_transport: raw" in sender_plugin
+
+    spec = yaml.safe_load((tmp_path / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8"))
+    inbound = next(topic for topic in spec["topics"] if topic["base"] == "/camera/image")
+    stages = {stage["stage"] for stage in inbound["stages"]}
+    assert "native_in" not in stages
+
+
 def test_reverse_transport_raw_stage_uses_sensor_image_type_for_compressed_source(tmp_path: Path) -> None:
     cfg = _heartbeat_cfg()
     cfg["shared"]["use_heartbeat"] = False
@@ -758,7 +839,8 @@ def test_reverse_transport_raw_stage_uses_sensor_image_type_for_compressed_sourc
                     "drop": {"drop_count": 1, "window_size": 2},
                     "transport": {
                         "type": "ffmpeg",
-                        "local_republish": True,
+                        "local_republish": "raw",
+                        "remote_republish": "raw",
                         "gop_size": 4,
                         "bit_rate": 500000,
                     },

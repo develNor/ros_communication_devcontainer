@@ -64,10 +64,19 @@ HEARTBEAT_MSG_TYPE = "com_msgs/msg/EchoHeartbeat"
 COMPRESSED_MSG_TYPE = "com_msgs/msg/CompressedData"
 OTA_STAMPED_MSG_TYPE = "com_msgs/msg/OtaStamped"
 SENSOR_IMAGE_MSG_TYPE = "sensor_msgs/msg/Image"
+SENSOR_COMPRESSED_IMAGE_MSG_TYPE = "sensor_msgs/msg/CompressedImage"
 TRANSPORT_OUTPUT_TYPES = {
     "compressed": "sensor_msgs/msg/CompressedImage",
     "ffmpeg": "ffmpeg_image_transport_msgs/msg/FFMPEGPacket",
     "foxglove": "foxglove_msgs/msg/CompressedVideo",
+}
+#: The image transports a reverse republish may decode *into*, and the message
+#: type each one delivers. `raw` is the neutral reconstruction -- the transport
+#: undone and nothing else -- and `compressed` trades a JPEG encode for roughly
+#: an order of magnitude less data on the wire and in a `record -a`.
+REPUBLISH_OUTPUT_TYPES = {
+    "raw": SENSOR_IMAGE_MSG_TYPE,
+    "compressed": SENSOR_COMPRESSED_IMAGE_MSG_TYPE,
 }
 
 
@@ -75,7 +84,14 @@ TRANSPORT_OUTPUT_TYPES = {
 class TransportSpec:
     type: str
     params: Dict[str, Any]
-    local_republish: bool = False
+    #: Reverse republish on the sending peer: decode the stream it just encoded,
+    #: so the machine that sends can see what the receiver will get. Optional.
+    local_republish: Optional[str] = None
+    #: Reverse republish on the receiving peer: the decode the receiving
+    #: application consumes. Optional too -- a consumer that subscribes through
+    #: image_transport itself, or one that only forwards or records packets,
+    #: does not want a second copy of every frame.
+    remote_republish: Optional[str] = None
 
 
 @dataclass
@@ -1288,11 +1304,14 @@ def _delivered_topic(pipe: Dict[str, Any], final: str) -> str:
         # renames nothing downstream of it.
         topic = str(pipe["ota_in"])
     transport = pipe.get("transport")
-    if isinstance(transport, TransportSpec) and transport.local_republish:
-        # image_transport reverse republish decodes the encoded topic into
-        # `<encoded>/raw`; PSNR/SSIM and application-level checks need that
-        # decoded sensor_msgs/Image stage, not the encoded packet.
-        topic = str(pipe["irt_in"]) + "/raw"
+    if isinstance(transport, TransportSpec) and transport.remote_republish:
+        # The receiver's reverse republish decodes the encoded topic into
+        # `<encoded>/<transport>`, and that decoded image -- not the encoded
+        # packet -- is what the receiving application subscribes to.
+        # `local_republish` is deliberately not consulted here: it is the
+        # *sender's* preview, on the sender's machine, and says nothing about
+        # what the receiver ends up reading.
+        topic = str(pipe["irt_in"]) + f"/{transport.remote_republish}"
     elif pipe.get("compress"):
         topic = str(pipe["comp_in"])
     if pipe.get("framebridge") == "global_to_local":
@@ -1544,8 +1563,8 @@ def _build_status_pipeline_spec(
             if postprocessed != final:
                 native_in_type = base_type
                 transport = p.get("transport")
-                if isinstance(transport, TransportSpec) and transport.local_republish:
-                    native_in_type = SENSOR_IMAGE_MSG_TYPE
+                if isinstance(transport, TransportSpec) and transport.remote_republish:
+                    native_in_type = REPUBLISH_OUTPUT_TYPES[transport.remote_republish]
                 stages.append(
                     {
                         "stage": "native_in",
@@ -1659,9 +1678,27 @@ def _compute_pipeline(
         if not isinstance(t, dict) or "type" not in t:
             raise ValueError(f"transport must be dict with 'type' for topic '{entry.base}'")
         ttype = t["type"]
-        local_republish = bool(t.get("local_republish", False))
-        params = {k: v for k, v in t.items() if k not in ("type", "local_republish")}
-        transport = TransportSpec(type=ttype, params=params, local_republish=local_republish)
+        republish_keys = ("local_republish", "remote_republish")
+
+        def _republish(key: str) -> Optional[str]:
+            value = t.get(key)
+            if value is None:
+                return None
+            if value not in REPUBLISH_OUTPUT_TYPES:
+                raise ValueError(
+                    f"transport.{key} must name an image transport "
+                    f"({'|'.join(sorted(REPUBLISH_OUTPUT_TYPES))}) for topic '{entry.base}', got {value!r}. "
+                    "Omit the key for no reverse republish on that side."
+                )
+            return str(value)
+
+        params = {k: v for k, v in t.items() if k not in ("type", *republish_keys)}
+        transport = TransportSpec(
+            type=ttype,
+            params=params,
+            local_republish=_republish("local_republish"),
+            remote_republish=_republish("remote_republish"),
+        )
 
     topic = entry.base
 
@@ -1747,7 +1784,11 @@ def _compute_pipeline(
     if transport:
         it_in = topic
         topic = topic + f"/{transport.type}"
-        if transport.local_republish:
+        if transport.local_republish or transport.remote_republish:
+            # The encoded topic a reverse republish decodes *from*. One name for
+            # both sides: each peer runs its own decoder against the copy it has
+            # (the sender against what it just encoded, the receiver against what
+            # arrived), and which of them exists is decided per side below.
             irt_in = topic
 
     # The wrapper is last, always. Its `seq` and send stamp describe whatever it
@@ -2607,7 +2648,11 @@ def func(
         thr_items = [(p["thr_in"], p["throttle"]) for p in out_pipes if p["thr_in"]]
         ipx_items = [(p["ipx_in"], p["pixel"]) for p in out_pipes if p["ipx_in"]]
         it_items = [(p["it_in"], p["transport"]) for p in out_pipes if p["it_in"]]
-        irt_items_local = [(p["irt_in"], p["transport"]) for p in out_pipes if p["irt_in"]]
+        # Sender-side reverse transport: this peer decodes what it just encoded,
+        # so the machine that sends can see what the receiver will get.
+        irt_items_local = [
+            (p["irt_in"], p["transport"]) for p in out_pipes if p["irt_in"] and p["transport"].local_republish
+        ]
 
         # Compression happens on the sender side for topics marked with processing.compress
         comp_topics = _dedup_keep_order([p["comp_in"] for p in out_pipes if p["comp_in"]])
@@ -2660,15 +2705,15 @@ def func(
         _assert_max("it", it_items, 4)
         _assert_max("nor", nor_items, 4)
 
-        # Remote-side reverse transport is configured (if requested via local_republish) on the receiver, too.
+        # Receiver-side reverse transport: this peer decodes what arrived, which
+        # is the copy the receiving application reads (see `_delivered_topic`).
         irt_items_remote = []
         for e, p in zip(in_entries, in_pipes):
-            if not p["irt_in"]:
-                continue
             tspec = p["transport"]
-            assert tspec is not None
+            if not p["irt_in"] or not (tspec and tspec.remote_republish):
+                continue
             topic = _prefix_with_source_name_if_needed(local, remote, p["irt_in"])
-            irt_items_remote.append((topic, tspec.type))
+            irt_items_remote.append((topic, tspec))
 
         # Build plugin.yaml blocks
         blocks: List[PluginBlock] = []
@@ -2953,9 +2998,9 @@ def func(
                         if p.get("it_in")
                     ]
                     + [
-                        f'{p["irt_in"]}/raw'
+                        f'{p["irt_in"]}/{p["transport"].local_republish}'
                         for p in out_pipes
-                        if p.get("irt_in")
+                        if p.get("irt_in") and p["transport"].local_republish
                     ]
                 )
                 blocks.append(
@@ -3152,12 +3197,15 @@ def func(
                     raise ValueError(f"Unsupported transport type '{tspec.type}'")
             blocks.append(PluginBlock("it", items2))
 
-        # Merge reverse-transport config for (a) local reconstruction and (b) inbound remote topics (if requested).
+        # Merge reverse-transport config for (a) the sender's own preview of what
+        # it encoded and (b) the decode of what arrived. Both run on *this* peer;
+        # what differs is which copy they decode and which transport the session
+        # asked each of them to publish in.
         irt_all: List[Tuple[str, str, str]] = []
         for t, tspec in irt_items_local:
             assert tspec is not None
-            irt_all.append((t, tspec.type, "raw"))
-        irt_all.extend((topic, ttype, "raw") for topic, ttype in irt_items_remote)
+            irt_all.append((t, tspec.type, str(tspec.local_republish)))
+        irt_all.extend((topic, tspec.type, str(tspec.remote_republish)) for topic, tspec in irt_items_remote)
         _assert_max("irt", irt_all, 4)
         if irt_all:
             items2 = [("irt", True)]

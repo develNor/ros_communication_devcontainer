@@ -57,9 +57,9 @@ def _pipeline(processing: dict, base: str = "/camera/image", msg_type: str = "se
 
 
 def _ffmpeg(**extra: object) -> dict:
-    spec = {"type": "ffmpeg", "local_republish": True}
+    spec: dict = {"type": "ffmpeg", "local_republish": "raw", "remote_republish": "raw"}
     spec.update(extra)
-    return {"transport": spec}
+    return {"transport": {k: v for k, v in spec.items() if v is not None}}
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +88,49 @@ def test_wrapping_a_transport_does_not_rename_the_delivered_topic() -> None:
 
 
 def test_transport_without_republish_delivers_the_unwrapped_packet() -> None:
-    _, pipe = _pipeline({**_ffmpeg(local_republish=False), "use_ota_wrapper": True})
+    _, pipe = _pipeline(
+        {**_ffmpeg(local_republish=None, remote_republish=None), "use_ota_wrapper": True},
+    )
 
     assert pipe["irt_in"] is None
     assert generator._postprocessed_topic(pipe, pipe["final"]) == "/camera/image/ffmpeg"
+
+
+# ---------------------------------------------------------------------------
+# the two reverse republishes are separate decisions (#276)
+# ---------------------------------------------------------------------------
+
+
+def test_the_receiver_decode_names_the_delivered_topic_and_type() -> None:
+    """`remote_republish` decides what the receiving application subscribes to."""
+    entry, pipe = _pipeline(_ffmpeg(remote_republish="compressed"))
+
+    assert generator._postprocessed_topic(pipe, pipe["final"]) == "/camera/image/ffmpeg/compressed"
+    assert generator.REPUBLISH_OUTPUT_TYPES["compressed"] == "sensor_msgs/msg/CompressedImage"
+    # What crosses the link is still the encoded packet; only the decode changed.
+    assert generator._final_topic_type(entry, pipe) == generator.TRANSPORT_OUTPUT_TYPES["ffmpeg"]
+
+
+def test_the_senders_preview_does_not_decide_the_delivered_topic() -> None:
+    """`local_republish` runs on the sending machine and never reaches the receiver."""
+    _, pipe = _pipeline(_ffmpeg(local_republish="raw", remote_republish="compressed"))
+
+    assert generator._postprocessed_topic(pipe, pipe["final"]) == "/camera/image/ffmpeg/compressed"
+
+
+def test_a_sender_only_preview_delivers_the_packet() -> None:
+    """A preview on the sender leaves the receiver with what crossed the link."""
+    _, pipe = _pipeline(_ffmpeg(remote_republish=None))
+
+    # The encoded topic still exists -- the sender decodes it locally --
+    # but nothing decodes it on the receiving side.
+    assert pipe["irt_in"] == "/camera/image/ffmpeg"
+    assert generator._postprocessed_topic(pipe, pipe["final"]) == "/camera/image/ffmpeg"
+
+
+def test_a_republish_must_name_a_known_image_transport() -> None:
+    with pytest.raises(ValueError, match="remote_republish"):
+        _pipeline(_ffmpeg(remote_republish="jpeg"))
 
 
 def test_trickle_republishes_the_unwrapped_topic() -> None:

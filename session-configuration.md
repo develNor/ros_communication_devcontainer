@@ -446,7 +446,8 @@ processing:
   pixel_cap_preset: "wsvga"       # scalar, used as suffix only,
   transport:
     type: ffmpeg                  # ffmpeg | foxglove | compressed
-    local_republish: false        # default false
+    local_republish: raw          # raw | compressed; omit for no sender-side decode
+    remote_republish: compressed  # raw | compressed; omit for no receiver-side decode
     # plus type-specific params (see below)
 ```
 
@@ -507,10 +508,36 @@ The receiver undoes the chain in reverse, and every stage there is computed from
 the delivered topic rather than from the OTA topic:
 
 1) unwrap → republishes on the pre-wrap name (so wrapping renames nothing)
-2) `local_republish: true` → reverse transport decodes into `+ /raw`
+2) `remote_republish: <transport>` → reverse transport decodes into `+ /<transport>`
 3) decompress → republishes on the pre-compress name
 4) framebridge `global_to_local` → the local base topic
 5) trickle → `+ /trickle`, the only receiver-side stage that adds a suffix
+
+##### The two reverse republishes
+
+An encoded stream crosses the link as packets — `FFMPEGPacket`, `CompressedVideo`
+— and something has to turn those back into an image. That decode can happen in
+two places, and they answer different questions:
+
+- **`remote_republish`** runs on the receiving peer and is the one that matters:
+  it produces the topic the receiving application subscribes to (`<encoded>/raw`
+  or `<encoded>/compressed`), and it is what `_delivered_topic` reports as the
+  delivered stage.
+- **`local_republish`** runs on the *sending* peer, against the stream it just
+  encoded. Nothing crosses the link for it; it exists so the sending machine can
+  see approximately what the receiver will get.
+
+Both name the image transport they publish in rather than being switched on:
+
+| value | delivered type | cost |
+|---|---|---|
+| `raw` | `sensor_msgs/msg/Image` | the transport undone and nothing else, at full frame size — a 1280x800 stream is ~3 MB per frame |
+| `compressed` | `sensor_msgs/msg/CompressedImage` | a JPEG encode per frame, roughly an order of magnitude less data on the wire and in a `record -a` |
+
+Omitting a key means that side does not decode. There is deliberately **no
+default**: `type: compressed` already delivers an image, so a decode that
+switched itself on would produce exactly the full-size copy a session chose that
+transport to avoid.
 
 #### Transport parameters
 `type: ffmpeg` supports:

@@ -6134,8 +6134,11 @@ def _smoke_postprocessed_topic(entry: Any, pipe: dict[str, Any]) -> str:
     if pipe.get("framebridge") == "global_to_local":
         return str(pipe["fb_g2l_base"])
     transport = pipe.get("transport")
-    if transport is not None and bool(getattr(transport, "local_republish", False)):
-        return str(pipe["final"]) + "/raw"
+    remote_republish = getattr(transport, "remote_republish", None) if transport is not None else None
+    if remote_republish:
+        # The receiver's decode is what the smoke drives and asserts; the
+        # sender's own preview (`local_republish`) never reaches this peer.
+        return str(pipe["final"]) + f"/{remote_republish}"
     return str(pipe["final"])
 
 

@@ -49,7 +49,11 @@ topics:
       processing:
         transport:
           type: ffmpeg
-          local_republish: true
+          # `raw` on both sides, because this example measures the codec: PSNR
+          # and SSIM compare pixels, and a JPEG twin would fold its own loss
+          # into the number the example exists to report.
+          local_republish: raw
+          remote_republish: raw
           gop_size: 4
           bit_rate: 2000000
         # Wrapping an encoded stream: the wrapper runs after the encoder, so the

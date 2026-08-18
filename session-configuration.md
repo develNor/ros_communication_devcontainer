@@ -531,13 +531,36 @@ Both name the image transport they publish in rather than being switched on:
 
 | value | delivered type | cost |
 |---|---|---|
-| `raw` | `sensor_msgs/msg/Image` | the transport undone and nothing else, at full frame size — a 1280x800 stream is ~3 MB per frame |
-| `compressed` | `sensor_msgs/msg/CompressedImage` | a JPEG encode per frame, roughly an order of magnitude less data on the wire and in a `record -a` |
+| `raw` | `sensor_msgs/msg/Image` | the transport undone and nothing else, at full frame size — width x height x 3 per frame |
+| `compressed` | `sensor_msgs/msg/CompressedImage` | one JPEG encode per frame on top of the codec |
 
 Omitting a key means that side does not decode. There is deliberately **no
 default**: `type: compressed` already delivers an image, so a decode that
 switched itself on would produce exactly the full-size copy a session chose that
 transport to avoid.
+
+**What the difference is worth**, measured on an operator drive rather than
+estimated (1920x1200 H.264 at gop 5, the recording carrying both the packets and
+the compressed twin of the same frames, so the raw twin could be reproduced by
+decoding):
+
+| | |
+|---|---|
+| size | **14.6x** — 6.91 MB vs 472 kB per frame, 65.2 vs 4.45 MB/s |
+| quality | **PSNR 44.9 dB** mean (44.0 worst), **SSIM 0.9959** |
+
+Read the second row next to what the codec itself costs on the same kind of
+stream — p50 ~30 dB for the H.264 encode, ~19 dB for an artifact frame after a
+lost keyframe — and the extra JPEG generation is roughly 15 dB below the loss
+already present.
+
+The decisive number is neither: what crossed the link for those frames was
+**12.9 kB**. A raw twin is ~500x the payload it decodes, so the choice is about
+what each machine publishes locally and writes into a `record -a`, not about the
+link. Sessions that measure the *codec* — PSNR/SSIM against the pre-encoder
+frame, as `examples/sessions/17_synthetic_camera_quality` does — want `raw` on
+both sides for exactly that reason: a JPEG twin folds its own loss into the
+number being reported.
 
 #### Transport parameters
 `type: ffmpeg` supports:

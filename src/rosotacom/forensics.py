@@ -361,6 +361,52 @@ def build_stream_bins(stream: Stream, *, run_start: float, bin_s: float) -> list
     return bins
 
 
+def build_offered_timelines(
+    offered_records: list[dict[str, Any]],
+    streams: list[Stream],
+    timelines: dict[str, list[dict[str, Any]]],
+    *,
+    run_start: float,
+    bin_s: float,
+) -> dict[str, list[float]]:
+    """Per-bin offered rate per stream, from the sending peer's own transit records.
+
+    ``offered_records`` are ``direction: outbound`` rows (stage ``com_out``):
+    what the source handed to the link. Their ``t_wrap`` is the same header
+    stamp the receiving side records, so offered and delivered bins share one
+    publish timeline with no clock join. Streams without a single stamped
+    sender-side row are absent from the result — their collapse cause stays
+    unknowable.
+    """
+    grouped: dict[tuple[str, str, str], list[float]] = {}
+    for record in join_transit_records(offered_records):
+        if record.get("t_wrap") is None:
+            continue
+        key = (
+            str(record.get("source") or ""),
+            str(record.get("target") or ""),
+            str(record.get("topic") or ""),
+        )
+        grouped.setdefault(key, []).append(float(record["t_wrap"]))
+
+    offered: dict[str, list[float]] = {}
+    for stream in streams:
+        stamps = grouped.get((stream.source, stream.target, stream.topic))
+        bins = timelines[stream.label]
+        if not stamps or not bins:
+            continue
+        # bin_start_epoch is run_start + index * bin_s by construction; round
+        # instead of floor so float error cannot shift the alignment by one.
+        first_index = round((float(bins[0]["bin_start_epoch"]) - run_start) / bin_s)
+        counts = [0] * len(bins)
+        for stamp in stamps:
+            index = math.floor((stamp - run_start) / bin_s) - first_index
+            if 0 <= index < len(counts):
+                counts[index] += 1
+        offered[stream.label] = [round(count / bin_s, 3) for count in counts]
+    return offered
+
+
 # --------------------------------------------------------------------------- #
 # Event detection
 # --------------------------------------------------------------------------- #
@@ -489,7 +535,11 @@ def detect_latency_excursions(stream: Stream, config: DetectionConfig) -> list[D
 
 
 def detect_rate_collapses(
-    stream: Stream, bins: list[dict[str, Any]], config: DetectionConfig
+    stream: Stream,
+    bins: list[dict[str, Any]],
+    config: DetectionConfig,
+    *,
+    offered_hz: list[float] | None = None,
 ) -> list[DegradationEvent]:
     """Runs of >= ``rate_collapse_min_bins`` interior bins delivering far below nominal.
 
@@ -497,45 +547,75 @@ def detect_rate_collapses(
     becomes lost rows when a later message arrives) and throttled-but-delivering
     regimes. Needs a nominal rate; the first and last bin of a stream are never
     judged (they are partial by construction).
+
+    ``offered_hz`` — one rate per entry of ``bins``, from the sending peer's own
+    records (``build_offered_timelines``) — names each event's culprit as
+    ``cause``: ``source`` when every collapsed bin was offered below the same
+    threshold (the collapse is fully explained by the source pausing or slowing;
+    the link delivered what it was given), ``link`` when at least one collapsed
+    bin was offered at/above threshold and the link still delivered below it,
+    and ``unknown`` without sender-side records. The receiver alone cannot tell
+    these apart: on the 2026-08-17 CCNG drive, 0 Hz "collapses" on the planner
+    visualization were the source pausing during manual interventions, not the
+    link.
     """
     nominal_hz = stream.nominal_hz
     if nominal_hz is None or len(bins) < 3:
         return []
+    threshold_hz = config.rate_collapse_fraction * nominal_hz
     events: list[DegradationEvent] = []
-    run: list[dict[str, Any]] = []
+    run: list[tuple[int, dict[str, Any]]] = []
+
+    def cause_details() -> dict[str, Any]:
+        if offered_hz is None or len(offered_hz) != len(bins):
+            return {"cause": "unknown"}
+        rates = [float(offered_hz[index]) for index, _entry in run]
+        return {
+            "cause": "source" if max(rates) < threshold_hz else "link",
+            "min_offered_hz": round(min(rates), 3),
+            "max_offered_hz": round(max(rates), 3),
+        }
 
     def flush() -> None:
         if len(run) >= config.rate_collapse_min_bins:
+            entries = [entry for _index, entry in run]
             events.append(
                 DegradationEvent(
                     kind=RATE_COLLAPSE,
                     stream=stream.label,
-                    start_epoch=float(run[0]["bin_start_epoch"]),
-                    end_epoch=float(run[-1]["bin_start_epoch"]) + config.bin_s,
-                    count=len(run),
+                    start_epoch=float(entries[0]["bin_start_epoch"]),
+                    end_epoch=float(entries[-1]["bin_start_epoch"]) + config.bin_s,
+                    count=len(entries),
                     details={
                         "nominal_hz": round(nominal_hz, 3),
-                        "min_delivered_hz": min(float(entry["delivered_hz"]) for entry in run),
-                        "threshold_hz": round(config.rate_collapse_fraction * nominal_hz, 3),
+                        "min_delivered_hz": min(float(entry["delivered_hz"]) for entry in entries),
+                        "threshold_hz": round(threshold_hz, 3),
+                        **cause_details(),
                     },
                 )
             )
         run.clear()
 
-    for entry in bins[1:-1]:
-        if float(entry["delivered_hz"]) < config.rate_collapse_fraction * nominal_hz:
-            run.append(entry)
+    for index, entry in enumerate(bins[1:-1], start=1):
+        if float(entry["delivered_hz"]) < threshold_hz:
+            run.append((index, entry))
         else:
             flush()
     flush()
     return events
 
 
-def detect_events(stream: Stream, bins: list[dict[str, Any]], config: DetectionConfig) -> list[DegradationEvent]:
+def detect_events(
+    stream: Stream,
+    bins: list[dict[str, Any]],
+    config: DetectionConfig,
+    *,
+    offered_hz: list[float] | None = None,
+) -> list[DegradationEvent]:
     events = [
         *detect_loss_bursts(stream, config),
         *detect_latency_excursions(stream, config),
-        *detect_rate_collapses(stream, bins, config),
+        *detect_rate_collapses(stream, bins, config, offered_hz=offered_hz),
     ]
     events.sort(key=lambda event: (event.start_epoch, event.end_epoch, event.kind, event.stream))
     return events
@@ -862,8 +942,15 @@ def build_report(
     config = config or DetectionConfig()
     inputs = discover_inputs(instance_dir, peers=peers)
     records = load_transit_records(inputs.events_paths)
+    # The sending peer's own rows (direction=outbound, stage com_out) carry the
+    # offered rate. They must stay out of the delivered view: the cross-peer
+    # join keys on (source, topic, epoch, seq), so a sender row would upgrade
+    # the receiver's lost row to delivered and flatten delivered_hz to the
+    # offered rate.
+    offered_records = [record for record in records if record.get("direction") == "outbound"]
+    delivered_records = [record for record in records if record.get("direction") != "outbound"]
     declared = load_declared_ffmpeg_topics(inputs.status_paths)
-    streams = build_streams(records, declared_ffmpeg_topics=declared)
+    streams = build_streams(delivered_records, declared_ffmpeg_topics=declared)
 
     send_spans = [(stream.send_time(stream.records[0]), stream.send_time(stream.records[-1])) for stream in streams]
     run_start = min((span[0] for span in send_spans), default=0.0)
@@ -878,9 +965,10 @@ def build_report(
     )
 
     timelines = {stream.label: build_stream_bins(stream, run_start=run_start, bin_s=config.bin_s) for stream in streams}
+    offered = build_offered_timelines(offered_records, streams, timelines, run_start=run_start, bin_s=config.bin_s)
     events: list[DegradationEvent] = []
     for stream in streams:
-        events.extend(detect_events(stream, timelines[stream.label], config))
+        events.extend(detect_events(stream, timelines[stream.label], config, offered_hz=offered.get(stream.label)))
     events.sort(key=lambda event: (event.start_epoch, event.end_epoch, event.kind, event.stream))
 
     incidents = group_incidents(events, merge_gap_s=config.merge_gap_s)
@@ -900,7 +988,7 @@ def build_report(
 
     from .transit import summarize_transit_records
 
-    summary = summarize_transit_records(records)["topics"]
+    summary = summarize_transit_records(delivered_records)["topics"]
     stream_entries: dict[str, Any] = {}
     for stream in streams:
         entry = dict(summary.get(stream.label, {}))
@@ -1003,9 +1091,21 @@ def _event_line(event: dict[str, Any]) -> str:
             f"baseline {_format_ms(details.get('baseline_ms'))} (threshold {_format_ms(details.get('threshold_ms'))}), "
             f"{window}"
         )
+    cause = details.get("cause")
+    if cause == "source":
+        name = (
+            "rate collapse (source paused)" if details.get("max_offered_hz") == 0.0 else "rate collapse (source slowed)"
+        )
+    elif cause == "link":
+        name = "rate collapse (link)"
+    else:
+        name = "rate collapse"
+    low, high = details.get("min_offered_hz"), details.get("max_offered_hz")
+    offered = "" if low is None else (f", offered {low}Hz" if low == high else f", offered {low}-{high}Hz")
+    suffix = "" if cause in ("source", "link") else "; cause unknown (no sender-side records)"
     return (
-        f"**rate collapse** on `{event['stream']}` — {event['count']} bins, delivered rate down to "
-        f"{details.get('min_delivered_hz')}Hz vs nominal {details.get('nominal_hz')}Hz, {window}"
+        f"**{name}** on `{event['stream']}` — {event['count']} bins, delivered rate down to "
+        f"{details.get('min_delivered_hz')}Hz vs nominal {details.get('nominal_hz')}Hz{offered}, {window}{suffix}"
     )
 
 

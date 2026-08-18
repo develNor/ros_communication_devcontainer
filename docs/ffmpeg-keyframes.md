@@ -45,6 +45,18 @@ Grouping a stream into GOPs is then just splitting at keyframes. Note the
 encoder may emit keyframes *early* (scene cuts), so GOPs can be shorter than
 `gop_size` — assert spacing `<= gop_size`, not `== gop_size`.
 
+## Transit records carry the flag
+
+The receiving status overview applies the same parse live: when an inbound
+`OtaStamped` envelope's `msg_type` names an FFMPEGPacket, it walks the wrapped
+CDR bytes to `flags` (`com_py/ffmpeg_flags.py`, a dependency-free mirror of the
+host parser) and writes `keyframe: true/false` on every delivered RFC 0003
+transit row in `events.jsonl`. Synthesized lost rows have no payload and carry
+no such field; a payload the walk cannot parse simply omits it. Downstream,
+`rosotacom report` annotates a stream from these real flags whenever they cover
+more than 90% of its delivered rows (provenance `ffmpeg_flags (transit
+records)`), and only recordings without the field fall back to size bimodality.
+
 ## Automated stream-stage stats
 
 `rosotacom stream-stats` applies the same packet parser and GOP grouping to
@@ -69,8 +81,9 @@ Inputs are explicit and repeatable:
   rosbag2 storage backends fall back to `rosbag2_py` in a ROS environment.
 - `--events LABEL=PATH:/topic` reads delivered RFC 0003 transit rows from
   `events.jsonl`, using receiver-side `t_com_in` timestamps and `size_bytes`.
-  Transit rows do not carry raw CDR flags, so GOP annotation uses the documented
-  size-bimodality fallback when the keyframe share looks like a real GOP.
+  Rows carrying the per-message `keyframe` field annotate GOPs from the real
+  flags; older recordings without it use the documented size-bimodality
+  fallback when the keyframe share looks like a real GOP.
 
 The Markdown output starts with the comparison table:
 
@@ -105,9 +118,9 @@ averages 43,723 B, while positions 1-4 average 3,738 B, 4,512 B, 4,834 B, and
 
 ## Fallback: size bimodality
 
-If `flags` is unavailable (foreign recordings, or bags anonymized before
-flag preservation existed), the size distribution still separates the two
-classes: delta frames dominate the stream (a GOP of N contributes N−1), so
+If `flags` is unavailable (foreign recordings, bags anonymized before flag
+preservation existed, or `events.jsonl` written before transit rows carried
+`keyframe`), the size distribution still separates the two classes: delta frames dominate the stream (a GOP of N contributes N−1), so
 the median frame size sits on the delta mode, while keyframes are typically
 5–100× larger. `rosotacom.ffmpeg_packet.keyframes_by_size` marks frames
 above `3 × median` as keyframes. This misclassifies only when delta frames
@@ -119,6 +132,12 @@ scene at a very low bitrate) — prefer `flags` whenever present.
 - `tests/unit/test_ffmpeg_packet.py` — CDR parsing (alignment across
   odd-length strings), flag semantics, and the size fallback on a synthetic
   GOP pattern.
+- `tests/unit/test_ffmpeg_flags.py` — the receiver-side keyframe-bit walk in
+  `com_py/ffmpeg_flags.py`: agreement with the host parser on hand-built
+  packets, and `None` (never an exception) on truncated or foreign bytes.
+- `tests/unit/test_forensics.py` — `rosotacom report` prefers transit-row
+  `keyframe` flags over size bimodality, and falls back below the coverage
+  gate.
 - `tests/unit/test_stream_stats.py` — exact stream statistics, per-GOP-position
   tables from hand-built CDR packets, events-row source loading, comparison
   table shape, and CLI output writing.

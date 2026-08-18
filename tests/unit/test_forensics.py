@@ -365,6 +365,43 @@ def test_keyframes_annotated_by_size_bimodality_without_declaration(tmp_path: Pa
     assert "size_bimodality" in keyframes["provenance"]
 
 
+def test_keyframes_prefer_transit_flags_over_size_bimodality(tmp_path: Path) -> None:
+    # Uniform sizes carry no GOP signal and there is no declaration: only the
+    # real per-row flags can be the source of this annotation.
+    rows = [{**_record(seq), "keyframe": seq % 5 == 0} for seq in range(200)]
+    instance = _write_instance(tmp_path / "inst", rows)
+    report = build_report(instance, argv=["test"])
+    keyframes = report["streams"]["a->b:/cam"]["keyframes"]
+    assert keyframes["count"] == 40
+    assert keyframes["provenance"] == "ffmpeg_flags (transit records)"
+
+
+def test_keyframe_flag_coverage_counts_delivered_rows_only(tmp_path: Path) -> None:
+    rows = [
+        _record(seq, status="lost") if 50 <= seq < 80 else {**_record(seq), "keyframe": seq % 5 == 0}
+        for seq in range(200)
+    ]
+    report = build_report(_write_instance(tmp_path / "inst", rows), argv=["test"])
+    keyframes = report["streams"]["a->b:/cam"]["keyframes"]
+    assert keyframes["provenance"] == "ffmpeg_flags (transit records)"
+    assert keyframes["count"] == 34  # 40 flagged positions minus the 6 lost ones
+
+
+def test_sparse_keyframe_flags_fall_back_to_size_bimodality(tmp_path: Path) -> None:
+    # Half the rows predate the field (receiver upgraded mid-instance): coverage
+    # 50% is below the gate, so the documented size fallback decides.
+    rows = [
+        {**_record(seq, size_bytes=40000 if seq % 5 == 0 else 3000), "keyframe": seq % 5 == 0}
+        if seq < 100
+        else _record(seq, size_bytes=40000 if seq % 5 == 0 else 3000)
+        for seq in range(200)
+    ]
+    report = build_report(_write_instance(tmp_path / "inst", rows), argv=["test"])
+    keyframes = report["streams"]["a->b:/cam"]["keyframes"]
+    assert keyframes["count"] == 40
+    assert keyframes["provenance"].startswith("size_bimodality")
+
+
 def test_uniform_and_rare_spike_streams_are_not_keyframe_annotated(tmp_path: Path) -> None:
     uniform = _steady(200)
     # One 100x outlier in 200 messages: share 0.5 % — below the GOP gate.

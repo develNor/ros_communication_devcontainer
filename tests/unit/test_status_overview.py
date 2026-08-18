@@ -1063,6 +1063,33 @@ def test_transit_records_carry_the_epoch_they_were_counted_in() -> None:
     assert [(record["seq"], record["epoch"]) for record in records] == [(5000, 0), (40, 1)]
 
 
+def test_transit_records_carry_the_ffmpeg_keyframe_flag() -> None:
+    obs = core.StageObservation(type_str="com_msgs/msg/OtaStamped")
+    transit = {
+        "topic": "/cam",
+        "direction": "inbound",
+        "stage": "com_in",
+        "t_wrap": 1.01,
+        "t_com_in": 1.05,
+        "keyframe": True,
+    }
+    obs.record(40000, 0.04, now_mono=10.0, now_wall=1.05, seq=0, transit=transit)
+    obs.record(3000, 0.04, now_mono=10.1, now_wall=1.15, seq=1, transit={**transit, "keyframe": False})
+    # seq 2 never arrives: the synthesized lost row has no payload to parse.
+    obs.record(3000, 0.04, now_mono=10.3, now_wall=1.35, seq=3, transit={**transit, "keyframe": False})
+    # A non-FFMPEG stream's transit dict carries keyframe=None -> field absent.
+    obs.record(3000, 0.04, now_mono=10.4, now_wall=1.45, seq=4, transit={**transit, "keyframe": None})
+
+    records = obs.drain_transit_records()
+    assert [(record["seq"], record.get("keyframe", "absent")) for record in records] == [
+        (0, True),
+        (1, False),
+        (2, "absent"),
+        (3, False),
+        (4, "absent"),
+    ]
+
+
 def test_loss_expect_classifies_wrapped_stage_bad(tmp_path: Path) -> None:
     agg = _build({"local": _FakeObserver(), "ota": _FakeObserver()}, tmp_path)
     metrics = {"hz": 10.0, "last_delay_s": 0.01, "loss_pct": 4.0}

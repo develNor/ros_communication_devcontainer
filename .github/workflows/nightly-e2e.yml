@@ -108,6 +108,7 @@ jobs:
           - cyclone-local-zenoh-ros2dds-ota
           - cyclone-ota
           - fastdds
+          - fastdds-default
           - zen-endpoints
     steps:
       - name: Check out repository

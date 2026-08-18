@@ -297,6 +297,10 @@ def test_generated_rmw_matrix_omits_mixed_dds_split_domain_cases() -> None:
     for session_file in sorted(rmw_matrix_dir.glob("*/session-definition.yaml")):
         session = yaml.safe_load(session_file.read_text(encoding="utf-8"))
         rmw = session["shared"]["rmw"]
+        if isinstance(rmw, str):
+            # The string shortcut sets both sides to the same implementation,
+            # so it can never be the mixed case this test is about.
+            continue
         local = rmw_name(rmw["local"])
         ota = rmw_name(rmw["ota"])
         if {local, ota} == {"cyclone", "fastdds"}:

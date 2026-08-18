@@ -77,6 +77,22 @@ missing tail after the last record is not judged either — without a sender-sid
 end marker it is indistinguishable from a normal shutdown (RFC 0003, honest
 limits).
 
+A receiver-only view also cannot tell a broken link from a source that simply
+stopped publishing — on the 2026-08-17 CCNG drive, "0 Hz collapses" on the
+planner visualization were the source pausing during manual interventions while
+the link delivered everything offered. When the instance also contains the
+sending peer's own transit records for a stream (`direction: outbound`, stage
+`com_out`), the report bins their `t_wrap` stamps into a per-bin **offered**
+rate on the same publish timeline and each collapse event names its culprit in
+`details.cause`: `source` when every collapsed bin was offered below the same
+threshold — the collapse is fully explained by the source, and the markdown
+line reads "source paused" (0 Hz offered) or "source slowed"; `link` when at
+least one collapsed bin was offered at/above threshold and the link still
+delivered below it; `unknown` without sender-side records. `min_offered_hz` /
+`max_offered_hz` accompany the verdict. Sender-side rows feed only the offered
+rate — they never enter the delivered view, where the cross-peer join would
+upgrade receiver-inferred lost rows to delivered.
+
 Events across streams and kinds are grouped into **incidents** when their
 windows touch (merge gap defaults to one bin): one degradation moment, several
 lenses on it.

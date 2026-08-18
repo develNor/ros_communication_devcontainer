@@ -78,6 +78,25 @@ def _steady(count: int, **kwargs: Any) -> list[dict[str, Any]]:
     return [_record(seq, **kwargs) for seq in range(count)]
 
 
+def _sender_record(seq: int, *, topic: str = "/cam", t0: float = T0, period_s: float = PERIOD_S) -> dict[str, Any]:
+    """The sending peer's own observation of the same message (stage com_out)."""
+    return {
+        "kind": "transit",
+        "peer": "a",
+        "source": "a",
+        "target": "b",
+        "topic": topic,
+        "direction": "outbound",
+        "stage": "com_out",
+        "seq": seq,
+        "status": "delivered",
+        "t_wrap": t0 + seq * period_s,
+        "t_com_in": None,
+        "sections": {"ota_hop_ms": None},
+        "size_bytes": 1000,
+    }
+
+
 def _write_instance(
     root: Path,
     rows: list[dict[str, Any]],
@@ -206,6 +225,103 @@ def test_stream_edges_are_never_rate_collapsed() -> None:
     config = DetectionConfig()
     bins = build_stream_bins(stream, run_start=T0, bin_s=config.bin_s)
     assert detect_rate_collapses(stream, bins, config) == []
+
+
+def test_rate_collapse_cause_from_offered_rate() -> None:
+    # Same delivered collapse (bins 5-7 at 5 Hz), three sender-side views:
+    # offered stayed nominal -> the link dropped it; offered collapsed with it
+    # -> the source did; no sender records -> unknowable from this instance.
+    rows = [_record(seq) for seq in range(300) if not (100 <= seq < 160) or seq % 4 == 0]
+    stream = _stream(rows)
+    config = DetectionConfig()
+    bins = build_stream_bins(stream, run_start=T0, bin_s=config.bin_s)
+
+    (event,) = detect_rate_collapses(stream, bins, config, offered_hz=[20.0] * len(bins))
+    assert event.details["cause"] == "link"
+    assert event.details["min_offered_hz"] == pytest.approx(20.0)
+
+    offered = [0.0 if 5 <= index <= 7 else 20.0 for index in range(len(bins))]
+    (event,) = detect_rate_collapses(stream, bins, config, offered_hz=offered)
+    assert event.details["cause"] == "source"
+    assert event.details["max_offered_hz"] == pytest.approx(0.0)
+
+    (event,) = detect_rate_collapses(stream, bins, config)
+    assert event.details["cause"] == "unknown"
+    assert "min_offered_hz" not in event.details
+
+
+def test_report_names_link_collapse_when_offered_stays_nominal(tmp_path: Path) -> None:
+    # Receiver sees 5 Hz in the stall window; the sender's own records show all
+    # 300 messages offered at 20 Hz. Sender rows must feed only the offered
+    # rate: merged into the delivered view they would fill the stall and hide
+    # the collapse entirely.
+    receiver = [_record(seq) for seq in range(300) if not (100 <= seq < 160) or seq % 4 == 0]
+    sender = [_sender_record(seq) for seq in range(300)]
+    instance = _write_instance(tmp_path / "inst", receiver, peer="b")
+    _write_instance(instance, sender, peer="a")
+    report = build_report(instance, argv=["test"])
+    (event,) = report["events"]
+    assert event["kind"] == RATE_COLLAPSE
+    assert event["details"]["cause"] == "link"
+    assert event["details"]["min_delivered_hz"] == pytest.approx(5.0)
+    assert event["details"]["min_offered_hz"] == pytest.approx(20.0)
+    assert "**rate collapse (link)**" in render_markdown(report)
+
+
+def test_report_names_source_pause_with_sender_side_records(tmp_path: Path) -> None:
+    # The source publishes nothing for 3 s (seq continues afterwards, so no
+    # lost rows): both sides go to 0 Hz in bins 5-7 -- the 2026-08-17 CCNG
+    # shape, where the link delivered everything offered.
+    receiver = [_record(seq, t0=T0 + 3.0 if seq >= 100 else T0) for seq in range(300)]
+    sender = [_sender_record(seq, t0=T0 + 3.0 if seq >= 100 else T0) for seq in range(300)]
+    instance = _write_instance(tmp_path / "inst", receiver, peer="b")
+    _write_instance(instance, sender, peer="a")
+    report = build_report(instance, argv=["test"])
+    (event,) = report["events"]
+    assert event["kind"] == RATE_COLLAPSE
+    assert event["count"] == 3
+    assert event["details"]["cause"] == "source"
+    assert event["details"]["max_offered_hz"] == pytest.approx(0.0)
+    assert "**rate collapse (source paused)**" in render_markdown(report)
+
+
+def test_report_names_source_slowdown_distinct_from_pause(tmp_path: Path) -> None:
+    # The source throttled to 5 Hz and the link delivered all of it: cause is
+    # still the source, but the line must not claim a pause.
+    pattern = [seq for seq in range(300) if not (100 <= seq < 160) or seq % 4 == 0]
+    receiver = [_record(seq) for seq in pattern]
+    sender = [_sender_record(seq) for seq in pattern]
+    instance = _write_instance(tmp_path / "inst", receiver, peer="b")
+    _write_instance(instance, sender, peer="a")
+    report = build_report(instance, argv=["test"])
+    (event,) = report["events"]
+    assert event["details"]["cause"] == "source"
+    assert event["details"]["min_offered_hz"] == pytest.approx(5.0)
+    assert "**rate collapse (source slowed)**" in render_markdown(report)
+
+
+def test_rate_collapse_without_sender_records_reads_cause_unknown(tmp_path: Path) -> None:
+    rows = [_record(seq) for seq in range(300) if not (100 <= seq < 160) or seq % 4 == 0]
+    report = build_report(_write_instance(tmp_path / "inst", rows), argv=["test"])
+    (event,) = report["events"]
+    assert event["details"]["cause"] == "unknown"
+    assert "cause unknown (no sender-side records)" in render_markdown(report)
+
+
+def test_offered_bins_align_when_stream_starts_mid_bin(tmp_path: Path) -> None:
+    # A second stream starting 2.5 s earlier shifts the shared run_start, so
+    # /cam's bins begin at a non-zero bin index. The offered rate must land in
+    # those same bins: misaligned by the offset, the paused source would read
+    # as offered-at-nominal and the cause would flip to "link".
+    cam_receiver = [_record(seq, t0=T0 + 3.0 if seq >= 100 else T0) for seq in range(300)]
+    tel_receiver = [_record(seq, topic="/tel", t0=T0 - 2.5) for seq in range(300)]
+    cam_sender = [_sender_record(seq, t0=T0 + 3.0 if seq >= 100 else T0) for seq in range(300)]
+    instance = _write_instance(tmp_path / "inst", [*cam_receiver, *tel_receiver], peer="b")
+    _write_instance(instance, cam_sender, peer="a")
+    report = build_report(instance, argv=["test"])
+    collapses = [event for event in report["events"] if event["kind"] == RATE_COLLAPSE]
+    assert [event["stream"] for event in collapses] == ["a->b:/cam"]
+    assert collapses[0]["details"]["cause"] == "source"
 
 
 # -- timeline bins ------------------------------------------------------------ #

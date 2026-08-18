@@ -222,3 +222,41 @@ def test_nominal_send_period_ignores_the_step_across_a_restart() -> None:
     records += [{**_record(seq, "delivered", 5.0, t_wrap=100.0 + seq * 0.1), "epoch": 1} for seq in range(10)]
 
     assert _nominal_send_period_ms(records) == 100.0
+
+
+def test_sender_rows_can_never_mask_a_receiver_loss() -> None:
+    """The sending peer's com_out rows join with the receiver's rows by
+    (source, topic, epoch, seq). `sent` ranks below every receiver verdict in
+    `join_transit_records`, so a message the link lost stays lost -- while the
+    joined record still gains the sender's timestamps."""
+    sent = {
+        **_record(1, "sent", t_wrap=100.0),
+        "stage": "com_out",
+        "direction": "outbound",
+        "t_com_out": 100.005,
+        "sections": {"wrap_to_com_out_ms": 5.0},
+    }
+    lost = {**_record(1, "lost"), "stage": "com_in", "direction": "inbound"}
+
+    for ordering in ([sent, lost], [lost, sent]):
+        (joined,) = join_transit_records(ordering)
+        assert joined["status"] == "lost"
+        assert joined["t_wrap"] == 100.0
+        assert joined["t_com_out"] == 100.005
+
+    delivered = {**_record(1, "delivered", 12.0, t_wrap=100.0), "stage": "com_in", "direction": "inbound"}
+    (joined,) = join_transit_records([sent, delivered])
+    assert joined["status"] == "delivered"
+    assert joined["sections"]["ota_hop_ms"] == 12.0
+    assert joined["sections"]["wrap_to_com_out_ms"] == 5.0
+
+
+def test_unobserved_sender_gaps_do_not_count_as_loss() -> None:
+    records = [
+        {**_record(0, "sent", t_wrap=10.0), "direction": "outbound", "stage": "com_out"},
+        {**_record(1, "unobserved"), "direction": "outbound", "stage": "com_out"},
+        {**_record(2, "sent", t_wrap=10.2), "direction": "outbound", "stage": "com_out"},
+    ]
+    summary = summarize_transit_records(records)["topics"]["/x"]
+    assert summary["lost"] == 0
+    assert summary["loss_pct"] == 0.0

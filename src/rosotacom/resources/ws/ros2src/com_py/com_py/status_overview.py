@@ -253,6 +253,22 @@ class StageObserver(Node):
                     ),
                     None,
                 )
+                com_out = next(
+                    (
+                        context
+                        for context in contexts
+                        if context.get("stage") == "com_out"
+                        and context.get("direction") == "outbound"
+                    ),
+                    None,
+                )
+                keyframe: Optional[bool] = None
+                if com_in is not None or com_out is not None:
+                    try:
+                        if msg.msg_type == FFMPEG_PACKET_TYPE:
+                            keyframe = parse_keyframe_flag(bytes(msg.serialized_msg))
+                    except Exception:
+                        keyframe = None
                 if com_in is not None:
                     seq = int(msg.seq)
                     t_wrap_s = _stamp_seconds(msg.header.stamp)
@@ -262,12 +278,6 @@ class StageObserver(Node):
                         clock_offset_s = estimate["offset_s"]
                         rtt_s = estimate["rtt_s"]
                         delay_s = now_ros_s + clock_offset_s - t_wrap_s
-                    keyframe: Optional[bool] = None
-                    try:
-                        if msg.msg_type == FFMPEG_PACKET_TYPE:
-                            keyframe = parse_keyframe_flag(bytes(msg.serialized_msg))
-                    except Exception:
-                        keyframe = None
                     transit = {
                         "peer": com_in.get("peer"),
                         "source": com_in.get("source"),
@@ -277,6 +287,26 @@ class StageObserver(Node):
                         "stage": com_in.get("stage"),
                         "t_wrap": t_wrap_s,
                         "t_com_in": now_ros_s,
+                        "keyframe": keyframe,
+                    }
+                elif com_out is not None:
+                    # The sending peer's own view of the same message: what the
+                    # source handed to the link, before any OTA hop. The wrapper
+                    # stamped `t_wrap` on THIS machine, so no peer offset applies
+                    # (same rule as the generic local-stage branch below) and the
+                    # delay is the wrap->com_out relay hop, not an OTA number.
+                    seq = int(msg.seq)
+                    t_wrap_s = _stamp_seconds(msg.header.stamp)
+                    delay_s = now_ros_s - t_wrap_s
+                    transit = {
+                        "peer": com_out.get("peer"),
+                        "source": com_out.get("source"),
+                        "target": com_out.get("target"),
+                        "topic": com_out.get("base"),
+                        "direction": com_out.get("direction"),
+                        "stage": com_out.get("stage"),
+                        "t_wrap": t_wrap_s,
+                        "t_com_out": now_ros_s,
                         "keyframe": keyframe,
                     }
             else:

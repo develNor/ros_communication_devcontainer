@@ -232,15 +232,49 @@ parameters:
   irt_1_topic: # e.g. /sensors/camera/front_wide/image_color
   irt_1_transport: # e.g. raw
   irt_1_out_transport: compressed # e.g. raw, compressed – determines the output remap format
+  irt_1_paced: # "true" -> decode reads ${irt_1_topic}/paced (playout pacer, PACE window)
   irt_2_topic: # e.g. /sensors/front_camera/image_raw/compressed
   irt_2_transport: # e.g. raw
   irt_2_out_transport: compressed # e.g. raw, compressed – determines the output remap format
+  irt_2_paced: # "true" -> decode reads ${irt_2_topic}/paced
   irt_3_topic: # e.g. /sensor/front_camera/image_color/compressed
   irt_3_transport: # e.g. raw
   irt_3_out_transport: compressed # e.g. raw, compressed – determines the output remap format
+  irt_3_paced: # "true" -> decode reads ${irt_3_topic}/paced
   irt_4_topic: # e.g. /sensor/front_camera/image_color/compressed
   irt_4_transport: # e.g. raw
   irt_4_out_transport: compressed # e.g. raw, compressed – determines the output remap format
+  irt_4_paced: # "true" -> decode reads ${irt_4_topic}/paced
+
+  # Receiver-side playout pacing (transport.playout in the session definition):
+  # re-times the arrived encoded stream on '<topic>/paced' so the decode sees a
+  # steady cadence instead of the network's delay jitter. Never reorders, never
+  # drops; late packets pass through immediately.
+  pace: false
+  pace_1_topic: # the arrived encoded stream, e.g. /camera/image/ffmpeg
+  pace_1_msg_type: # e.g. ffmpeg_image_transport_msgs/msg/FFMPEGPacket
+  pace_1_adaptive: # "true" | "false"
+  pace_1_target_ms: # fixed budget when adaptive is "false"
+  pace_1_min_ms: # adaptive clamp above the observed delay floor
+  pace_1_max_ms:
+  pace_2_topic:
+  pace_2_msg_type:
+  pace_2_adaptive:
+  pace_2_target_ms:
+  pace_2_min_ms:
+  pace_2_max_ms:
+  pace_3_topic:
+  pace_3_msg_type:
+  pace_3_adaptive:
+  pace_3_target_ms:
+  pace_3_min_ms:
+  pace_3_max_ms:
+  pace_4_topic:
+  pace_4_msg_type:
+  pace_4_adaptive:
+  pace_4_target_ms:
+  pace_4_min_ms:
+  pace_4_max_ms:
 
 common:
   before_commands:
@@ -623,6 +657,30 @@ windows:
         - args+=(--remap "${in_remap}:=${it_4_topic}" --remap "out/${it_4_transport}:=${it_4_topic}/${outgoing_suffix}")
         - echo ${args[@]}
         - ${args[@]}
+  - name: PACE
+    if: pace
+    layout: even-vertical
+    splits:
+      - commands:
+        - if [ '${pace_1_topic}' = "None" ]; then exit; fi
+        - args=(ros2 run com_py playout_pacer --ros-args -p topic:=${pace_1_topic} -p msg_type:=${pace_1_msg_type} -p adaptive:=${pace_1_adaptive} -p target_ms:=${pace_1_target_ms} -p min_ms:=${pace_1_min_ms} -p max_ms:=${pace_1_max_ms} -p qos_config_file:='${qos_config_file}')
+        - echo ${args[@]}
+        - ${args[@]}
+      - commands:
+        - if [ '${pace_2_topic}' = "None" ]; then exit; fi
+        - args=(ros2 run com_py playout_pacer --ros-args -p topic:=${pace_2_topic} -p msg_type:=${pace_2_msg_type} -p adaptive:=${pace_2_adaptive} -p target_ms:=${pace_2_target_ms} -p min_ms:=${pace_2_min_ms} -p max_ms:=${pace_2_max_ms} -p qos_config_file:='${qos_config_file}')
+        - echo ${args[@]}
+        - ${args[@]}
+      - commands:
+        - if [ '${pace_3_topic}' = "None" ]; then exit; fi
+        - args=(ros2 run com_py playout_pacer --ros-args -p topic:=${pace_3_topic} -p msg_type:=${pace_3_msg_type} -p adaptive:=${pace_3_adaptive} -p target_ms:=${pace_3_target_ms} -p min_ms:=${pace_3_min_ms} -p max_ms:=${pace_3_max_ms} -p qos_config_file:='${qos_config_file}')
+        - echo ${args[@]}
+        - ${args[@]}
+      - commands:
+        - if [ '${pace_4_topic}' = "None" ]; then exit; fi
+        - args=(ros2 run com_py playout_pacer --ros-args -p topic:=${pace_4_topic} -p msg_type:=${pace_4_msg_type} -p adaptive:=${pace_4_adaptive} -p target_ms:=${pace_4_target_ms} -p min_ms:=${pace_4_min_ms} -p max_ms:=${pace_4_max_ms} -p qos_config_file:='${qos_config_file}')
+        - echo ${args[@]}
+        - ${args[@]}
   - name: IRT
     if: irt
     layout: even-vertical
@@ -630,28 +688,32 @@ windows:
       - commands:
         - if [ '${irt_1_topic}' = "None" ]; then exit; fi
         - if [[ "${irt_1_out_transport}" == "raw" ]]; then out_remap="out"; else out_remap="out/${irt_1_out_transport}"; fi
+        - if [[ "${irt_1_paced}" != "None" ]]; then irt_in_topic="${irt_1_topic}/paced"; else irt_in_topic="${irt_1_topic}"; fi
         - args=(ros2 run image_transport republish --ros-args -r __node:=irt_republish1 -p in_transport:=${irt_1_transport} -p out_transport:=${irt_1_out_transport}
-            --remap in/${irt_1_transport}:=${irt_1_topic} --remap ${out_remap}:=${irt_1_topic}/${irt_1_out_transport})
+            --remap in/${irt_1_transport}:=${irt_in_topic} --remap ${out_remap}:=${irt_1_topic}/${irt_1_out_transport})
         - echo ${args[@]}
         - ${args[@]}
       - commands:
         - if [ '${irt_2_topic}' = "None" ]; then exit; fi
         - if [[ "${irt_2_out_transport}" == "raw" ]]; then out_remap="out"; else out_remap="out/${irt_2_out_transport}"; fi
+        - if [[ "${irt_2_paced}" != "None" ]]; then irt_in_topic="${irt_2_topic}/paced"; else irt_in_topic="${irt_2_topic}"; fi
         - args=(ros2 run image_transport republish --ros-args -r __node:=irt_republish2 -p in_transport:=${irt_2_transport} -p out_transport:=${irt_2_out_transport}
-            --remap in/${irt_2_transport}:=${irt_2_topic} --remap ${out_remap}:=${irt_2_topic}/${irt_2_out_transport})
+            --remap in/${irt_2_transport}:=${irt_in_topic} --remap ${out_remap}:=${irt_2_topic}/${irt_2_out_transport})
         - echo ${args[@]}
         - ${args[@]}
       - commands:
         - if [ '${irt_3_topic}' = "None" ]; then exit; fi
         - if [[ "${irt_3_out_transport}" == "raw" ]]; then out_remap="out"; else out_remap="out/${irt_3_out_transport}"; fi
+        - if [[ "${irt_3_paced}" != "None" ]]; then irt_in_topic="${irt_3_topic}/paced"; else irt_in_topic="${irt_3_topic}"; fi
         - args=(ros2 run image_transport republish --ros-args -r __node:=irt_republish3 -p in_transport:=${irt_3_transport} -p out_transport:=${irt_3_out_transport}
-            --remap in/${irt_3_transport}:=${irt_3_topic} --remap ${out_remap}:=${irt_3_topic}/${irt_3_out_transport})
+            --remap in/${irt_3_transport}:=${irt_in_topic} --remap ${out_remap}:=${irt_3_topic}/${irt_3_out_transport})
         - echo ${args[@]}
         - ${args[@]}
       - commands:
         - if [ '${irt_4_topic}' = "None" ]; then exit; fi
         - if [[ "${irt_4_out_transport}" == "raw" ]]; then out_remap="out"; else out_remap="out/${irt_4_out_transport}"; fi
+        - if [[ "${irt_4_paced}" != "None" ]]; then irt_in_topic="${irt_4_topic}/paced"; else irt_in_topic="${irt_4_topic}"; fi
         - args=(ros2 run image_transport republish --ros-args -r __node:=irt_republish4 -p in_transport:=${irt_4_transport} -p out_transport:=${irt_4_out_transport}
-            --remap in/${irt_4_transport}:=${irt_4_topic} --remap ${out_remap}:=${irt_4_topic}/${irt_4_out_transport})
+            --remap in/${irt_4_transport}:=${irt_in_topic} --remap ${out_remap}:=${irt_4_topic}/${irt_4_out_transport})
         - echo ${args[@]}
         - ${args[@]}

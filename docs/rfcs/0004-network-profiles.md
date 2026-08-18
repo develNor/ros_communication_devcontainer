@@ -91,11 +91,24 @@ profiles:
       - { for: 40s, uplink: { rate: 2.5mbit, delay: 90ms,  loss: 1%   } }
 ```
 
-- **static** — constant `{rate, delay, jitter, distribution, loss,
-  loss_correlation, reorder, duplicate, seed}` per direction. `loss_correlation`
-  (netem state/`gemodel`) makes loss bursty rather than independent — closer to
-  real radio loss. `seed` maps to `tc netem seed SEED` when supported, making the
-  generated random delay/loss draw replayable.
+- **static** — constant `{rate, delay, jitter, distribution, distribution_file,
+  loss, loss_correlation, loss_gemodel, reorder, duplicate, seed}` per
+  direction. Two loss models, mutually exclusive per direction:
+  `loss` (+ optional `loss_correlation`) is netem's independent/correlated
+  per-packet loss; `loss_gemodel: {p, r, loss_bad, loss_good}` is the
+  Gilbert–Elliott state model (`tc netem loss gemodel`), the vocabulary a real
+  cellular link needs — rare transitions into a short intense bad state
+  (`p`/`r` per packet) with distinct loss probabilities inside (`loss_bad`)
+  and outside (`loss_good`) of it. The 2026-08-17 CCNG field fit is the
+  reference: `p 0.12%, r 2.9%, loss_bad 2.7%, loss_good 0.098%` reproduces
+  113 ms bad states every ~2.8 s. `distribution` accepts the iproute2
+  builtins (`normal|pareto|paretonormal`) or a custom table name whose
+  `distribution_file` (a `.dist` built by `python -m rosotacom.netem_dist`
+  from measured delay samples) the runner installs into the shaping netns as
+  `/usr/lib/tc/<name>.dist` — because a field link's delay is
+  lognormal-tailed and `normal` under-tails p99 by ~2x. `seed` maps to
+  `tc netem seed SEED` when supported, making the generated random
+  delay/loss draw replayable.
 - **timeline** — an ordered list of `{ for: <dur>, <static-params> | outage }`
   segments. A recovery benchmark (RFC 0005) *is* a timeline profile; `outage` is
   the step whose recovery is measured.
@@ -189,8 +202,11 @@ RFC 0002's `calibrate` / `--suggest` machinery, **per profile**:
   the fluctuation `netem` does not reproduce by default. Emulation buys
   **reproducibility, not truth** — rung 4 (real cellular) calibrates the
   *shape* of the emulated profile; the profile then gives repeatable gating.
-- **Bursty loss needs the state model.** Default `netem loss` is independent; use
-  `loss_correlation` / `gemodel` to approximate real burst loss.
+- **Bursty loss needs the state model.** Default `netem loss` is independent; the
+  2-arg `loss p% corr%` cannot express short-bad/long-good either. `loss_gemodel`
+  carries the Gilbert–Elliott parameters directly (see the schema section); fit
+  `p`/`r` from the measured bad/good run lengths (per packet) and the two loss
+  probabilities from the loss rate inside/outside bad states.
 - **Outage semantics are a choice.** `netem loss 100%` keeps the interface up (DDS
   endpoints survive, recovery is "catch up") vs link-down (forces RMW
   re-discovery, a harsher recovery). They test different recoveries — see Open
@@ -215,6 +231,12 @@ risk — a stuck `qdisc` silently corrupts every later result on the machine.
   `profiles.yaml` referenced from `rosotacom.yaml`), and resolve selection via
   `--profile <name>` / `shared.profile` / `none` (`resolve_profile_selection`,
   `cli._resolve_active_profile`).
+- [x] Extend the loss/delay vocabulary to what field links actually need
+  (issue #278): `loss_gemodel` (Gilbert–Elliott state loss, exclusive with
+  `loss`) and custom delay-distribution tables (`distribution` beyond the
+  builtins + `distribution_file`, generated from measured samples by
+  `rosotacom.netem_dist`, installed into the shaping netns by the lab runner
+  before arming).
 - [x] Arm a named static profile on the OTA-interface egress with fail-safe
   teardown (revert on stop, on error, and via a safety max-duration watchdog);
   target the data interface only, never the SSH/control interface
@@ -268,6 +290,21 @@ off during implementation). Notes whether automation is feasible; privileged
   for a given profile/direction (rate/delay/jitter/loss/correlation → `tbf`+`netem`
   string), without touching a real interface (`test_shaping_commands_*`,
   `test_netem_arg_ordering_is_valid`). Done.
+- [x] **Gilbert–Elliott loss (`loss_gemodel`)** — host unit tests on the schema
+  (required/unknown keys, exclusivity against `loss`) and on the argv (all four
+  probabilities always emitted): `test_gemodel_parse_and_exclusivity`,
+  `test_gemodel_argv_emits_all_four_probabilities`. The *statistical* fidelity of
+  the emitted process (bad-run length, in-state loss rates) stays a bench check
+  against a field fit — the 2026-08-17 CCNG fragment replay is the reference.
+- [x] **Custom delay-distribution tables** — host unit tests: a non-builtin
+  `distribution` requires `distribution_file` and resolves relative to the
+  profiles file (`test_custom_distribution_requires_a_file_and_builtin_does_not`,
+  `test_load_profiles_file_resolves_distribution_files_and_lists_installs`);
+  table generation is normalized, monotonic, tail-preserving
+  (`test_netem_dist.py`). The lab runner installs required tables into the
+  shaping netns before arming (`required_dist_installs` consumed in
+  `cli_benchmark`); that a netem referencing the installed name actually loads
+  it is part of the same bench check as arming itself.
 - [~] **Fail-safe teardown** (revert on stop, on error, on safety max-duration; the
   idempotent `tc qdisc del … root` always runs; data-interface-only, never the
   SSH/control interface) — host unit test on the teardown/targeting logic done

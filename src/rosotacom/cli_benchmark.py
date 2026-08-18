@@ -5514,6 +5514,30 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
 
                 # 3. Arm the network shapers (after discovery is complete)
                 if profile_obj is not None:
+                    from .network_profiles import required_dist_installs
+
+                    dist_installs = required_dist_installs(profile_obj)
+                    if dist_installs:
+                        # Custom delay-distribution tables must exist inside the
+                        # shaping netns before netem references them by name.
+                        for dist_container in (a_container, b_container):
+                            if not dist_container:
+                                continue
+                            for table_name, file_path in dist_installs:
+                                dist_target = f"/usr/lib/tc/{table_name}.dist"
+                                for install_cmd in (
+                                    ["docker", "exec", "-u", "root", dist_container, "mkdir", "-p", "/usr/lib/tc"],
+                                    ["docker", "cp", file_path, f"{dist_container}:{dist_target}"],
+                                ):
+                                    res = subprocess.run(install_cmd, capture_output=True, text=True, check=False)
+                                    if res.returncode != 0:
+                                        raise RuntimeError(
+                                            f"failed to install netem distribution table {table_name!r} in "
+                                            f"{dist_container}: {' '.join(install_cmd)} -> {res.stderr or res.stdout}"
+                                        )
+                                print(
+                                    f"  netem distribution {table_name!r} installed in {dist_container}: {dist_target}"
+                                )
                     if profile_obj.is_timeline:
                         # Peer A shapes uplink (egress to B)
                         shaper_a = ProfileShaper("eth0", make_container_runner(a_container))

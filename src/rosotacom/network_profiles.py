@@ -136,6 +136,38 @@ def parse_seed(value: Any, what: str = "seed") -> int:
 # Schema
 # --------------------------------------------------------------------------- #
 
+# Distribution tables iproute2 ships; anything else needs a ``distribution_file``
+# that the runner installs into the shaping netns as ``/usr/lib/tc/<name>.dist``.
+_BUILTIN_DISTRIBUTIONS = ("normal", "pareto", "paretonormal")
+_DISTRIBUTION_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+@dataclass(frozen=True)
+class GemodelLoss:
+    """netem ``loss gemodel`` — the Gilbert(-Elliott) two-state loss process.
+
+    Per-*packet* state transitions (netem evaluates the chain once per packet):
+    ``p_pct`` = P(good→bad), ``r_pct`` = P(bad→good), ``loss_bad_pct`` = loss
+    probability while bad (netem's ``1-h`` argument), ``loss_good_pct`` = loss
+    probability while good (netem's ``1-k``). All four are always emitted, so the
+    argv never depends on iproute2 defaults. This is the vocabulary the plain
+    2-arg ``loss p% corr%`` cannot express: short intense bad states inside long
+    clean good states, as measured on real cellular links.
+    """
+
+    p_pct: float
+    r_pct: float
+    loss_bad_pct: float = 100.0
+    loss_good_pct: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("p_pct", "r_pct", "loss_bad_pct", "loss_good_pct"):
+            value = getattr(self, name)
+            if not 0.0 <= value <= 100.0:
+                raise ValueError(f"gemodel {name} must be within [0, 100]%, got {value!r}")
+        if self.p_pct == 0.0 and self.loss_good_pct == 0.0:
+            raise ValueError("gemodel with p=0 and loss_good=0 never loses anything; drop the block instead")
+
 
 @dataclass(frozen=True)
 class DirectionShaping:
@@ -145,9 +177,11 @@ class DirectionShaping:
     rate_bps: float | None = None
     delay_ms: float | None = None
     jitter_ms: float | None = None
-    distribution: str | None = None  # normal | pareto | paretonormal (needs jitter)
+    distribution: str | None = None  # builtin (normal|pareto|paretonormal) or a custom table name
+    distribution_file: str | None = None  # .dist file for a custom table (installed as /usr/lib/tc/<name>.dist)
     loss_pct: float | None = None
     loss_correlation_pct: float | None = None  # netem correlated loss (needs loss)
+    loss_gemodel: GemodelLoss | None = None  # netem Gilbert-Elliott loss (exclusive with loss)
     reorder_pct: float | None = None  # netem reorder (needs delay)
     duplicate_pct: float | None = None
     seed: int | None = None
@@ -156,23 +190,29 @@ class DirectionShaping:
 
     @property
     def is_empty(self) -> bool:
-        return all(
-            getattr(self, name) is None
-            for name in (
-                "rate_bps",
-                "delay_ms",
-                "jitter_ms",
-                "loss_pct",
-                "reorder_pct",
-                "duplicate_pct",
+        return (
+            all(
+                getattr(self, name) is None
+                for name in (
+                    "rate_bps",
+                    "delay_ms",
+                    "jitter_ms",
+                    "loss_pct",
+                    "reorder_pct",
+                    "duplicate_pct",
+                )
             )
+            and self.loss_gemodel is None
         )
 
     @property
     def has_netem(self) -> bool:
-        return any(
-            getattr(self, name) is not None
-            for name in ("delay_ms", "jitter_ms", "loss_pct", "reorder_pct", "duplicate_pct")
+        return (
+            any(
+                getattr(self, name) is not None
+                for name in ("delay_ms", "jitter_ms", "loss_pct", "reorder_pct", "duplicate_pct")
+            )
+            or self.loss_gemodel is not None
         )
 
     def __post_init__(self) -> None:
@@ -182,10 +222,21 @@ class DirectionShaping:
             raise ValueError("distribution requires a jitter")
         if self.loss_correlation_pct is not None and self.loss_pct is None:
             raise ValueError("loss_correlation requires a loss")
+        if self.loss_gemodel is not None and self.loss_pct is not None:
+            raise ValueError("loss_gemodel and loss are exclusive: one loss model per direction")
         if self.reorder_pct is not None and self.delay_ms is None:
             raise ValueError("reorder requires a delay (netem reorders within the delay window)")
-        if self.distribution is not None and self.distribution not in ("normal", "pareto", "paretonormal"):
-            raise ValueError(f"unsupported distribution {self.distribution!r}")
+        if self.distribution is not None:
+            if not _DISTRIBUTION_NAME_RE.fullmatch(self.distribution):
+                raise ValueError(f"unsupported distribution name {self.distribution!r}")
+            if self.distribution not in _BUILTIN_DISTRIBUTIONS and self.distribution_file is None:
+                raise ValueError(
+                    f"distribution {self.distribution!r} is not built into iproute2 "
+                    f"({', '.join(_BUILTIN_DISTRIBUTIONS)}); give distribution_file so the "
+                    "runner can install /usr/lib/tc/" + self.distribution + ".dist"
+                )
+        if self.distribution_file is not None and self.distribution is None:
+            raise ValueError("distribution_file requires a distribution name")
 
 
 @dataclass(frozen=True)
@@ -235,8 +286,10 @@ _DIRECTION_KEYS = frozenset(
         "delay",
         "jitter",
         "distribution",
+        "distribution_file",
         "loss",
         "loss_correlation",
+        "loss_gemodel",
         "reorder",
         "duplicate",
         "seed",
@@ -244,6 +297,26 @@ _DIRECTION_KEYS = frozenset(
         "tbf_latency",
     }
 )
+
+_GEMODEL_KEYS = frozenset({"p", "r", "loss_bad", "loss_good"})
+
+
+def parse_gemodel(spec: Mapping[str, Any]) -> GemodelLoss:
+    """Parse a ``loss_gemodel`` block (``p``/``r`` required, loss_bad/loss_good optional)."""
+    if not isinstance(spec, Mapping):
+        raise ValueError(f"loss_gemodel: expected a mapping with p/r[/loss_bad/loss_good], got {spec!r}")
+    unknown = sorted(set(spec) - _GEMODEL_KEYS)
+    if unknown:
+        raise ValueError(f"unsupported loss_gemodel keys {unknown}; allowed: {sorted(_GEMODEL_KEYS)}")
+    missing = sorted({"p", "r"} - set(spec))
+    if missing:
+        raise ValueError(f"loss_gemodel requires {missing}")
+    return GemodelLoss(
+        p_pct=parse_pct(spec["p"], "loss_gemodel p"),
+        r_pct=parse_pct(spec["r"], "loss_gemodel r"),
+        loss_bad_pct=parse_pct(spec["loss_bad"], "loss_gemodel loss_bad") if "loss_bad" in spec else 100.0,
+        loss_good_pct=parse_pct(spec["loss_good"], "loss_gemodel loss_good") if "loss_good" in spec else 0.0,
+    )
 
 
 def parse_direction(spec: Mapping[str, Any] | None) -> DirectionShaping | None:
@@ -258,10 +331,12 @@ def parse_direction(spec: Mapping[str, Any] | None) -> DirectionShaping | None:
         delay_ms=parse_ms(spec["delay"], "delay") if "delay" in spec else None,
         jitter_ms=parse_ms(spec["jitter"], "jitter") if "jitter" in spec else None,
         distribution=str(spec["distribution"]) if "distribution" in spec else None,
+        distribution_file=str(spec["distribution_file"]) if "distribution_file" in spec else None,
         loss_pct=parse_pct(spec["loss"], "loss") if "loss" in spec else None,
         loss_correlation_pct=(
             parse_pct(spec["loss_correlation"], "loss_correlation") if "loss_correlation" in spec else None
         ),
+        loss_gemodel=parse_gemodel(spec["loss_gemodel"]) if "loss_gemodel" in spec else None,
         reorder_pct=parse_pct(spec["reorder"], "reorder") if "reorder" in spec else None,
         duplicate_pct=parse_pct(spec["duplicate"], "duplicate") if "duplicate" in spec else None,
         seed=parse_seed(spec["seed"], "seed") if "seed" in spec else None,
@@ -330,13 +405,71 @@ def parse_profiles(doc: Mapping[str, Any]) -> dict[str, Profile]:
 
 
 def load_profiles_file(path: str | Path) -> dict[str, Profile]:
-    """Load a project-scoped ``profiles.yaml`` into ``{name: Profile}``."""
+    """Load a project-scoped ``profiles.yaml`` into ``{name: Profile}``.
+
+    Relative ``distribution_file`` entries are resolved against the profiles
+    file's own directory, so a profiles file stays self-contained wherever the
+    project is checked out.
+    """
     import yaml
 
     doc = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     if not isinstance(doc, Mapping):
         raise ValueError(f"{path}: profiles file must be a mapping (with a top-level 'profiles:' block)")
-    return parse_profiles(doc)
+    profiles = parse_profiles(doc)
+    base = Path(path).resolve().parent
+    return {name: _resolve_distribution_files(profile, base) for name, profile in profiles.items()}
+
+
+def _resolve_distribution_files(profile: Profile, base: Path) -> Profile:
+    from dataclasses import replace
+
+    def fix(shaping: DirectionShaping | None) -> DirectionShaping | None:
+        if shaping is None or shaping.distribution_file is None:
+            return shaping
+        file = Path(shaping.distribution_file)
+        if not file.is_absolute():
+            file = base / file
+        return replace(shaping, distribution_file=str(file))
+
+    if profile.is_timeline:
+        segments = tuple(
+            replace(segment, uplink=fix(segment.uplink), downlink=fix(segment.downlink)) for segment in profile.timeline
+        )
+        return replace(profile, timeline=segments)
+    return replace(profile, uplink=fix(profile.uplink), downlink=fix(profile.downlink))
+
+
+def required_dist_installs(profile: Profile) -> list[tuple[str, str]]:
+    """``(table_name, file_path)`` pairs a runner must install as
+    ``/usr/lib/tc/<table_name>.dist`` inside the shaping netns before arming.
+
+    Builtin distributions need nothing; duplicates collapse; conflicting files
+    for one name are an error (two segments must mean the same table).
+    """
+    found: dict[str, str] = {}
+
+    def visit(shaping: DirectionShaping | None) -> None:
+        if shaping is None or shaping.distribution is None:
+            return
+        if shaping.distribution in _BUILTIN_DISTRIBUTIONS or shaping.distribution_file is None:
+            return
+        existing = found.get(shaping.distribution)
+        if existing is not None and existing != shaping.distribution_file:
+            raise ValueError(
+                f"distribution {shaping.distribution!r} maps to two files: {existing!r} and "
+                f"{shaping.distribution_file!r}"
+            )
+        found[shaping.distribution] = shaping.distribution_file
+
+    if profile.is_timeline:
+        for segment in profile.timeline:
+            visit(segment.uplink)
+            visit(segment.downlink)
+    else:
+        visit(profile.uplink)
+        visit(profile.downlink)
+    return sorted(found.items())
 
 
 # Selecting nothing — the unshaped rung (0/1) or the "no emulation" sentinel.
@@ -400,6 +533,18 @@ def _netem_args(shaping: DirectionShaping) -> list[str]:
         args += ["loss", _pct(shaping.loss_pct)]
         if shaping.loss_correlation_pct is not None:
             args.append(_pct(shaping.loss_correlation_pct))
+    if shaping.loss_gemodel is not None:
+        gem = shaping.loss_gemodel
+        # netem's positional names are p, r, 1-h, 1-k: the 3rd/4th arguments ARE
+        # the loss probabilities in bad/good state. All four always emitted.
+        args += [
+            "loss",
+            "gemodel",
+            _pct(gem.p_pct),
+            _pct(gem.r_pct),
+            _pct(gem.loss_bad_pct),
+            _pct(gem.loss_good_pct),
+        ]
     if shaping.duplicate_pct is not None:
         args += ["duplicate", _pct(shaping.duplicate_pct)]
     if shaping.reorder_pct is not None:

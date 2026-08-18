@@ -608,6 +608,46 @@ def _profile_context(profile: str | None, profiles_file: Path | None) -> dict[st
     return cast(dict[str, Any], _jsonable(context))
 
 
+def _benchmark_probe_load(args: argparse.Namespace) -> dict[str, Any]:
+    """The load a probe drives, whether it is synthetic or a replay target."""
+    if _uses_explicit_ota_target(args):
+        return {
+            "driven_by": {
+                "target": str(args.target),
+                "target_type": str(getattr(args, "target_type", None) or "auto"),
+            }
+        }
+    return _probe_load(
+        size=getattr(args, "size", 18_000),
+        size_pattern=getattr(args, "size_pattern", None),
+        rate_hz=getattr(args, "rate_hz", 20.0),
+        streams=getattr(args, "streams", 1),
+        interval_jitter_ms=getattr(args, "interval_jitter_ms", 0.0),
+        interval_jitter_seed=getattr(args, "interval_jitter_seed", 42),
+    )
+
+
+def _benchmark_session_context(args: argparse.Namespace, session_name: str, run_dir: Path) -> dict[str, Any]:
+    """The session a genre drives, and whether this run had to prepare it.
+
+    A genre normally drives its own packaged session and pins `shared.rmw` into
+    a copy of it. With an explicit OTA `--target` the load is somebody else's
+    session, running from each peer's own project — nothing is copied and
+    nothing is rewritten, so recording a prepared genre session here would
+    describe a file the run never used.
+    """
+    if _uses_explicit_ota_target(args):
+        return {
+            "name": session_name,
+            "prepared": False,
+            "target_override": {
+                "target": str(args.target),
+                "target_type": str(getattr(args, "target_type", None) or "auto"),
+            },
+        }
+    return _prepare_benchmark_session_config(args, session_name, run_dir)
+
+
 def _benchmark_result_context(
     args: argparse.Namespace,
     *,
@@ -673,6 +713,25 @@ def _mean_payload_bytes(load: dict[str, Any]) -> float | None:
 
 
 def _load_context(load: dict[str, Any]) -> dict[str, Any]:
+    driven_by = load.get("driven_by")
+    if driven_by is not None:
+        # An explicit OTA `--target` brings its own publishers, so `--size` /
+        # `--rate-hz` describe nothing that ran. Recording them anyway is worse
+        # than recording nothing: a figure would carry an offered bandwidth the
+        # link never saw.
+        return cast(
+            dict[str, Any],
+            _jsonable(
+                {
+                    "driven_by": driven_by,
+                    "parameters": None,
+                    "rate_hz": None,
+                    "streams": None,
+                    "mean_payload_bytes": None,
+                    "offered_bandwidth_bps": None,
+                }
+            ),
+        )
     rate_hz = float(load.get("rate", load.get("rate_hz", 0.0)) or 0.0)
     streams = int(load.get("streams", 1) or 1)
     mean_payload_bytes = _mean_payload_bytes(load)
@@ -5665,7 +5724,7 @@ def benchmark_probe(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
     run_dir = _setup_benchmark_run_dir(args, "probe", args.profile)
-    session_context = _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
+    session_context = _benchmark_session_context(args, "bench_1_1_capacity", run_dir)
     result_context = _benchmark_result_context(
         args,
         genre="probe",
@@ -5673,14 +5732,7 @@ def benchmark_probe(args: argparse.Namespace) -> int:
         run_dir=run_dir,
         session=session_context,
     )
-    probe_load = _probe_load(
-        size=getattr(args, "size", 18_000),
-        size_pattern=getattr(args, "size_pattern", None),
-        rate_hz=getattr(args, "rate_hz", 20.0),
-        streams=getattr(args, "streams", 1),
-        interval_jitter_ms=getattr(args, "interval_jitter_ms", 0.0),
-        interval_jitter_seed=getattr(args, "interval_jitter_seed", 42),
-    )
+    probe_load = _benchmark_probe_load(args)
     _attach_benchmark_diagnostics(
         result_context,
         spdp=_probe_spdp_diagnostics(
@@ -5741,7 +5793,7 @@ def benchmark_capacity(args: argparse.Namespace) -> int:
         return _start_interactive_benchmark(args, "capacity")
 
     run_dir = _setup_benchmark_run_dir(args, "capacity", args.profile)
-    session_context = _prepare_benchmark_session_config(args, "bench_1_1_capacity", run_dir)
+    session_context = _benchmark_session_context(args, "bench_1_1_capacity", run_dir)
     result_context = _benchmark_result_context(
         args,
         genre="capacity",
@@ -6183,17 +6235,7 @@ def benchmark_rows(args: argparse.Namespace) -> int:
 def _drive_gate_row(args: argparse.Namespace, row: Any, run_dir: Path) -> None:
     """Run one registry row's genre driver with the row's committed parameters."""
     session_name = BENCHMARK_SESSIONS_BY_GENRE[row.genre]
-    if _uses_explicit_ota_target(args):
-        session_context = {
-            "name": session_name,
-            "prepared": False,
-            "target_override": {
-                "target": str(args.target),
-                "target_type": str(getattr(args, "target_type", None) or "auto"),
-            },
-        }
-    else:
-        session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    session_context = _benchmark_session_context(args, session_name, run_dir)
     result_context = _benchmark_result_context(
         args, genre=row.genre, profile=row.profile, run_dir=run_dir, session=session_context
     )
@@ -6631,7 +6673,7 @@ def benchmark_ramp(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
     run_dir = _setup_benchmark_run_dir(args, "ramp", args.profile)
-    session_context = _prepare_benchmark_session_config(args, "bench_1_3_ramp", run_dir)
+    session_context = _benchmark_session_context(args, "bench_1_3_ramp", run_dir)
     result_context = _benchmark_result_context(
         args,
         genre="ramp",
@@ -6683,7 +6725,7 @@ def benchmark_recovery(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
     run_dir = _setup_benchmark_run_dir(args, "recovery", args.profile)
-    session_context = _prepare_benchmark_session_config(args, "bench_1_4_recovery", run_dir)
+    session_context = _benchmark_session_context(args, "bench_1_4_recovery", run_dir)
     profiles_file = _benchmark_profiles_file(args.profile, runtime.profiles_file)
     result_context = _benchmark_result_context(
         args,
@@ -6736,7 +6778,7 @@ def benchmark_sweep(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir) if getattr(args, "artifacts_dir", None) else runtime.benchmarks_dir
 
     run_dir = _setup_benchmark_run_dir(args, "sweep", None)
-    session_context = _prepare_benchmark_session_config(args, "bench_1_2_load_sweep", run_dir)
+    session_context = _benchmark_session_context(args, "bench_1_2_load_sweep", run_dir)
     result_context = _benchmark_result_context(
         args,
         genre="sweep",
@@ -7043,7 +7085,7 @@ def benchmark_sensitivity(args: argparse.Namespace) -> int:
     args.profiles_file = str(generated_profiles_file)
 
     session_name = BENCHMARK_SESSIONS_BY_GENRE["sensitivity"]
-    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    session_context = _benchmark_session_context(args, session_name, run_dir)
     result_context = _benchmark_result_context(
         args,
         genre="sensitivity",
@@ -7123,7 +7165,7 @@ def benchmark_matrix(args: argparse.Namespace) -> int:
     args.profiles_file = str(generated_profiles_file)
 
     session_name = BENCHMARK_SESSIONS_BY_GENRE["matrix"]
-    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    session_context = _benchmark_session_context(args, session_name, run_dir)
     result_context = _benchmark_result_context(
         args,
         genre="matrix",
@@ -7309,7 +7351,7 @@ def benchmark_requirements(args: argparse.Namespace) -> int:
     else:
         session_name = replay.session_name
 
-    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    session_context = _benchmark_session_context(args, session_name, run_dir)
     result_context = _benchmark_result_context(
         args,
         genre="requirements",
@@ -7443,7 +7485,7 @@ def benchmark_loss_boundaries(args: argparse.Namespace) -> int:
     else:
         session_name = replay.session_name
 
-    session_context = _prepare_benchmark_session_config(args, session_name, run_dir)
+    session_context = _benchmark_session_context(args, session_name, run_dir)
     result_context = _benchmark_result_context(
         args,
         genre="loss-boundaries",

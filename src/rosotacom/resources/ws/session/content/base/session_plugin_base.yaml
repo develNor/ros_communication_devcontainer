@@ -300,14 +300,26 @@ windows:
       #   - curl http://localhost:8000/@/local/ros2/route/** 2>&1 | tee ${zen_config_file}.route-log
   # ZEN: native rmw_zenoh_cpp router. Runs on this peer's local_domain_id (already exported
   # by common.before_commands). Exactly one of the two peers (the non-main peer) opens a
-  # TCP connect endpoint to the main peer via ZENOH_CONFIG_OVERRIDE; the main peer runs
-  # rmw_zenohd with default config and listens on its endpoint.
+  # connect endpoint to the main peer via ZENOH_CONFIG_OVERRIDE, over the transport the
+  # session chose (`shared.rmw.ota.zenoh_connect_endpoints.transport`, default tcp).
+  #
+  # The inter-host transport is a link decision, and TCP is the wrong default on a
+  # lossy one: a retransmit stalls everything behind it, which is how a cellular
+  # dip turns into seconds of latency rather than one lost sample. UDP is the
+  # alternative the endpoint syntax already carries.
+  #
+  # The listen side keeps TCP on 7447 whatever the inter-host transport is. Every
+  # rmw_zenoh node on this host is a zenoh *client* of this router and connects to
+  # tcp/localhost:7447; a router that stopped listening there would take its own
+  # peer's nodes off the graph.
   - name: ZEN
     if: use_zenoh_rmw
     splits:
       - commands:
         - if [ '${zen_connect}' = "True" ] || [ '${zen_connect}' = "true" ]; then
-            export ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/'"${zen_main_ip}"':'"${zen_main_port}"'"]';
+            export ZENOH_CONFIG_OVERRIDE='connect/endpoints=["'"${zen_transport}"'/'"${zen_main_ip}"':'"${zen_main_port}"'"]';
+          elif [ '${zen_transport}' != "tcp" ]; then
+            export ZENOH_CONFIG_OVERRIDE='listen/endpoints=["tcp/[::]:7447","'"${zen_transport}"'/0.0.0.0:'"${zen_main_port}"'"]';
           fi
         - ros2 run rmw_zenoh_cpp rmw_zenohd
   - name: COM

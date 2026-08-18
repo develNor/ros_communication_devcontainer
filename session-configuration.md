@@ -201,6 +201,13 @@ Per-side config blocks:
   interface and sets no peer list, because local discovery must keep working.
   The OTA templates are not usable on the local side for exactly that reason.
 - `zenoh_connect_endpoints` (native, OTA side only; `zenoh` is still accepted as a legacy OTA alias) accepts:
+  - `transport: tcp|udp` — the inter-host transport between the two routers.
+    Default `tcp`. On a lossy link TCP is the wrong choice for a best-effort
+    stream: one retransmit stalls everything queued behind it, which turns a
+    cellular dip into seconds of latency instead of one lost sample. The
+    listening router keeps `tcp/[::]:7447` whatever this is set to, because
+    every rmw_zenoh node on that host is a zenoh *client* of it over
+    `tcp/localhost:7447`.
   - `main_peer: <peer_key>` — the peer whose zenoh router listens. Defaults to the first peer declared under `peers:`.
   - `main_port: 7447` — listening port. Default `7447`.
 - `zenoh_ros2dds` (bridge) accepts (OTA side only):

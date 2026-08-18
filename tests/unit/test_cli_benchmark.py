@@ -3645,3 +3645,79 @@ def test_prepare_ab_config_requires_an_a_to_b_load_topic(tmp_path: Path) -> None
             is_baseline=True,
             run_dir=tmp_path / "run",
         )
+
+
+def test_explicit_ota_target_is_recorded_without_preparing_a_genre_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--target` means the load is somebody else's session, run from each peer's project.
+
+    Nothing is copied and no `shared.rmw` is rewritten, so a genre must not
+    report a prepared session it never used — and must not touch the disk
+    preparing one.
+    """
+
+    def _fail(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("an explicit OTA target must not prepare a genre session")
+
+    monkeypatch.setattr(benchmark_cli, "_prepare_benchmark_session_config", _fail)
+    args = argparse.Namespace(
+        ota_benchmark=True,
+        target="mwc_fastdds_12k",
+        target_type="session",
+    )
+
+    context = benchmark_cli._benchmark_session_context(args, "bench_1_1_capacity", tmp_path)
+
+    assert context["prepared"] is False
+    assert context["target_override"] == {"target": "mwc_fastdds_12k", "target_type": "session"}
+
+
+def test_without_an_explicit_target_a_genre_still_prepares_its_own_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared: list[str] = []
+
+    def _prepare(_args: Any, session_name: str, _run_dir: Path) -> dict[str, Any]:
+        prepared.append(session_name)
+        return {"name": session_name, "prepared": True}
+
+    monkeypatch.setattr(benchmark_cli, "_prepare_benchmark_session_config", _prepare)
+    args = argparse.Namespace(ota_benchmark=True, target=None, target_type=None)
+
+    context = benchmark_cli._benchmark_session_context(args, "bench_1_1_capacity", tmp_path)
+
+    assert prepared == ["bench_1_1_capacity"]
+    assert context["prepared"] is True
+
+
+def test_a_target_driven_probe_records_the_target_instead_of_unused_load_parameters() -> None:
+    """`--size` / `--rate-hz` describe nothing when the target brings its own publishers.
+
+    Recording them anyway is worse than recording nothing: a figure would carry
+    an offered bandwidth the link never saw.
+    """
+    args = argparse.Namespace(
+        ota_benchmark=True,
+        target="mwc_fastdds_12k",
+        target_type="session",
+        size=18_000,
+        rate_hz=20.0,
+    )
+
+    context = benchmark_cli._load_context(benchmark_cli._benchmark_probe_load(args))
+
+    assert context["driven_by"] == {"target": "mwc_fastdds_12k", "target_type": "session"}
+    assert context["offered_bandwidth_bps"] is None
+    assert context["parameters"] is None
+
+
+def test_a_synthetic_probe_still_records_its_offered_bandwidth() -> None:
+    args = argparse.Namespace(ota_benchmark=False, target=None, size=12_000, rate_hz=10.0, streams=1)
+
+    context = benchmark_cli._load_context(benchmark_cli._benchmark_probe_load(args))
+
+    assert context["mean_payload_bytes"] == 12_000
+    assert context["offered_bandwidth_bps"] == 12_000 * 8 * 10

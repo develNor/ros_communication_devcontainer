@@ -94,3 +94,74 @@ def test_fragmenting_fastdds_gets_the_asynchronous_publication_it_requires() -> 
     for occurrence in exports_profile:
         assert "RMW_FASTRTPS_PUBLICATION_MODE" in occurrence
         assert "ASYNCHRONOUS" in occurrence
+
+
+def test_native_zenoh_carries_the_sessions_inter_host_transport(tmp_path: Path) -> None:
+    """The transport between the two routers is a link decision, so a session makes it.
+
+    Only the connecting peer opens an endpoint; the listening peer keeps TCP on
+    7447 regardless, because its own nodes reach it over `tcp/localhost:7447`.
+    """
+    import contextlib
+    import io
+
+    import yaml
+
+    generator = _load(GENERATOR_PY, "rosotacom_generate_session_files_zenoh")
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 50}, "b": {"domain_id": 51}},
+        "shared": {
+            "ota_domain_id": 52,
+            "use_heartbeat": True,
+            "rmw": {
+                "local": "zenoh",
+                "ota": {"zenoh_connect_endpoints": {"transport": "udp", "main_peer": "a"}},
+            },
+        },
+        "topics": {"a_to_b": [], "b_to_a": [{"topic": "/x", "type": "std_msgs/msg/Bool"}]},
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        generator.func(
+            session_config_obj=cfg,
+            output_dir=str(tmp_path),
+            force=True,
+            peer_addresses={"a": "10.0.0.1", "b": "10.0.0.2"},
+        )
+
+    plugins = {
+        peer: yaml.safe_load((tmp_path / peer / "plugin.yaml").read_text(encoding="utf-8"))["parameters"]
+        for peer in "ab"
+    }
+    for peer, parameters in plugins.items():
+        assert parameters["zen_transport"] == "udp", peer
+        assert parameters["zen_main_ip"] == "10.0.0.1", peer
+    assert plugins["a"]["zen_connect"] is False
+    assert plugins["b"]["zen_connect"] is True
+
+    plugin_base = PLUGIN_BASE.read_text(encoding="utf-8")
+    assert 'connect/endpoints=["\'"${zen_transport}"\'/' in plugin_base
+    assert 'listen/endpoints=["tcp/[::]:7447"' in plugin_base
+
+
+def test_native_zenoh_refuses_a_transport_it_cannot_configure(tmp_path: Path) -> None:
+    """tls/quic need certificates the generator has nowhere to put."""
+    generator = _load(GENERATOR_PY, "rosotacom_generate_session_files_zenoh_bad")
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 50}, "b": {"domain_id": 51}},
+        "shared": {
+            "ota_domain_id": 52,
+            "rmw": {"local": "zenoh", "ota": {"zenoh_connect_endpoints": {"transport": "quic"}}},
+        },
+        "topics": {"a_to_b": [], "b_to_a": [{"topic": "/x", "type": "std_msgs/msg/Bool"}]},
+    }
+    import pytest
+
+    with pytest.raises(RuntimeError, match="transport must be one of"):
+        generator.func(
+            session_config_obj=cfg,
+            output_dir=str(tmp_path),
+            force=True,
+            peer_addresses={"a": "10.0.0.1", "b": "10.0.0.2"},
+        )

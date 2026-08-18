@@ -158,7 +158,7 @@ class YamlBlockScalar:
 #   - a tagged-union mapping with exactly one key (the RMW name):
 #       {cyclone: {config?: <fname.xml>, easy_mode_ip?: <address>, spdp_interval?: <duration>}}
 #       {fastdds: {config?: <fname.xml>, easy_mode_ip?: <address>}}
-#       {zenoh_connect_endpoints: {main_peer?: <peer_key>, main_port?: 7447}}
+#       {zenoh_connect_endpoints: {transport?: tcp|udp, main_peer?: <peer_key>, main_port?: 7447}}
 #       {zenoh_ros2dds: {transport?: udp|tcp, main_peer?: <peer_key>, main_port?: 7447}}
 # -----------------------------------------------------------------------------
 
@@ -170,7 +170,11 @@ _LOCAL_SHORTS = {"cyclone", "fastdds", "zenoh"}
 _SHORTCUT_ALLOWED = {"cyclone", "fastdds", "zenoh"}
 
 _DDS_CFG_KEYS = {"config", "easy_mode_ip", "spdp_interval"}
-_ZEN_OTA_CFG_KEYS = {"main_peer", "main_port"}
+_ZEN_OTA_CFG_KEYS = {"transport", "main_peer", "main_port"}
+#: Inter-host transports the native zenoh router may be pointed at. Both are
+#: plain zenoh locator schemes; tls/quic would additionally need certificates
+#: this generator has nowhere to put.
+_ZEN_NATIVE_TRANSPORTS = {"tcp", "udp"}
 _ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
 
 # OTA is cross-host by definition. The bare `cyclone`/`fastdds` OTA shortcuts
@@ -220,9 +224,8 @@ class RmwSideSpec:
     dds_config: Optional[str] = None
     dds_easy_mode_ip: Optional[str] = None
     dds_spdp_interval: Optional[str] = None
-    # zenoh / zenoh_ros2dds
+    # zenoh (native) and zenoh_ros2dds
     zen_main_peer: Optional[str] = None
-    # zenoh_ros2dds only
     zen_transport: Optional[str] = None
     zen_main_port: Optional[int] = None
 
@@ -292,6 +295,13 @@ def _parse_rmw_side(value: Any, ctx: str, *, is_local: bool) -> RmwSideSpec:
             raise RuntimeError(
                 f"{ctx}.{impl} contains unsupported keys {sorted(extra)}. Allowed: {sorted(_ZEN_OTA_CFG_KEYS)}."
             )
+        if cfg.get("transport") is not None:
+            transport = cfg["transport"]
+            if not isinstance(transport, str) or transport.strip() not in _ZEN_NATIVE_TRANSPORTS:
+                raise RuntimeError(
+                    f"{ctx}.{impl}.transport must be one of {sorted(_ZEN_NATIVE_TRANSPORTS)}; got {transport!r}."
+                )
+            spec.zen_transport = transport.strip()
         if cfg.get("main_peer") is not None:
             if not isinstance(cfg["main_peer"], str) or not cfg["main_peer"].strip():
                 raise RuntimeError(f"{ctx}.{impl}.main_peer must be a non-empty string if provided.")
@@ -2183,7 +2193,8 @@ def func(
                 [
                     ("zen_main_ip", peer_ip[main_peer]),
                     ("zen_main_port", main_port),
-                    # Only the non-main peer opens a TCP connect endpoint.
+                    ("zen_transport", ota.zen_transport or "tcp"),
+                    # Only the non-main peer opens a connect endpoint.
                     ("zen_connect", local_peer != main_peer),
                 ],
             )

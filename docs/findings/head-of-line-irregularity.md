@@ -45,13 +45,23 @@ The mechanism is visible only per message: the stream carrying alternating
 heavy/light samples can lose more than the steady stream despite lower mean
 payload bandwidth.
 
+Field recurrence (2026-08-17 CCNG drive): the DELAY half of the mechanism
+recurred and was measured per message — a small message with more than 30 KB
+in flight ahead of it paid +17.4 ms p50 / +67 ms p90, a small message sent
+within 40 ms after a video keyframe paid p50 42.1 vs 28.4 ms, and 18.4% of
+cross-topic pairs sent within 2 ms flipped order after a >20 KB first message.
+The LOSS half (delayed-then-overwritten) did not trigger there: it needs a
+queue tight against the offered load, and that link had ~14 Mbit/s
+serialization headroom at 2.5 Mbit/s offered. Both halves stay reproducible
+with the tight profile above.
+
 Verification: manual: run the two commands above from a source checkout with
 Docker and `tc` privileges; automation waits for the RFC 0007 regression matrix
 row for patterned loads because the public row registry does not exist yet.
 
 ## Status
 
-confirmed, 2026-07-02.
+confirmed, 2026-08-18.
 
 ## Publication notes
 

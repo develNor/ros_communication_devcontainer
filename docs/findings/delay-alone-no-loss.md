@@ -54,13 +54,20 @@ rosotacom benchmark capacity --project src/rosotacom/resources/examples/rosotaco
 Migrated summary: 400 expected, 400 delivered, 0 lost, max p95 latency
 306.927 ms.
 
+Field recurrence (2026-08-17 CCNG drive): the negative control held on a real
+cellular link — five jam episodes ran one-way delay up to 401–459 ms with zero
+losses, and the drive's soggy last minute held p90 ≈ 138 ms at 0.04 losses/s.
+The positive counterpart (where the delay actually comes from when a link is
+too slow rather than too far) is
+[oversubscription-queues-not-losses.md](oversubscription-queues-not-losses.md).
+
 Verification: manual: run the commands above from a source checkout with Docker
 and `tc` privileges; this is a no-loss negative-control finding rather than a
 must-fail boundary row, so it remains outside the RFC 0007 boundary gate.
 
 ## Status
 
-confirmed, 2026-06-29.
+confirmed, 2026-08-18.
 
 ## Publication notes
 

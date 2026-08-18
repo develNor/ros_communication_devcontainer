@@ -109,7 +109,7 @@ def relay_module() -> Iterator[ModuleType]:
     _stub_module("rclpy.node", Node=type("Node", (), {}))
     _stub_module("com_py")
     _stub_module("com_py.topic_resolution", resolve_topics=lambda *a, **k: [])
-    _stub_module("com_py.qos", load_qos_config=lambda *a, **k: {})
+    _stub_module("com_py.qos", load_qos_config=lambda *a, **k: {}, load_topic_types=lambda *a, **k: {})
     _stub_module("com_py.pub_sub_pair", PubSubPair=type("PubSubPair", (), {}))
     _stub_module("com_py.pair_management", PairRefreshMixin=type("PairRefreshMixin", (), {}))
 

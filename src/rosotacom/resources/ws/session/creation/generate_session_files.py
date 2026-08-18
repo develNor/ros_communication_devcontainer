@@ -1375,6 +1375,31 @@ def _heartbeat_monitor_overrides(heartbeat_expect: Optional[Dict[str, Any]]) -> 
     return overrides
 
 
+def _build_topic_types_map(status_spec_yaml: str) -> str:
+    """`<stage topic>: <message type>` for every stage this peer takes part in.
+
+    The bridge and relay nodes used to learn a topic's type from the ROS graph,
+    which means they can only create an endpoint after somebody else has created
+    the matching one. Over a transport that carries data but not the graph — the
+    zenoh DDS bridge — that is a deadlock: the bridge routes a topic once a local
+    reader exists, and the reader is not created until the bridge has routed a
+    publisher into the graph. The session already knows every stage's type, so it
+    says so instead.
+
+    Derived from the status pipeline spec rather than recomputed, so the two can
+    never disagree about what a stage is called.
+    """
+    spec = yaml.safe_load(status_spec_yaml) or {}
+    types: Dict[str, str] = {}
+    for topic in spec.get("topics") or []:
+        for stage in topic.get("stages") or []:
+            name = str(stage.get("topic") or "").strip()
+            msg_type = str(stage.get("type") or "").strip()
+            if name and msg_type:
+                types.setdefault(name, msg_type)
+    return yaml.safe_dump({"topic_types": types}, sort_keys=True, default_flow_style=False)
+
+
 def _build_status_pipeline_spec(
     *,
     local: str,
@@ -2646,6 +2671,7 @@ def func(
     per_peer_otau_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
     per_peer_domain_bridge_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
     per_peer_status_spec_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
+    per_peer_topic_types_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
 
     def _prefix_with_source_name_if_needed(target_peer: str, source_peer: str, topic: str) -> str:
         ps = peer_settings_all.get(target_peer, {}) or {}
@@ -2995,6 +3021,32 @@ def func(
                     ),
                 )
             )
+
+        # Always: the bridge and relay nodes need the stage types whether or not
+        # anyone asked for a status overview.
+        pipeline_spec_yaml = _build_status_pipeline_spec(
+            local=local,
+            remote=remote,
+            peer_name=peer_name,
+            out_entries=out_entries,
+            out_pipes=out_pipes,
+            in_entries=in_entries,
+            in_pipes=in_pipes,
+            use_target_prefix=use_target_prefix,
+            remote_uses_target_prefix=remote_uses_target_prefix,
+            native_have_source_prefix=native_have_source_prefix,
+            inbound_keep_source_prefix=bool(inbound_cfg.get("keep_source_prefix", False)),
+            local_domain_id=peer_local_domain_id[local],
+            ota_domain_id=ota_domain_id,
+            uses_domain_bridge=_use_domain_bridge(local),
+            hb_topic=hb_topic,
+            use_heartbeat=use_heartbeat,
+            heartbeat_expect=(shared.get("heartbeat") or {}).get("expect"),
+            out_enabled=out_enabled,
+            in_enabled=in_enabled,
+            final_topic_type=_final_topic_type,
+        )
+        per_peer_topic_types_yaml[local] = _build_topic_types_map(pipeline_spec_yaml)
 
         if use_status_overview:
             per_peer_status_spec_yaml[local] = _build_status_pipeline_spec(
@@ -3348,6 +3400,8 @@ def func(
             generated.append((os.path.join(param_dir, p, "domain_bridge.yaml"), per_peer_domain_bridge_yaml[p] or ""))
         if per_peer_status_spec_yaml.get(p):
             generated.append((os.path.join(param_dir, p, "pipeline_spec.yaml"), per_peer_status_spec_yaml[p] or ""))
+        if per_peer_topic_types_yaml.get(p):
+            generated.append((os.path.join(param_dir, p, "topic_types.yaml"), per_peer_topic_types_yaml[p] or ""))
 
     _write_generated_files(generated, force=force, rewrite_formatting=rewrite_formatting)
 

@@ -18,6 +18,8 @@ parameters:
   local_name: "" # e.g. "control_center"
   remote_name: "" # e.g. "shuttle_ella"
   qos_config_file: '""' # e.g. "/config/qos_config.yaml"
+  topic_types_file: ${peer_dir}/topic_types.yaml # `<stage topic>: <type>`; lets a bridge/relay pair
+                                                 # create its endpoints without waiting for the graph
 
   in: false
   topic_list_paths_inbound: ""
@@ -343,6 +345,7 @@ windows:
             -p base_topic_files:=[${topic_list_paths_inbound}]
             -p local_name:=${local_name}
             -p qos_config_file:='${qos_config_file}'
+            -p topic_types_file:='${topic_types_file}'
             -p source_names:=[${remote_name}]
             -p local_explicitly_targeted:=${local_explicitly_targeted_inbound}
       - commands:
@@ -350,6 +353,7 @@ windows:
             -p base_topic_files:=[${topic_list_paths_inbound}]
             -p local_name:=${local_name}
             -p qos_config_file:='${qos_config_file}'
+            -p topic_types_file:='${topic_types_file}'
             -p source_names:=[${remote_name}]
             -p local_explicitly_targeted:=${local_explicitly_targeted_inbound}
             -p app_keep_source_name:=${app_keep_source_name_inbound}
@@ -368,12 +372,14 @@ windows:
             -p base_topic_files:=[${topic_list_paths_outbound}]
             -p local_name:=${local_name}
             -p qos_config_file:='${qos_config_file}'
+            -p topic_types_file:='${topic_types_file}'
             -p target_names:=[${remote_explicitly_targeted_name_outbound}]
       - commands:
         - ros2 run com_py relay_out --ros-args
             -p base_topic_files:=[${topic_list_paths_outbound}]
             -p local_name:=${local_name}
             -p qos_config_file:='${qos_config_file}'
+            -p topic_types_file:='${topic_types_file}'
             -p target_names:=[${remote_explicitly_targeted_name_outbound}]
             -p app_has_source_name:=${app_has_source_name_outbound}
   - name: TM

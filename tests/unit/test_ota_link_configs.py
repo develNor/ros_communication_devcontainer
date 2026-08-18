@@ -213,3 +213,41 @@ def test_fastdds_tuned_keeps_the_same_host_path_open() -> None:
     # An initial peer without a port probes participant indices 0..range; the
     # Fast DDS default of 4 is smaller than an OTA domain can hand out.
     assert "<maxInitialPeersRange>10</maxInitialPeersRange>" in resolved
+
+
+def test_every_peer_gets_the_stage_types_its_bridges_need(tmp_path: Path) -> None:
+    """The session declares what each stage carries, so a bridge need not ask the graph.
+
+    Generated for every session, not only when a status overview was asked for:
+    the bridge and relay nodes need it either way, and over a transport that
+    carries data but not the ROS graph it is the only thing that lets them
+    create an endpoint at all.
+    """
+    import contextlib
+    import io
+
+    import yaml
+
+    generator = _load(GENERATOR_PY, "rosotacom_generate_session_files_types")
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 50}, "b": {"domain_id": 51}},
+        "shared": {"ota_domain_id": 52, "use_heartbeat": True, "rmw": "cyclone"},
+        "topics": {
+            "a_to_b": [],
+            "b_to_a": [{"topic": "/cam", "type": "std_msgs/msg/Bool", "processing": {"use_ota_wrapper": True}}],
+        },
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        generator.func(
+            session_config_obj=cfg,
+            output_dir=str(tmp_path),
+            force=True,
+            peer_addresses={"a": "10.0.0.1", "b": "10.0.0.2"},
+        )
+
+    for peer in "ab":
+        declared = yaml.safe_load((tmp_path / peer / "topic_types.yaml").read_text(encoding="utf-8"))["topic_types"]
+        # The wrapped OTA stage is the one a receiving bridge cannot look up.
+        assert declared["/ota/b/cam/ota_stamped"] == "com_msgs/msg/OtaStamped", peer
+        assert declared["/heartbeat_b"] == "com_msgs/msg/EchoHeartbeat", peer

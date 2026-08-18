@@ -275,6 +275,22 @@ topics to/from zenoh. The local graph still speaks DDS, so `rmw.local` must be
 - `zen_pub_allow` / `zen_sub_allow` are derived from peer `com-name`s (`/ota/<com-name>/.*`).
 - `zen_qos_pub` is derived from per-topic `zen_qos:` entries and baked into the generated `<peer>/plugin.yaml`.
 
+#### Generated per peer: `topic_types.yaml`
+
+Every session writes `<peer>/topic_types.yaml` — `<stage topic>: <message
+type>` for every stage that peer takes part in — and the bridge and relay nodes
+read it. It is generated whether or not `use_status_overview` is set, and is
+derived from the same pipeline description the status node uses, so the two
+cannot disagree about what a stage is called.
+
+It exists because the alternative was the ROS graph, and the graph makes an
+endpoint's creation depend on somebody else having created the matching one
+first. Over a transport that carries data but not the graph — `rmw.ota:
+zenoh_ros2dds`, where the bridge routes a topic only once a local DDS reader
+exists — that is a deadlock, and a silent one: the receiving peer logs
+`Initialized 1 pair(s). Pending=1` and the topic simply never arrives. The graph
+is still consulted for anything the file does not name.
+
 #### Domain bridging
 
 If `shared.ota_domain_id` and `peer_settings.<peer>.domain_id` are both set and

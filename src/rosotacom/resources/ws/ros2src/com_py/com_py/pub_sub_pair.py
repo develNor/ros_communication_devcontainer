@@ -71,7 +71,8 @@ class PubSubPair:
                  pub_topic: str,
                  sub_role: str,
                  pub_role: str,
-                 qos_config: dict):
+                 qos_config: dict,
+                 topic_types: dict = None):
 
         self.node = node
         self.base_topic_name = base_topic_name
@@ -94,6 +95,9 @@ class PubSubPair:
         self.sub_qos = get_topic_qos(self.logger, qos_config, base_topic_name, sub_role)
         self.pub_qos = get_topic_qos(self.logger, qos_config, base_topic_name, pub_role)
 
+        # What the session says this stage carries, when it says anything.
+        self.declared_types = topic_types or {}
+
         # Try initial setup
         self.try_initialize()
 
@@ -111,12 +115,20 @@ class PubSubPair:
         if self.is_valid:
             return True
 
-        # Get message type from topic info
-        topic_types = dict(self.node.get_topic_names_and_types())
-        if self.sub_topic not in topic_types:
-            return False
-
-        msg_type_str = topic_types[self.sub_topic][0]
+        # What this stage carries. The session's own declaration first, the ROS
+        # graph second: reading it from the graph means an endpoint can only be
+        # created after somebody else created the matching one, and over a
+        # transport that carries data but not the graph — the zenoh DDS bridge —
+        # that is a deadlock. The bridge routes a topic once a local reader
+        # exists; the reader waited for the bridge to route a publisher into the
+        # graph, so neither ever happened and the topic stayed pending in
+        # silence.
+        msg_type_str = self.declared_types.get(self.sub_topic)
+        if not msg_type_str:
+            graph_types = dict(self.node.get_topic_names_and_types())
+            if self.sub_topic not in graph_types:
+                return False
+            msg_type_str = graph_types[self.sub_topic][0]
         msg_type = get_message(msg_type_str)
         if not msg_type:
             self.logger.error(f"[PubSubPair] Could not load message type '{msg_type_str}'!")

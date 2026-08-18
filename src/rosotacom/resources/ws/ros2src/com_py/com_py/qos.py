@@ -258,3 +258,27 @@ def dict_to_qos(logger, fields: dict) -> QoSProfile:
             raise ValueError("[dict_to_qos] 'liveliness_lease' must be positive.")
 
     return qos
+
+
+def load_topic_types(logger, path):
+    """`{topic: message type}` from a generated topic_types.yaml, or {}.
+
+    A missing or unreadable file is not an error: the graph is still consulted,
+    and it was the only source before this file existed. What the file buys is
+    the case where the graph cannot answer — a transport that carries data but
+    not the ROS graph, or simply an endpoint that has not been created yet.
+    """
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as error:
+        logger.warning(f"[topic_types] Could not read '{path}': {error}")
+        return {}
+    types = document.get("topic_types") or {}
+    if not isinstance(types, dict):
+        logger.warning(f"[topic_types] '{path}' has no 'topic_types' mapping; ignoring it")
+        return {}
+    logger.info(f"[topic_types] Loaded {len(types)} declared topic type(s) from '{path}'")
+    return {str(topic): str(msg_type) for topic, msg_type in types.items()}

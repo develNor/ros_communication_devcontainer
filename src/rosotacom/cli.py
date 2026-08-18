@@ -121,7 +121,15 @@ EXTERNAL_SESSION_CONTAINER_DIR = "/session/current"
 # `anonymize_bag.py` two thousand lines below already does it this way.
 RUN_SESSION_CONTAINER_ARGV = ("python3", "/ws/session/creation/run_session.py")
 DEFAULT_SMOKE_SESSION = "1_heartbeat"
-OTA_SUDO_MODES = ("passwordless", "askpass")
+# How profile shaping obtains tc/ip privileges on a peer. `passwordless` and
+# `askpass` are the two sudo shapes. `container` needs no sudo at all: every
+# tc/ip argv runs in a short-lived `docker run --rm --network host --cap-add
+# NET_ADMIN` container on the peer, so docker-group membership is the whole
+# privilege — the mode that makes profiles runnable on a machine that has
+# Docker but no passwordless sudo (issue #279). `--network host` puts tc in
+# the host netns, which is the netns the OTA com containers use, so it shapes
+# exactly the interface sudo would.
+OTA_SUDO_MODES = ("passwordless", "askpass", "container")
 
 # How ota-smoke puts rosotacom on each peer.
 #
@@ -2663,6 +2671,59 @@ def _sudo_command(argv: Sequence[str], *, askpass: bool = False) -> str:
     return f"{mode} {shlex.join(list(argv))}"
 
 
+#: Deterministic name for the container-mode safety watchdog on a peer. Fixed
+#: (not per-run) on purpose: arming replaces a stale predecessor with
+#: `docker rm -f`, so a crashed run's watchdog cannot accumulate — and the
+#: dash spelling keeps it out of the `rosotacom_` conflict scan, whose signal
+#: for a live run is the qdisc itself, not the sleeping watchdog.
+_SHAPING_WATCHDOG_NAME = "rosotacom-shaping-watchdog"
+
+
+def _shaping_image_resolution(image: str | None) -> str:
+    """Shell preamble that leaves the shaping image in ``$img`` on the peer.
+
+    An explicit image wins. Otherwise resolve on the peer itself, because the
+    scoped image name (`<base>-<install_id>`) is a property of the peer's own
+    install that the orchestrator cannot know before that install ran: prefer
+    the image of a running `rosotacom_` container, fall back to the newest
+    local `ros-communication*` image. Exit 69 with an actionable message when
+    neither exists (a machine that never ran rosotacom): shaping needs *an*
+    image with iproute2, and the com image is the one guaranteed relevant."""
+    if image:
+        return f"img={shlex.quote(image)}; "
+    return (
+        "img=\"$(docker ps --filter name=rosotacom_ --format '{{.Image}}' | head -n1)\"; "
+        '[ -n "$img" ] || img="$(docker image ls --format \'{{.Repository}}:{{.Tag}}\''
+        " | grep -m1 '^ros-communication' || true)\"; "
+        '[ -n "$img" ] || { echo "no shaping image on this peer: run rosotacom here once'
+        ' (any smoke/start builds the com image) or pass --shaping-image" >&2; exit 69; }; '
+    )
+
+
+def _container_shaping_command(argv: Sequence[str], *, image: str | None, watchdog: bool = False) -> str:
+    """One privileged tc/ip argv as a short-lived NET_ADMIN container run.
+
+    ``--network host`` is the point: the ephemeral container shares the host
+    netns, so ``tc`` acts on the same interface sudo would — but the privilege
+    comes from docker-group membership instead of a sudoers entry. A watchdog
+    argv (``sh -c 'sleep …; tc …'``) runs detached (``-d``) under the fixed
+    name above, replacing any stale predecessor; docker itself keeps it alive
+    across an orchestrator crash, which is the fail-safe RFC 0004 demands."""
+    argv = list(argv)
+    resolve = _shaping_image_resolution(image)
+    run = "docker run --rm --network host --cap-add NET_ADMIN"
+    if watchdog:
+        run = (
+            f"docker rm -f {_SHAPING_WATCHDOG_NAME} >/dev/null 2>&1 || true; "
+            f"docker run -d --rm --name {_SHAPING_WATCHDOG_NAME} --network host --cap-add NET_ADMIN"
+        )
+    if len(argv) >= 3 and argv[0] == "sh" and argv[1] == "-c":
+        tail = f'--entrypoint sh "$img" -c {shlex.quote(str(argv[2]))}'
+    else:
+        tail = f'--entrypoint {shlex.quote(argv[0])} "$img" {shlex.join(argv[1:])}'
+    return f"{resolve}{run} {tail}"
+
+
 def _passwordless_watchdog_command(argv: Sequence[str]) -> str:
     argv = list(argv)
     if len(argv) >= 3 and argv[0] == "sh" and argv[1] == "-c":
@@ -2744,6 +2805,7 @@ def _ota_preflight(
     require_network_shaping_sudo: bool = False,
     sudo_mode: str = OTA_DEFAULT_SUDO_MODE,
     sudo_passwords: Mapping[str, str] | None = None,
+    shaping_image: str | None = None,
     check_conflicts: bool = True,
 ) -> None:
     sudo_mode = _validate_ota_sudo_mode(sudo_mode)
@@ -2771,6 +2833,27 @@ def _ota_preflight(
         )
         _ota_run(peer, "docker ps >/dev/null", label=f"{peer.name}: docker access", dry_run=dry_run, batch=True)
         if require_network_shaping_sudo:
+            if sudo_mode == "container":
+                # tc/ip live in the shaping image, not on the host, and no sudo
+                # is involved: the one thing to prove is that a NET_ADMIN
+                # host-netns container can run and sees the tools. This also
+                # fails early — with the actionable exit-69 message — on a
+                # machine that has no candidate image yet.
+                _ota_run(
+                    peer,
+                    _container_shaping_command(
+                        [
+                            "sh",
+                            "-c",
+                            "command -v tc >/dev/null && command -v ip >/dev/null && tc qdisc show >/dev/null",
+                        ],
+                        image=shaping_image,
+                    ),
+                    label=f"{peer.name}: containerized network shaping (docker run, NET_ADMIN, tc in image)",
+                    dry_run=dry_run,
+                    batch=True,
+                )
+                continue
             _ota_run(
                 peer,
                 "command -v tc >/dev/null 2>&1 && command -v ip >/dev/null 2>&1",
@@ -3241,13 +3324,21 @@ def _ota_resolve_interfaces(peer: OtaSmokePeer, peer_addr: str, *, dry_run: bool
 
 
 def _peer_command_runner(
-    peer: OtaSmokePeer, *, dry_run: bool, sudo_password: str | None = None
+    peer: OtaSmokePeer,
+    *,
+    dry_run: bool,
+    sudo_password: str | None = None,
+    sudo_mode: str = OTA_DEFAULT_SUDO_MODE,
+    shaping_image: str | None = None,
 ) -> Callable[[Sequence[str]], None]:
     """A CommandRunner that runs one privileged argv on ``peer`` via the SSH path."""
 
     def run(argv: Sequence[str]) -> None:
         label = f"{peer.name}: tc/netem"
-        if sudo_password is None:
+        if sudo_mode == "container":
+            script = _container_shaping_command(argv, image=shaping_image)
+            _ota_run(peer, script, label=label, dry_run=dry_run)
+        elif sudo_password is None:
             script = _sudo_command(argv)
             _ota_run(peer, script, label=label, dry_run=dry_run)
         else:
@@ -3265,12 +3356,23 @@ def _peer_command_runner(
 
 
 def _peer_watchdog_launcher(
-    peer: OtaSmokePeer, *, dry_run: bool, sudo_password: str | None = None
+    peer: OtaSmokePeer,
+    *,
+    dry_run: bool,
+    sudo_password: str | None = None,
+    sudo_mode: str = OTA_DEFAULT_SUDO_MODE,
+    shaping_image: str | None = None,
 ) -> Callable[[Sequence[str]], None]:
     """Launch the safety-watchdog argv detached on ``peer`` so it survives a crash."""
 
     def launch(argv: Sequence[str]) -> None:
-        if sudo_password is None:
+        if sudo_mode == "container":
+            # `docker run -d` is the detachment: the daemon owns the sleeping
+            # watchdog, so it survives the SSH session, the orchestrator, and
+            # every rosotacom container on the machine.
+            detached = _container_shaping_command(argv, image=shaping_image, watchdog=True)
+            _ota_run(peer, detached, label=f"{peer.name}: profile safety watchdog", dry_run=dry_run, check=False)
+        elif sudo_password is None:
             detached = _passwordless_watchdog_command(argv)
             _ota_run(peer, detached, label=f"{peer.name}: profile safety watchdog", dry_run=dry_run, check=False)
         else:
@@ -3297,6 +3399,8 @@ def _ota_arm_profile(
     *,
     dry_run: bool,
     sudo_passwords: Mapping[str, str] | None = None,
+    sudo_mode: str = OTA_DEFAULT_SUDO_MODE,
+    shaping_image: str | None = None,
 ) -> list[Any]:
     """Arm the static profile per direction on every peer's OTA egress (RFC 0004),
     returning the ``ProfileShaper`` handles to revert in the run's ``finally``."""
@@ -3320,10 +3424,22 @@ def _ota_arm_profile(
         sudo_password = (sudo_passwords or {}).get(peer_name)
         shaper = ProfileShaper(
             ota_iface,
-            _peer_command_runner(peer, dry_run=dry_run, sudo_password=sudo_password),
+            _peer_command_runner(
+                peer,
+                dry_run=dry_run,
+                sudo_password=sudo_password,
+                sudo_mode=sudo_mode,
+                shaping_image=shaping_image,
+            ),
             control_interface=control_iface,
             safety_max_duration_s=_PROFILE_SAFETY_MAX_S,
-            watchdog_launcher=_peer_watchdog_launcher(peer, dry_run=dry_run, sudo_password=sudo_password),
+            watchdog_launcher=_peer_watchdog_launcher(
+                peer,
+                dry_run=dry_run,
+                sudo_password=sudo_password,
+                sudo_mode=sudo_mode,
+                shaping_image=shaping_image,
+            ),
         )
         # Register before arming so a mid-arm failure is still reverted in `finally`.
         shapers.append(shaper)
@@ -4085,7 +4201,20 @@ def _start_noninteractive_ota_smoke(args: argparse.Namespace) -> int:
     errors: list[str] = []
     try:
         if profile is not None:
-            shapers = _ota_arm_profile(plan, profile, directions, dry_run=dry_run)
+            shapers = _ota_arm_profile(
+                plan,
+                profile,
+                directions,
+                dry_run=dry_run,
+                sudo_passwords=_ota_network_sudo_passwords(
+                    plan,
+                    sudo_mode=getattr(args, "sudo_mode", OTA_DEFAULT_SUDO_MODE),
+                    require_network_shaping_sudo=True,
+                    dry_run=dry_run,
+                ),
+                sudo_mode=getattr(args, "sudo_mode", OTA_DEFAULT_SUDO_MODE),
+                shaping_image=getattr(args, "shaping_image", None),
+            )
         _ota_start_peers(
             target,
             plan,
@@ -9038,6 +9167,24 @@ def main(argv: list[str] | None = None) -> int:
         "--keep-workdir",
         action="store_true",
         help="Keep staged source and project files after cleanup.",
+    )
+    ota_smoke_parser.add_argument(
+        "--sudo-mode",
+        choices=OTA_SUDO_MODES,
+        default=OTA_DEFAULT_SUDO_MODE,
+        help=(
+            "How profile shaping obtains tc/ip privileges on the peers "
+            "(passwordless: require sudo -n; askpass: prompt locally per peer and feed sudo -S; "
+            "container: no sudo -- run each tc/ip in a short-lived NET_ADMIN host-netns container, "
+            "for peers with Docker but no passwordless sudo)."
+        ),
+    )
+    ota_smoke_parser.add_argument(
+        "--shaping-image",
+        help=(
+            "Image for --sudo-mode container (must contain tc/ip). Default: resolve on the peer -- "
+            "the image of a running rosotacom_ container, else the newest local ros-communication* image."
+        ),
     )
     ota_smoke_parser.add_argument("--skip-preflight", action="store_true", help="Skip SSH/Docker readiness checks.")
     ota_smoke_parser.add_argument(

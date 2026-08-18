@@ -266,6 +266,17 @@ risk — a stuck `qdisc` silently corrupts every later result on the machine.
   and outage steps, plus static distillation from a full trace or window
   (`trace_profiles.convert_trace_to_profile_yaml`). Passive throughput is omitted
   as `rate` unless the sample is marked saturated/probed/capacity-like.
+- [x] Shape without host sudo (issue #279): `--sudo-mode container` runs every
+  tc/ip argv in a short-lived `docker run --rm --network host --cap-add
+  NET_ADMIN` container on the peer, so docker-group membership is the whole
+  privilege. `--network host` keeps the target identical to the sudo modes
+  (the host netns is the netns the OTA com containers use); the safety
+  watchdog detaches as `docker run -d` under a fixed name and replaces a
+  stale predecessor at arm time; the image is `--shaping-image` or resolved
+  on the peer (running `rosotacom_` container's image, else the newest local
+  `ros-communication*` image, else an actionable exit-69). The lab benchmark
+  path needed none of this — it has always armed tc inside the peer
+  containers' own netns (`--cap-add NET_ADMIN` on the isolated network).
 - [ ] Confirm the `/proc/net/dev` link sampler (RFC 0003 / `link_bytes.py`) reports
   post-shaping wire bytes so link-overhead stays meaningful under a profile. *(Bench
   check.)*
@@ -342,6 +353,13 @@ off during implementation). Notes whether automation is feasible; privileged
   load generated YAML through `load_profiles_file`, and feed the resulting
   timeline into dry-run `ProfileShaper` command generation
   (`tests/unit/test_trace_profiles.py`). Done.
+- [x] **Sudo-free container shaping** (`--sudo-mode container`) — host unit tests
+  pin the generated shell: host-netns + NET_ADMIN on every tc/ip run, the
+  watchdog's `docker run -d` detachment and stale-predecessor replacement, the
+  on-peer image resolution with its actionable failure, and that the watchdog
+  name stays out of the `rosotacom_` conflict scan
+  (`tests/unit/test_container_shaping.py`). Arming it against a live remote pair
+  stays a bench check (same standing as the sudo modes' live half).
 - [ ] **Emulated-profile gate (rung 2)** — an example session run under one
   canonical profile in the per-promotion CI smoke, asserting a conditional bound
   that differs from the unshaped run. Automatable in the smoke matrix.

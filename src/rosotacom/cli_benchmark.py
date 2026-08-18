@@ -4981,8 +4981,17 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
         choices=OTA_SUDO_MODES,
         default=OTA_DEFAULT_SUDO_MODE,
         help=(
-            "How OTA benchmark profile shaping obtains sudo for tc/ip "
-            "(passwordless: require sudo -n; askpass: prompt locally per peer and feed sudo -S)."
+            "How OTA benchmark profile shaping obtains tc/ip privileges "
+            "(passwordless: require sudo -n; askpass: prompt locally per peer and feed sudo -S; "
+            "container: no sudo -- run each tc/ip in a short-lived NET_ADMIN host-netns container, "
+            "for peers with Docker but no passwordless sudo)."
+        ),
+    )
+    parser.add_argument(
+        "--shaping-image",
+        help=(
+            "Image for --sudo-mode container (must contain tc/ip). Default: resolve on the peer -- "
+            "the image of a running rosotacom_ container, else the newest local ros-communication* image."
         ),
     )
     parser.add_argument("--interactive", action="store_true", help="Open a tmux operator view for this benchmark run.")
@@ -5148,6 +5157,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 profile=profile,
                 benchmark_stepping=True,
                 sudo_mode=getattr(args, "sudo_mode", "passwordless"),
+                shaping_image=getattr(args, "shaping_image", None),
             )
 
             runtime, plan, target = _resolve_ota_smoke_context(smoke_args)
@@ -5170,6 +5180,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     require_network_shaping_sudo=profile_obj is not None,
                     sudo_mode=smoke_args.sudo_mode,
                     sudo_passwords=sudo_passwords,
+                    shaping_image=smoke_args.shaping_image,
                     check_conflicts=not getattr(args, "skip_conflict_check", False),
                 )
             _ota_prepare_hosts(smoke_args, runtime, plan)
@@ -5210,12 +5221,20 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                             shaper = ProfileShaper(
                                 ota_iface,
                                 _peer_command_runner(
-                                    peer, dry_run=dry_run, sudo_password=sudo_passwords.get(peer_name)
+                                    peer,
+                                    dry_run=dry_run,
+                                    sudo_password=sudo_passwords.get(peer_name),
+                                    sudo_mode=smoke_args.sudo_mode,
+                                    shaping_image=smoke_args.shaping_image,
                                 ),
                                 control_interface=control_iface,
                                 safety_max_duration_s=_PROFILE_SAFETY_MAX_S,
                                 watchdog_launcher=_peer_watchdog_launcher(
-                                    peer, dry_run=dry_run, sudo_password=sudo_passwords.get(peer_name)
+                                    peer,
+                                    dry_run=dry_run,
+                                    sudo_password=sudo_passwords.get(peer_name),
+                                    sudo_mode=smoke_args.sudo_mode,
+                                    shaping_image=smoke_args.shaping_image,
                                 ),
                             )
                             shapers.append(shaper)
@@ -5226,7 +5245,13 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                             shaper.arm([])
                     else:
                         shapers = _ota_arm_profile(
-                            plan, profile_obj, directions, dry_run=dry_run, sudo_passwords=sudo_passwords
+                            plan,
+                            profile_obj,
+                            directions,
+                            dry_run=dry_run,
+                            sudo_passwords=sudo_passwords,
+                            sudo_mode=smoke_args.sudo_mode,
+                            shaping_image=smoke_args.shaping_image,
                         )
 
                 _ota_start_peers(target, plan, instance.instance_id, dry_run=dry_run)

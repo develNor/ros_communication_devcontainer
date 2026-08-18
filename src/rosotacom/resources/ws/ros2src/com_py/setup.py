@@ -48,6 +48,7 @@ setup(
             'restamp = com_py.restamp:main',
             'latch_relay = com_py.latch_relay:main',
             'trickle = com_py.trickle:main',
+            'playout_pacer = com_py.playout_pacer:main',
             'sized_publisher = com_py.sized_publisher:main',
             'stage_latency = com_py.stage_latency:main',
         ],

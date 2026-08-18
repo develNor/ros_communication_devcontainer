@@ -568,6 +568,27 @@ number being reported.
 - `bit_rate` (int)
 - `encoder_av_options` (string)
 
+#### Receiver-side playout pacing (manual node)
+
+A receiver that hands every packet to the decoder the moment it arrives turns
+network delay jitter into display stutter. `com_py playout_pacer` re-times a
+received packet stream to `stamp + budget` (budget adaptive above the fastest
+observed path, clock-offset-proof; late packets pass through immediately, order
+always preserved — the decoder chain sees every packet):
+
+```bash
+ros2 run com_py playout_pacer --ros-args \
+  -p topic:=/cam/image/compressed/drop1of2/ffmpeg \
+  -p target_ms:=350.0 -p adaptive:=true
+```
+
+It republishes on `<topic>/paced` plus `.../paced/budget_ms` and
+`.../paced/queue_depth` debug topics; point the reverse republish (or any
+decoder) at the paced name. On the 2026-08-17 CCNG field trace this removes
+~95 % of delay-caused >200 ms display gaps at ~100 ms median added age
+(adaptive mode). Declarative wiring as a `transport.playout` block is tracked
+in issue #284.
+
 `type: foxglove` supports (CompressedVideo):
 - `gop_size` (int)
 - `bit_rate` (int)

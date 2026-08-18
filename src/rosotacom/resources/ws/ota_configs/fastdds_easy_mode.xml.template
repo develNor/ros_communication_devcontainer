@@ -10,12 +10,12 @@
   discover anything it was not told about, while easy mode depends on a server
   process being reachable on 11811.
 
-  Data transport is NOT discovery, and easy mode does not change it. The cap
-  below is the same 1200 B every other OTA template sets, expressed as an
-  attribute on the builtin transports rather than a custom
-  `<transport_descriptor>`: easy mode configures its own transport mix, and
-  replacing it with `useBuiltinTransports=false` would take the discovery-server
-  path with it.
+  Data transport is NOT discovery, and easy mode does not change it. The
+  transport line below therefore only takes shared memory out of the mix (each
+  container has its own /dev/shm) and makes a full socket buffer drop rather
+  than block the writer. It deliberately does not cap the datagram: measured on
+  the bench pair (2026-08-18/19), a `<max_msg_size>` below the sample size stops
+  the sample from arriving at all — see fastdds_tuned.xml for the measurement.
 
   `#easy_mode_ip` resolves to the peer's address (override per side with
   `shared.rmw.{local|ota}.fastdds.easy_mode_ip`).
@@ -26,21 +26,12 @@
       <rtps>
         <easy_mode_ip>#easy_mode_ip</easy_mode_ip>
 
-        <!-- One RTPS datagram never exceeds this, so a 38 kB camera keyframe
-             becomes ~32 independent fragments instead of ~27 IP fragments the
-             peer has to reassemble as a unit. non_blocking drops rather than
-             stalls the writer when the socket buffer is full. -->
-        <builtinTransports max_msg_size="1200" sockets_size="1MB" non_blocking="true">UDPv4</builtinTransports>
+        <builtinTransports sockets_size="1MB" non_blocking="true">UDPv4</builtinTransports>
       </rtps>
     </participant>
 
     <data_writer profile_name="rosotacom_fastdds_easy_mode_writer" is_default_profile="true">
       <qos>
-        <!-- A synchronous writer cannot fragment, and a profile that says
-             nothing means synchronous once RMW_FASTRTPS_USE_QOS_FROM_XML is on. -->
-        <publishMode>
-          <kind>ASYNCHRONOUS</kind>
-        </publishMode>
         <data_sharing>
           <kind>OFF</kind>
         </data_sharing>

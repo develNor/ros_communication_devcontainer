@@ -181,22 +181,31 @@ Per-side config blocks:
   locator list. It fails differently from `fastdds_tuned.xml` rather than
   better — an explicit peer list cannot discover what it was not told about,
   while easy mode depends on a server process being reachable on 11811 — which
-  is why both are packaged. Both cap the datagram at the same 1200 B; easy mode
-  does it with a `<builtinTransports max_msg_size=…>` attribute because
-  replacing the transports outright would take its discovery path with them.
+  is why both are packaged. Neither caps the datagram (see above); easy mode
+  expresses its transport settings as `<builtinTransports …>` attributes,
+  because replacing the transports outright would take its discovery path with
+  them.
 
   **On the OTA side, omitting `config` is not "no configuration".** Each
   implementation has a default template, and both defaults are the link-ready
   one: `cyclone` → `cyclonedds_tuned.xml`, `fastdds` → `fastdds_tuned.xml`.
   That is what makes `shared.rmw` an interchangeable choice — a session names a
-  middleware and gets unicast discovery, a pinned interface and 1200 B
-  fragments either way, rather than one middleware that survives a cellular
-  tunnel and one that has to be configured into surviving it. The fragment cap
-  is the load-bearing part: at the Fast DDS default a 38 kB camera keyframe
-  leaves the host as a single datagram the kernel splits into ~27 IP fragments
-  that the peer must reassemble as a unit. `fastdds_unicast.xml` is that
-  earlier, locator-only configuration, kept for a run that wants to measure the
+  middleware and gets unicast discovery with the OTA interface pinned either
+  way, rather than one middleware that survives a cellular tunnel and one that
+  has to be configured into surviving it. `fastdds_unicast.xml` is the earlier,
+  locator-only configuration, kept for a run that wants to measure the
   difference.
+
+  The two defaults are **not** identical in what they put on the wire, and the
+  difference is deliberate. CycloneDDS fragments at the RTPS layer (1200 B);
+  Fast DDS hands a large sample to the kernel as one datagram and lets IP
+  fragment it. Writing the same cap into the Fast DDS profile is the obvious
+  move and it takes the link down: measured on the bench pair (2026-08-18/19,
+  ROS 2 Kilted, Fast DDS 3.2.4) a `maxMessageSize` below the sample size stops
+  the sample from ever arriving — at 1200 B and at 8192 B, synchronous writer
+  and asynchronous — while an 84 B heartbeat on the same link keeps flowing.
+  Plan the payload accordingly: the measured OpenVPN barrier on this path is
+  around 110 kB per message.
 
   On the **local** side, omitting `config` really is no configuration: no
   template is applied and no `CYCLONEDDS_URI` / `FASTDDS_DEFAULT_PROFILES_FILE`

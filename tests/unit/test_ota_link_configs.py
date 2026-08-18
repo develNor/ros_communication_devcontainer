@@ -39,6 +39,11 @@ def _load(path: Path, name: str) -> ModuleType:
     return module
 
 
+def _without_comments(xml: str) -> str:
+    """The rationale is in the XML comments and names the elements it argues about."""
+    return re.sub(r"<!--.*?-->", "", xml, flags=re.DOTALL)
+
+
 def _resolved(config: str) -> str:
     module = _load(OTA_CONFIGS / "get_ota_xml.py", "rosotacom_get_ota_xml_link")
     return str(module.main(config=config, host_ip="10.0.0.1", peer="10.0.0.2", easy_mode_ip="10.0.0.2"))
@@ -55,13 +60,25 @@ def test_naming_only_the_middleware_still_selects_the_link_ready_template() -> N
         assert (OTA_CONFIGS / f"{template}.template").is_file()
 
 
-def test_both_default_ota_templates_cap_the_fragment_at_the_same_size() -> None:
+def test_only_cyclone_caps_the_datagram_and_fast_dds_must_not() -> None:
+    """The obvious symmetry is wrong, and writing it costs the whole link.
+
+    CycloneDDS carries this link at 1200 B RTPS fragments. Measured on the bench
+    pair (2026-08-18/19, Fast DDS 3.2.4), a `<maxMessageSize>` below the sample
+    size stops the sample from ever arriving — at 1200 B and at 8192 B, with a
+    synchronous writer and with an asynchronous one — while an 84 B heartbeat on
+    the same link keeps flowing. Fast DDS lets IP fragment a large sample here;
+    that is a difference in behaviour to state, not one to paper over.
+    """
     cyclone = _resolved("cyclonedds_tuned.xml")
-    fastdds = _resolved("fastdds_tuned.xml")
 
     assert f"<FragmentSize>{OTA_FRAGMENT_BYTES}B</FragmentSize>" in cyclone
     assert f"<MaxMessageSize>{OTA_FRAGMENT_BYTES}B</MaxMessageSize>" in cyclone
-    assert f"<maxMessageSize>{OTA_FRAGMENT_BYTES}</maxMessageSize>" in fastdds
+
+    for config in ("fastdds_tuned.xml", "fastdds_easy_mode.xml"):
+        resolved = _without_comments(_resolved(config))
+        assert "<maxMessageSize>" not in resolved, config
+        assert "max_msg_size=" not in resolved, config
 
 
 def test_both_default_ota_templates_pin_the_interface_and_the_peer() -> None:
@@ -76,30 +93,23 @@ def test_fastdds_tuned_drops_rather_than_blocks_the_writer() -> None:
     assert "<non_blocking_send>true</non_blocking_send>" in _resolved("fastdds_tuned.xml")
 
 
-def test_fragmenting_fastdds_gets_the_asynchronous_publication_it_requires() -> None:
-    """A synchronous Fast DDS writer cannot fragment, and the XML is what decides.
+def test_no_ota_window_forces_a_publication_mode_any_more() -> None:
+    """Asynchronous publication existed to make fragmentation work; nothing does.
 
-    The runtime exports RMW_FASTRTPS_PUBLICATION_MODE, but that only supplies
-    rmw_fastrtps's default: it also sets RMW_FASTRTPS_USE_QOS_FROM_XML=1
-    wherever an OTA profile exists, and then the publish mode comes from the
-    profile — where saying nothing means SYNCHRONOUS. Every template that caps
-    the datagram therefore has to say ASYNCHRONOUS itself, and every window that
-    exports the profile has to export the default too.
+    It is not free: on the packaged 12 kB bench stream an asynchronous writer
+    measured 9.3 Hz at 285 ms where the synchronous default held 10 Hz at a few
+    ms, so forcing it now would be a pessimisation with no fragmentation to pay
+    for it.
     """
-    for config in ("fastdds_tuned.xml", "fastdds_easy_mode.xml"):
-        resolved = _resolved(config)
-        assert "<kind>ASYNCHRONOUS</kind>" in resolved, config
-
     plugin_base = PLUGIN_BASE.read_text(encoding="utf-8")
 
     exports_profile = re.findall(
         r"fastdds\) export FASTDDS_DEFAULT_PROFILES_FILE=\"\$\{ota_config_file\}\";[^\n]*", plugin_base
     )
     assert len(exports_profile) == 3  # the COM, IN and OUT windows each bootstrap the OTA side
-    assert exports_profile
     for occurrence in exports_profile:
-        assert "RMW_FASTRTPS_PUBLICATION_MODE" in occurrence
-        assert "ASYNCHRONOUS" in occurrence
+        assert "RMW_FASTRTPS_PUBLICATION_MODE" not in occurrence
+    assert "<publishMode>" not in _without_comments(_resolved("fastdds_tuned.xml"))
 
 
 def test_native_zenoh_carries_the_sessions_inter_host_transport(tmp_path: Path) -> None:
@@ -173,17 +183,15 @@ def test_native_zenoh_refuses_a_transport_it_cannot_configure(tmp_path: Path) ->
         )
 
 
-def test_easy_mode_caps_the_datagram_without_replacing_its_transport() -> None:
-    """Easy mode configures its own transport mix; the cap has to ride on it.
+def test_easy_mode_configures_its_transport_without_replacing_it() -> None:
+    """Easy mode configures its own transport mix, so the knobs have to ride on it.
 
     `useBuiltinTransports=false` plus a custom descriptor — what the other Fast
-    DDS templates do — would take the discovery-server path with it, so the size
-    cap is an attribute on the builtin transports instead.
+    DDS template does — would take the discovery-server path with it.
     """
     resolved = _resolved("fastdds_easy_mode.xml")
 
     assert "<easy_mode_ip>10.0.0.2</easy_mode_ip>" in resolved
-    assert f'max_msg_size="{OTA_FRAGMENT_BYTES}"' in resolved
     assert 'non_blocking="true"' in resolved
     assert "<useBuiltinTransports>" not in resolved
     assert "#" not in resolved

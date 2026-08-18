@@ -3668,8 +3668,18 @@ def _ota_extract_peer_artifacts(instance: SessionInstance, peer: OtaSmokePeer, e
                 extracted = archive.extractfile(member)
                 if extracted is None:
                     continue
+                # A peer's own `.session_readonly.yaml` is written 0400 on purpose
+                # ("generated, do not edit"), and a peer that runs on the orchestrator
+                # collects into the very directory it wrote. Replacing the file rather
+                # than opening it for writing keeps both true: the copy lands, and the
+                # mode the peer chose travels with it.
+                if target.exists():
+                    target.unlink()
                 with extracted, target.open("wb") as handle:
                     shutil.copyfileobj(extracted, handle)
+                mode = member.mode & 0o7777
+                if mode:
+                    target.chmod(mode)
     except tarfile.TarError:
         print(f"OTA smoke: could not unpack collected artifacts from peer {peer.name}", file=sys.stderr)
 
@@ -6323,6 +6333,33 @@ def _smoke_publish_rate(expect: Any) -> float:
     return 5.0
 
 
+#: What a `com_msgs/msg/SizedPayload` smoke stream carries when the session does
+#: not say. Big enough to fragment on any real link, which is what the packaged
+#: examples want to exercise.
+SMOKE_SIZED_PAYLOAD_BYTES = 66000
+
+
+def _smoke_native_payload_bytes(expect: Any, msg_type: str | None) -> int | None:
+    """How large the synthetic source's `SizedPayload` messages should be.
+
+    The size is a property of the load a session wants driven, not of the smoke
+    driver, so a session may declare `expect.smoke_native_bytes` — the size
+    sibling of `smoke_native_hz`. Comparing two OTA middlewares means holding
+    the payload at a chosen size (a 38 kB camera keyframe, say) rather than at
+    whatever constant the driver happens to carry.
+    """
+    if msg_type != "com_msgs/msg/SizedPayload":
+        return None
+    if isinstance(expect, dict):
+        declared = expect.get("smoke_native_bytes")
+        if declared is not None:
+            size = int(declared)
+            if size <= 0:
+                raise RuntimeError("expect.smoke_native_bytes must be a positive number of bytes.")
+            return size
+    return SMOKE_SIZED_PAYLOAD_BYTES
+
+
 def _smoke_native_publish_rate(expect: Any) -> float:
     """The rate the synthetic source should publish the NATIVE topic at.
 
@@ -6529,7 +6566,7 @@ def _received_crossed_topics(cfg: dict[str, Any], receiver_peer_key: str) -> lis
                         hz_min=expect_hz_min,
                         hz_max=expect_hz_max,
                         max_delay_s=expect_max_delay_s,
-                        expected_size=66000 if entry.msg_type == "com_msgs/msg/SizedPayload" else None,
+                        expected_size=_smoke_native_payload_bytes(entry.expect, entry.msg_type),
                         publish_qos=_smoke_publish_qos(entry.qos),
                     ),
                 ]
@@ -6752,7 +6789,7 @@ def _smoke_topic_pub_qos_args(qos: dict[str, Any] | None) -> str:
 def _smoke_publisher_command(spec: SmokeTopicSpec, ros_setup: str, duration: float) -> str:
     assert spec.publish_topic is not None and spec.publish_type is not None
     if spec.publish_type == "com_msgs/msg/SizedPayload":
-        size = spec.expected_size or 66000
+        size = spec.expected_size or SMOKE_SIZED_PAYLOAD_BYTES
         return (
             f"{ros_setup} && timeout {duration} ros2 run com_py sized_publisher --ros-args "
             f"-p topic:={shlex.quote(spec.publish_topic)} -p size:={size} -p rate:={spec.publish_rate}"
@@ -8550,6 +8587,55 @@ def _add_peer_arg(parser: argparse.ArgumentParser) -> None:
     cast(Any, action).completer = _peer_host_completer
 
 
+def _add_ota_install_args(parser: argparse.ArgumentParser) -> None:
+    """How the peers get rosotacom, and how they are reached.
+
+    Shared by `ota-smoke` and every OTA benchmark genre. They were only on
+    `ota-smoke` while the benchmarks were something an operator ran with an ssh
+    key in hand; a run driven by a narrower transport needs the same four
+    options wherever it starts, or the measurement is the one thing that still
+    demands a shell on the peer.
+    """
+    parser.add_argument(
+        "--peer-checkout",
+        action="append",
+        default=[],
+        metavar="PEER=PATH",
+        help=(
+            "Absolute path of a peer's project checkout, for --install-mode checkout. "
+            "Required for every peer in that mode; the same repository is at a different path on each machine."
+        ),
+    )
+    parser.add_argument(
+        "--peer-exec",
+        action="append",
+        default=[],
+        metavar="PEER=COMMAND",
+        help=(
+            "Run this peer's commands through COMMAND instead of ssh; the script is appended as the final "
+            "argument, the same contract ssh has. For --install-mode checkout only, and mutually exclusive "
+            "with --peer-ssh for the same peer. Use it to put a peer behind a transport narrower than a "
+            "shell, such as a forced command that accepts only this project's own commands."
+        ),
+    )
+    parser.add_argument(
+        "--install-mode",
+        choices=list(OTA_INSTALL_MODES),
+        default="source",
+        help=(
+            "How the peers get rosotacom. 'source' (default) stages and installs what you are running — "
+            "right while iterating on rosotacom. 'pin' installs a published release from the index, so the "
+            "peers run the artefact that ships — right when rehearsing a deployment. 'checkout' stages and "
+            "installs nothing: each peer uses its own installed rosotacom and its own project checkout "
+            "(see --peer-checkout), so the run tests the machines as git left them."
+        ),
+    )
+    parser.add_argument(
+        "--install-pin",
+        help="Version for --install-mode pin (default: the version of the rosotacom you are running).",
+    )
+
+
 def _add_peer_ssh_arg(parser: argparse.ArgumentParser) -> None:
     action = parser.add_argument(
         "--peer-ssh",
@@ -9109,28 +9195,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_peer_arg(ota_smoke_parser)
     _add_peer_address_arg(ota_smoke_parser)
     _add_peer_ssh_arg(ota_smoke_parser)
-    ota_smoke_parser.add_argument(
-        "--peer-checkout",
-        action="append",
-        default=[],
-        metavar="PEER=PATH",
-        help=(
-            "Absolute path of a peer's project checkout, for --install-mode checkout. "
-            "Required for every peer in that mode; the same repository is at a different path on each machine."
-        ),
-    )
-    ota_smoke_parser.add_argument(
-        "--peer-exec",
-        action="append",
-        default=[],
-        metavar="PEER=COMMAND",
-        help=(
-            "Run this peer's commands through COMMAND instead of ssh; the script is appended as the final "
-            "argument, the same contract ssh has. For --install-mode checkout only, and mutually exclusive "
-            "with --peer-ssh for the same peer. Use it to put a peer behind a transport narrower than a "
-            "shell, such as a forced command that accepts only this project's own commands."
-        ),
-    )
+    _add_ota_install_args(ota_smoke_parser)
     ota_smoke_parser.add_argument("--target-type", choices=["auto", "session", "scenario"], default="auto")
     ota_smoke_parser.add_argument("--interactive", action="store_true", help="Open a local control tmux UI.")
     ota_smoke_parser.add_argument("--stop", action="store_true", help="Stop an OTA smoke run.")
@@ -9146,22 +9211,6 @@ def main(argv: list[str] | None = None) -> int:
         "--reuse",
         action="store_true",
         help="Reuse an already installed rosotacom source tree in the workdir.",
-    )
-    ota_smoke_parser.add_argument(
-        "--install-mode",
-        choices=list(OTA_INSTALL_MODES),
-        default="source",
-        help=(
-            "How the peers get rosotacom. 'source' (default) stages and installs what you are running — "
-            "right while iterating on rosotacom. 'pin' installs a published release from the index, so the "
-            "peers run the artefact that ships — right when rehearsing a deployment. 'checkout' stages and "
-            "installs nothing: each peer uses its own installed rosotacom and its own project checkout "
-            "(see --peer-checkout), so the run tests the machines as git left them."
-        ),
-    )
-    ota_smoke_parser.add_argument(
-        "--install-pin",
-        help="Version for --install-mode pin (default: the version of the rosotacom you are running).",
     )
     ota_smoke_parser.add_argument(
         "--keep-workdir",

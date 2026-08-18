@@ -167,8 +167,30 @@ not override `RMW_IMPLEMENTATION` and relies on the ambient ROS 2 defaults — n
 Per-side config blocks:
 
 - DDS implementations (`cyclone`, `fastdds`) accept:
-  - `config: <template>` — template file under `ws/ota_configs/` (e.g. `fastdds_v1.xml`, `cyclonedds.xml`, `fastdds_easy_mode.xml`). Omit to use the RMW's built-in defaults.
-  - `easy_mode_ip: <string>` — only honored by `fastdds_easy_mode.xml`; defaults to the first resolved peer address.
+  - `config: <template>` — template file under `ws/ota_configs/`
+    (`cyclonedds_tuned.xml`, `cyclonedds_minimal.xml`,
+    `cyclonedds_local_participants.xml`, `fastdds_tuned.xml`,
+    `fastdds_unicast.xml`).
+  - `easy_mode_ip: <string>` — resolved into a template's `#easy_mode_ip`
+    placeholder; defaults to the first resolved peer address. No packaged
+    template uses it today.
+
+  **On the OTA side, omitting `config` is not "no configuration".** Each
+  implementation has a default template, and both defaults are the link-ready
+  one: `cyclone` → `cyclonedds_tuned.xml`, `fastdds` → `fastdds_tuned.xml`.
+  That is what makes `shared.rmw` an interchangeable choice — a session names a
+  middleware and gets unicast discovery, a pinned interface and 1200 B
+  fragments either way, rather than one middleware that survives a cellular
+  tunnel and one that has to be configured into surviving it. The fragment cap
+  is the load-bearing part: at the Fast DDS default a 38 kB camera keyframe
+  leaves the host as a single datagram the kernel splits into ~27 IP fragments
+  that the peer must reassemble as a unit. `fastdds_unicast.xml` is that
+  earlier, locator-only configuration, kept for a run that wants to measure the
+  difference.
+
+  On the **local** side, omitting `config` really is no configuration: no
+  template is applied and no `CYCLONEDDS_URI` / `FASTDDS_DEFAULT_PROFILES_FILE`
+  is exported.
 
   On the **local** side of a busy machine, set
   `config: cyclonedds_local_participants.xml`. Cyclone allows 33 participants
@@ -420,6 +442,21 @@ Each entry is either:
   - `zen_qos` (optional mapping)
   - `expect` (optional mapping); `smoke_probe: false` keeps the topic in the
     generated contract but excludes it from synthetic local-smoke probes
+
+    Two `expect` keys describe the *synthetic source* rather than the contract,
+    for the runs (local smoke, `ota-smoke`, OTA benchmark genres) that drive a
+    session with generated traffic instead of a replay:
+
+    - `smoke_native_hz` — publish the native topic at this rate instead of
+      deriving it from the `hz` bounds. Needed wherever the pipeline changes the
+      rate (`drop`, `throttle_hz`, `trickle_hz`), because the asserted rate is
+      the delivered one and the source has to run faster.
+    - `smoke_native_bytes` — the payload size for a
+      `com_msgs/msg/SizedPayload` topic (default 66000). The size belongs to the
+      load a session wants driven: comparing two OTA middlewares, or two
+      profiles, means holding the payload at a chosen size — a 38 kB camera
+      keyframe, say — rather than at whatever constant the driver carries. It is
+      also what the receiving side asserts, so both ends stay consistent.
 
 In split-domain mode the generator must emit a standard ROS 2 `domain_bridge` YAML with explicit
 message types for `/com/...` topics. For that reason, user-defined topic entries need `type:`.

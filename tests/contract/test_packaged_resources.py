@@ -40,6 +40,7 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
         "resources/ws/ota_configs/cyclonedds_tuned.xml.template",
         "resources/ws/ota_configs/cyclonedds_local_participants.xml.template",
         "resources/ws/ota_configs/fastdds_unicast.xml.template",
+        "resources/ws/ota_configs/fastdds_tuned.xml.template",
         "resources/ws/ros2src/com_msgs/msg/EchoHeartbeat.msg",
     )
 

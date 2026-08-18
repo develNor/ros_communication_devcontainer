@@ -4936,6 +4936,7 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
         OTA_DEFAULT_SUDO_MODE,
         OTA_SUDO_MODES,
         _add_common_config_args,
+        _add_ota_install_args,
         _add_peer_address_arg,
         _add_peer_arg,
         _add_peer_ssh_arg,
@@ -4945,6 +4946,11 @@ def _add_benchmark_common_args(parser: argparse.ArgumentParser, *, ota_benchmark
     _add_peer_arg(parser)
     _add_peer_ssh_arg(parser)
     _add_peer_address_arg(parser)
+    if ota_benchmark:
+        # Same four options as `ota-smoke`: a measurement run has to be able to
+        # reach a peer the same ways a smoke run can, including a transport that
+        # is narrower than a shell.
+        _add_ota_install_args(parser)
     parser.add_argument("--skip-preflight", action="store_true", help="Skip SSH/Docker readiness checks.")
     parser.add_argument("--keep-workdir", action="store_true", help="Keep temporary checkout directories.")
     parser.add_argument("--dry-run", action="store_true", help="Show commands but do not run them.")
@@ -5148,6 +5154,10 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 peer=getattr(args, "peer", None),
                 peer_address=getattr(args, "peer_address", None),
                 peer_ssh=getattr(args, "peer_ssh", None),
+                peer_checkout=getattr(args, "peer_checkout", None),
+                peer_exec=getattr(args, "peer_exec", None),
+                install_mode=getattr(args, "install_mode", None),
+                install_pin=getattr(args, "install_pin", None),
                 workdir=getattr(args, "workdir", None),
                 reuse=getattr(args, "reuse", False),
                 skip_preflight=getattr(args, "skip_preflight", False),

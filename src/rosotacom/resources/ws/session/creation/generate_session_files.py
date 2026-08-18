@@ -179,9 +179,14 @@ _ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
 # overlay/tunnel networks that drop multicast. Default each DDS OTA side to its
 # interface-pinned, unicast-peer config so cross-host delivery works out of the
 # box; an explicit `ota: {cyclone|fastdds: {config: ...}}` still overrides this.
+#: What `rmw.ota: <impl>` means when no ``config:`` is given. Both entries are
+#: the link-ready configuration for their implementation, not the minimal one:
+#: a session that names an OTA middleware and nothing else gets unicast
+#: discovery, a pinned interface and 1200 B fragments either way, which is what
+#: makes `shared.rmw` an interchangeable choice rather than a rewrite.
 _DDS_OTA_DEFAULT_CONFIG = {
     "cyclone": "cyclonedds_tuned.xml",
-    "fastdds": "fastdds_unicast.xml",
+    "fastdds": "fastdds_tuned.xml",
 }
 
 

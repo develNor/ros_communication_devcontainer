@@ -233,3 +233,76 @@ def test_generated_peer_files_wire_the_wrapped_camera(tmp_path: Path) -> None:
     # ... and what the application finally reads is the decoded image.
     assert stages["native_in"]["topic"] == "/camera/image/ffmpeg/raw"
     assert stages["native_in"]["type"] == "sensor_msgs/msg/Image"
+
+
+# ---------------------------------------------------------------------------
+# receiver-side playout pacing (transport.playout, issue #284)
+# ---------------------------------------------------------------------------
+
+
+def test_playout_requires_a_receiver_republish() -> None:
+    """Without a reverse republish the pacer would rename the delivered topic."""
+    with pytest.raises(ValueError, match="requires remote_republish"):
+        _pipeline({"transport": {"type": "ffmpeg", "playout": {"min_ms": 100}}})
+
+
+def test_playout_rejects_unknown_keys_and_bad_numbers() -> None:
+    with pytest.raises(ValueError, match="unknown keys"):
+        _pipeline(_ffmpeg(playout={"budget_ms": 350}))
+    with pytest.raises(ValueError, match="positive number"):
+        _pipeline(_ffmpeg(playout={"target_ms": -1}))
+    with pytest.raises(ValueError, match="max_ms must be >= min_ms"):
+        _pipeline(_ffmpeg(playout={"min_ms": 500, "max_ms": 100}))
+
+
+def test_playout_never_leaks_into_encoder_params() -> None:
+    _entry, pipe = _pipeline(_ffmpeg(gop_size=3, playout={"min_ms": 100, "max_ms": 800}))
+    tspec = pipe["transport"]
+    assert tspec.playout == {"min_ms": 100, "max_ms": 800}
+    assert "playout" not in tspec.params
+    assert tspec.params["gop_size"] == 3
+
+
+def test_playout_does_not_rename_the_delivered_topic() -> None:
+    """The pacer sits between unwrapper and decode; what the application reads keeps its name."""
+    _entry, plain = _pipeline(_ffmpeg())
+    _entry, paced = _pipeline(_ffmpeg(playout={}))
+    assert generator._delivered_topic(paced, paced["final"]) == generator._delivered_topic(plain, plain["final"])
+
+
+def test_generated_peer_files_wire_the_pacer(tmp_path: Path) -> None:
+    processing = {
+        "transport": {
+            "type": "ffmpeg",
+            "gop_size": 3,
+            "remote_republish": "compressed",
+            "playout": {"adaptive": True, "min_ms": 120, "max_ms": 600},
+        },
+        "use_ota_wrapper": True,
+    }
+    generator.func(
+        session_config_obj=_camera_cfg(processing),
+        output_dir=str(tmp_path),
+        force=True,
+        peer_addresses={"a": "127.0.0.1", "b": "127.0.0.2"},
+    )
+
+    receiver = (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
+    # The pacer runs on the receiving peer against the arrived encoded stream...
+    assert "pace_1_topic: /camera/image/ffmpeg" in receiver
+    assert "pace_1_msg_type: ffmpeg_image_transport_msgs/msg/FFMPEGPacket" in receiver
+    assert (
+        "pace_1_adaptive: 'true'" in receiver
+        or 'pace_1_adaptive: "true"' in receiver
+        or "pace_1_adaptive: true" in receiver
+    )
+    assert "pace_1_min_ms: 120.0" in receiver
+    assert "pace_1_max_ms: 600.0" in receiver
+    # ...and the decode reads the paced copy.
+    assert "irt_1_paced" in receiver
+
+    # The sender has no pacer: its preview (if any) reads its own encode, and
+    # this session declares no local_republish at all.
+    sender = (tmp_path / "b" / "plugin.yaml").read_text(encoding="utf-8")
+    assert "pace" not in sender or "pace_1_topic" not in sender
+    assert "irt_1_paced" not in sender

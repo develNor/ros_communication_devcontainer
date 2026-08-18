@@ -92,6 +92,13 @@ class TransportSpec:
     #: image_transport itself, or one that only forwards or records packets,
     #: does not want a second copy of every frame.
     remote_republish: Optional[str] = None
+    #: Receiver-side playout pacing (issue #284): re-time the arrived packet
+    #: stream to smooth network delay jitter before the reverse republish
+    #: decodes it. Keys: adaptive / target_ms / min_ms / max_ms (validated in
+    #: the parser; defaults live in the playout_pacer node). Requires
+    #: `remote_republish`, because the pacer publishes on `<encoded>/paced`
+    #: and only the republish remap keeps the delivered topic name unchanged.
+    playout: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1692,12 +1699,45 @@ def _compute_pipeline(
                 )
             return str(value)
 
-        params = {k: v for k, v in t.items() if k not in ("type", *republish_keys)}
+        remote_republish = _republish("remote_republish")
+
+        playout: Optional[Dict[str, Any]] = None
+        playout_cfg = t.get("playout")
+        if playout_cfg is not None:
+            if not isinstance(playout_cfg, dict):
+                raise ValueError(f"transport.playout must be a mapping for topic '{entry.base}'")
+            allowed = {"adaptive", "target_ms", "min_ms", "max_ms"}
+            unknown = sorted(set(playout_cfg) - allowed)
+            if unknown:
+                raise ValueError(
+                    f"transport.playout for topic '{entry.base}' has unknown keys {unknown}; "
+                    f"allowed: {sorted(allowed)}"
+                )
+            if remote_republish is None:
+                raise ValueError(
+                    f"transport.playout for topic '{entry.base}' requires remote_republish: "
+                    "the pacer publishes on '<encoded>/paced', and only the reverse republish's "
+                    "input remap keeps the delivered topic name unchanged. Without a republish "
+                    "the receiver would have to subscribe a renamed topic."
+                )
+            for key in ("target_ms", "min_ms", "max_ms"):
+                if key in playout_cfg and (not isinstance(playout_cfg[key], (int, float)) or playout_cfg[key] <= 0):
+                    raise ValueError(f"transport.playout.{key} must be a positive number for topic '{entry.base}'")
+            min_ms = float(playout_cfg.get("min_ms", 100.0))
+            max_ms = float(playout_cfg.get("max_ms", 800.0))
+            if max_ms < min_ms:
+                raise ValueError(f"transport.playout.max_ms must be >= min_ms for topic '{entry.base}'")
+            if "adaptive" in playout_cfg and not isinstance(playout_cfg["adaptive"], bool):
+                raise ValueError(f"transport.playout.adaptive must be a boolean for topic '{entry.base}'")
+            playout = dict(playout_cfg)
+
+        params = {k: v for k, v in t.items() if k not in ("type", "playout", *republish_keys)}
         transport = TransportSpec(
             type=ttype,
             params=params,
             local_republish=_republish("local_republish"),
-            remote_republish=_republish("remote_republish"),
+            remote_republish=remote_republish,
+            playout=playout,
         )
 
     topic = entry.base
@@ -3201,20 +3241,45 @@ def func(
         # it encoded and (b) the decode of what arrived. Both run on *this* peer;
         # what differs is which copy they decode and which transport the session
         # asked each of them to publish in.
-        irt_all: List[Tuple[str, str, str]] = []
+        # The sender's own preview decode is never paced: it reads the local
+        # copy of what it just encoded, so there is no network jitter to
+        # absorb. Playout pacing exists on the receiving side only.
+        irt_all: List[Tuple[str, str, str, Optional[Dict[str, Any]]]] = []
         for t, tspec in irt_items_local:
             assert tspec is not None
-            irt_all.append((t, tspec.type, str(tspec.local_republish)))
-        irt_all.extend((topic, tspec.type, str(tspec.remote_republish)) for topic, tspec in irt_items_remote)
+            irt_all.append((t, tspec.type, str(tspec.local_republish), None))
+        irt_all.extend(
+            (topic, tspec.type, str(tspec.remote_republish), tspec.playout) for topic, tspec in irt_items_remote
+        )
         _assert_max("irt", irt_all, 4)
         if irt_all:
             items2 = [("irt", True)]
-            for i, (topic, _ttype, _out_transport) in enumerate(irt_all, 1):
+            for i, (topic, _ttype, _out_transport, _playout) in enumerate(irt_all, 1):
                 items2.append((f"irt_{i}_topic", topic))
-            for i, (_topic, ttype, out_transport) in enumerate(irt_all, 1):
+            for i, (_topic, ttype, out_transport, playout) in enumerate(irt_all, 1):
                 items2.append((f"irt_{i}_transport", ttype))
                 items2.append((f"irt_{i}_out_transport", out_transport))
+                if playout is not None:
+                    # Points the decode's input remap at '<topic>/paced'; the
+                    # pacer itself runs in the PACE window below.
+                    items2.append((f"irt_{i}_paced", "true"))
             blocks.append(PluginBlock("irt", items2))
+
+        paced_entries = [
+            (i, topic, ttype, playout)
+            for i, (topic, ttype, _out_transport, playout) in enumerate(irt_all, 1)
+            if playout is not None
+        ]
+        if paced_entries:
+            items_pace: List[Tuple[str, Any]] = [("pace", True)]
+            for i, topic, ttype, playout in paced_entries:
+                items_pace.append((f"pace_{i}_topic", topic))
+                items_pace.append((f"pace_{i}_msg_type", TRANSPORT_OUTPUT_TYPES[ttype]))
+                items_pace.append((f"pace_{i}_adaptive", "true" if playout.get("adaptive", True) else "false"))
+                items_pace.append((f"pace_{i}_target_ms", float(playout.get("target_ms", 350.0))))
+                items_pace.append((f"pace_{i}_min_ms", float(playout.get("min_ms", 100.0))))
+                items_pace.append((f"pace_{i}_max_ms", float(playout.get("max_ms", 800.0))))
+            blocks.append(PluginBlock("pace", items_pace))
 
         if nor_items:
             items2 = [("nor", True)]

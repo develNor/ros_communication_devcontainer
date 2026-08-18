@@ -568,13 +568,39 @@ number being reported.
 - `bit_rate` (int)
 - `encoder_av_options` (string)
 
-#### Receiver-side playout pacing (manual node)
+#### Receiver-side playout pacing
 
 A receiver that hands every packet to the decoder the moment it arrives turns
 network delay jitter into display stutter. `com_py playout_pacer` re-times a
 received packet stream to `stamp + budget` (budget adaptive above the fastest
 observed path, clock-offset-proof; late packets pass through immediately, order
-always preserved — the decoder chain sees every packet):
+always preserved — the decoder chain sees every packet). On the 2026-08-17 CCNG
+field trace this removes ~95 % of delay-caused >200 ms display gaps at ~100 ms
+median added age (adaptive mode).
+
+Declaratively, add a `playout` block to the transport:
+
+```yaml
+        transport:
+          type: "ffmpeg"
+          gop_size: 3
+          remote_republish: compressed
+          playout:            # receiver-side; requires remote_republish
+            adaptive: true    # default true; false uses target_ms as a fixed budget
+            target_ms: 350    # fixed budget when adaptive: false
+            min_ms: 100       # adaptive clamp above the observed delay floor
+            max_ms: 800
+```
+
+The receiving peer then runs the pacer in its own `PACE` window against the
+arrived encoded stream, and the reverse republish decodes `<encoded>/paced`
+instead of the raw arrival — the delivered topic name is unchanged, which is
+why `playout` requires `remote_republish`: without a republish the pacer's
+`/paced` suffix would rename what the receiving application subscribes to.
+The sender's own preview decode (`local_republish`) is never paced — it reads
+the local copy of what was just encoded, so there is no jitter to absorb.
+
+The node also runs standalone against any packet stream:
 
 ```bash
 ros2 run com_py playout_pacer --ros-args \
@@ -583,11 +609,7 @@ ros2 run com_py playout_pacer --ros-args \
 ```
 
 It republishes on `<topic>/paced` plus `.../paced/budget_ms` and
-`.../paced/queue_depth` debug topics; point the reverse republish (or any
-decoder) at the paced name. On the 2026-08-17 CCNG field trace this removes
-~95 % of delay-caused >200 ms display gaps at ~100 ms median added age
-(adaptive mode). Declarative wiring as a `transport.playout` block is tracked
-in issue #284.
+`.../paced/queue_depth` debug topics.
 
 `type: foxglove` supports (CompressedVideo):
 - `gop_size` (int)

@@ -28,6 +28,9 @@ living verification hook.
 
 ## Findings
 
+- [Sender-side transit rows made a dead link report zero loss](sender-rows-make-a-dead-link-look-loss-free.md) - `delivered = rows - lost` counted the sender's own `sent` rows as deliveries, so a topic the receiver never saw summarised as `delivered == expected` at 0.0% loss, with the publisher's timer reported as arrival spacing.
+- [A bridge that learns types from the graph cannot use a transport that does not carry the graph](graph-derived-types-block-a-non-graph-transport.md) - over `zenoh_ros2dds` the payload topic never arrived in either run: the bridge routes a topic once a local reader exists and the reader waited for the bridge, leaving only `Pending=1` in a log.
+- [A Fast DDS datagram cap stops every message larger than it](fastdds-datagram-cap-drops-large-samples.md) - copying CycloneDDS's 1200 B fragment size into the Fast DDS OTA profile makes every sample above the cap never arrive, at 1200 B and at 8192 B, sync and async — while the 84 B heartbeat keeps flowing at 10 Hz.
 - [A lost keyframe silences exactly the next gop_size−2 deltas](keyframe-loss-kills-the-next-deltas.md) - libavcodec emits nothing for them, the last delta decodes with artifacts, the next keyframe restores clean decode; a lost delta never blocks decode — so the display hole is gop_size × frame period, deterministically.
 - [Oversubscription queues — it does not lose until the queue itself dies](oversubscription-queues-not-losses.md) - 16% over an emulated cap climbed one-way delay 340 → 3250 ms across twelve bins with zero loss in every one; the losses arrived only when the queue died, all at once.
 - [Best-effort reordering becomes reader-side loss, independent of history depth](reorder-becomes-reader-loss.md) - under pure delay jitter a Cyclone best-effort reader discards every overtaken sample (57% at 100 Hz under 50+-45 ms), delivery stays strictly monotonic, and depth 50 loses the same as depth 1.

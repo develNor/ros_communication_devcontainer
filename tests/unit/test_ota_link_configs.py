@@ -184,3 +184,21 @@ def test_easy_mode_caps_the_datagram_without_replacing_its_transport() -> None:
     assert 'non_blocking="true"' in resolved
     assert "<useBuiltinTransports>" not in resolved
     assert "#" not in resolved
+
+
+def test_fastdds_tuned_keeps_the_same_host_path_open() -> None:
+    """A split OTA domain carries a same-host peer, and pinning it away kills the link.
+
+    With `shared.ota_domain_id` set, the stock `domain_bridge` process sits on
+    the OTA domain speaking whatever RMW the *local* side uses. An OTA
+    participant that may only use the tunnel address cannot discover it, and the
+    failure reads as a dead link: every stage flows up to `com_out` and nothing
+    is ever published on `/ota/...`.
+    """
+    resolved = _resolved("fastdds_tuned.xml")
+
+    assert '<interface name="127.0.0.1" netmask_filter="OFF"/>' in resolved
+    assert resolved.count("<address>127.0.0.1</address>") == 3  # default, metatraffic, initial peers
+    # An initial peer without a port probes participant indices 0..range; the
+    # Fast DDS default of 4 is smaller than an OTA domain can hand out.
+    assert "<maxInitialPeersRange>10</maxInitialPeersRange>" in resolved

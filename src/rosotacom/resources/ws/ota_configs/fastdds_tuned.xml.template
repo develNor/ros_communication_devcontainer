@@ -48,20 +48,41 @@
         <!-- Drop rather than block when the socket buffer is full. -->
         <non_blocking_send>true</non_blocking_send>
 
-        <!-- The OTA address is the only one this participant may use. On a
-             multi-homed VPN host the default (every interface) is what lets a
-             peer announce a locator the other side cannot route to. -->
+        <!-- Two addresses, and both are load-bearing. #host_ip is the OTA
+             address, and pinning it is what keeps a multi-homed VPN host from
+             announcing a locator the peer cannot route to. 127.0.0.1 is the
+             same-host half: with a split OTA domain the stock `domain_bridge`
+             process sits on that domain too and speaks whatever RMW the local
+             side uses, so this participant has to be able to discover a peer on
+             its own machine. An allowlist of the OTA address alone takes the
+             loopback path away and the bridge and the OTA processes never see
+             each other -- the failure looks like a dead link and is not one. -->
         <interfaces>
           <allowlist>
+            <interface name="127.0.0.1" netmask_filter="OFF"/>
             <interface name="#host_ip" netmask_filter="OFF"/>
           </allowlist>
         </interfaces>
+
+        <!-- An initial peer without a port makes Fast DDS probe participant
+             indices 0..maxInitialPeersRange on that address. The default is 4,
+             and an OTA domain carrying a bridge plus the IN/OUT splits can
+             hand out a higher index than that -- whichever process starts late
+             is then simply never found. CycloneDDS probes 10 by default; this
+             matches it. -->
+        <maxInitialPeersRange>10</maxInitialPeersRange>
       </transport_descriptor>
     </transport_descriptors>
 
     <participant profile_name="rosotacom_fastdds_tuned" is_default_profile="true">
       <rtps>
         <defaultUnicastLocatorList>
+          <locator>
+            <udpv4>
+              <address>127.0.0.1</address>
+              <port>0</port>
+            </udpv4>
+          </locator>
           <locator>
             <udpv4>
               <address>#host_ip</address>
@@ -74,6 +95,12 @@
           <metatrafficUnicastLocatorList>
             <locator>
               <udpv4>
+                <address>127.0.0.1</address>
+                <port>0</port>
+              </udpv4>
+            </locator>
+            <locator>
+              <udpv4>
                 <address>#host_ip</address>
                 <port>0</port>
               </udpv4>
@@ -81,6 +108,12 @@
           </metatrafficUnicastLocatorList>
 
           <initialPeersList>
+            <locator>
+              <udpv4>
+                <address>127.0.0.1</address>
+                <port>0</port>
+              </udpv4>
+            </locator>
             <locator>
               <udpv4>
                 <address>#host_ip</address>

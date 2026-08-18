@@ -451,6 +451,15 @@ class StageObservation:
                 self.sequence_events.append((now, expected_delta, missing, reordered, missing))
 
             if transit is not None and seq is not None:
+                # A sender-side com_out row observes its own machine's wrapper:
+                # a sequence gap there means the local observer missed the
+                # message, not that the link lost it, and an observed message
+                # was *sent*, not delivered. The distinct status values also
+                # keep the offline join honest: `join_transit_records` ranks
+                # only lost < reordered < delivered, so a sender row can never
+                # overwrite the receiving side's `lost` verdict for the same
+                # (source, topic, epoch, seq).
+                outbound = transit.get("direction") == "outbound"
                 common = {
                     "kind": "transit",
                     "peer": transit.get("peer"),
@@ -465,16 +474,21 @@ class StageObservation:
                     "epoch": self.epoch,
                 }
                 if missing_start is not None:
+                    gap_time_field = "t_com_out" if outbound else "t_com_in"
                     for missing_seq in range(missing_start, int(seq)):
                         self.transit_records.append(
                             {
                                 **common,
                                 "seq": missing_seq,
-                                "status": "lost",
+                                "status": "unobserved" if outbound else "lost",
                                 "t_wrap": None,
-                                "t_com_in": None,
+                                gap_time_field: None,
                                 "clock_offset_ms": None,
-                                "sections": {"ota_hop_ms": None},
+                                "sections": (
+                                    {"wrap_to_com_out_ms": None}
+                                    if outbound
+                                    else {"ota_hop_ms": None}
+                                ),
                                 "size_bytes": None,
                                 "inter_arrival_ms": None,
                                 "jitter_ms": None,
@@ -493,18 +507,21 @@ class StageObservation:
                 if inter_arrival_s is not None:
                     self.last_inter_arrival_s = inter_arrival_s
                 self.last_transit_recv_wall = wall
-                row = {
-                    **common,
-                    "seq": int(seq),
-                    "status": sequence_status,
-                    "t_wrap": transit.get("t_wrap"),
-                    "t_com_in": transit.get("t_com_in"),
-                    "clock_offset_ms": (
-                        round(clock_offset_s * 1000.0, 3)
-                        if clock_offset_s is not None
-                        else None
-                    ),
-                    "sections": {
+                if outbound:
+                    # Same clock on both ends of this hop, so there is no
+                    # corrected/uncorrected pair and no OTA section: the only
+                    # honest number is the wrap->com_out relay hop.
+                    status = "sent"
+                    time_fields = {"t_com_out": transit.get("t_com_out")}
+                    sections: Dict[str, Any] = {
+                        "wrap_to_com_out_ms": (
+                            round(delay_s * 1000.0, 3) if delay_s is not None else None
+                        ),
+                    }
+                else:
+                    status = sequence_status
+                    time_fields = {"t_com_in": transit.get("t_com_in")}
+                    sections = {
                         "ota_hop_ms": (
                             round(delay_s * 1000.0, 3) if delay_s is not None else None
                         ),
@@ -513,7 +530,19 @@ class StageObservation:
                             if raw_delay_s is not None
                             else None
                         ),
-                    },
+                    }
+                row = {
+                    **common,
+                    "seq": int(seq),
+                    "status": status,
+                    "t_wrap": transit.get("t_wrap"),
+                    **time_fields,
+                    "clock_offset_ms": (
+                        round(clock_offset_s * 1000.0, 3)
+                        if clock_offset_s is not None
+                        else None
+                    ),
+                    "sections": sections,
                     "size_bytes": size,
                     "inter_arrival_ms": (
                         round(inter_arrival_s * 1000.0, 3)

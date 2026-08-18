@@ -328,3 +328,78 @@ def test_ota_unparseable_ffmpeg_payload_omits_the_flag(node_module: ModuleType) 
     records = node.observations[topic].drain_transit_records()
     assert [record["seq"] for record in records] == [0, 1]
     assert all("keyframe" not in record for record in records)
+
+
+# ---------------------------------------------------------------------------
+# the sender-side com_out branch: what the source handed to the link (#293)
+# ---------------------------------------------------------------------------
+
+
+def _ota_out_observer(node_module: ModuleType, topic: str):
+    node = object.__new__(node_module.StageObserver)
+    node.observations = {topic: core.StageObservation(type_str="com_msgs/msg/OtaStamped")}
+    node._stage_metadata = {
+        topic: [
+            {
+                "peer": "a",
+                "source": "a",
+                "target": "b",
+                "base": "/cam",
+                "direction": "outbound",
+                "stage": "com_out",
+            }
+        ]
+    }
+    # A live peer estimate exists; the branch must not apply it to a local hop.
+    node.clock_estimator = _Estimator(5.0)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=int(_NOW_S * 1e9)))
+    node.get_logger = lambda: SimpleNamespace(error=lambda *a, **k: None, warning=lambda *a, **k: None)
+    return node
+
+
+def test_com_out_ota_payload_produces_a_sent_transit_record(node_module: ModuleType) -> None:
+    topic = "/com/out/a/cam/ffmpeg/ota_stamped"
+    node = _ota_out_observer(node_module, topic)
+    cb = node._make_cb(topic)
+
+    cb(_ota_stamped(0, msg_type=ffmpeg_flags.FFMPEG_PACKET_TYPE, serialized_msg=_ffmpeg_packet(1)))
+    cb(_ota_stamped(1, msg_type=ffmpeg_flags.FFMPEG_PACKET_TYPE, serialized_msg=_ffmpeg_packet(0)))
+
+    records = node.observations[topic].drain_transit_records()
+    assert [(r["seq"], r["status"], r["keyframe"]) for r in records] == [
+        (0, "sent", True),
+        (1, "sent", False),
+    ]
+    first = records[0]
+    assert first["stage"] == "com_out"
+    assert first["direction"] == "outbound"
+    assert first["t_wrap"] == pytest.approx(_NOW_S - 0.03, abs=1e-6)
+    assert first["t_com_out"] == pytest.approx(_NOW_S, abs=1e-6)
+    assert "t_com_in" not in first
+    # Wrapper and observer share one clock, so the peer offset must not leak in.
+    assert first["clock_offset_ms"] is None
+    assert first["sections"]["wrap_to_com_out_ms"] == pytest.approx(30.0, abs=0.5)
+    assert "ota_hop_ms" not in first["sections"]
+
+
+def test_com_out_sequence_gap_is_unobserved_not_lost(node_module: ModuleType) -> None:
+    """A gap at com_out means the local observer missed the message, not the link."""
+    topic = "/com/out/a/cam/ffmpeg/ota_stamped"
+    node = _ota_out_observer(node_module, topic)
+    cb = node._make_cb(topic)
+
+    cb(_ota_stamped(0, msg_type=ffmpeg_flags.FFMPEG_PACKET_TYPE, serialized_msg=_ffmpeg_packet(1)))
+    cb(_ota_stamped(3, msg_type=ffmpeg_flags.FFMPEG_PACKET_TYPE, serialized_msg=_ffmpeg_packet(0)))
+
+    records = node.observations[topic].drain_transit_records()
+    assert [(r["seq"], r["status"]) for r in records] == [
+        (0, "sent"),
+        (1, "unobserved"),
+        (2, "unobserved"),
+        (3, "sent"),
+    ]
+    gap = records[1]
+    assert gap["t_wrap"] is None
+    assert gap["t_com_out"] is None
+    assert "t_com_in" not in gap
+    assert gap["sections"] == {"wrap_to_com_out_ms": None}

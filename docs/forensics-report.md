@@ -93,6 +93,13 @@ delivered below it; `unknown` without sender-side records. `min_offered_hz` /
 rate — they never enter the delivered view, where the cross-peer join would
 upgrade receiver-inferred lost rows to delivered.
 
+The sending peer's status overview emits those rows itself for every wrapped
+stream (stage `com_out`, status `sent`, sequence gaps in its own observation as
+`unobserved` — see RFC 0003): record on both machines and place both peers'
+`logs/<peer>/status/` under one instance directory before running the report,
+and the `unknown` verdicts disappear. Recordings made before the sender-side
+rows existed stay `unknown` for their outbound streams.
+
 Events across streams and kinds are grouped into **incidents** when their
 windows touch (merge gap defaults to one bin): one degradation moment, several
 lenses on it.

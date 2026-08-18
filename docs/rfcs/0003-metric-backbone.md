@@ -56,6 +56,17 @@ Every metric on the wishlist is a projection of one recorded object per message:
   inter_arrival / jitter         — receiver-local regularity
 ```
 
+The **sending peer** records its own view of the same message at `com_out`
+(`direction: outbound`): `t_wrap` plus `t_com_out` (both its own clock, so
+`sections.wrap_to_com_out_ms` is the relay hop, and there is no θ). Its status
+values are deliberately different — `sent` for an observed message,
+`unobserved` for a gap in its own observation (the local best-effort observer
+missed it; the link cannot lose a message before the link) — so the offline
+join, which ranks only `lost < reordered < delivered`, can enrich a receiver
+row with sender timestamps but a sender row can never overwrite a receiver's
+`lost` verdict. This is what lets the forensics report classify a rate collapse
+as `source` vs `link`: offered (sender `t_wrap` bins) against delivered.
+
 **Why `epoch` is part of the key.** `universal_ota_wrapper` counts per topic
 from zero, so a peer that restarts inside an instance replays sequence numbers
 the receiver has already seen. The receiver detects the restart from the

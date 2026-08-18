@@ -9,6 +9,7 @@ from rosotacom.network_profiles import (
     OUTAGE_CATCHUP,
     OUTAGE_RECONNECT,
     DirectionShaping,
+    GemodelLoss,
     Profile,
     TimelineSegment,
     expand_timeline,
@@ -21,6 +22,7 @@ from rosotacom.network_profiles import (
     parse_rate_bps,
     parse_seconds,
     parse_seed,
+    required_dist_installs,
     resolve_profile_selection,
     shaping_commands,
     teardown_command,
@@ -431,3 +433,88 @@ def test_resolve_profile_selection() -> None:
         resolve_profile_selection("cellular", available=available, allow_shaping=False)
     # ...but 'none' is always fine, shaping or not.
     assert resolve_profile_selection("none", allow_shaping=False) is None
+
+
+# --- Gilbert-Elliott loss (loss gemodel) ----------------------------------- #
+
+
+def test_gemodel_argv_emits_all_four_probabilities() -> None:
+    # Field-fitted burst loss (2026-08-17 CCNG drive): rare entry into a short
+    # intense bad state, light independent loss in the good state. The plain
+    # 2-arg correlated loss cannot express this shape.
+    shaping = DirectionShaping(
+        delay_ms=25.0,
+        jitter_ms=18.0,
+        loss_gemodel=GemodelLoss(p_pct=0.12, r_pct=2.9, loss_bad_pct=2.7, loss_good_pct=0.098),
+    )
+    commands = shaping_commands("eth0", shaping)
+    assert len(commands) == 1
+    netem = commands[0]
+    i = netem.index("loss")
+    # All four positional values are always emitted, so the argv never depends
+    # on iproute2 defaults (the 3rd/4th args ARE the bad/good loss probabilities).
+    assert netem[i : i + 6] == ["loss", "gemodel", "0.12%", "2.9%", "2.7%", "0.098%"]
+
+
+def test_gemodel_parse_and_exclusivity() -> None:
+    shaping = parse_direction({"delay": "25ms", "loss_gemodel": {"p": "0.12%", "r": "2.9%", "loss_bad": "2.7%"}})
+    assert shaping is not None and shaping.loss_gemodel is not None
+    assert shaping.loss_gemodel.loss_good_pct == 0.0  # default: clean good state
+    with pytest.raises(ValueError):
+        parse_direction({"loss": "2%", "loss_gemodel": {"p": 1, "r": 50}})  # one loss model only
+    with pytest.raises(ValueError):
+        parse_direction({"loss_gemodel": {"p": 1}})  # r required
+    with pytest.raises(ValueError):
+        parse_direction({"loss_gemodel": {"p": 1, "r": 50, "h": 3}})  # unknown key
+    with pytest.raises(ValueError):
+        GemodelLoss(p_pct=0.0, r_pct=50.0, loss_good_pct=0.0)  # can never lose anything
+
+
+# --- custom delay-distribution tables -------------------------------------- #
+
+
+def test_custom_distribution_requires_a_file_and_builtin_does_not() -> None:
+    assert parse_direction({"delay": "25ms", "jitter": "18ms", "distribution": "paretonormal"}) is not None
+    with pytest.raises(ValueError):
+        DirectionShaping(delay_ms=25.0, jitter_ms=18.0, distribution="fieldlink")  # no file
+    with pytest.raises(ValueError):
+        DirectionShaping(delay_ms=25.0, jitter_ms=18.0, distribution="Bad Name", distribution_file="x.dist")
+    with pytest.raises(ValueError):
+        DirectionShaping(distribution_file="x.dist")  # file without a name
+    shaping = DirectionShaping(
+        delay_ms=25.0, jitter_ms=18.0, distribution="fieldlink", distribution_file="tables/fieldlink.dist"
+    )
+    commands = shaping_commands("eth0", shaping)
+    i = commands[0].index("distribution")
+    assert commands[0][i : i + 2] == ["distribution", "fieldlink"]
+
+
+def test_load_profiles_file_resolves_distribution_files_and_lists_installs(tmp_path) -> None:
+    (tmp_path / "tables").mkdir()
+    (tmp_path / "tables" / "fieldlink.dist").write_text("# test\n0 0 0 0\n", encoding="utf-8")
+    path = tmp_path / "profiles.yaml"
+    path.write_text(
+        "profiles:\n"
+        "  field:\n"
+        "    uplink:\n"
+        "      delay: 25ms\n"
+        "      jitter: 18ms\n"
+        "      distribution: fieldlink\n"
+        "      distribution_file: tables/fieldlink.dist\n"
+        "      loss_gemodel: { p: 0.12%, r: 2.9%, loss_bad: 2.7%, loss_good: 0.098% }\n",
+        encoding="utf-8",
+    )
+    profiles = load_profiles_file(path)
+    field = profiles["field"]
+    assert field.uplink is not None
+    # Relative distribution_file entries resolve against the profiles file.
+    assert field.uplink.distribution_file == str(tmp_path / "tables" / "fieldlink.dist")
+    installs = required_dist_installs(field)
+    assert installs == [("fieldlink", str(tmp_path / "tables" / "fieldlink.dist"))]
+    # Builtin distributions need no install.
+    assert (
+        required_dist_installs(
+            parse_profile("p", {"uplink": {"delay": "10ms", "jitter": "5ms", "distribution": "normal"}})
+        )
+        == []
+    )

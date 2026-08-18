@@ -28,6 +28,8 @@ living verification hook.
 
 ## Findings
 
+- [A lost keyframe silences exactly the next gop_size−2 deltas](keyframe-loss-kills-the-next-deltas.md) - libavcodec emits nothing for them, the last delta decodes with artifacts, the next keyframe restores clean decode; a lost delta never blocks decode — so the display hole is gop_size × frame period, deterministically.
+- [Oversubscription queues — it does not lose until the queue itself dies](oversubscription-queues-not-losses.md) - 16% over an emulated cap climbed one-way delay 340 → 3250 ms across twelve bins with zero loss in every one; the losses arrived only when the queue died, all at once.
 - [Best-effort reordering becomes reader-side loss, independent of history depth](reorder-becomes-reader-loss.md) - under pure delay jitter a Cyclone best-effort reader discards every overtaken sample (57% at 100 Hz under 50+-45 ms), delivery stays strictly monotonic, and depth 50 loses the same as depth 1.
 - [Jitter causes loss while bandwidth shortage builds latency](jitter-loss-bandwidth-latency.md) - 18 KB at 20 Hz separates jitter-induced loss from bandwidth-induced queueing.
 - [Lighter alternating messages can lose more than steady messages](lighter-message-loss.md) - a 1x18KB+1x0KB pattern lost under a tight emulated profile while the steady 18 KB comparison did not.

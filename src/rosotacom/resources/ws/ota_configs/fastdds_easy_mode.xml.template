@@ -36,6 +36,11 @@
 
     <data_writer profile_name="rosotacom_fastdds_easy_mode_writer" is_default_profile="true">
       <qos>
+        <!-- A synchronous writer cannot fragment, and a profile that says
+             nothing means synchronous once RMW_FASTRTPS_USE_QOS_FROM_XML is on. -->
+        <publishMode>
+          <kind>ASYNCHRONOUS</kind>
+        </publishMode>
         <data_sharing>
           <kind>OFF</kind>
         </data_sharing>

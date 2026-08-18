@@ -27,10 +27,16 @@
   On a shaped uplink the blocking default turns a link-layer backlog into
   application-level latency, which is the "delay builds up" failure mode.
 
-  Fragmented data requires asynchronous publication. The runtime exports
-  RMW_FASTRTPS_PUBLICATION_MODE=ASYNCHRONOUS for the OTA side rather than
-  setting <publishMode> here, so the mode does not depend on
-  RMW_FASTRTPS_USE_QOS_FROM_XML also being honoured.
+  Fragmented data requires asynchronous publication, and the mode has to be set
+  HERE. The runtime also exports RMW_FASTRTPS_PUBLICATION_MODE=ASYNCHRONOUS, but
+  that only supplies rmw_fastrtps's default: with
+  RMW_FASTRTPS_USE_QOS_FROM_XML=1 -- which the runtime sets whenever an OTA
+  profile file exists -- a DataWriter's publish mode comes from the XML profile,
+  and a profile that says nothing means SYNCHRONOUS. A synchronous writer cannot
+  fragment, so every sample larger than the cap above is simply never sent:
+  measured on the lamborghini/majestic pair (2026-08-18), an 84 B heartbeat
+  crossed at 10 Hz while a 12 kB stream on the same link never reached the
+  bridge at all.
 -->
 <dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
   <profiles>
@@ -147,6 +153,10 @@
 
     <data_writer profile_name="rosotacom_fastdds_tuned_writer" is_default_profile="true">
       <qos>
+        <!-- Without this the writer is synchronous and cannot fragment. -->
+        <publishMode>
+          <kind>ASYNCHRONOUS</kind>
+        </publishMode>
         <data_sharing>
           <kind>OFF</kind>
         </data_sharing>

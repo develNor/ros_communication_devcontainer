@@ -41,7 +41,7 @@ def _load(path: Path, name: str) -> ModuleType:
 
 def _resolved(config: str) -> str:
     module = _load(OTA_CONFIGS / "get_ota_xml.py", "rosotacom_get_ota_xml_link")
-    return str(module.main(config=config, host_ip="10.0.0.1", peer="10.0.0.2"))
+    return str(module.main(config=config, host_ip="10.0.0.1", peer="10.0.0.2", easy_mode_ip="10.0.0.2"))
 
 
 def test_naming_only_the_middleware_still_selects_the_link_ready_template() -> None:
@@ -77,13 +77,19 @@ def test_fastdds_tuned_drops_rather_than_blocks_the_writer() -> None:
 
 
 def test_fragmenting_fastdds_gets_the_asynchronous_publication_it_requires() -> None:
-    """Fast DDS refuses to fragment in synchronous publication mode.
+    """A synchronous Fast DDS writer cannot fragment, and the XML is what decides.
 
-    The mode is an environment variable rather than a `<publishMode>` in the XML
-    so it does not also depend on RMW_FASTRTPS_USE_QOS_FROM_XML being honoured —
-    and every place that exports the OTA profile file has to set it, or the
-    window that missed it sends nothing.
+    The runtime exports RMW_FASTRTPS_PUBLICATION_MODE, but that only supplies
+    rmw_fastrtps's default: it also sets RMW_FASTRTPS_USE_QOS_FROM_XML=1
+    wherever an OTA profile exists, and then the publish mode comes from the
+    profile — where saying nothing means SYNCHRONOUS. Every template that caps
+    the datagram therefore has to say ASYNCHRONOUS itself, and every window that
+    exports the profile has to export the default too.
     """
+    for config in ("fastdds_tuned.xml", "fastdds_easy_mode.xml"):
+        resolved = _resolved(config)
+        assert "<kind>ASYNCHRONOUS</kind>" in resolved, config
+
     plugin_base = PLUGIN_BASE.read_text(encoding="utf-8")
 
     exports_profile = re.findall(
@@ -174,10 +180,7 @@ def test_easy_mode_caps_the_datagram_without_replacing_its_transport() -> None:
     DDS templates do — would take the discovery-server path with it, so the size
     cap is an attribute on the builtin transports instead.
     """
-    module = _load(OTA_CONFIGS / "get_ota_xml.py", "rosotacom_get_ota_xml_easy")
-    resolved = str(
-        module.main(config="fastdds_easy_mode.xml", host_ip="10.0.0.1", peer="10.0.0.2", easy_mode_ip="10.0.0.2")
-    )
+    resolved = _resolved("fastdds_easy_mode.xml")
 
     assert "<easy_mode_ip>10.0.0.2</easy_mode_ip>" in resolved
     assert f'max_msg_size="{OTA_FRAGMENT_BYTES}"' in resolved

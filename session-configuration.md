@@ -170,10 +170,20 @@ Per-side config blocks:
   - `config: <template>` — template file under `ws/ota_configs/`
     (`cyclonedds_tuned.xml`, `cyclonedds_minimal.xml`,
     `cyclonedds_local_participants.xml`, `fastdds_tuned.xml`,
-    `fastdds_unicast.xml`).
+    `fastdds_unicast.xml`, `fastdds_easy_mode.xml`).
   - `easy_mode_ip: <string>` — resolved into a template's `#easy_mode_ip`
-    placeholder; defaults to the first resolved peer address. No packaged
-    template uses it today.
+    placeholder; defaults to the first resolved peer address. Only
+    `fastdds_easy_mode.xml` uses it.
+
+  `fastdds_easy_mode.xml` is the discovery alternative: Fast DDS 3.1 spawns or
+  reuses one Discovery Server per host and points the participant at the peer's
+  server too, so two hosts find each other with no multicast and no per-peer
+  locator list. It fails differently from `fastdds_tuned.xml` rather than
+  better — an explicit peer list cannot discover what it was not told about,
+  while easy mode depends on a server process being reachable on 11811 — which
+  is why both are packaged. Both cap the datagram at the same 1200 B; easy mode
+  does it with a `<builtinTransports max_msg_size=…>` attribute because
+  replacing the transports outright would take its discovery path with them.
 
   **On the OTA side, omitting `config` is not "no configuration".** Each
   implementation has a default template, and both defaults are the link-ready

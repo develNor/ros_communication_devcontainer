@@ -165,3 +165,22 @@ def test_native_zenoh_refuses_a_transport_it_cannot_configure(tmp_path: Path) ->
             force=True,
             peer_addresses={"a": "10.0.0.1", "b": "10.0.0.2"},
         )
+
+
+def test_easy_mode_caps_the_datagram_without_replacing_its_transport() -> None:
+    """Easy mode configures its own transport mix; the cap has to ride on it.
+
+    `useBuiltinTransports=false` plus a custom descriptor — what the other Fast
+    DDS templates do — would take the discovery-server path with it, so the size
+    cap is an attribute on the builtin transports instead.
+    """
+    module = _load(OTA_CONFIGS / "get_ota_xml.py", "rosotacom_get_ota_xml_easy")
+    resolved = str(
+        module.main(config="fastdds_easy_mode.xml", host_ip="10.0.0.1", peer="10.0.0.2", easy_mode_ip="10.0.0.2")
+    )
+
+    assert "<easy_mode_ip>10.0.0.2</easy_mode_ip>" in resolved
+    assert f'max_msg_size="{OTA_FRAGMENT_BYTES}"' in resolved
+    assert 'non_blocking="true"' in resolved
+    assert "<useBuiltinTransports>" not in resolved
+    assert "#" not in resolved

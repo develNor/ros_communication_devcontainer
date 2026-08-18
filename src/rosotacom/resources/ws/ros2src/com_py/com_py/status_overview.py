@@ -67,6 +67,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from rclpy.serialization import serialize_message
 from rosidl_runtime_py.utilities import get_message
 
+from com_py.ffmpeg_flags import FFMPEG_PACKET_TYPE, parse_keyframe_flag
 from com_py.link_bytes import LinkByteSampler, resolve_link_interface
 from com_py.link_trace import LinkTraceRecorder
 from com_py.status_overview_core import (
@@ -261,6 +262,12 @@ class StageObserver(Node):
                         clock_offset_s = estimate["offset_s"]
                         rtt_s = estimate["rtt_s"]
                         delay_s = now_ros_s + clock_offset_s - t_wrap_s
+                    keyframe: Optional[bool] = None
+                    try:
+                        if msg.msg_type == FFMPEG_PACKET_TYPE:
+                            keyframe = parse_keyframe_flag(bytes(msg.serialized_msg))
+                    except Exception:
+                        keyframe = None
                     transit = {
                         "peer": com_in.get("peer"),
                         "source": com_in.get("source"),
@@ -270,6 +277,7 @@ class StageObserver(Node):
                         "stage": com_in.get("stage"),
                         "t_wrap": t_wrap_s,
                         "t_com_in": now_ros_s,
+                        "keyframe": keyframe,
                     }
             else:
                 header = getattr(msg, "header", None)

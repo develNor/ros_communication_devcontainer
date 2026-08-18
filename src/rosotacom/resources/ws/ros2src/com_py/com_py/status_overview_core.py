@@ -493,39 +493,44 @@ class StageObservation:
                 if inter_arrival_s is not None:
                     self.last_inter_arrival_s = inter_arrival_s
                 self.last_transit_recv_wall = wall
-                self.transit_records.append(
-                    {
-                        **common,
-                        "seq": int(seq),
-                        "status": sequence_status,
-                        "t_wrap": transit.get("t_wrap"),
-                        "t_com_in": transit.get("t_com_in"),
-                        "clock_offset_ms": (
-                            round(clock_offset_s * 1000.0, 3)
-                            if clock_offset_s is not None
+                row = {
+                    **common,
+                    "seq": int(seq),
+                    "status": sequence_status,
+                    "t_wrap": transit.get("t_wrap"),
+                    "t_com_in": transit.get("t_com_in"),
+                    "clock_offset_ms": (
+                        round(clock_offset_s * 1000.0, 3)
+                        if clock_offset_s is not None
+                        else None
+                    ),
+                    "sections": {
+                        "ota_hop_ms": (
+                            round(delay_s * 1000.0, 3) if delay_s is not None else None
+                        ),
+                        "ota_hop_uncorrected_ms": (
+                            round(raw_delay_s * 1000.0, 3)
+                            if raw_delay_s is not None
                             else None
                         ),
-                        "sections": {
-                            "ota_hop_ms": (
-                                round(delay_s * 1000.0, 3) if delay_s is not None else None
-                            ),
-                            "ota_hop_uncorrected_ms": (
-                                round(raw_delay_s * 1000.0, 3)
-                                if raw_delay_s is not None
-                                else None
-                            ),
-                        },
-                        "size_bytes": size,
-                        "inter_arrival_ms": (
-                            round(inter_arrival_s * 1000.0, 3)
-                            if inter_arrival_s is not None
-                            else None
-                        ),
-                        "jitter_ms": (
-                            round(jitter_s * 1000.0, 3) if jitter_s is not None else None
-                        ),
-                    }
-                )
+                    },
+                    "size_bytes": size,
+                    "inter_arrival_ms": (
+                        round(inter_arrival_s * 1000.0, 3)
+                        if inter_arrival_s is not None
+                        else None
+                    ),
+                    "jitter_ms": (
+                        round(jitter_s * 1000.0, 3) if jitter_s is not None else None
+                    ),
+                }
+                # The FFMPEG keyframe bit (AV_PKT_FLAG_KEY) exists only for
+                # recognized FFMPEGPacket payloads; other streams' rows omit
+                # the field rather than carrying a null on every message.
+                keyframe = transit.get("keyframe")
+                if keyframe is not None:
+                    row["keyframe"] = bool(keyframe)
+                self.transit_records.append(row)
 
     def metrics(self, now_mono: float, window_s: float) -> Dict[str, Any]:
         with self.lock:

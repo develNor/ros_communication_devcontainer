@@ -360,7 +360,14 @@ def load_events_source(spec: SourceSpec) -> StreamSource:
             stamp = record.get("t_wrap")
         if stamp is None:
             continue
-        samples.append(StreamSample(timestamp_ns=int(float(stamp) * 1_000_000_000), size_bytes=int(size)))
+        keyframe = record.get("keyframe")
+        samples.append(
+            StreamSample(
+                timestamp_ns=int(float(stamp) * 1_000_000_000),
+                size_bytes=int(size),
+                keyframe=keyframe if isinstance(keyframe, bool) else None,
+            )
+        )
     return StreamSource(
         label=spec.label,
         kind="events",

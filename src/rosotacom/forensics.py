@@ -42,6 +42,11 @@ RATE_COLLAPSE = "rate_collapse"
 KEYFRAME_SHARE_MIN = 0.02
 KEYFRAME_SHARE_MAX = 0.4
 
+# Real per-message FFMPEG flags win over the size heuristic once they cover
+# most delivered rows; the slack tolerates isolated parse failures in a
+# recording that otherwise carries the field.
+KEYFRAME_FLAG_COVERAGE_MIN = 0.9
+
 CAVEAT = (
     "Context is correlation, not causation: a link-trace sample or profile step that overlaps an event "
     "does not prove it caused the event. The causal test is reproduction under an emulated profile."
@@ -228,13 +233,27 @@ class Stream:
 
 
 def _annotate_keyframes(stream: Stream, *, declared: bool) -> None:
-    """Mark keyframes by size bimodality (transit records carry sizes, not FFMPEG flags).
+    """Mark keyframes, preferring the real FFMPEG flags in the transit records.
 
-    ``rosotacom.ffmpeg_packet.keyframes_by_size`` is the documented fallback for
-    exactly this case. Declared FFMPEGPacket streams (type from status.json) are
-    always annotated; other streams only when the flagged share looks like a real
-    GOP structure, so uniform or spiky non-video streams are not mislabeled.
+    The receiver parses ``AV_PKT_FLAG_KEY`` out of the wrapped FFMPEGPacket CDR
+    at com_in and writes it as ``keyframe`` on delivered rows, so when the field
+    covers (nearly) all delivered rows the real flags are authoritative — the
+    field only exists where the wrapper's ``msg_type`` named an FFMPEGPacket,
+    which is a stronger declaration than status.json, so no share gate applies.
+
+    Recordings from before the field existed fall back to
+    ``rosotacom.ffmpeg_packet.keyframes_by_size``: declared FFMPEGPacket streams
+    (type from status.json) are always annotated; other streams only when the
+    flagged share looks like a real GOP structure, so uniform or spiky
+    non-video streams are not mislabeled.
     """
+    delivered = [record for record in stream.records if record.get("status") != "lost"]
+    flagged = [record for record in delivered if isinstance(record.get("keyframe"), bool)]
+    if delivered and len(flagged) / len(delivered) > KEYFRAME_FLAG_COVERAGE_MIN:
+        stream.keyframe_seqs = frozenset(int(record["seq"]) for record in flagged if record["keyframe"])
+        stream.keyframe_provenance = "ffmpeg_flags (transit records)"
+        return
+
     sized = [record for record in stream.records if record.get("size_bytes") is not None]
     if not sized:
         return
@@ -246,7 +265,7 @@ def _annotate_keyframes(stream: Stream, *, declared: bool) -> None:
         return
     stream.keyframe_seqs = frozenset(int(record["seq"]) for record, flag in zip(sized, flags, strict=True) if flag)
     origin = "declared FFMPEGPacket stream" if declared else f"size share {share * 100.0:.1f}%"
-    stream.keyframe_provenance = f"size_bimodality ({origin}); transit records carry no FFMPEG flags"
+    stream.keyframe_provenance = f"size_bimodality ({origin}); these transit records carry no FFMPEG flags"
 
 
 def build_streams(records: list[dict[str, Any]], *, declared_ffmpeg_topics: Collection[str] = ()) -> list[Stream]:

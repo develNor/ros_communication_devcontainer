@@ -154,6 +154,18 @@ def test_events_source_filters_topic_and_detects_gop_by_size(tmp_path: Path) -> 
     assert stats["gop"]["keyframes"] == 2
 
 
+def test_events_source_prefers_recorded_keyframe_flags(tmp_path: Path) -> None:
+    # Uniform sizes: only the transit rows' keyframe field can mark the GOP.
+    rows = [{**_event(seq, size=3000), "keyframe": seq % 5 == 0} for seq in range(10)]
+    events = tmp_path / "events.jsonl"
+    events.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    stats = summarize_source(load_events_source(parse_source_spec("events", f"post={events}:/cam")))
+
+    assert stats["gop"]["method"] == "ffmpeg_packet.flags"
+    assert stats["gop"]["keyframes"] == 2
+
+
 def test_mcap_bag_source_reads_metadata_without_rosbag2(tmp_path: Path, monkeypatch) -> None:
     bag = tmp_path / "bag"
     bag.mkdir()

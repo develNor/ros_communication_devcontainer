@@ -1,16 +1,20 @@
-"""Latency measurement in the status overview's stage observer.
+"""Latency and keyframe measurement in the status overview's stage observer.
 
-Two layers: the ROS-independent `stamp_delay` in `status_overview_core`, and the
+Three layers: the ROS-independent `stamp_delay` in `status_overview_core`, the
 observer callback that decides *whether* a stamp is comparable to the local
-clock at all. The node module imports rclpy, which the host suite does not have,
-so its ROS surface is stubbed and the real core module is registered under the
-name the node imports (`tests/unit/test_ota_wrapper.py` uses the same approach).
+clock at all, and the OtaStamped branch that reads the FFMPEG keyframe bit out
+of the wrapped payload. The node module imports rclpy, which the host suite
+does not have, so its ROS surface is stubbed and the real core and
+ffmpeg_flags modules are registered under the names the node imports
+(`tests/unit/test_ota_wrapper.py` uses the same approach).
 """
 
 from __future__ import annotations
 
 import importlib.util
+import struct
 import sys
+from array import array
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -33,6 +37,7 @@ _STUBBED = (
     "rosidl_runtime_py",
     "rosidl_runtime_py.utilities",
     "com_py",
+    "com_py.ffmpeg_flags",
     "com_py.link_bytes",
     "com_py.link_trace",
     "com_py.status_overview_core",
@@ -61,6 +66,7 @@ def _stub_module(name: str, **attrs: object) -> ModuleType:
 
 
 core = _load(CORE_PY, "rosotacom_status_overview_core_observer")
+ffmpeg_flags = _load(COM_PY / "ffmpeg_flags.py", "rosotacom_status_overview_ffmpeg_flags")
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +130,7 @@ def node_module() -> Iterator[ModuleType]:
     )
     _stub_module("com_py.link_trace", LinkTraceRecorder=object)
     sys.modules["com_py.status_overview_core"] = core
+    sys.modules["com_py.ffmpeg_flags"] = ffmpeg_flags
 
     module = _load(NODE_PY, "rosotacom_status_overview_node")
 
@@ -227,3 +234,97 @@ def test_a_message_without_a_header_reports_no_latency(node_module: ModuleType) 
     obs = node.observations[topic]
     assert obs.last_delay_s is None
     assert obs.msg_total == 1
+
+
+# ---------------------------------------------------------------------------
+# the OtaStamped branch: FFMPEG keyframe flag into the transit record
+# ---------------------------------------------------------------------------
+
+
+def _cdr_string(offset: int, value: str) -> tuple[bytes, int]:
+    pad = (-offset) % 4
+    raw = value.encode() + b"\x00"
+    chunk = b"\x00" * pad + struct.pack("<I", len(raw)) + raw
+    return chunk, offset + len(chunk)
+
+
+def _ffmpeg_packet(flags: int) -> bytes:
+    """A minimal serialized FFMPEGPacket (XCDR1 little-endian)."""
+    body = struct.pack("<iI", 7, 9)  # header.stamp
+    chunk, offset = _cdr_string(8, "camera")
+    body += chunk
+    body += b"\x00" * ((-offset) % 4) + struct.pack("<ii", 640, 480)
+    offset += (-offset) % 4 + 8
+    chunk, offset = _cdr_string(offset, "h264")
+    body += chunk
+    body += b"\x00" * ((-offset) % 8) + struct.pack("<QBB", 42, flags, 0)
+    return b"\x00\x01\x00\x00" + body
+
+
+def _ota_observer(node_module: ModuleType, topic: str):
+    node = object.__new__(node_module.StageObserver)
+    node.observations = {topic: core.StageObservation(type_str="com_msgs/msg/OtaStamped")}
+    node._stage_metadata = {
+        topic: [
+            {
+                "peer": "b",
+                "source": "a",
+                "target": "b",
+                "base": "/cam",
+                "direction": "inbound",
+                "stage": "com_in",
+            }
+        ]
+    }
+    node.clock_estimator = _Estimator(0.0)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=int(_NOW_S * 1e9)))
+    node.get_logger = lambda: SimpleNamespace(error=lambda *a, **k: None, warning=lambda *a, **k: None)
+    return node
+
+
+def _ota_stamped(seq: int, *, msg_type: str, serialized_msg) -> SimpleNamespace:
+    stamp_s = _NOW_S - 0.03
+    sec = int(stamp_s)
+    return SimpleNamespace(
+        header=SimpleNamespace(stamp=SimpleNamespace(sec=sec, nanosec=int((stamp_s - sec) * 1e9))),
+        seq=seq,
+        msg_type=msg_type,
+        serialized_msg=serialized_msg,
+    )
+
+
+def test_ota_ffmpeg_payload_marks_the_transit_record_keyframe(node_module: ModuleType) -> None:
+    topic = "/cam/ffmpeg/ota"
+    node = _ota_observer(node_module, topic)
+    cb = node._make_cb(topic)
+
+    # rclpy delivers uint8[] as array('B'); the branch must take it as-is.
+    cb(_ota_stamped(0, msg_type=ffmpeg_flags.FFMPEG_PACKET_TYPE, serialized_msg=array("B", _ffmpeg_packet(1))))
+    cb(_ota_stamped(1, msg_type=ffmpeg_flags.FFMPEG_PACKET_TYPE, serialized_msg=_ffmpeg_packet(0)))
+
+    records = node.observations[topic].drain_transit_records()
+    assert [(record["seq"], record["keyframe"]) for record in records] == [(0, True), (1, False)]
+
+
+def test_ota_non_ffmpeg_payload_gets_no_keyframe_field(node_module: ModuleType) -> None:
+    topic = "/twist/ota"
+    node = _ota_observer(node_module, topic)
+
+    node._make_cb(topic)(_ota_stamped(0, msg_type="geometry_msgs/msg/Twist", serialized_msg=_ffmpeg_packet(1)))
+
+    (record,) = node.observations[topic].drain_transit_records()
+    assert record["topic"] == "/cam"
+    assert "keyframe" not in record
+
+
+def test_ota_unparseable_ffmpeg_payload_omits_the_flag(node_module: ModuleType) -> None:
+    topic = "/cam/ffmpeg/ota"
+    node = _ota_observer(node_module, topic)
+    cb = node._make_cb(topic)
+
+    cb(_ota_stamped(0, msg_type=ffmpeg_flags.FFMPEG_PACKET_TYPE, serialized_msg=b"\x00\x01\x00\x00\x07"))
+    cb(_ota_stamped(1, msg_type=ffmpeg_flags.FFMPEG_PACKET_TYPE, serialized_msg=None))
+
+    records = node.observations[topic].drain_transit_records()
+    assert [record["seq"] for record in records] == [0, 1]
+    assert all("keyframe" not in record for record in records)

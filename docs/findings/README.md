@@ -28,6 +28,7 @@ living verification hook.
 
 ## Findings
 
+- [Best-effort reordering becomes reader-side loss, independent of history depth](reorder-becomes-reader-loss.md) - under pure delay jitter a Cyclone best-effort reader discards every overtaken sample (57% at 100 Hz under 50+-45 ms), delivery stays strictly monotonic, and depth 50 loses the same as depth 1.
 - [Jitter causes loss while bandwidth shortage builds latency](jitter-loss-bandwidth-latency.md) - 18 KB at 20 Hz separates jitter-induced loss from bandwidth-induced queueing.
 - [Lighter alternating messages can lose more than steady messages](lighter-message-loss.md) - a 1x18KB+1x0KB pattern lost under a tight emulated profile while the steady 18 KB comparison did not.
 - [Delay alone was not the loss boundary for the 18 KB at 20 Hz probe](delay-alone-no-loss.md) - pure delay profiles showed no material loss, and the 300 ms delay-only probe delivered all messages.

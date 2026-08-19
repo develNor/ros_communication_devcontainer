@@ -25,6 +25,41 @@ slice. The full local suite also runs nightly, as does the blocking benchmark
 regression matrix ([performance-bands.md](performance-bands.md)). The external
 OTA gate remains operator-started before a promotion to `main`.
 
+## Every read has a producer
+
+`tests/contract/test_generated_topics_have_a_producer.py` generates every
+example session and asserts that each topic a node is *configured to read* is
+either written by another node on the same peer or a stage that peer's own
+`pipeline_spec.yaml` models. Writes are deliberately not required to be stages:
+a node may publish for a human (`NOR` restores `/tf`, the pacer publishes
+`budget_ms`) and none of that is something the link promises to deliver.
+
+It exists because this project's characteristic defect — #12, #259, #276, #304 —
+is always the same one: a ROS node advertises its output whether or not its
+input exists, so a node pointed at a name nobody publishes starts, stays up,
+reports healthy and delivers nothing. #304 was the first of the four caught by
+any check at all, and that check was a six-minute Docker slice covering one
+example. This one runs the same corpus in about a second.
+
+Two guards keep it honest, and both fail loudly rather than degrading:
+
+- every parameter `session_plugin_base.yaml` declares must be classified in the
+  check, so a new window cannot arrive unmodelled and be silently covered;
+- the composed names the check derives (`<topic>/paced`, `<topic>/drop1of2`, …)
+  are asserted to be the forms the template itself composes.
+
+It also pins **which window families the examples actually exercise**. Today
+`fb`, `ipx`, `nor` and `pace` are exercised by no example, so the check models
+them unverified — `pace` most notably, since the playout pacer is deployed on a
+real link. Tracked in
+[#307](https://github.com/develNor/ros_communication_devcontainer/issues/307);
+adding an example that uses one of them is the way to close it.
+
+The check covers reads by nodes *the session configures*. It cannot see an
+application outside the session subscribing to a name the link no longer
+delivers — that half of #12 and #276 needs the consumer to be declared
+somewhere, and nothing declares it today.
+
 ## Expectations
 
 Per-topic `expect` blocks are behavioral contracts in `session-definition.yaml`.

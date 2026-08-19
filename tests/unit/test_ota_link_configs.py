@@ -208,11 +208,42 @@ def test_fastdds_tuned_keeps_the_same_host_path_open() -> None:
     """
     resolved = _resolved("fastdds_tuned.xml")
 
-    assert '<interface name="127.0.0.1" netmask_filter="OFF"/>' in resolved
+    # The locator lists are what keeps the same-host path open, and they are now
+    # the only thing that does: the interface allowlist that used to say the same
+    # thing lived in a transport descriptor, and any transport element doubles
+    # the wire (see the test below). Measured on the multi-homed host this
+    # profile exists for — 38 interfaces, 195 of 195 delivered, discovery in
+    # 4.1 s, unchanged with 12 extra participants — so the lists carry it alone.
     assert resolved.count("<address>127.0.0.1</address>") == 3  # default, metatraffic, initial peers
-    # An initial peer without a port probes participant indices 0..range; the
-    # Fast DDS default of 4 is smaller than an OTA domain can hand out.
-    assert "<maxInitialPeersRange>10</maxInitialPeersRange>" in resolved
+
+
+def test_no_fastdds_profile_names_a_transport() -> None:
+    """A transport element in a Fast DDS participant profile doubles the wire.
+
+    Measured on a two-container bench (2026-08-19, ROS 2 Kilted, Fast DDS 3.2.4,
+    rmw_fastrtps_cpp 9.3.4) against a 960 kbit/s payload:
+
+        <userTransports> + <useBuiltinTransports>false   1741 kbit/s
+        <builtinTransports non_blocking="true">UDPv4     1741 kbit/s
+        <builtinTransports>UDPv4                         1741 kbit/s
+        <builtinTransports>DEFAULT                       1741 kbit/s
+        no transport element at all                      1007 kbit/s
+
+    The DEFAULT row settles it: that selection asks for exactly the built-in set
+    and still doubles, so the trigger is the presence of the element and not what
+    it selects. Per datagram: 366 to the reader's data locator for 180 published
+    samples against 183 without it, each a full 11 951 B to the same address and
+    port, discarded at the reader by sequence number.
+
+    This test exists because the fix is a deletion, and a deletion is exactly the
+    kind of change a later edit re-adds while trying to be helpful.
+    """
+    for name in ("fastdds_tuned.xml", "fastdds_unicast.xml", "fastdds_local.xml"):
+        resolved = _resolved(name)
+        # Comments are allowed to name the elements — they explain the deletion.
+        body = re.sub(r"<!--.*?-->", "", resolved, flags=re.DOTALL)
+        for element in ("<userTransports>", "<builtinTransports", "<useBuiltinTransports>", "<transport_descriptors>"):
+            assert element not in body, f"{name} names {element}, which doubles every sample on the wire"
 
 
 def test_every_peer_gets_the_stage_types_its_bridges_need(tmp_path: Path) -> None:

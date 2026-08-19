@@ -3113,6 +3113,7 @@ def _ota_verify_checkouts(plan: OtaSmokePlan, *, dry_run: bool) -> None:
     distinct one-line failure here, before any container starts, rather than a
     confusing one an hour later.
     """
+    peer_profiles: dict[str, list[str]] = {}
     for peer in plan.peers.values():
         checkout = shlex.quote(_ota_peer_workdir(plan, peer))
         project = shlex.quote(plan.project)
@@ -3150,6 +3151,46 @@ def _ota_verify_checkouts(plan: OtaSmokePlan, *, dry_run: bool) -> None:
             # a real hazard, but it is also a legitimate mid-migration state,
             # and a check that refuses it would be the wrong place to find out.
             print(f"+ {peer.name}: rosotacom {version.stdout.strip() or 'unknown'}")
+        profiles = _ota_run(
+            peer,
+            f"{OTA_CHECKOUT_PATH_PREFIX}"
+            'ls "$(rosotacom resources path ws)"/ota_configs/*.template '
+            "2>/dev/null | xargs -r -n1 basename | sort | tr '\\n' ' '",
+            label=f"{peer.name}: OTA profile templates",
+            dry_run=dry_run,
+            batch=True,
+            check=False,
+        )
+        if not dry_run and profiles.returncode == 0:
+            peer_profiles[peer.name] = profiles.stdout.split()
+
+    # Unlike the version, this one refuses. A peer whose installed stack lacks
+    # the template a session names does not fail loudly: the renderer errors,
+    # the profile file is left unusable, and the DDS stack silently falls back
+    # to its own defaults — multicast discovery, which no tunnelled OTA link
+    # carries. The run then completes and reports zero delivered messages, which
+    # reads as a middleware that does not work. That is exactly what happened on
+    # 2026-08-19, when #299 made fastdds_tuned.xml the Fast DDS default while
+    # the deployed stack predated the template: eight runs, all recorded as
+    # evidence about Fast DDS, none of which had ever configured it.
+    if len(peer_profiles) > 1:
+        names = sorted(peer_profiles)
+        reference = set(peer_profiles[names[0]])
+        for name in names[1:]:
+            missing = reference - set(peer_profiles[name])
+            extra = set(peer_profiles[name]) - reference
+            if missing or extra:
+                detail = []
+                if missing:
+                    detail.append(f"absent on {name}: {', '.join(sorted(missing))}")
+                if extra:
+                    detail.append(f"only on {name}: {', '.join(sorted(extra))}")
+                raise RuntimeError(
+                    f"Peers disagree about their OTA profile templates ({'; '.join(detail)}). "
+                    "A missing template renders nothing and the DDS stack falls back to "
+                    "defaults, so the link would come up and carry no data. Bring the peers "
+                    "to the same rosotacom before measuring."
+                )
 
 
 def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: OtaSmokePlan) -> None:

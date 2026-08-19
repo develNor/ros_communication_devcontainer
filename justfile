@@ -92,7 +92,9 @@ _package-smoke:
 	expected = (
 	    "py.typed",
 	    "resources/ros2docker.json.example",
+	    "resources/ros2docker.lyrical.json.example",
 	    "resources/examples/rosotacom.yaml",
+	    "resources/examples/ros2docker.lyrical.json",
 	    "resources/examples/sessions/1_heartbeat/session-definition.yaml",
 	    "resources/examples/scenarios/2_native_chatter/scenario-definition.yaml",
 	    "resources/ws/session/creation/run_session.py",

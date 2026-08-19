@@ -159,7 +159,8 @@ jobs:
   quick-gate:
     # Everything `e2e` waits for that is not the image, and deliberately no
     # more. It exists to answer one question — is the tree obviously broken,
-    # such that seventeen slices would burn roughly 73 runner-minutes to say so.
+    # such that two variants across seventeen slices would burn roughly 146
+    # runner-minutes to say so.
     #
     # It replaced a `needs: preflight-success` edge that made e2e wait for the
     # whole five-version matrix. That barrier cost 2.15 min of every gate run
@@ -204,7 +205,8 @@ jobs:
     # ROS base from Docker Hub, 40s exporting layers, 47s of apt and pip. A pull
     # from GHCR — co-located with the runners, no Hub rate limit, one transfer
     # instead of a transfer plus a build — replaces all of it. The benefit
-    # grows with the diagnostic matrix; seventeen jobs still build only once.
+    # grows with the diagnostic matrix; both distribution variants still build
+    # only once each.
     #
     # The tag is a hash of everything that decides the image (base digest,
     # package lists, Dockerfile, entrypoint, ros2docker version, build UID):
@@ -255,18 +257,32 @@ jobs:
           # artifacts that live beside the checkout in the private harness, so it
           # does not resolve here.
           project="$(.venv/bin/rosotacom resources path examples)/rosotacom.yaml"
-          .venv/bin/rosotacom image references --project "$project" --repository "$repository" > references.txt
-          cat references.txt
-
-          while read -r reference; do
-            if docker manifest inspect "$reference" >/dev/null 2>&1; then
-              echo "present: $reference"
-              continue
+          lyrical_config="$(.venv/bin/rosotacom resources path ros2docker-lyrical)"
+          for variant in kilted lyrical; do
+            config=""
+            if [[ "$variant" == "lyrical" ]]; then
+              config="$lyrical_config"
             fi
-            echo "missing, building: $reference"
-            .venv/bin/rosotacom image build --project "$project" --reference "$reference"
-            docker push "$reference" || echo "::warning::could not push $reference"
-          done < references.txt
+            variant_references="references-${variant}.txt"
+            ROSOTACOM_ROS2DOCKER_CONFIG="$config" \
+              .venv/bin/rosotacom image references \
+              --project "$project" \
+              --repository "$repository" > "$variant_references"
+
+            while read -r reference; do
+              if docker manifest inspect "$reference" >/dev/null 2>&1; then
+                echo "present ($variant): $reference"
+                continue
+              fi
+              echo "missing ($variant), building: $reference"
+              ROSOTACOM_ROS2DOCKER_CONFIG="$config" \
+                .venv/bin/rosotacom image build --project "$project" --reference "$reference"
+              docker push "$reference" || echo "::warning::could not push $reference"
+            done < "$variant_references"
+          done
+
+          sort -u references-kilted.txt references-lyrical.txt > references.txt
+          cat references.txt
 
           # Report the repository only when every reference resolves. A
           # read-only GITHUB_TOKEN (a fork PR, Dependabot) can log in and pull
@@ -301,7 +317,7 @@ jobs:
     # reaches the measured floor: #253 split the four overloaded themes along
     # transport, stream, or concurrency semantics. Which tests a slice owns and
     # what each costs is E2E_SLICES in tests/e2e/conftest.py.
-    name: e2e-${{ matrix.slice }}
+    name: e2e-${{ matrix.variant }}-${{ matrix.slice }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     needs: [quick-gate, image]
@@ -312,6 +328,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        variant: [kilted, lyrical]
         slice:
           - heartbeat
           - chatter
@@ -371,13 +388,14 @@ jobs:
           # that tag itself and never accepts one, so it cannot be pointed at an
           # image built from something else.
           ROSOTACOM_IMAGE_CACHE: ${{ needs.image.outputs.repository }}
+          ROSOTACOM_ROS2DOCKER_CONFIG: ${{ matrix.variant == 'lyrical' && format('{0}/src/rosotacom/resources/examples/ros2docker.lyrical.json', github.workspace) || '' }}
         run: just test-e2e-slice ${{ matrix.slice }}
 
       - name: Upload session artifacts
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: session-instances-e2e-${{ matrix.slice }}
+          name: session-instances-e2e-${{ matrix.variant }}-${{ matrix.slice }}
           path: session-instances/
           if-no-files-found: ignore
 

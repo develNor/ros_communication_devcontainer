@@ -28,7 +28,7 @@ The ROS Communication DevContainer is a Docker-based solution designed to stream
 - Git for configuration management
 - Python 3 with virtual environment support (`python3-venv` on Debian/Ubuntu;
   for versioned Python packages this may be named like `python3.14-venv`)
-- `ros2docker` v0.1.4 or newer. The local installer below installs the pinned
+- `ros2docker` v0.1.5.dev9 or newer (below v0.2). The local installer below installs the pinned
   supported range into this checkout's virtual environment.
 - `tmux` for the optional `rosotacom scenario` orchestration commands
 - Machines connected to the same network (VPN or local WLAN)
@@ -171,6 +171,7 @@ The copied packaged example project uses this layout:
 ```text
 rosotacom.yaml
 ros2docker.json
+ros2docker.lyrical.json
 deployment.example.yaml
 sessions/
 scenarios/
@@ -201,12 +202,50 @@ composes directly in a shell:
 ```bash
 rosotacom resources path com_msgs   # the ROS 2 message package
 rosotacom resources path ws         # the packaged runtime workspace
+rosotacom resources path ros2docker-lyrical  # the opt-in ROS 2 Lyrical image config
 ```
 
 Use this wherever another project needs rosotacom's files on the host, for
 example to bake `com_msgs` into its own container image. Ask for the resource by
 name rather than reconstructing a path: the names are part of the CLI contract,
 the layout behind them is not.
+
+### ROS 2 distribution variants
+
+ROS 2 Kilted remains the default. The packaged Lyrical/Ubuntu Resolute image is
+an explicit opt-in and uses a separate image name, so trying it does not replace
+the default image. To select it for one command, including the built-in example:
+
+```bash
+ROSOTACOM_ROS2DOCKER_CONFIG="$(rosotacom resources path ros2docker-lyrical)" \
+  rosotacom smoke
+```
+
+An example project copied with `rosotacom examples create` also contains
+`ros2docker.lyrical.json`. To opt that project in persistently, select it in
+`rosotacom.yaml`:
+
+```yaml
+ros2docker_config: ros2docker.lyrical.json
+```
+
+The Lyrical config keeps every available ROS dependency on the official binary
+packages. `domain_bridge` is the current exception: because no Lyrical binary
+package exists, ros2docker's `domain-bridge` profile builds a pinned upstream
+commit with a pinned compatibility patch. The build fails closed outside
+Lyrical or if that patch no longer applies. Replace this fallback with
+`ros-lyrical-domain-bridge` once the official package is released.
+
+The communication container follows this variant selection. Scenario
+application containers retain their own explicit ros2docker configs; mixed ROS
+distributions across the application/communication boundary therefore remain
+part of the tested shape.
+
+The default switch is intentionally not part of this change. Before promoting
+Lyrical, keep the two-variant E2E and RMW matrices green, point the packaged
+default and example project at the Lyrical configs, and recalibrate the
+distribution-specific performance budgets. Existing copied projects continue
+to name their own config and do not change when the package default changes.
 
 ### Reusing an image instead of rebuilding it
 

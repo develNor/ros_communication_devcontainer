@@ -91,6 +91,7 @@ RESOURCE_DIR = PACKAGE_DIR / "resources"
 PROJECT_DIR = RESOURCE_DIR
 WS_DIR = RESOURCE_DIR / "ws"
 DEFAULT_ROS2DOCKER_CONFIG = RESOURCE_DIR / "ros2docker.json.example"
+LYRICAL_ROS2DOCKER_CONFIG = RESOURCE_DIR / "ros2docker.lyrical.json.example"
 EXAMPLE_PROJECT_DIR = RESOURCE_DIR / "examples"
 
 # Packaged resources external tooling may need to locate on the host. rosotacom
@@ -103,6 +104,7 @@ NAMED_RESOURCES = {
     "ws": WS_DIR,
     "com_msgs": WS_DIR / "ros2src" / "com_msgs",
     "examples": EXAMPLE_PROJECT_DIR,
+    "ros2docker-lyrical": LYRICAL_ROS2DOCKER_CONFIG,
 }
 SESSION_CONFIG_CONTAINER_DIR = "/session/configs"
 SESSION_DEFINITION_CONTAINER_DIR = "/session/definitions"

@@ -217,6 +217,7 @@ def test_examples_create_copies_project_and_refuses_overwrite(
 
     assert (target / "rosotacom.yaml").is_file()
     assert (target / "ros2docker.json").is_file()
+    assert (target / "ros2docker.lyrical.json").is_file()
     assert (target / "deployment.example.yaml").is_file()
     assert "session-instances/" in (target / ".gitignore").read_text(encoding="utf-8")
     assert (target / "sessions" / "1_heartbeat" / "session-definition.yaml").is_file()
@@ -3211,8 +3212,10 @@ def test_resources_path_prints_an_absolute_existing_path(capsys: pytest.CaptureF
         assert out.endswith("\n")
         printed = Path(out.strip())
         assert printed.is_absolute()
-        assert printed.is_dir()
+        assert printed.exists()
         assert len(out.splitlines()) == 1
+
+    assert Path(rosotacom.NAMED_RESOURCES["ros2docker-lyrical"]).is_file()
 
 
 def test_resources_path_rejects_an_unknown_resource_name() -> None:

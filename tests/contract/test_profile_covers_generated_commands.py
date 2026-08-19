@@ -21,12 +21,16 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 from ros2docker.config import load_config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESOURCES = REPO_ROOT / "src" / "rosotacom" / "resources"
 SESSION_CONTENT = RESOURCES / "ws" / "session" / "content"
-PROFILE = RESOURCES / "examples" / "ros2docker.json"
+PROFILES = (
+    RESOURCES / "examples" / "ros2docker.json",
+    RESOURCES / "examples" / "ros2docker.lyrical.json",
+)
 
 #: `ros2 run <package> <executable>` in a template.
 ROS2_RUN = re.compile(r"\bros2\s+run\s+([A-Za-z_][A-Za-z0-9_]*)\b")
@@ -51,10 +55,12 @@ def _invoked_packages() -> dict[str, set[str]]:
     return found
 
 
-def test_profile_installs_every_package_the_sessions_run() -> None:
+@pytest.mark.parametrize("profile", PROFILES, ids=("kilted", "lyrical"))
+def test_profile_installs_every_package_the_sessions_run(profile: Path) -> None:
     # Read it through ros2docker itself, so the test sees exactly what the
     # tool that builds the image sees rather than a second parser's idea of it.
-    installed = str(load_config(PROFILE)["build_args"]["APT_PACKAGES"]).split()
+    build_args = load_config(profile)["build_args"]
+    installed = str(build_args["APT_PACKAGES"]).split()
     # `ros-<distro>-topic-tools` installs the `topic_tools` package; compare on
     # the ROS package name rather than the apt name so a distro bump does not
     # silently turn this test green.
@@ -63,6 +69,10 @@ def test_profile_installs_every_package_the_sessions_run() -> None:
         for name in installed
         if name.startswith("ros-") and name.count("-") >= 2
     }
+    # Lyrical's domain_bridge is provided by ros2docker's pinned source profile
+    # until an official binary package exists.
+    if build_args.get("INSTALL_DOMAIN_BRIDGE") == "1":
+        installed_ros_packages.add("domain_bridge")
 
     missing = {
         package: sorted(where)

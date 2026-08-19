@@ -37,11 +37,18 @@ def test_image_scan_is_advisory_and_not_a_pr_check() -> None:
     assert '- cron: "23 3 * * *"' in image_scan
     assert "workflow_dispatch:" in image_scan
     assert "pull_request:" not in image_scan
-    assert "IMAGE_TAG: rosotacom:scan-${{ github.sha }}" in image_scan
+    assert "IMAGE_TAG: rosotacom:scan-${{ matrix.variant }}-${{ github.sha }}" in image_scan
     assert "aquasecurity/trivy-action@v0.36.0" in image_scan
     assert 'exit-code: "0"' in image_scan
     assert "image-scan" not in merge_gate
     assert "trivy" not in merge_gate.lower()
+
+    scan_job = yaml.safe_load(image_scan)["jobs"]["trivy-image"]
+    variants = {entry["variant"]: entry["config"] for entry in scan_job["strategy"]["matrix"]["include"]}
+    assert variants == {
+        "kilted": "src/rosotacom/resources/ros2docker.json.example",
+        "lyrical": "src/rosotacom/resources/ros2docker.lyrical.json.example",
+    }
 
 
 def test_merge_gate_requires_non_docker_package_and_docker_smoke() -> None:
@@ -201,6 +208,10 @@ def test_full_e2e_workflow_runs_nightly_and_supports_manual_dispatch() -> None:
     assert "name: smoke-e2e" in full_e2e
     assert "rmw-matrix:" in full_e2e
     assert "just test-e2e-rmw" in full_e2e
+
+    jobs = yaml.safe_load(full_e2e)["jobs"]
+    assert jobs["smoke-e2e"]["strategy"]["matrix"]["variant"] == ["kilted", "lyrical"]
+    assert jobs["rmw-matrix"]["strategy"]["matrix"]["variant"] == ["kilted", "lyrical"]
 
 
 def test_nightly_rmw_matrix_matches_local_checkable_smoke_params() -> None:

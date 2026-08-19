@@ -7,7 +7,7 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: check-json
-        exclude: ^src/rosotacom/resources/(examples/ros2docker\.json|ros2docker\.json\.example)$
+        exclude: ^src/rosotacom/resources/(examples/ros2docker(?:\.lyrical)?\.json|ros2docker(?:\.lyrical)?\.json\.example)$
       - id: check-merge-conflict
       - id: debug-statements
 

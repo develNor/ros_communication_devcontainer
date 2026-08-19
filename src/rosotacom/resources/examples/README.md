@@ -73,6 +73,20 @@ Expected result:
 session definitions contain only logical peers, so local testing never depends
 on physical-machine configuration.
 
+### Opt in to ROS 2 Lyrical
+
+Kilted remains this project's default. The copied project includes a second,
+independent `ros2docker.lyrical.json`; select it for one command with:
+
+```bash
+ROSOTACOM_ROS2DOCKER_CONFIG="$PWD/ros2docker.lyrical.json" rosotacom smoke
+```
+
+For a persistent project opt-in, set
+`ros2docker_config: ros2docker.lyrical.json` in `rosotacom.yaml`. The Lyrical
+image uses ros2docker's pinned `domain_bridge` source fallback until an official
+Lyrical binary package is available.
+
 For an interactive local end-to-end debug session, use the same smoke target
 with `--interactive`:
 
@@ -151,6 +165,7 @@ Use `--identity b` on the second host. Alternatively copy
 
 - `rosotacom.yaml`: project-local rosotacom setup
 - `ros2docker.json`: Docker runtime defaults used by the communication containers
+- `ros2docker.lyrical.json`: opt-in ROS 2 Lyrical runtime configuration
 - `deployment.example.yaml`: optional named-host deployment example
 - `bags/`: small rosbag metadata fixtures used by documentation and host tests
 - `sessions/`: tracked static session definitions/templates

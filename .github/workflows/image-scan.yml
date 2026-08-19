@@ -14,11 +14,19 @@ concurrency:
 
 jobs:
   trivy-image:
-    name: trivy-image
+    name: trivy-image-${{ matrix.variant }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: kilted
+            config: src/rosotacom/resources/ros2docker.json.example
+          - variant: lyrical
+            config: src/rosotacom/resources/ros2docker.lyrical.json.example
     env:
-      IMAGE_TAG: rosotacom:scan-${{ github.sha }}
+      IMAGE_TAG: rosotacom:scan-${{ matrix.variant }}-${{ github.sha }}
 
     steps:
       - name: Check out repository
@@ -41,10 +49,10 @@ jobs:
       - name: Show Docker environment
         run: docker info
 
-      - name: Build default rosotacom image
+      - name: Build rosotacom image
         run: |
           .venv/bin/ros2docker build \
-            -f src/rosotacom/resources/ros2docker.json.example \
+            -f "${{ matrix.config }}" \
             -o "{\"image_name\":\"${IMAGE_TAG}\"}"
 
       - name: Run Trivy vulnerability scanner
@@ -61,6 +69,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: trivy-image-report
+          name: trivy-image-report-${{ matrix.variant }}
           path: trivy-image-report.txt
           if-no-files-found: warn

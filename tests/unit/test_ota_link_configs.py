@@ -251,3 +251,38 @@ def test_every_peer_gets_the_stage_types_its_bridges_need(tmp_path: Path) -> Non
         # The wrapped OTA stage is the one a receiving bridge cannot look up.
         assert declared["/ota/b/cam/ota_stamped"] == "com_msgs/msg/OtaStamped", peer
         assert declared["/heartbeat_b"] == "com_msgs/msg/EchoHeartbeat", peer
+
+
+def test_the_zenoh_bridge_defaults_to_the_transport_that_measured_better(tmp_path: Path) -> None:
+    """TCP, not UDP, and the reason is a measurement rather than a preference.
+
+    On the bench pair (2026-08-19, the 2026-08-17 drive's loss process, 12 kB at
+    10 Hz) the UDP bridge delivered in one run of five and lost 66% of that one;
+    the TCP bridge delivered in every run at ~1% loss. UDP stays selectable.
+    """
+    import contextlib
+    import io
+
+    import yaml
+
+    generator = _load(GENERATOR_PY, "rosotacom_generate_session_files_bridge")
+    cfg = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 50}, "b": {"domain_id": 51}},
+        "shared": {
+            "ota_domain_id": 52,
+            "use_heartbeat": True,
+            "rmw": {"local": "cyclone", "ota": "zenoh_ros2dds"},
+        },
+        "topics": {"a_to_b": [], "b_to_a": [{"topic": "/x", "type": "std_msgs/msg/Bool"}]},
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        generator.func(
+            session_config_obj=cfg,
+            output_dir=str(tmp_path),
+            force=True,
+            peer_addresses={"a": "10.0.0.1", "b": "10.0.0.2"},
+        )
+
+    parameters = yaml.safe_load((tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8"))["parameters"]
+    assert parameters["zen_transport"] == "tcp"

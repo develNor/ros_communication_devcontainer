@@ -2226,7 +2226,14 @@ def func(
         if ota.impl == "zenoh_ros2dds":
             main_peer = ota.zen_main_peer or peer_keys[0]
             main_port = ota.zen_main_port or 7447
-            transport = ota.zen_transport or "udp"
+            # TCP by default, measured rather than assumed. On the bench pair
+            # (2026-08-19, the 2026-08-17 drive's loss process, 12 kB at 10 Hz)
+            # the UDP bridge delivered in one run of five and lost 66% of that
+            # one, while the TCP bridge delivered in every run at ~1% loss and
+            # the lowest median latency in the whole campaign. UDP stays
+            # available: it is the right answer on a link where TCP's
+            # head-of-line blocking costs more than its retransmission buys.
+            transport = ota.zen_transport or "tcp"
             endpoint_role = "listen" if local_peer == main_peer else "connect"
             items: List[Tuple[str, Any]] = [
                 ("zen_pub_allow", f"/ota/{peer_name[local_peer]}/.*"),

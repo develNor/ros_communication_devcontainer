@@ -230,7 +230,12 @@ Per-side config blocks:
   - `main_peer: <peer_key>` — the peer whose zenoh router listens. Defaults to the first peer declared under `peers:`.
   - `main_port: 7447` — listening port. Default `7447`.
 - `zenoh_ros2dds` (bridge) accepts (OTA side only):
-  - `transport: udp|tcp` — default `udp`.
+  - `transport: udp|tcp` — default `tcp`, measured rather than assumed. On the
+    bench pair (2026-08-19, the 2026-08-17 drive's loss process, 12 kB at 10 Hz)
+    the UDP bridge delivered in one run of five and lost 66% of that one, while
+    the TCP bridge delivered in every run at ~1% loss with the lowest median
+    latency in the campaign. UDP stays available for a link where TCP's
+    head-of-line blocking costs more than its retransmission buys.
   - `main_peer: <peer_key>` — defaults to the first peer.
   - `main_port: 7447` — default `7447`.
 

@@ -264,6 +264,24 @@ rosotacom start 1_heartbeat --identity b \
   --peer-address a=10.0.0.10 --peer-address b=10.0.0.11
 ```
 
+Before `start` stops a conflicting container, writes an instance, or builds an
+image, it verifies that the selected identity's address belongs to this host and
+that the route to the other peer selects that address as its source. A missing
+VPN/data-plane interface or a route through the wrong network therefore fails
+without disturbing a working session. Run the same check on its own with
+`preflight`; deployments that require the other host to be online already can
+also make three bounded ICMP probes mandatory:
+
+```bash
+rosotacom preflight 1_heartbeat --identity a \
+  --peer-address a=10.0.0.10 --peer-address b=10.0.0.11 \
+  --require-peer-reachable
+```
+
+Peer reachability is opt-in because some valid networks block ICMP and peers may
+be started in either order. `rosotacom start` accepts the same
+`--require-peer-reachable` policy when a deployment does require it.
+
 `rosotacom` reads the static session input and creates generated files under `session-instances/<date>/<session>_<timestamp>_<id>/config/`, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`. Catmux pane output is logged under the same instance in `logs/<peer>/catmux/`.
 
 What else a run leaves under `logs/<peer>/`, and which file to open first when a

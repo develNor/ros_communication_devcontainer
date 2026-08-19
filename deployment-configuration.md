@@ -85,6 +85,29 @@ Precedence is explicit:
 All logical peers must resolve to addresses before a session starts. Session
 definitions do not accept physical addresses or SSH targets.
 
+## Data-plane preflight
+
+`rosotacom start` checks the resolved bindings against the host before it stops
+or creates containers:
+
+1. The selected identity's IPv4 address must be assigned locally.
+2. `ip route get` for the other peer must select that same address as its
+   source.
+
+This makes an absent VPN/interface, a wrong identity, and a route escaping over
+another network startup errors instead of silent communication failures. Inspect
+the result without starting anything:
+
+```bash
+rosotacom preflight SESSION --identity PEER
+```
+
+Add `--require-peer-reachable` to `preflight` or `start` when this deployment
+also requires three bounded ICMP probes to succeed. Reachability is not the
+global default: ICMP can be intentionally filtered, and valid peers can be
+started in either order. Docker-isolated local smoke networks use their own
+network lifecycle and bypass this host data-plane check.
+
 ## Project selection and completion
 
 The nearest `rosotacom.yaml` is discovered upward from the current directory.

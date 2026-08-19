@@ -64,6 +64,7 @@ from .image_cache import (
     image_fingerprint,
     reference_tag,
 )
+from .network_preflight import NetworkPreflightResult, run_network_preflight
 
 anonymize_lib = importlib.import_module("rosotacom.anonymize")
 
@@ -1125,7 +1126,7 @@ def _get_local_ipv4s() -> list[str]:
         out = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True)
     except Exception:
         return []
-    return _IPV4_RE.findall(out)
+    return re.findall(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", out)
 
 
 def _default_local_ip() -> str:
@@ -1232,6 +1233,29 @@ def _auto_identity(bindings: dict[str, PeerBinding]) -> str:
             f"Auto identity failed: no peer address matched local IPv4s={sorted(local_ips)}. Use --identity."
         )
     raise RuntimeError(f"Auto identity ambiguous: matched peers={matches} for local IPv4s={sorted(local_ips)}.")
+
+
+def _network_preflight(
+    bindings: dict[str, PeerBinding],
+    identity: str,
+    *,
+    require_peer_reachable: bool = False,
+) -> NetworkPreflightResult:
+    return run_network_preflight(
+        bindings,
+        identity,
+        local_addresses=_get_local_ipv4s(),
+        require_peer_reachable=require_peer_reachable,
+    )
+
+
+def _print_network_preflight(result: NetworkPreflightResult) -> None:
+    reachability = "peer reachable" if result.peer_reachable else "route verified"
+    print(
+        f"Network preflight OK: {result.identity} ({result.local_address}) -> "
+        f"{result.remote_identity} ({result.remote_address}) via {result.interface} "
+        f"src {result.source_address}; {reachability}."
+    )
 
 
 def _peer_com_name(peers: dict[str, Any], peer_key: str) -> str:
@@ -5123,10 +5147,18 @@ def start_session(args: argparse.Namespace) -> str:
     identity = args.identity or _auto_identity(bindings)
     if not args.identity:
         print(f"Auto-selected identity: {identity}")
+    network_isolated = bool(getattr(args, "network_name", None))
+    if not network_isolated:
+        _print_network_preflight(
+            _network_preflight(
+                bindings,
+                identity,
+                require_peer_reachable=getattr(args, "require_peer_reachable", False),
+            )
+        )
     remote_name = _remote_peer_name(cfg, identity)
     instance = _resolve_session_instance(runtime, session, getattr(args, "instance_id", None))
     container_name = _container_name(remote_name, runtime, instance.instance_id)
-    network_isolated = bool(getattr(args, "network_name", None))
     if not network_isolated and not getattr(args, "skip_conflict_check", False):
         matching = _matching_com_containers(runtime, remote_name)
         if _fixed_com_container_name(runtime, remote_name) is not None:
@@ -5233,6 +5265,30 @@ def start_session(args: argparse.Namespace) -> str:
 
     print(f"rosotacom session started in container: {container_name}")
     return container_name
+
+
+def preflight_session(args: argparse.Namespace) -> NetworkPreflightResult:
+    runtime = _load_runtime_config(args)
+    session = _resolve_session(args.session_dir, runtime)
+    cfg = _effective_session_config(session.host_dir, runtime)
+    bindings = _resolve_bindings(
+        cfg,
+        runtime,
+        peer=getattr(args, "peer", None),
+        peer_address=getattr(args, "peer_address", None),
+    )
+    if not args.identity and not getattr(args, "auto_identity", True):
+        raise RuntimeError("Missing --identity. Provide --identity <peer> or allow auto identity.")
+    identity = args.identity or _auto_identity(bindings)
+    if not args.identity:
+        print(f"Auto-selected identity: {identity}")
+    result = _network_preflight(
+        bindings,
+        identity,
+        require_peer_reachable=getattr(args, "require_peer_reachable", False),
+    )
+    _print_network_preflight(result)
+    return result
 
 
 def stop_session(args: argparse.Namespace) -> None:
@@ -8668,6 +8724,11 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rewrite-formatting", action="store_true")
     _add_peer_arg(parser)
     _add_peer_address_arg(parser)
+    parser.add_argument(
+        "--require-peer-reachable",
+        action="store_true",
+        help="Require three bounded ICMP probes to the peer to succeed before starting.",
+    )
     parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
     parser.add_argument(
         "--skip-conflict-check",
@@ -8679,6 +8740,22 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--network-name", help=argparse.SUPPRESS)
     parser.add_argument("--network-ip", help=argparse.SUPPRESS)
     parser.set_defaults(force=True, auto_identity=True)
+
+
+def _add_preflight_args(parser: argparse.ArgumentParser) -> None:
+    _add_common_config_args(parser)
+    _add_session_arg(parser, "session_dir_positional", nargs="?")
+    _add_session_arg(parser, "-s", "--session-dir", dest="session_dir")
+    _add_identity_arg(parser)
+    parser.add_argument("--no-auto-identity", dest="auto_identity", action="store_false")
+    _add_peer_arg(parser)
+    _add_peer_address_arg(parser)
+    parser.add_argument(
+        "--require-peer-reachable",
+        action="store_true",
+        help="Require three bounded ICMP probes to the peer to succeed.",
+    )
+    parser.set_defaults(auto_identity=True)
 
 
 def _normalize_session_arg(args: argparse.Namespace) -> None:
@@ -8694,6 +8771,12 @@ def _normalize_session_arg(args: argparse.Namespace) -> None:
 def start_command(args: argparse.Namespace) -> int:
     _normalize_session_arg(args)
     start_session(args)
+    return 0
+
+
+def preflight_command(args: argparse.Namespace) -> int:
+    _normalize_session_arg(args)
+    preflight_session(args)
     return 0
 
 
@@ -9052,6 +9135,7 @@ def videoquality_command(args: argparse.Namespace) -> int:
 # turn into `rosotacom start foo` — so a contract test keeps the two in sync.
 TOP_LEVEL_COMMANDS = {
     "start",
+    "preflight",
     "stop",
     "doctor",
     "ps",
@@ -9126,6 +9210,13 @@ def main(argv: list[str] | None = None) -> int:
     start_parser = subparsers.add_parser("start", help="Start a rosotacom session.")
     _add_start_args(start_parser)
     start_parser.set_defaults(func=start_command)
+
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Validate the resolved local address, peer route, and optional peer reachability.",
+    )
+    _add_preflight_args(preflight_parser)
+    preflight_parser.set_defaults(func=preflight_command)
 
     stop_parser = subparsers.add_parser("stop", help="Stop rosotacom containers for a session.")
     _add_common_config_args(stop_parser)

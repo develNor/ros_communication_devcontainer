@@ -1743,12 +1743,13 @@ def test_positional_session_defaults_to_start(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(rosotacom, "start_session", fake_start_session)
 
-    result = rosotacom.main(["1_heartbeat", "--identity", "a"])
+    result = rosotacom.main(["1_heartbeat", "--identity", "a", "--require-peer-reachable"])
 
     assert result == 0
     assert calls
     assert calls[0].session_dir == "1_heartbeat"
     assert calls[0].identity == "a"
+    assert calls[0].require_peer_reachable is True
 
 
 def test_probe_verbs_dispatch_not_wrapped_in_start(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2017,7 +2018,7 @@ def test_path_yaml_and_network_helpers(tmp_path: Path, monkeypatch: pytest.Monke
 
     def fake_check_output(command: list[str], *, text: bool) -> str:
         if command[:4] == ["ip", "-o", "-4", "addr"]:
-            return "1: lo inet 127.0.0.1/8\n2: eth0 inet 10.0.0.5/24\n"
+            return "1: lo inet 127.0.0.1/8\n2: eth0 inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\n"
         return "1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.5 uid 1000"
 
     monkeypatch.setattr(rosotacom.subprocess, "check_output", fake_check_output)
@@ -2287,6 +2288,14 @@ def test_start_session_detached_dispatches_ros2docker(monkeypatch: pytest.Monkey
     monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
     monkeypatch.setattr(rosotacom, "_resolve_session", lambda session_dir, runtime: session)
     monkeypatch.setattr(rosotacom, "_effective_session_config", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(
+        rosotacom,
+        "_network_preflight",
+        lambda *args, **kwargs: rosotacom.NetworkPreflightResult(
+            "a", "127.0.0.1", "b", "127.0.0.2", "lo", "127.0.0.1", None
+        ),
+    )
+    monkeypatch.setattr(rosotacom, "_print_network_preflight", lambda result: None)
     monkeypatch.setattr(rosotacom, "_scoped_image_name", lambda runtime: "image:id")
     monkeypatch.setattr(
         rosotacom,
@@ -2334,6 +2343,14 @@ def test_start_session_attach_dispatches_command_run(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(rosotacom, "_resolve_session", lambda session_dir, runtime: session)
     monkeypatch.setattr(rosotacom, "_effective_session_config", lambda *args, **kwargs: cfg)
     monkeypatch.setattr(rosotacom, "_auto_identity", lambda *args: "a")
+    monkeypatch.setattr(
+        rosotacom,
+        "_network_preflight",
+        lambda *args, **kwargs: rosotacom.NetworkPreflightResult(
+            "a", "127.0.0.1", "b", "127.0.0.2", "lo", "127.0.0.1", None
+        ),
+    )
+    monkeypatch.setattr(rosotacom, "_print_network_preflight", lambda result: None)
     monkeypatch.setattr(rosotacom, "_scoped_image_name", lambda runtime: "image:id")
     monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg, instance, **kwargs: [])
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "attach")

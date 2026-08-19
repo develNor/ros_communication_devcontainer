@@ -535,6 +535,13 @@ the ssh client's own argv apart, and a transport that promises no more than
 `-t` and `-o BatchMode=yes` are dropped rather than forwarded. They are options
 of one client, and a transport that is not ssh never agreed to understand them.
 
+The same four options — `--peer-checkout`, `--peer-exec`, `--install-mode`,
+`--install-pin` — are on every `ota-benchmark` genre, not just `ota-smoke`. A
+measurement is the last thing that should require a shell on the peer: the
+whole point of a narrower transport is that the runs which touch a machine
+repeatedly can go through it, and a benchmark touches it far more often than a
+smoke test does.
+
 ### Live status / debugging overview
 
 Enable a continuously-updated, per-topic pipeline overview by setting

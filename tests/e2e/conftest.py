@@ -91,6 +91,7 @@ E2E_SLICES: dict[str, dict[str, float]] = {
         "tests/e2e/test_smoke.py::test_full_rmw_heartbeat_smoke_matrix[cyclone-local-zenoh-ros2dds-ota]": 0.0,
         "tests/e2e/test_smoke.py::test_full_rmw_heartbeat_smoke_matrix[cyclone-ota]": 0.0,
         "tests/e2e/test_smoke.py::test_full_rmw_heartbeat_smoke_matrix[fastdds]": 0.0,
+        "tests/e2e/test_smoke.py::test_full_rmw_heartbeat_smoke_matrix[fastdds-default]": 0.0,
         "tests/e2e/test_smoke.py::test_full_rmw_heartbeat_smoke_matrix[zen-endpoints]": 0.0,
     },
     "chatter": {

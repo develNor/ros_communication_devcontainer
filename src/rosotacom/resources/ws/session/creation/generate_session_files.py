@@ -158,7 +158,7 @@ class YamlBlockScalar:
 #   - a tagged-union mapping with exactly one key (the RMW name):
 #       {cyclone: {config?: <fname.xml>, easy_mode_ip?: <address>, spdp_interval?: <duration>}}
 #       {fastdds: {config?: <fname.xml>, easy_mode_ip?: <address>}}
-#       {zenoh_connect_endpoints: {main_peer?: <peer_key>, main_port?: 7447}}
+#       {zenoh_connect_endpoints: {transport?: tcp|udp, main_peer?: <peer_key>, main_port?: 7447}}
 #       {zenoh_ros2dds: {transport?: udp|tcp, main_peer?: <peer_key>, main_port?: 7447}}
 # -----------------------------------------------------------------------------
 
@@ -170,7 +170,11 @@ _LOCAL_SHORTS = {"cyclone", "fastdds", "zenoh"}
 _SHORTCUT_ALLOWED = {"cyclone", "fastdds", "zenoh"}
 
 _DDS_CFG_KEYS = {"config", "easy_mode_ip", "spdp_interval"}
-_ZEN_OTA_CFG_KEYS = {"main_peer", "main_port"}
+_ZEN_OTA_CFG_KEYS = {"transport", "main_peer", "main_port"}
+#: Inter-host transports the native zenoh router may be pointed at. Both are
+#: plain zenoh locator schemes; tls/quic would additionally need certificates
+#: this generator has nowhere to put.
+_ZEN_NATIVE_TRANSPORTS = {"tcp", "udp"}
 _ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
 
 # OTA is cross-host by definition. The bare `cyclone`/`fastdds` OTA shortcuts
@@ -179,9 +183,14 @@ _ZEN_R2D_CFG_KEYS = {"transport", "main_peer", "main_port"}
 # overlay/tunnel networks that drop multicast. Default each DDS OTA side to its
 # interface-pinned, unicast-peer config so cross-host delivery works out of the
 # box; an explicit `ota: {cyclone|fastdds: {config: ...}}` still overrides this.
+#: What `rmw.ota: <impl>` means when no ``config:`` is given. Both entries are
+#: the link-ready configuration for their implementation, not the minimal one:
+#: a session that names an OTA middleware and nothing else gets unicast
+#: discovery, a pinned interface and 1200 B fragments either way, which is what
+#: makes `shared.rmw` an interchangeable choice rather than a rewrite.
 _DDS_OTA_DEFAULT_CONFIG = {
     "cyclone": "cyclonedds_tuned.xml",
-    "fastdds": "fastdds_unicast.xml",
+    "fastdds": "fastdds_tuned.xml",
 }
 
 
@@ -215,9 +224,8 @@ class RmwSideSpec:
     dds_config: Optional[str] = None
     dds_easy_mode_ip: Optional[str] = None
     dds_spdp_interval: Optional[str] = None
-    # zenoh / zenoh_ros2dds
+    # zenoh (native) and zenoh_ros2dds
     zen_main_peer: Optional[str] = None
-    # zenoh_ros2dds only
     zen_transport: Optional[str] = None
     zen_main_port: Optional[int] = None
 
@@ -287,6 +295,13 @@ def _parse_rmw_side(value: Any, ctx: str, *, is_local: bool) -> RmwSideSpec:
             raise RuntimeError(
                 f"{ctx}.{impl} contains unsupported keys {sorted(extra)}. Allowed: {sorted(_ZEN_OTA_CFG_KEYS)}."
             )
+        if cfg.get("transport") is not None:
+            transport = cfg["transport"]
+            if not isinstance(transport, str) or transport.strip() not in _ZEN_NATIVE_TRANSPORTS:
+                raise RuntimeError(
+                    f"{ctx}.{impl}.transport must be one of {sorted(_ZEN_NATIVE_TRANSPORTS)}; got {transport!r}."
+                )
+            spec.zen_transport = transport.strip()
         if cfg.get("main_peer") is not None:
             if not isinstance(cfg["main_peer"], str) or not cfg["main_peer"].strip():
                 raise RuntimeError(f"{ctx}.{impl}.main_peer must be a non-empty string if provided.")
@@ -1360,6 +1375,31 @@ def _heartbeat_monitor_overrides(heartbeat_expect: Optional[Dict[str, Any]]) -> 
     return overrides
 
 
+def _build_topic_types_map(status_spec_yaml: str) -> str:
+    """`<stage topic>: <message type>` for every stage this peer takes part in.
+
+    The bridge and relay nodes used to learn a topic's type from the ROS graph,
+    which means they can only create an endpoint after somebody else has created
+    the matching one. Over a transport that carries data but not the graph — the
+    zenoh DDS bridge — that is a deadlock: the bridge routes a topic once a local
+    reader exists, and the reader is not created until the bridge has routed a
+    publisher into the graph. The session already knows every stage's type, so it
+    says so instead.
+
+    Derived from the status pipeline spec rather than recomputed, so the two can
+    never disagree about what a stage is called.
+    """
+    spec = yaml.safe_load(status_spec_yaml) or {}
+    types: Dict[str, str] = {}
+    for topic in spec.get("topics") or []:
+        for stage in topic.get("stages") or []:
+            name = str(stage.get("topic") or "").strip()
+            msg_type = str(stage.get("type") or "").strip()
+            if name and msg_type:
+                types.setdefault(name, msg_type)
+    return yaml.safe_dump({"topic_types": types}, sort_keys=True, default_flow_style=False)
+
+
 def _build_status_pipeline_spec(
     *,
     local: str,
@@ -2178,14 +2218,22 @@ def func(
                 [
                     ("zen_main_ip", peer_ip[main_peer]),
                     ("zen_main_port", main_port),
-                    # Only the non-main peer opens a TCP connect endpoint.
+                    ("zen_transport", ota.zen_transport or "tcp"),
+                    # Only the non-main peer opens a connect endpoint.
                     ("zen_connect", local_peer != main_peer),
                 ],
             )
         if ota.impl == "zenoh_ros2dds":
             main_peer = ota.zen_main_peer or peer_keys[0]
             main_port = ota.zen_main_port or 7447
-            transport = ota.zen_transport or "udp"
+            # TCP by default, measured rather than assumed. On the bench pair
+            # (2026-08-19, the 2026-08-17 drive's loss process, 12 kB at 10 Hz)
+            # the UDP bridge delivered in one run of five and lost 66% of that
+            # one, while the TCP bridge delivered in every run at ~1% loss and
+            # the lowest median latency in the whole campaign. UDP stays
+            # available: it is the right answer on a link where TCP's
+            # head-of-line blocking costs more than its retransmission buys.
+            transport = ota.zen_transport or "tcp"
             endpoint_role = "listen" if local_peer == main_peer else "connect"
             items: List[Tuple[str, Any]] = [
                 ("zen_pub_allow", f"/ota/{peer_name[local_peer]}/.*"),
@@ -2630,6 +2678,7 @@ def func(
     per_peer_otau_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
     per_peer_domain_bridge_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
     per_peer_status_spec_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
+    per_peer_topic_types_yaml: Dict[str, Optional[str]] = {p: None for p in peer_keys}
 
     def _prefix_with_source_name_if_needed(target_peer: str, source_peer: str, topic: str) -> str:
         ps = peer_settings_all.get(target_peer, {}) or {}
@@ -2979,6 +3028,32 @@ def func(
                     ),
                 )
             )
+
+        # Always: the bridge and relay nodes need the stage types whether or not
+        # anyone asked for a status overview.
+        pipeline_spec_yaml = _build_status_pipeline_spec(
+            local=local,
+            remote=remote,
+            peer_name=peer_name,
+            out_entries=out_entries,
+            out_pipes=out_pipes,
+            in_entries=in_entries,
+            in_pipes=in_pipes,
+            use_target_prefix=use_target_prefix,
+            remote_uses_target_prefix=remote_uses_target_prefix,
+            native_have_source_prefix=native_have_source_prefix,
+            inbound_keep_source_prefix=bool(inbound_cfg.get("keep_source_prefix", False)),
+            local_domain_id=peer_local_domain_id[local],
+            ota_domain_id=ota_domain_id,
+            uses_domain_bridge=_use_domain_bridge(local),
+            hb_topic=hb_topic,
+            use_heartbeat=use_heartbeat,
+            heartbeat_expect=(shared.get("heartbeat") or {}).get("expect"),
+            out_enabled=out_enabled,
+            in_enabled=in_enabled,
+            final_topic_type=_final_topic_type,
+        )
+        per_peer_topic_types_yaml[local] = _build_topic_types_map(pipeline_spec_yaml)
 
         if use_status_overview:
             per_peer_status_spec_yaml[local] = _build_status_pipeline_spec(
@@ -3332,6 +3407,8 @@ def func(
             generated.append((os.path.join(param_dir, p, "domain_bridge.yaml"), per_peer_domain_bridge_yaml[p] or ""))
         if per_peer_status_spec_yaml.get(p):
             generated.append((os.path.join(param_dir, p, "pipeline_spec.yaml"), per_peer_status_spec_yaml[p] or ""))
+        if per_peer_topic_types_yaml.get(p):
+            generated.append((os.path.join(param_dir, p, "topic_types.yaml"), per_peer_topic_types_yaml[p] or ""))
 
     _write_generated_files(generated, force=force, rewrite_formatting=rewrite_formatting)
 

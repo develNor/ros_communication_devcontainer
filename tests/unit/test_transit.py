@@ -251,7 +251,14 @@ def test_sender_rows_can_never_mask_a_receiver_loss() -> None:
     assert joined["sections"]["wrap_to_com_out_ms"] == 5.0
 
 
-def test_unobserved_sender_gaps_do_not_count_as_loss() -> None:
+def test_sender_rows_alone_report_nothing_delivered_and_no_loss_figure() -> None:
+    """Only the receiving peer can say a message arrived.
+
+    Sender gaps are still not loss — the far side may simply not have been
+    observed yet — but neither are sender rows a delivery. A link that carried
+    nothing used to report `delivered == expected, loss 0%` off its own
+    sender-side rows, which is the most dangerous shape a wrong number can take.
+    """
     records = [
         {**_record(0, "sent", t_wrap=10.0), "direction": "outbound", "stage": "com_out"},
         {**_record(1, "unobserved"), "direction": "outbound", "stage": "com_out"},
@@ -259,4 +266,21 @@ def test_unobserved_sender_gaps_do_not_count_as_loss() -> None:
     ]
     summary = summarize_transit_records(records)["topics"]["/x"]
     assert summary["lost"] == 0
-    assert summary["loss_pct"] == 0.0
+    assert summary["loss_pct"] is None
+    assert summary["delivered"] == 0
+    assert summary["unconfirmed"] == 3
+
+
+def test_a_receiver_row_is_what_makes_a_message_delivered() -> None:
+    records = [
+        {**_record(0, "sent", t_wrap=10.0), "direction": "outbound", "stage": "com_out"},
+        {**_record(0, "delivered", 12.0, t_wrap=10.0), "direction": "inbound", "stage": "com_in"},
+        {**_record(1, "sent", t_wrap=10.1), "direction": "outbound", "stage": "com_out"},
+        {**_record(1, "lost"), "direction": "inbound", "stage": "com_in"},
+        {**_record(2, "sent", t_wrap=10.2), "direction": "outbound", "stage": "com_out"},
+    ]
+    summary = summarize_transit_records(records)["topics"]["/x"]
+    assert summary["delivered"] == 1
+    assert summary["lost"] == 1
+    assert summary["unconfirmed"] == 1  # seq 2 was sent and never accounted for
+    assert summary["loss_pct"] == 50.0  # of what the receiver could account for

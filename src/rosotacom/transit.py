@@ -44,6 +44,11 @@ def record_epoch(record: dict[str, Any]) -> int:
     return 0 if value is None else int(value)
 
 
+#: Statuses only a receiving peer can produce. Everything else on a joined row
+#: came from the sender, which cannot know whether the message arrived.
+_RECEIVER_STATUSES = frozenset({"delivered", "reordered", "lost"})
+
+
 def join_transit_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Join duplicate observations by ``(source, topic, epoch, seq)``.
 
@@ -268,7 +273,16 @@ def summarize_transit_records(records: Iterable[dict[str, Any]]) -> dict[str, An
     for topic, topic_records in sorted(by_topic.items()):
         lost = sum(record.get("status") == "lost" for record in topic_records)
         reordered = sum(record.get("status") == "reordered" for record in topic_records)
-        delivered = len(topic_records) - lost
+        # Only the receiving peer can say a message arrived. A row that is still
+        # `sent` after the join was written by the sender and never met a
+        # receiver row, so it is neither delivered nor confirmed lost — an
+        # in-flight message at the window edge looks exactly like one the link
+        # never carried. Counting them as delivered is how a link that delivered
+        # *nothing* reported `delivered == expected, loss 0%`: sender-side rows
+        # (issue #294) arrive whether or not the far side ever sees anything.
+        receiver_seen = [record for record in topic_records if record.get("status") in _RECEIVER_STATUSES]
+        unconfirmed = len(topic_records) - len(receiver_seen)
+        delivered = len(receiver_seen) - lost
         ota = [latency for record in topic_records if (latency := _record_latency_ms(record)) is not None]
         jitter = [float(record["jitter_ms"]) for record in topic_records if record.get("jitter_ms") is not None]
         topics[topic] = {
@@ -279,8 +293,12 @@ def summarize_transit_records(records: Iterable[dict[str, Any]]) -> dict[str, An
             # in the summary because it changes how every rate-like number
             # below should be read, and because it is otherwise invisible.
             "epochs": len({record_epoch(record) for record in topic_records}),
-            "loss_pct": round(100.0 * lost / len(topic_records), 3) if topic_records else 0.0,
+            # Loss is a receiver fact. With no receiver row at all there is no
+            # denominator, and `0.0` would be a claim the data cannot support.
+            "loss_pct": round(100.0 * lost / len(receiver_seen), 3) if receiver_seen else None,
             "reordered": reordered,
+            # Sent and never accounted for by the receiver.
+            "unconfirmed": unconfirmed,
             "ota_hop_ms": _distribution_ms(ota),
             "ota_hop_trend_ms": _latency_trend_ms(topic_records),
             "jitter_ms": _distribution_ms(jitter),

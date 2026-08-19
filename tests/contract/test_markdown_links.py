@@ -8,7 +8,21 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 README = (PACKAGE_ROOT / "README.md").resolve()
 # session-instances holds gitignored runtime output; `rosotacom report` writes
 # a generated report.md into instances, which is not public documentation.
-IGNORED_DIRS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "build", "dist", "session-instances"}
+# `.agents` is the gitignored per-checkout credential directory the contributor
+# guide tells you to create; a note a contributor keeps there is not this
+# repository's documentation, and scanning it made the gate fail on exactly the
+# machines that followed the instructions.
+IGNORED_DIRS = {
+    ".agents",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "build",
+    "dist",
+    "session-instances",
+}
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\((?P<target>[^)]+)\)")
 REACHABILITY_ALLOWLIST_GLOBS = (
     # GitHub renders these through issue / PR UI flows; they are executable

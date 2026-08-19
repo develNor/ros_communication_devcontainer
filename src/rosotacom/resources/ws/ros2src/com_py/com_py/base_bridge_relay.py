@@ -40,7 +40,7 @@
 import rclpy
 from rclpy.node import Node
 from com_py.topic_resolution import resolve_topics
-from com_py.qos import load_qos_config
+from com_py.qos import load_qos_config, load_topic_types
 from com_py.pub_sub_pair import PubSubPair
 from com_py.pair_management import PairRefreshMixin
 
@@ -59,6 +59,11 @@ class BaseBridgeRelay(Node, PairRefreshMixin):
         self.base_topic_files = self.declare_parameter('base_topic_files', rclpy.Parameter.Type.STRING_ARRAY).value
         self.host_name = self.declare_parameter('local_name', '').value
         self.qos_config_file = self.declare_parameter('qos_config_file', '').value
+        # `<stage topic>: <message type>` for every stage of this session, so a
+        # pair can create its endpoints without waiting for somebody else to
+        # create the matching one first. Empty is allowed: the graph is still
+        # consulted, and was the only source before this existed.
+        self.topic_types_file = self.declare_parameter('topic_types_file', '').value
 
         # Optional parameters with defaults
         self.source_names = self.declare_optional_string_array('source_names')
@@ -112,6 +117,7 @@ class BaseBridgeRelay(Node, PairRefreshMixin):
             return
 
         self.qos_config = load_qos_config(self.get_logger(), self.qos_config_file)
+        self.topic_types = load_topic_types(self.get_logger(), self.topic_types_file)
 
         for (sub_t, pub_t, base_t) in triplets:
             pair = PubSubPair(
@@ -121,7 +127,8 @@ class BaseBridgeRelay(Node, PairRefreshMixin):
                 pub_topic=pub_t,
                 sub_role=self.sub_role,
                 pub_role=self.pub_role,
-                qos_config=self.qos_config
+                qos_config=self.qos_config,
+                topic_types=self.topic_types
             )
             self.pairs.append(pair)
 

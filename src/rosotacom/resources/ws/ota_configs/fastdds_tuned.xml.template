@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Fast DDS on a real OTA link: what `rmw.ota: fastdds` means by default.
+
+  fastdds_unicast.xml pins the locators and stops there, which is enough on a
+  LAN and leaves two things open on a cellular tunnel: a multi-homed host still
+  announces every interface it has, and a participant that starts late is never
+  found. This profile closes both and changes nothing else.
+
+  WHAT IT DELIBERATELY DOES NOT DO — cap the datagram. CycloneDDS carries this
+  link at FragmentSize/MaxMessageSize 1200 B, and the obvious move is to write
+  the same number here. Measured on the bench pair (2026-08-18/19, ROS 2 Kilted,
+  Fast DDS 3.2.4): a `<maxMessageSize>` below the sample size stops the sample
+  from ever arriving, through the whole OTA pipeline, at 1200 B and at 8192 B,
+  with a synchronous writer and with an asynchronous one. An 84 B heartbeat kept
+  flowing at 10 Hz while a 12 kB stream on the same link delivered nothing — the
+  shape that makes this worth a paragraph, because a link that carries the small
+  topics looks alive. Every other knob below was added to the working profile one
+  at a time and measured; only the cap breaks it.
+
+  So Fast DDS here hands a large sample to the kernel as one datagram and lets IP
+  fragment it, where CycloneDDS sends RTPS fragments. That is a real difference
+  in what a lost packet costs and in what the tunnel has to reassemble, not an
+  implementation detail — the measured OpenVPN barrier on this path is around
+  110 kB per message (docs/network-baseline.md).
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>rosotacom_ota_udp</transport_id>
+        <type>UDPv4</type>
+
+        <sendBufferSize>1048576</sendBufferSize>
+        <receiveBufferSize>4194304</receiveBufferSize>
+
+        <!-- Drop rather than block when the socket buffer is full: on a shaped
+             uplink the blocking default turns a link-layer backlog into
+             application-level latency. -->
+        <non_blocking_send>true</non_blocking_send>
+
+        <!-- An initial peer given without a port makes Fast DDS probe
+             participant indices 0..range on that address. The default is 4, and
+             an OTA domain carrying a domain bridge plus the IN and OUT splits
+             can hand out a higher index, so whichever process starts late is
+             never found. CycloneDDS probes 10; this matches it. -->
+        <maxInitialPeersRange>10</maxInitialPeersRange>
+
+        <!-- Two addresses, both load-bearing. #host_ip is the OTA address, and
+             pinning it is what keeps a multi-homed VPN host from announcing a
+             locator the peer cannot route to. 127.0.0.1 is the same-host half:
+             with a split OTA domain the stock `domain_bridge` process sits on
+             that domain too and speaks whatever RMW the local side uses, so
+             this participant has to be able to discover a peer on its own
+             machine. An allowlist of the OTA address alone takes the loopback
+             path away and the bridge and the OTA processes never see each
+             other — a failure that reads as a dead link and is not one. -->
+        <interfaces>
+          <allowlist>
+            <interface name="127.0.0.1" netmask_filter="OFF"/>
+            <interface name="#host_ip" netmask_filter="OFF"/>
+          </allowlist>
+        </interfaces>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="rosotacom_fastdds_tuned" is_default_profile="true">
+      <rtps>
+        <defaultUnicastLocatorList>
+          <locator>
+            <udpv4>
+              <address>127.0.0.1</address>
+              <port>0</port>
+            </udpv4>
+          </locator>
+          <locator>
+            <udpv4>
+              <address>#host_ip</address>
+              <port>0</port>
+            </udpv4>
+          </locator>
+        </defaultUnicastLocatorList>
+
+        <builtin>
+          <discovery_config>
+            <leaseDuration>
+              <sec>60</sec>
+            </leaseDuration>
+            <leaseAnnouncement>
+              <sec>10</sec>
+            </leaseAnnouncement>
+          </discovery_config>
+
+          <metatrafficUnicastLocatorList>
+            <locator>
+              <udpv4>
+                <address>127.0.0.1</address>
+                <port>0</port>
+              </udpv4>
+            </locator>
+            <locator>
+              <udpv4>
+                <address>#host_ip</address>
+                <port>0</port>
+              </udpv4>
+            </locator>
+          </metatrafficUnicastLocatorList>
+
+          <initialPeersList>
+            <locator>
+              <udpv4>
+                <address>127.0.0.1</address>
+                <port>0</port>
+              </udpv4>
+            </locator>
+            <locator>
+              <udpv4>
+                <address>#host_ip</address>
+                <port>0</port>
+              </udpv4>
+            </locator>
+            <!--peer-block--><locator>
+              <udpv4>
+                <address>#peer</address>
+                <port>0</port>
+              </udpv4>
+            </locator><!--/peer-block-->
+          </initialPeersList>
+        </builtin>
+
+        <userTransports>
+          <transport_id>rosotacom_ota_udp</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+
+    <data_writer profile_name="rosotacom_fastdds_tuned_writer" is_default_profile="true">
+      <qos>
+        <data_sharing>
+          <kind>OFF</kind>
+        </data_sharing>
+      </qos>
+    </data_writer>
+
+    <data_reader profile_name="rosotacom_fastdds_tuned_reader" is_default_profile="true">
+      <qos>
+        <data_sharing>
+          <kind>OFF</kind>
+        </data_sharing>
+      </qos>
+    </data_reader>
+  </profiles>
+</dds>

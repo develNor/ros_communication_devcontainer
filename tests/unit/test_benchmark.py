@@ -1194,3 +1194,18 @@ def test_evaluate_bag_run_is_order_independent() -> None:
     b = evaluate_bag_run(reverse, thresholds=thresholds, ground_truth=gt)
     assert a.failing_topics == b.failing_topics == ("/b",)
     assert a.passes == b.passes is False
+
+
+def test_an_unknown_loss_figure_is_read_as_the_worst_case() -> None:
+    """No receiver evidence must not pass an oracle.
+
+    `summarize_transit_records` reports `loss_pct: None` when no receiving peer
+    accounted for a topic at all. Reading that as zero would turn a link that
+    delivered nothing into a green run.
+    """
+    thresholds = OracleThresholds(max_loss_pct=5.0, max_latency_ms=1000.0, latency_quantile="p95")
+    unknown = {"loss_pct": None, "delivered": 0, "lost": 0, "ota_hop_ms": {"p95": 10.0}}
+    known_good = {"loss_pct": 1.0, "delivered": 100, "lost": 1, "ota_hop_ms": {"p95": 10.0}}
+
+    assert oracle_passes_topic(unknown, thresholds) is False
+    assert oracle_passes_topic(known_good, thresholds) is True

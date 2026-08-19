@@ -33,6 +33,13 @@ RMW_CASES: list[dict[str, Any]] = [
         },
     },
     {
+        # What `rmw: fastdds` means when a session names nothing else: the OTA
+        # side defaults to `fastdds_tuned.xml`. The shipped default is the one
+        # combination a matrix must not leave to a session author to discover.
+        "name": "1_heartbeat_fastdds-default",
+        "rmw": "fastdds",
+    },
+    {
         "name": "1_heartbeat_cyclone-ota",
         "rmw": {
             "local": {"cyclone": {"config": "cyclonedds_minimal.xml"}},

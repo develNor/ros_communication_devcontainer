@@ -167,8 +167,49 @@ not override `RMW_IMPLEMENTATION` and relies on the ambient ROS 2 defaults — n
 Per-side config blocks:
 
 - DDS implementations (`cyclone`, `fastdds`) accept:
-  - `config: <template>` — template file under `ws/ota_configs/` (e.g. `fastdds_v1.xml`, `cyclonedds.xml`, `fastdds_easy_mode.xml`). Omit to use the RMW's built-in defaults.
-  - `easy_mode_ip: <string>` — only honored by `fastdds_easy_mode.xml`; defaults to the first resolved peer address.
+  - `config: <template>` — template file under `ws/ota_configs/`
+    (`cyclonedds_tuned.xml`, `cyclonedds_minimal.xml`,
+    `cyclonedds_local_participants.xml`, `fastdds_tuned.xml`,
+    `fastdds_unicast.xml`, `fastdds_easy_mode.xml`).
+  - `easy_mode_ip: <string>` — resolved into a template's `#easy_mode_ip`
+    placeholder; defaults to the first resolved peer address. Only
+    `fastdds_easy_mode.xml` uses it.
+
+  `fastdds_easy_mode.xml` is the discovery alternative: Fast DDS 3.1 spawns or
+  reuses one Discovery Server per host and points the participant at the peer's
+  server too, so two hosts find each other with no multicast and no per-peer
+  locator list. It fails differently from `fastdds_tuned.xml` rather than
+  better — an explicit peer list cannot discover what it was not told about,
+  while easy mode depends on a server process being reachable on 11811 — which
+  is why both are packaged. Neither caps the datagram (see above); easy mode
+  expresses its transport settings as `<builtinTransports …>` attributes,
+  because replacing the transports outright would take its discovery path with
+  them.
+
+  **On the OTA side, omitting `config` is not "no configuration".** Each
+  implementation has a default template, and both defaults are the link-ready
+  one: `cyclone` → `cyclonedds_tuned.xml`, `fastdds` → `fastdds_tuned.xml`.
+  That is what makes `shared.rmw` an interchangeable choice — a session names a
+  middleware and gets unicast discovery with the OTA interface pinned either
+  way, rather than one middleware that survives a cellular tunnel and one that
+  has to be configured into surviving it. `fastdds_unicast.xml` is the earlier,
+  locator-only configuration, kept for a run that wants to measure the
+  difference.
+
+  The two defaults are **not** identical in what they put on the wire, and the
+  difference is deliberate. CycloneDDS fragments at the RTPS layer (1200 B);
+  Fast DDS hands a large sample to the kernel as one datagram and lets IP
+  fragment it. Writing the same cap into the Fast DDS profile is the obvious
+  move and it takes the link down: measured on the bench pair (2026-08-18/19,
+  ROS 2 Kilted, Fast DDS 3.2.4) a `maxMessageSize` below the sample size stops
+  the sample from ever arriving — at 1200 B and at 8192 B, synchronous writer
+  and asynchronous — while an 84 B heartbeat on the same link keeps flowing.
+  Plan the payload accordingly: the measured OpenVPN barrier on this path is
+  around 110 kB per message.
+
+  On the **local** side, omitting `config` really is no configuration: no
+  template is applied and no `CYCLONEDDS_URI` / `FASTDDS_DEFAULT_PROFILES_FILE`
+  is exported.
 
   On the **local** side of a busy machine, set
   `config: cyclonedds_local_participants.xml`. Cyclone allows 33 participants
@@ -179,10 +220,22 @@ Per-side config blocks:
   interface and sets no peer list, because local discovery must keep working.
   The OTA templates are not usable on the local side for exactly that reason.
 - `zenoh_connect_endpoints` (native, OTA side only; `zenoh` is still accepted as a legacy OTA alias) accepts:
+  - `transport: tcp|udp` — the inter-host transport between the two routers.
+    Default `tcp`. On a lossy link TCP is the wrong choice for a best-effort
+    stream: one retransmit stalls everything queued behind it, which turns a
+    cellular dip into seconds of latency instead of one lost sample. The
+    listening router keeps `tcp/[::]:7447` whatever this is set to, because
+    every rmw_zenoh node on that host is a zenoh *client* of it over
+    `tcp/localhost:7447`.
   - `main_peer: <peer_key>` — the peer whose zenoh router listens. Defaults to the first peer declared under `peers:`.
   - `main_port: 7447` — listening port. Default `7447`.
 - `zenoh_ros2dds` (bridge) accepts (OTA side only):
-  - `transport: udp|tcp` — default `udp`.
+  - `transport: udp|tcp` — default `tcp`, measured rather than assumed. On the
+    bench pair (2026-08-19, the 2026-08-17 drive's loss process, 12 kB at 10 Hz)
+    the UDP bridge delivered in one run of five and lost 66% of that one, while
+    the TCP bridge delivered in every run at ~1% loss with the lowest median
+    latency in the campaign. UDP stays available for a link where TCP's
+    head-of-line blocking costs more than its retransmission buys.
   - `main_peer: <peer_key>` — defaults to the first peer.
   - `main_port: 7447` — default `7447`.
 
@@ -226,6 +279,22 @@ topics to/from zenoh. The local graph still speaks DDS, so `rmw.local` must be
 - IN/OUT processes keep whatever DDS RMW was configured via `rmw.local`.
 - `zen_pub_allow` / `zen_sub_allow` are derived from peer `com-name`s (`/ota/<com-name>/.*`).
 - `zen_qos_pub` is derived from per-topic `zen_qos:` entries and baked into the generated `<peer>/plugin.yaml`.
+
+#### Generated per peer: `topic_types.yaml`
+
+Every session writes `<peer>/topic_types.yaml` — `<stage topic>: <message
+type>` for every stage that peer takes part in — and the bridge and relay nodes
+read it. It is generated whether or not `use_status_overview` is set, and is
+derived from the same pipeline description the status node uses, so the two
+cannot disagree about what a stage is called.
+
+It exists because the alternative was the ROS graph, and the graph makes an
+endpoint's creation depend on somebody else having created the matching one
+first. Over a transport that carries data but not the graph — `rmw.ota:
+zenoh_ros2dds`, where the bridge routes a topic only once a local DDS reader
+exists — that is a deadlock, and a silent one: the receiving peer logs
+`Initialized 1 pair(s). Pending=1` and the topic simply never arrives. The graph
+is still consulted for anything the file does not name.
 
 #### Domain bridging
 
@@ -420,6 +489,21 @@ Each entry is either:
   - `zen_qos` (optional mapping)
   - `expect` (optional mapping); `smoke_probe: false` keeps the topic in the
     generated contract but excludes it from synthetic local-smoke probes
+
+    Two `expect` keys describe the *synthetic source* rather than the contract,
+    for the runs (local smoke, `ota-smoke`, OTA benchmark genres) that drive a
+    session with generated traffic instead of a replay:
+
+    - `smoke_native_hz` — publish the native topic at this rate instead of
+      deriving it from the `hz` bounds. Needed wherever the pipeline changes the
+      rate (`drop`, `throttle_hz`, `trickle_hz`), because the asserted rate is
+      the delivered one and the source has to run faster.
+    - `smoke_native_bytes` — the payload size for a
+      `com_msgs/msg/SizedPayload` topic (default 66000). The size belongs to the
+      load a session wants driven: comparing two OTA middlewares, or two
+      profiles, means holding the payload at a chosen size — a 38 kB camera
+      keyframe, say — rather than at whatever constant the driver carries. It is
+      also what the receiving side asserts, so both ends stay consistent.
 
 In split-domain mode the generator must emit a standard ROS 2 `domain_bridge` YAML with explicit
 message types for `/com/...` topics. For that reason, user-defined topic entries need `type:`.

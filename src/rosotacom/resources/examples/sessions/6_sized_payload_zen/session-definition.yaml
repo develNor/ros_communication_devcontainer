@@ -23,6 +23,9 @@ shared:
     local: cyclone
     ota:
       zenoh_ros2dds:
+        # Explicit, and deliberately the non-default: `tcp` is what a link gets
+        # by default since it measured better on the operator's bench pair, so
+        # something has to keep exercising the UDP bridge.
         transport: udp
         main_peer: a
         main_port: 7447

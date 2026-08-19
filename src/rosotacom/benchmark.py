@@ -191,9 +191,19 @@ def oracle_passes(loss_pct: float, latency_ms: float | None, thresholds: OracleT
     return loss_pct <= thresholds.max_loss_pct and latency_ms <= thresholds.max_latency_ms
 
 
+def _oracle_loss_pct(value: Any) -> float:
+    """A topic's loss for an oracle, with "unknown" read as the worst case.
+
+    `summarize_transit_records` reports `None` when no receiving peer accounted
+    for the topic at all. That is not zero loss; it is no evidence, and an
+    oracle that let it pass would turn a dead link into a green run.
+    """
+    return 100.0 if value is None else float(value)
+
+
 def oracle_passes_topic(topic_summary: dict[str, Any], thresholds: OracleThresholds) -> bool:
     """Apply the oracle to one topic of ``transit.summarize_transit_records`` output."""
-    loss_pct = float(topic_summary.get("loss_pct", 100.0))
+    loss_pct = _oracle_loss_pct(topic_summary.get("loss_pct", 100.0))
     latency = (topic_summary.get("ota_hop_ms") or {}).get(thresholds.latency_quantile)
     return oracle_passes(loss_pct, None if latency is None else float(latency), thresholds)
 
@@ -323,7 +333,7 @@ def evaluate_bag_run(
         lost = data.get("lost")
         reordered = data.get("reordered")
         run_expected = data.get("expected")
-        loss_pct = float(data.get("loss_pct", 100.0)) if data else 100.0
+        loss_pct = _oracle_loss_pct(data.get("loss_pct", 100.0)) if data else 100.0
         latency_p95 = (data.get("ota_hop_ms") or {}).get(quantile) if data else None
         jitter_p95 = (data.get("jitter_ms") or {}).get("p95") if data else None
         latency_val = None if latency_p95 is None else float(latency_p95)

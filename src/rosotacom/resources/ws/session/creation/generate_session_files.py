@@ -101,6 +101,41 @@ class TransportSpec:
     playout: Optional[Dict[str, Any]] = None
 
 
+#: What `transport.playout.republish` may say, and what each answer decodes.
+#: The delivered topic name is the same in all three -- only what feeds the
+#: decode moves, and `both` adds a second decode under a name of its own.
+PLAYOUT_REPUBLISH_MODES = ("paced", "unpaced", "both")
+PLAYOUT_REPUBLISH_DEFAULT = "paced"
+
+
+def playout_republish(playout: Optional[Dict[str, Any]]) -> str:
+    """Which stream a paced link's receiver decodes ('paced' when unpaced)."""
+    if not playout:
+        return PLAYOUT_REPUBLISH_DEFAULT
+    return str(playout.get("republish", PLAYOUT_REPUBLISH_DEFAULT))
+
+
+@dataclass
+class IrtSlot:
+    """One reverse-transport decode: what it reads, and where it publishes.
+
+    Four of these fit in the base plugin. Most links use one per direction, but
+    a comparison decode (`playout.republish: both`) is a second slot on the same
+    topic -- which is the only reason `out_topic` exists, since two decodes of
+    one stream would otherwise remap onto the same output name.
+    """
+
+    topic: str
+    ttype: str
+    out_transport: str
+    #: Set only for the slot that a pacer feeds; the pacer is configured from it.
+    playout: Optional[Dict[str, Any]] = None
+    #: Read '<topic>/paced' rather than '<topic>'.
+    reads_paced: bool = False
+    #: Override the output remap; None means '<topic>/<out_transport>'.
+    out_topic: Optional[str] = None
+
+
 @dataclass
 class TopicEntry:
     base: str
@@ -1746,7 +1781,7 @@ def _compute_pipeline(
         if playout_cfg is not None:
             if not isinstance(playout_cfg, dict):
                 raise ValueError(f"transport.playout must be a mapping for topic '{entry.base}'")
-            allowed = {"adaptive", "target_ms", "min_ms", "max_ms"}
+            allowed = {"adaptive", "target_ms", "min_ms", "max_ms", "republish"}
             unknown = sorted(set(playout_cfg) - allowed)
             if unknown:
                 raise ValueError(
@@ -1769,6 +1804,15 @@ def _compute_pipeline(
                 raise ValueError(f"transport.playout.max_ms must be >= min_ms for topic '{entry.base}'")
             if "adaptive" in playout_cfg and not isinstance(playout_cfg["adaptive"], bool):
                 raise ValueError(f"transport.playout.adaptive must be a boolean for topic '{entry.base}'")
+            if "republish" in playout_cfg and playout_cfg["republish"] not in PLAYOUT_REPUBLISH_MODES:
+                raise ValueError(
+                    f"transport.playout.republish for topic '{entry.base}' is "
+                    f"{playout_cfg['republish']!r}; allowed: {list(PLAYOUT_REPUBLISH_MODES)}. "
+                    "'paced' decodes the paced copy (the default), 'unpaced' runs the pacer "
+                    "without putting it on the display path, and 'both' adds a second decode "
+                    "on '<encoded>/unpaced/<transport>' for comparison. The delivered topic "
+                    "name is the same in all three."
+                )
             playout = dict(playout_cfg)
 
         params = {k: v for k, v in t.items() if k not in ("type", "playout", *republish_keys)}
@@ -2781,11 +2825,12 @@ def func(
             nor_items.append((base, suffix))
 
         # Hard limits from session_plugin_base.yaml.
-        def _assert_max(label: str, items: List[Any], limit: int) -> None:
+        def _assert_max(label: str, items: List[Any], limit: int, note: str = "") -> None:
             if len(items) > limit:
                 raise RuntimeError(
                     f"peer '{local}': too many '{label}' entries ({len(items)}). "
                     f"The base session plugin supports at most {limit}."
+                    + (f" Note: {note}." if note else "")
                 )
 
         _assert_max("drp", drp_items, 8)
@@ -3319,31 +3364,52 @@ def func(
         # The sender's own preview decode is never paced: it reads the local
         # copy of what it just encoded, so there is no network jitter to
         # absorb. Playout pacing exists on the receiving side only.
-        irt_all: List[Tuple[str, str, str, Optional[Dict[str, Any]]]] = []
+        irt_all: List[IrtSlot] = []
         for t, tspec in irt_items_local:
             assert tspec is not None
-            irt_all.append((t, tspec.type, str(tspec.local_republish), None))
-        irt_all.extend(
-            (topic, tspec.type, str(tspec.remote_republish), tspec.playout) for topic, tspec in irt_items_remote
+            irt_all.append(IrtSlot(t, tspec.type, str(tspec.local_republish)))
+        for topic, tspec in irt_items_remote:
+            out_transport = str(tspec.remote_republish)
+            mode = playout_republish(tspec.playout)
+            # The decode an application reads keeps its name in every mode; only
+            # what feeds it moves. `unpaced` still runs the pacer -- it publishes
+            # '<topic>/paced' and its debug topics for measurement -- and simply
+            # does not put it on the display path.
+            irt_all.append(
+                IrtSlot(topic, tspec.type, out_transport, playout=tspec.playout, reads_paced=mode != "unpaced")
+            )
+            if mode == "both":
+                # The comparison branch: same stream, undelayed, under a name of
+                # its own. `<topic>/unpaced` is a valid image_transport base, so
+                # a viewer subscribes to it exactly like the delivered one.
+                irt_all.append(
+                    IrtSlot(topic, tspec.type, out_transport, out_topic=f"{topic}/unpaced/{out_transport}")
+                )
+        _assert_max(
+            "irt",
+            irt_all,
+            4,
+            note="a `playout.republish: both` comparison decode consumes a slot of its own",
         )
-        _assert_max("irt", irt_all, 4)
         if irt_all:
             items2 = [("irt", True)]
-            for i, (topic, _ttype, _out_transport, _playout) in enumerate(irt_all, 1):
-                items2.append((f"irt_{i}_topic", topic))
-            for i, (_topic, ttype, out_transport, playout) in enumerate(irt_all, 1):
-                items2.append((f"irt_{i}_transport", ttype))
-                items2.append((f"irt_{i}_out_transport", out_transport))
-                if playout is not None:
+            for i, slot in enumerate(irt_all, 1):
+                items2.append((f"irt_{i}_topic", slot.topic))
+            for i, slot in enumerate(irt_all, 1):
+                items2.append((f"irt_{i}_transport", slot.ttype))
+                items2.append((f"irt_{i}_out_transport", slot.out_transport))
+                if slot.out_topic is not None:
+                    items2.append((f"irt_{i}_out_topic", slot.out_topic))
+                if slot.reads_paced:
                     # Points the decode's input remap at '<topic>/paced'; the
                     # pacer itself runs in the PACE window below.
                     items2.append((f"irt_{i}_paced", "true"))
             blocks.append(PluginBlock("irt", items2))
 
         paced_entries = [
-            (i, topic, ttype, playout)
-            for i, (topic, ttype, _out_transport, playout) in enumerate(irt_all, 1)
-            if playout is not None
+            (i, slot.topic, slot.ttype, slot.playout)
+            for i, slot in enumerate(irt_all, 1)
+            if slot.playout is not None
         ]
         if paced_entries:
             items_pace: List[Tuple[str, Any]] = [("pace", True)]

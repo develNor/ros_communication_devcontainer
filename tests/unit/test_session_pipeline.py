@@ -306,3 +306,75 @@ def test_generated_peer_files_wire_the_pacer(tmp_path: Path) -> None:
     sender = (tmp_path / "b" / "plugin.yaml").read_text(encoding="utf-8")
     assert "pace" not in sender or "pace_1_topic" not in sender
     assert "irt_1_paced" not in sender
+
+
+# `transport.playout.republish` — which stream the receiver decodes (#302).
+#
+# The improvement a pacer makes is invisible while it replaces the picture under
+# the same name: there is no moment where paced and unpaced are on screen
+# together. `both` puts them there. What must hold across all three modes is
+# that the *delivered* name never moves — an application subscribes to
+# `<encoded>/<out_transport>` whatever the mode, which is the rule #276 exists
+# to protect and exactly what a comparison switch could break in silence.
+
+
+def _receiver_plugin(tmp_path: Path, playout: dict) -> str:
+    processing = {
+        "transport": {"type": "ffmpeg", "remote_republish": "compressed", "playout": playout},
+        "use_ota_wrapper": True,
+    }
+    generator.func(
+        session_config_obj=_camera_cfg(processing),
+        output_dir=str(tmp_path),
+        force=True,
+        peer_addresses={"a": "127.0.0.1", "b": "127.0.0.2"},
+    )
+    return (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
+
+
+def test_republish_rejects_a_mode_that_is_not_one_of_the_three() -> None:
+    with pytest.raises(ValueError, match="allowed: \\['paced', 'unpaced', 'both'\\]"):
+        _pipeline(_ffmpeg(playout={"republish": "compare"}))
+
+
+def test_paced_is_the_default_and_needs_no_output_override() -> None:
+    _entry, pipe = _pipeline(_ffmpeg(playout={}))
+    assert generator.playout_republish(pipe["transport"].playout) == "paced"
+
+
+def test_unpaced_runs_the_pacer_but_keeps_it_off_the_display_path(tmp_path: Path) -> None:
+    """The measurement mode: '/paced' and its debug topics exist, nothing reads them."""
+    receiver = _receiver_plugin(tmp_path, {"republish": "unpaced"})
+
+    assert "pace_1_topic: /camera/image/ffmpeg" in receiver
+    assert "irt_1_paced" not in receiver
+    assert "irt_1_out_topic" not in receiver
+
+
+def test_both_adds_a_second_decode_under_a_name_of_its_own(tmp_path: Path) -> None:
+    receiver = _receiver_plugin(tmp_path, {"republish": "both"})
+
+    # Slot 1 is the delivered one: paced input, unchanged output name.
+    assert "irt_1_topic: /camera/image/ffmpeg" in receiver
+    assert "irt_1_paced" in receiver
+    assert "irt_1_out_topic" not in receiver
+    # Slot 2 is the comparison: same stream, undelayed, qualified output.
+    assert "irt_2_topic: /camera/image/ffmpeg" in receiver
+    assert "irt_2_out_topic: /camera/image/ffmpeg/unpaced/compressed" in receiver
+    assert "irt_2_paced" not in receiver
+    # One pacer, not two -- the second decode reads what the first one's pacer
+    # was fed, and a second pacer on the same topic would publish onto the same
+    # '/paced' name.
+    assert "pace_2_topic" not in receiver
+
+
+def test_every_mode_delivers_the_same_topic_name(tmp_path: Path) -> None:
+    """The one invariant a comparison switch must not break."""
+    delivered = set()
+    for mode in ("paced", "unpaced", "both"):
+        _entry, pipe = _pipeline(_ffmpeg(playout={"republish": mode}))
+        delivered.add(generator._delivered_topic(pipe, pipe["final"]))
+    _entry, unpaced_link = _pipeline(_ffmpeg())
+    delivered.add(generator._delivered_topic(unpaced_link, unpaced_link["final"]))
+
+    assert len(delivered) == 1, delivered

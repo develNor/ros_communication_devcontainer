@@ -674,6 +674,7 @@ Declaratively, add a `playout` block to the transport:
             target_ms: 350    # fixed budget when adaptive: false
             min_ms: 100       # adaptive clamp above the observed delay floor
             max_ms: 800
+            republish: paced  # paced (default) | unpaced | both
 ```
 
 The receiving peer then runs the pacer in its own `PACE` window against the
@@ -683,6 +684,33 @@ why `playout` requires `remote_republish`: without a republish the pacer's
 `/paced` suffix would rename what the receiving application subscribes to.
 The sender's own preview decode (`local_republish`) is never paced — it reads
 the local copy of what was just encoded, so there is no jitter to absorb.
+
+##### `republish`: which stream reaches the display
+
+Pacing under an unchanged topic name is what keeps applications working, and it
+is also what makes the improvement invisible — nothing shows paced and unpaced
+together. `republish` names which stream the receiver decodes:
+
+| value | decodes | publishes |
+|---|---|---|
+| `paced` (default) | `<encoded>/paced` | `<encoded>/<remote_republish>` |
+| `unpaced` | `<encoded>` | `<encoded>/<remote_republish>` |
+| `both` | both | delivered as above, comparison on `<encoded>/unpaced/<remote_republish>` |
+
+**The delivered name is the same in all three.** Only what feeds the decode
+moves, so switching modes never changes what an application subscribes to.
+
+`unpaced` still runs the pacer: `/paced` and its `budget_ms` / `queue_depth`
+debug topics are published and recordable, they just do not reach the display.
+That is the A/B control — measure a pacer on a live link without changing what
+an operator sees.
+
+`both` runs the receiver's expensive stage twice (a codec decode plus, for
+`compressed`, a JPEG encode per frame) and adds one local topic; nothing extra
+crosses the link. It also consumes one of the four reverse-transport slots. It
+is a rehearsal and diagnosis switch — the comparison stream is deliberately not
+a status pipeline stage, because it is not something the link promises to
+deliver.
 
 The node also runs standalone against any packet stream:
 

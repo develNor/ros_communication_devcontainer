@@ -473,9 +473,6 @@ def test_every_default_ota_profile_template_is_packaged() -> None:
     from rosotacom.resources.ws.session.creation import generate_session_files as gsf
 
     ota_configs = cli.WS_DIR / "ota_configs"
-    missing = [
-        name
-        for name in gsf._DDS_OTA_DEFAULT_CONFIG.values()
-        if name and not (ota_configs / f"{name}.template").exists()
-    ]
-    assert not missing, f"default OTA templates absent from the package: {missing}"
+    defaults = list(gsf._DDS_OTA_DEFAULT_CONFIG.values()) + list(gsf._DDS_LOCAL_DEFAULT_CONFIG.values())
+    missing = [name for name in defaults if name and not (ota_configs / f"{name}.template").exists()]
+    assert not missing, f"default profile templates absent from the package: {missing}"

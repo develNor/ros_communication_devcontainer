@@ -193,6 +193,24 @@ _DDS_OTA_DEFAULT_CONFIG = {
     "fastdds": "fastdds_tuned.xml",
 }
 
+# The *local* domain needs a default only for Fast DDS, and only because the two
+# stacks differ in what they do with no configuration at all. CycloneDDS talks
+# between containers on a host out of the box; Fast DDS announces every
+# interface it can enumerate, a developer machine has dozens of down `br-*`
+# bridges, and the peer can settle on one that carries nothing. Measured
+# 2026-08-19 on two containers sharing a network namespace: 0 of 80 samples
+# without a profile, 79 of 80 once the loopback locators are named. The failure
+# is quiet — the writer reports a matched reader and the pipeline's last stage
+# sits IDLE with pub=1 — so this is a default rather than something a session
+# has to know to ask for.
+#
+# Cyclone deliberately has no entry: cyclonedds_local_participants.xml raises
+# the participant-index ceiling, which is a control-centre concern, not
+# something every session should inherit.
+_DDS_LOCAL_DEFAULT_CONFIG = {
+    "fastdds": "fastdds_local.xml",
+}
+
 
 def _validate_positive_seconds(value: str, ctx: str) -> None:
     text = value.strip().lower()
@@ -2160,8 +2178,9 @@ def func(
         items: List[Tuple[str, Any]] = []
         if effective_impl is not None:
             items.append(("rmw_local", effective_impl))
-        if side.dds_config:
-            items.append(("local_config_template", side.dds_config))
+        local_dds_config = side.dds_config or _DDS_LOCAL_DEFAULT_CONFIG.get(effective_impl or "")
+        if local_dds_config:
+            items.append(("local_config_template", local_dds_config))
             items.append(("local_config_file", "${peer_dir}/local_dds.xml"))
             if side.impl == "fastdds" and side.dds_config == "fastdds_easy_mode.xml":
                 items.append(

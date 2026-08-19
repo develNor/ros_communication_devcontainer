@@ -265,10 +265,19 @@ def _check_expect(
             failures.append(f"[{peer}] {base}: latency_ms.stage '{stage_name}' not in pipeline")
             return failures
         lat_stage = named
-    lat = lat_stage.get("latency_ms")
+    # A stage the session delays on purpose reports the split, and `expect` is
+    # about what the *link* delivers -- the buffer is already bounded by the
+    # `playout` block that asked for it. The live status classifies on the same
+    # number, and the two must not disagree about one contract: that is how a
+    # session ends up passing `rosotacom test` while its own panel reads BAD.
+    lat = lat_stage.get("link_latency_ms")
+    measured = "link latency"
+    if lat is None:
+        lat = lat_stage.get("latency_ms")
+        measured = "latency"
     if "max" in lat_exp and (lat is None or lat > lat_exp["max"]):
         where = f" at '{stage_name}'" if stage_name else ""
-        failures.append(f"[{peer}] {base}: latency {lat}ms{where} > expected max {lat_exp['max']}ms")
+        failures.append(f"[{peer}] {base}: {measured} {lat}ms{where} > expected max {lat_exp['max']}ms")
 
     loss_exp = expect.get("loss_pct") or {}
     if "max" in loss_exp:

@@ -1666,17 +1666,23 @@ def _build_status_pipeline_spec(
             if postprocessed != final:
                 native_in_type = base_type
                 transport = p.get("transport")
+                native_in: Dict[str, Any] = {
+                    "stage": "native_in",
+                    "topic": _relay_in_local_topic(postprocessed),
+                    "type": native_in_type,
+                    "domain": "local",
+                    "produced_by": "postprocessing",
+                }
                 if isinstance(transport, TransportSpec) and transport.remote_republish:
-                    native_in_type = REPUBLISH_OUTPUT_TYPES[transport.remote_republish]
-                stages.append(
-                    {
-                        "stage": "native_in",
-                        "topic": _relay_in_local_topic(postprocessed),
-                        "type": native_in_type,
-                        "domain": "local",
-                        "produced_by": "postprocessing",
-                    }
-                )
+                    native_in["type"] = REPUBLISH_OUTPUT_TYPES[transport.remote_republish]
+                    if transport.playout is not None and playout_republish(transport.playout) != "unpaced":
+                        # This stage's age is the link plus a hold this session
+                        # asked for. The pacer reports the hold it applied; naming
+                        # the topic here is what lets the status separate the two
+                        # instead of reading a deliberate buffer as a fault.
+                        paced = _relay_in_local_topic(str(p.get("irt_in"))) + "/paced"
+                        native_in["paced_hold_topic"] = f"{paced}/hold_ms"
+                stages.append(native_in)
 
             topics.append(
                 {

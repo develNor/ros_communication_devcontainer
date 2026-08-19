@@ -61,6 +61,12 @@ GOOD = "GOOD"
 DEGRADED = "DEGRADED"
 BAD = "BAD"
 
+#: A stage whose age includes a delay this session asked for names the topic on
+#: which the node responsible reports what it actually held. Set by the
+#: generator for a decode that reads a playout pacer's output.
+PACED_HOLD_KEY = "paced_hold_topic"
+SCALAR_MSG_TYPE = "std_msgs/msg/Float64"
+
 # Topic-level rollup
 OK = "OK"
 PARTIAL = "PARTIAL"
@@ -371,6 +377,9 @@ class StageObservation:
     last_recv_wall: Optional[float] = None
     last_delay_s: Optional[float] = None
     last_raw_delay_s: Optional[float] = None
+    #: Payload of the last message, for the scalar topics this node reads as
+    #: numbers rather than observes as stages (the pacing hold).
+    last_value: Optional[float] = None
     last_rtt_s: Optional[float] = None
     last_clock_offset_s: Optional[float] = None
     # (t_mono, size_bytes, delay_s_or_None)
@@ -673,6 +682,21 @@ class StatusAggregator:
         self._startup_pending: Optional[Tuple[float, set]] = None
 
     # -- observation lookup --
+    def _pacing_hold_ms(self, stage: Dict[str, Any]) -> Optional[float]:
+        """How long this session deliberately held the last message of a stage.
+
+        None whenever the answer is not actually known -- no pacer named, or the
+        pacer has not reported yet. Guessing zero would read a paced picture as
+        a slow link; guessing the configured budget would do the opposite and
+        credit a hold that a late message never received.
+        """
+        hold_topic = stage.get(PACED_HOLD_KEY)
+        if not hold_topic:
+            return None
+        observer = self._observers.get("local")
+        observation = observer.observations.get(str(hold_topic)) if observer else None
+        return None if observation is None else observation.last_value
+
     def _obs_for(self, stage: Dict[str, Any]) -> Optional[StageObservation]:
         domain = stage.get("domain", "local")
         observer = self._observers.get(domain) or self._observers.get("local")
@@ -714,6 +738,9 @@ class StatusAggregator:
             "observation": "graph" if obs is not None and obs.graph_only else "payload",
             "inferred_from": None,
             "latched": str((expect or {}).get("mode", "")).strip().lower() == "latched",
+            # Split of `latency_ms` for a stage this session delays on purpose.
+            "pacing_hold_ms": None,
+            "link_latency_ms": None,
         }
         if obs is None:
             return result
@@ -727,6 +754,10 @@ class StatusAggregator:
         result["age_s"] = round(m["age_s"], 3) if m["age_s"] is not None else None
         if m["last_delay_s"] is not None:
             result["latency_ms"] = round(m["last_delay_s"] * 1000.0, 1)
+            hold_ms = self._pacing_hold_ms(stage)
+            if hold_ms is not None:
+                result["pacing_hold_ms"] = round(hold_ms, 1)
+                result["link_latency_ms"] = round(max(0.0, result["latency_ms"] - hold_ms), 1)
         if m["last_raw_delay_s"] is not None:
             result["latency_uncorrected_ms"] = round(m["last_raw_delay_s"] * 1000.0, 1)
         if m["last_rtt_s"] is not None:
@@ -759,7 +790,9 @@ class StatusAggregator:
             return result
 
         result["state"] = FLOWING
-        quality, reason = self._classify_quality(m, expected_hz, expect)
+        quality, reason = self._classify_quality(
+            m, expected_hz, expect, pacing_hold_ms=result["pacing_hold_ms"]
+        )
         result["quality"] = quality
         result["quality_reason"] = reason
         return result
@@ -823,7 +856,12 @@ class StatusAggregator:
                 self._copy_inferred_activity(stage_result, source)
 
     def _classify_quality(
-        self, m: Dict[str, Any], expected_hz: Optional[float], expect: Optional[Dict[str, Any]] = None
+        self,
+        m: Dict[str, Any],
+        expected_hz: Optional[float],
+        expect: Optional[Dict[str, Any]] = None,
+        *,
+        pacing_hold_ms: Optional[float] = None,
     ) -> Tuple[str, Optional[str]]:
         expect = expect or {}
         hz_exp = expect.get("hz") or {}
@@ -833,8 +871,17 @@ class StatusAggregator:
         # Latency: a declared `expect.latency_ms.max` overrides the global bad
         # threshold; the good band stays the default so a tight contract still
         # surfaces a DEGRADED before BAD where it makes sense.
+        #
+        # A stage the session delays on purpose is judged on what is left after
+        # that delay is taken back out. Otherwise a threshold calibrated for a
+        # link measures a buffer, which reads as a fault on a healthy stream and
+        # teaches an operator to stop believing the panel. The subtracted value
+        # is the hold actually applied, so a late message -- which the pacer
+        # passes straight through -- is credited nothing and still flags.
         bad_lat = float(lat_exp["max"]) if "max" in lat_exp else self._delay_bad_ms
         delay_ms = (m["last_delay_s"] * 1000.0) if m["last_delay_s"] is not None else None
+        if delay_ms is not None and pacing_hold_ms is not None:
+            delay_ms = max(0.0, delay_ms - pacing_hold_ms)
         if delay_ms is not None:
             if delay_ms >= bad_lat:
                 return BAD, "latency"
@@ -1142,7 +1189,16 @@ class StatusAggregator:
                 if st["state"] in (FLOWING, STALE):
                     parts = [f"{st['hz']:.1f}Hz"]
                     if st["latency_ms"] is not None:
-                        parts.append(f"{st['latency_ms']:.0f}ms")
+                        # A paced stage reads as one big number unless the split
+                        # is on the same line: what the link cost, and what this
+                        # session chose to add on top of it.
+                        if st.get("pacing_hold_ms") is not None:
+                            parts.append(
+                                f"{st['latency_ms']:.0f}ms"
+                                f"(link {st['link_latency_ms']:.0f}+paced {st['pacing_hold_ms']:.0f})"
+                            )
+                        else:
+                            parts.append(f"{st['latency_ms']:.0f}ms")
                     elif st["latency_uncorrected_ms"] is not None:
                         parts.append(f"{st['latency_uncorrected_ms']:.0f}ms(raw)")
                     if st["loss_pct"] is not None:
@@ -1298,7 +1354,12 @@ class StatusAggregator:
 
 
 def collect_stage_topics(spec: Dict[str, Any]) -> Dict[str, Dict[str, Optional[str]]]:
-    """Return {domain: {topic: type_hint}} from the pipeline spec."""
+    """Return {domain: {topic: type_hint}} from the pipeline spec.
+
+    Includes the pacing-hold topics a stage names: they are not stages of the
+    link -- nothing is delivered on them -- but the aggregator has to read them
+    to tell this session's deliberate delay from the network's.
+    """
     by_domain: Dict[str, Dict[str, Optional[str]]] = {"local": {}, "ota": {}}
     for topic_spec in spec.get("topics", []):
         type_hint = topic_spec.get("type")
@@ -1307,6 +1368,9 @@ def collect_stage_topics(spec: Dict[str, Any]) -> Dict[str, Dict[str, Optional[s
             by_domain.setdefault(domain, {})
             existing = by_domain[domain].get(stage["topic"])
             by_domain[domain][stage["topic"]] = existing or stage.get("type") or type_hint
+            hold_topic = stage.get(PACED_HOLD_KEY)
+            if hold_topic:
+                by_domain["local"].setdefault(str(hold_topic), SCALAR_MSG_TYPE)
     return by_domain
 
 

@@ -108,11 +108,14 @@ PLAYOUT_REPUBLISH_MODES = ("paced", "unpaced", "both")
 PLAYOUT_REPUBLISH_DEFAULT = "paced"
 
 
-def playout_republish(playout: Optional[Dict[str, Any]]) -> str:
-    """Which stream a paced link's receiver decodes ('paced' when unpaced)."""
-    if not playout:
-        return PLAYOUT_REPUBLISH_DEFAULT
-    return str(playout.get("republish", PLAYOUT_REPUBLISH_DEFAULT))
+def playout_republish(playout: Dict[str, Any]) -> str:
+    """Which stream the receiver decodes, for a link that declares `playout`.
+
+    Only meaningful where a pacer runs. A link without `playout` has no paced
+    copy to read, so callers decide that case before asking -- passing None here
+    would answer 'paced' for a stream nothing paces.
+    """
+    return str((playout or {}).get("republish", PLAYOUT_REPUBLISH_DEFAULT))
 
 
 @dataclass
@@ -3370,6 +3373,12 @@ def func(
             irt_all.append(IrtSlot(t, tspec.type, str(tspec.local_republish)))
         for topic, tspec in irt_items_remote:
             out_transport = str(tspec.remote_republish)
+            if tspec.playout is None:
+                # No pacer on this link: the decode reads what arrived. Asking
+                # it for '<topic>/paced' would give it a name nothing publishes,
+                # which advertises an output and then never fills it.
+                irt_all.append(IrtSlot(topic, tspec.type, out_transport))
+                continue
             mode = playout_republish(tspec.playout)
             # The decode an application reads keeps its name in every mode; only
             # what feeds it moves. `unpaced` still runs the pacer -- it publishes

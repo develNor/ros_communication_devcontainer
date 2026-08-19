@@ -318,18 +318,34 @@ def test_generated_peer_files_wire_the_pacer(tmp_path: Path) -> None:
 # to protect and exactly what a comparison switch could break in silence.
 
 
-def _receiver_plugin(tmp_path: Path, playout: dict) -> str:
-    processing = {
-        "transport": {"type": "ffmpeg", "remote_republish": "compressed", "playout": playout},
-        "use_ota_wrapper": True,
-    }
+def _receiver_plugin(tmp_path: Path, playout: dict | None) -> str:
+    transport: dict = {"type": "ffmpeg", "remote_republish": "compressed"}
+    if playout is not None:
+        transport["playout"] = playout
     generator.func(
-        session_config_obj=_camera_cfg(processing),
+        session_config_obj=_camera_cfg({"transport": transport, "use_ota_wrapper": True}),
         output_dir=str(tmp_path),
         force=True,
         peer_addresses={"a": "127.0.0.1", "b": "127.0.0.2"},
     )
     return (tmp_path / "a" / "plugin.yaml").read_text(encoding="utf-8")
+
+
+def test_a_receiver_without_playout_decodes_what_arrived(tmp_path: Path) -> None:
+    """A link that paces nothing has no '/paced' for its decode to read.
+
+    Worth its own test because of how it fails: `image_transport republish`
+    advertises its output whether or not its input exists, so a decode pointed
+    at a name nobody publishes looks alive and delivers nothing. That is what
+    the `17_synthetic_camera_quality` slice caught while the whole unit suite
+    stayed green — the receiver's *unpaced* case had no assertion at all.
+    """
+    receiver = _receiver_plugin(tmp_path, None)
+
+    assert "irt_1_topic: /camera/image/ffmpeg" in receiver
+    assert "irt_1_paced" not in receiver
+    assert "irt_1_out_topic" not in receiver
+    assert "pace_1_topic" not in receiver
 
 
 def test_republish_rejects_a_mode_that_is_not_one_of_the_three() -> None:

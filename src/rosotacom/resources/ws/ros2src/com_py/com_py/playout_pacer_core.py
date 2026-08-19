@@ -32,7 +32,10 @@ class PacerConfig:
     adaptive: bool = True
     percentile: float = 0.95  # of (arrival - stamp), window-local
     margin_ms: float = 40.0  # headroom above the tracked percentile
-    window: int = 400  # samples (~40 s at 10 Hz)
+    #: Samples (~40 s at 10 Hz). Bounds both the tracked percentile and the
+    #: delay floor, so how fast the schedule re-anchors after the path changes
+    #: is this number: a longer window is steadier and slower to recover.
+    window: int = 400
 
     def __post_init__(self) -> None:
         if not 0.0 < self.percentile < 1.0:
@@ -72,8 +75,18 @@ class PlayoutSchedule:
         """
         d = arrival_s - stamp_s
         self._d.append(d)
-        if self._d_floor is None or d < self._d_floor:
-            self._d_floor = d
+        # The minimum over the *window*, not over all time. An all-time floor
+        # can only fall, so any upward shift in `arrival - stamp` -- a clock
+        # step, an NTP correction, a route change, a looping replay -- leaves
+        # every later message past `stamp + floor + budget`, and the pacer
+        # degrades to a pass-through it can never come back from. Found on the
+        # fleet e2e, where a bag loop moved the delay by the bag's length and
+        # the centre's camera ran unpaced for the rest of the run with every
+        # panel healthy. Windowed, the same shift re-anchors within one window.
+        #
+        # O(window) per message: 400 floats at 10 Hz. A monotonic deque would
+        # make it O(1) and is not worth the machinery at these rates.
+        self._d_floor = min(self._d)
         release = stamp_s + self._d_floor + self.budget_ms / 1000.0
         if release < arrival_s:  # already late: pass through immediately
             release = arrival_s

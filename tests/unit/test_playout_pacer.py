@@ -111,3 +111,57 @@ def test_a_late_message_is_reported_as_held_for_nothing() -> None:
     _hold_ms(schedule, 0.0, 0.030)
 
     assert _hold_ms(schedule, 1.0, 1.400) == 0.0
+
+
+# The floor has to be able to rise again (#312).
+#
+# Every budget is anchored to `d_floor`, the fastest path observed. Taking that
+# over all time rather than over the window means it can only fall, so one
+# upward shift in `arrival - stamp` puts every later message past its release
+# time and the pacer becomes a pass-through it never recovers from. A clock step
+# on either peer is enough; the fleet e2e's looping bag replay does it every
+# lap, and until #301 the symptom was invisible -- node up, topic flowing,
+# nothing re-timed.
+
+
+def _hold_p50(schedule: PlayoutSchedule, count: int, stamp0: float, offset: float) -> float:
+    holds = []
+    for index in range(count):
+        stamp = stamp0 + index * 0.1
+        # 10 ms most of the time, 50 ms every third message: enough jitter for
+        # an adaptive budget to have something to track.
+        arrival = stamp + offset + (0.05 if index % 3 == 0 else 0.01)
+        holds.append(max(0.0, (schedule.on_message(stamp, arrival) - arrival) * 1000.0))
+    return sorted(holds)[len(holds) // 2]
+
+
+def test_a_delay_step_up_is_re_anchored_within_one_window() -> None:
+    schedule = PlayoutSchedule(PacerConfig(adaptive=True, min_ms=100.0, max_ms=300.0))
+    window = schedule.config.window
+
+    assert _hold_p50(schedule, 500, 0.0, 0.20) == pytest.approx(100.0, abs=5.0)
+    # The step itself is absorbed, not smoothed: those messages are genuinely
+    # late relative to what was known, and pass through.
+    _hold_p50(schedule, window, 1000.0, 161.20)
+    # One window later the floor describes the new path again.
+    assert _hold_p50(schedule, 500, 2000.0, 161.20) == pytest.approx(100.0, abs=5.0)
+
+
+def test_a_constant_offset_is_still_absorbed_entirely() -> None:
+    """The property the floor exists for: no clock synchronization needed."""
+    near = PlayoutSchedule(PacerConfig(adaptive=True, min_ms=100.0, max_ms=300.0))
+    far = PlayoutSchedule(PacerConfig(adaptive=True, min_ms=100.0, max_ms=300.0))
+
+    assert _hold_p50(near, 500, 0.0, 0.20) == pytest.approx(_hold_p50(far, 500, 0.0, 3600.20), abs=1.0)
+
+
+def test_the_step_neither_drops_nor_reorders() -> None:
+    schedule = PlayoutSchedule(PacerConfig(adaptive=True, min_ms=100.0, max_ms=300.0))
+    releases = []
+    for index in range(600):
+        stamp = index * 0.1
+        offset = 0.20 if index < 300 else 161.20
+        releases.append(schedule.on_message(stamp, stamp + offset + 0.01))
+
+    assert len(releases) == 600
+    assert releases == sorted(releases)

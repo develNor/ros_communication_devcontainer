@@ -190,6 +190,14 @@ def _patch_start_session_collaborators(
     monkeypatch.setattr(rosotacom, "_load_runtime_config", lambda args: runtime)
     monkeypatch.setattr(rosotacom, "_resolve_session", lambda session_dir, runtime: session)
     monkeypatch.setattr(rosotacom, "_effective_session_config", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(
+        rosotacom,
+        "_network_preflight",
+        lambda *args, **kwargs: rosotacom.NetworkPreflightResult(
+            "a", "127.0.0.1", "b", "127.0.0.2", "lo", "127.0.0.1", None
+        ),
+    )
+    monkeypatch.setattr(rosotacom, "_print_network_preflight", lambda result: None)
     monkeypatch.setattr(rosotacom, "_scoped_image_name", lambda runtime: "image:id")
     monkeypatch.setattr(rosotacom, "_base_extra_run_args", lambda runtime, session, cfg, instance, **kwargs: [])
     monkeypatch.setattr(rosotacom, "_resolve_mode", lambda mode: "detached")
@@ -236,16 +244,31 @@ def test_start_session_force_replaces_conflicting_identity_container(
     cfg = {"peers": {"a": {}, "b": {"com-name": "remote"}}}
     calls: list[tuple[str, dict[str, object]]] = []
     stopped: list[str] = []
+    events: list[str] = []
     _patch_start_session_collaborators(monkeypatch, runtime, session, cfg, calls)
+    monkeypatch.setattr(
+        rosotacom,
+        "_network_preflight",
+        lambda *args, **kwargs: (
+            events.append("preflight")
+            or rosotacom.NetworkPreflightResult("a", "127.0.0.1", "b", "127.0.0.2", "lo", "127.0.0.1", None)
+        ),
+    )
     monkeypatch.setattr(
         rosotacom,
         "_list_docker_containers",
         lambda all_states=False: [("rosotacom_id_other_com_to_remote", ["bridge"])],
     )
+
+    def record_stop(name: str, runtime: rosotacom.RuntimeConfig, **kwargs: object) -> bool:
+        events.append("stop")
+        stopped.append(name)
+        return True
+
     monkeypatch.setattr(
         rosotacom,
         "_stop_container_name",
-        lambda name, runtime, **kwargs: stopped.append(name) or True,
+        record_stop,
     )
 
     container = rosotacom.start_session(_start_session_args(force=True))
@@ -254,6 +277,7 @@ def test_start_session_force_replaces_conflicting_identity_container(
     # The conflicting other-instance container is stopped first; force also
     # keeps its pre-existing own-name replace for --instance-id rejoins.
     assert stopped == ["rosotacom_id_other_com_to_remote", "rosotacom_id_unit_com_to_remote"]
+    assert events == ["preflight", "stop", "stop"]
     assert [name for name, _ in calls] == ["build", "run", "exec"]
 
 

@@ -2912,6 +2912,66 @@ def _ota_load_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
             print(f"+ {peer.name}: {summary}")
 
 
+_REACH_ATTEMPTS = 3
+_REACH_BACKOFF_SECONDS = 2.0
+_REACH_TIMEOUT_SECONDS = 20.0
+
+
+def _ota_reach_check(peer: OtaSmokePeer, *, dry_run: bool) -> None:
+    """Open the control channel to a peer, retrying a transport that flaked.
+
+    This is the only preflight step that retries, and the reason is the probe
+    itself: the remote command is ``true``. It cannot fail. Every non-zero exit
+    and every timeout here is therefore the transport — an ssh handshake that
+    timed out because the peer was loaded, a link that had not come up yet —
+    and never a condition on the machine that a second look would paper over.
+
+    The checks after this one deliberately do not retry. A container that is
+    already running is still running a moment later, and a peer somebody else is
+    saturating is still saturated; retrying those would convert a real refusal
+    into a delayed one. Retrying is right where the answer is stateless and the
+    failure is transient, and that is here alone.
+
+    Each attempt is printed. A run that needed three tries to reach a peer was
+    taken under conditions worth knowing about, so the artefact says so rather
+    than reporting a clean first-try connection.
+    """
+    if dry_run:
+        _ota_run(peer, "true", label=f"{peer.name}: reachable", dry_run=True, batch=True)
+        return
+
+    last_detail = ""
+    for attempt in range(1, _REACH_ATTEMPTS + 1):
+        suffix = "" if attempt == 1 else f" (attempt {attempt} of {_REACH_ATTEMPTS})"
+        try:
+            result = _ota_run(
+                peer,
+                "true",
+                label=f"{peer.name}: reachable{suffix}",
+                batch=True,
+                check=False,
+                timeout=_REACH_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            last_detail = f"no answer within {_REACH_TIMEOUT_SECONDS:.0f}s"
+        else:
+            if result.returncode == 0:
+                if attempt > 1:
+                    print(
+                        f"! {peer.name}: reachable on attempt {attempt} of {_REACH_ATTEMPTS} — the transport was flaky"
+                    )
+                return
+            last_detail = ((result.stdout or "") + (result.stderr or "")).strip() or f"exit code {result.returncode}"
+        if attempt < _REACH_ATTEMPTS:
+            print(f"! {peer.name}: not reachable ({last_detail}); retrying")
+            time.sleep(_REACH_BACKOFF_SECONDS * attempt)
+
+    raise RuntimeError(
+        f"{peer.name}: not reachable via {_ota_peer_target(peer)} after "
+        f"{_REACH_ATTEMPTS} attempts.\nLast failure: {last_detail}"
+    )
+
+
 def _ota_preflight(
     plan: OtaSmokePlan,
     *,
@@ -2928,7 +2988,7 @@ def _ota_preflight(
     sudo_passwords = sudo_passwords or {}
     for peer in plan.peers.values():
         if _ota_peer_is_remote(peer):
-            _ota_run(peer, "true", label=f"{peer.name}: reachable", dry_run=dry_run, batch=True)
+            _ota_reach_check(peer, dry_run=dry_run)
         required = ["python3", "docker", "tar"]
         if require_tmux:
             required.append("tmux")

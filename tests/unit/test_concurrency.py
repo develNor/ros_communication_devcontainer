@@ -702,3 +702,97 @@ def test_sigterm_disposition_is_restored() -> None:
     with rosotacom._terminate_via_exception():
         assert signal.getsignal(signal.SIGTERM) is not before
     assert signal.getsignal(signal.SIGTERM) is before
+
+
+def _reach_peer() -> rosotacom.OtaSmokePeer:
+    return rosotacom.OtaSmokePeer("a", "robot-a", "10.0.0.10")
+
+
+def test_reach_check_retries_a_transport_that_flaked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An ssh handshake that times out under load is not a verdict about the peer.
+
+    The probe is `true`, so a non-zero exit can only be the transport. That is
+    what makes retrying safe here and nowhere else in the preflight.
+    """
+    attempts: list[str] = []
+
+    def fake_ota_run(peer: object, script: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        attempts.append(script)
+        if len(attempts) < 3:
+            return subprocess.CompletedProcess([script], 255, "", "ssh: connect to host port 22: Connection timed out")
+        return subprocess.CompletedProcess([script], 0, "", "")
+
+    monkeypatch.setattr(rosotacom, "_ota_run", fake_ota_run)
+    monkeypatch.setattr(rosotacom.time, "sleep", lambda _seconds: None)
+
+    rosotacom._ota_reach_check(_reach_peer(), dry_run=False)
+
+    assert len(attempts) == 3
+    out = capsys.readouterr().out
+    # The run must not read as a clean first-try connection.
+    assert "attempt 3 of 3" in out
+    assert "flaky" in out
+
+
+def test_reach_check_retries_a_timeout_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    def fake_ota_run(peer: object, script: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd=["ssh"], timeout=20.0)
+        return subprocess.CompletedProcess([script], 0, "", "")
+
+    monkeypatch.setattr(rosotacom, "_ota_run", fake_ota_run)
+    monkeypatch.setattr(rosotacom.time, "sleep", lambda _seconds: None)
+
+    rosotacom._ota_reach_check(_reach_peer(), dry_run=False)
+    assert len(calls) == 2
+
+
+def test_reach_check_gives_up_and_says_how_often_it_tried(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    def fake_ota_run(peer: object, script: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess([script], 255, "", "ssh: Could not resolve hostname robot-a")
+
+    monkeypatch.setattr(rosotacom, "_ota_run", fake_ota_run)
+    monkeypatch.setattr(rosotacom.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        rosotacom._ota_reach_check(_reach_peer(), dry_run=False)
+
+    assert len(calls) == rosotacom._REACH_ATTEMPTS
+    message = str(excinfo.value)
+    assert "after 3 attempts" in message
+    assert "Could not resolve hostname" in message
+
+
+def test_the_load_check_does_not_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the reachability probe retries.
+
+    A peer somebody else is saturating is still saturated a moment later, and a
+    container that is already running is still running. Retrying those would
+    turn a real refusal into a delayed one, which is the failure mode the load
+    check exists to prevent.
+    """
+    calls: list[str] = []
+
+    def fake_ota_run(peer: object, script: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(script)
+        return subprocess.CompletedProcess([script], 0, "78.24 81.86 81.28\n32\n", "")
+
+    monkeypatch.setattr(rosotacom, "_ota_run", fake_ota_run)
+    monkeypatch.setattr(rosotacom.time, "sleep", lambda _seconds: pytest.fail("the load check must not sleep"))
+
+    with pytest.raises(RuntimeError):
+        rosotacom._ota_load_check(_load_plan(tmp_path), dry_run=False)
+
+    assert len(calls) == 1

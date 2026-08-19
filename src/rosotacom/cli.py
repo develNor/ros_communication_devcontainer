@@ -2740,9 +2740,11 @@ def _passwordless_watchdog_command(argv: Sequence[str]) -> str:
 def _ota_conflict_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
     """Fail-safe preflight: OTA runs require exclusive control of the peers.
 
-    Aborts when a peer already runs rosotacom containers or has active network
-    shaping (netem/tbf/htb) on the data interface toward another peer — both
-    signal an OTA run that is still active or was not cleaned up.
+    Aborts when a peer already runs rosotacom containers, has active network
+    shaping (netem/tbf/htb) on the data interface toward another peer, or is
+    carrying so much unrelated load that a measurement taken on it would not
+    mean anything. The first two signal an OTA run that is still active or was
+    not cleaned up; the third signals a machine somebody else is using.
     """
     from .network_shaper import ota_interface_from_route
 
@@ -2794,6 +2796,59 @@ def _ota_conflict_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
                     + f"\nStop the run that applied it, clear it (sudo tc qdisc del dev {interface} root),"
                     " or pass --skip-conflict-check."
                 )
+
+
+# A run on a machine somebody else is saturating does not fail — it succeeds
+# and reports numbers that describe the contention rather than the link. That
+# is the expensive kind of wrong, because nothing in the artefact says so
+# afterwards.
+#
+# The thresholds are per-CPU, so they read the same on an 8-core laptop and a
+# 32-thread desktop. At 2.0 the run stops: with twice as many runnable threads
+# as CPUs, a thread waits on average as long as it runs, which lands directly
+# in the scheduling latency a transport measurement is trying to resolve.
+_LOAD_WARN_PER_CPU = 0.7
+_LOAD_REFUSE_PER_CPU = 2.0
+
+
+def _ota_load_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
+    """Refuse to measure on a peer that is busy with someone else's work."""
+    for peer in plan.peers.values():
+        result = _ota_run(
+            peer,
+            "cut -d' ' -f1-3 /proc/loadavg; nproc",
+            label=f"{peer.name}: host load",
+            dry_run=dry_run,
+            batch=True,
+            check=False,
+        )
+        if dry_run or result.returncode != 0:
+            continue
+        lines = (result.stdout or "").split()
+        if len(lines) < 4:
+            continue
+        try:
+            load1, load5, load15 = (float(value) for value in lines[:3])
+            cpus = max(1, int(lines[3]))
+        except ValueError:
+            continue
+        # load5 as well as load1: a run takes minutes, and a machine that was
+        # busy a moment ago is about to be busy again.
+        ratio = max(load1, load5) / cpus
+        # Two decimals to match /proc/loadavg and uptime, so the number in an
+        # artefact can be compared against what the machine reports itself.
+        summary = f"load {load1:.2f}/{load5:.2f}/{load15:.2f} on {cpus} CPUs ({ratio:.2f} per CPU)"
+        if ratio >= _LOAD_REFUSE_PER_CPU:
+            raise RuntimeError(
+                f"Peer {peer.name} is carrying unrelated load: {summary}.\n"
+                "A measurement taken here would describe the contention, not the link.\n"
+                "Wait for the machine to go quiet, measure on another pair, or — if this "
+                "load is yours and expected — pass --skip-conflict-check."
+            )
+        if ratio >= _LOAD_WARN_PER_CPU:
+            print(f"! {peer.name}: {summary} — comparisons survive if runs are interleaved, absolute latencies do not")
+        else:
+            print(f"+ {peer.name}: {summary}")
 
 
 def _ota_preflight(
@@ -2900,6 +2955,7 @@ def _ota_preflight(
 
     if check_conflicts:
         _ota_conflict_check(plan, dry_run=dry_run)
+        _ota_load_check(plan, dry_run=dry_run)
 
 
 _OTA_STAGE_EXCLUDES = {
@@ -4176,6 +4232,7 @@ def _start_interactive_ota_smoke(args: argparse.Namespace) -> int:
 
     if not getattr(args, "skip_preflight", False) and not getattr(args, "skip_conflict_check", False):
         _ota_conflict_check(plan, dry_run=dry_run)
+        _ota_load_check(plan, dry_run=dry_run)
     _ota_prepare_hosts(args, runtime, plan)
     instance = _resolve_session_instance(
         runtime,

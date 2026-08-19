@@ -580,3 +580,69 @@ def test_local_benchmark_aborts_on_any_active_rosotacom_container(
 def test_local_benchmark_passes_on_quiet_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rosotacom, "_list_docker_containers", lambda all_states=False: [("onedrive", ["bridge"])])
     cli_benchmark._abort_on_local_benchmark_conflicts(argparse.Namespace())
+
+
+def _load_plan(tmp_path: Path) -> rosotacom.OtaSmokePlan:
+    return rosotacom.OtaSmokePlan(
+        state_path=tmp_path / "ota-deployment.yaml",
+        workdir="/tmp/rosotacom_ota",
+        rosotacom="rosotacom",
+        project="rosotacom.yaml",
+        peers={"a": rosotacom.OtaSmokePeer("a", None, "10.0.0.10")},
+    )
+
+
+def test_ota_load_check_refuses_a_peer_someone_else_is_saturating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy peer must stop the run, not quietly distort it.
+
+    Measured on majestic on 2026-08-19: load 78 on 32 CPUs while a colleague
+    trained models. Runs there did not fail — they completed and reported
+    numbers that described the contention.
+    """
+    monkeypatch.setattr(
+        rosotacom,
+        "_ota_run",
+        _fake_ota_run_factory({"/proc/loadavg": "78.24 81.86 81.28\n32\n"}),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        rosotacom._ota_load_check(_load_plan(tmp_path), dry_run=False)
+
+    message = str(excinfo.value)
+    assert "unrelated load" in message
+    assert "--skip-conflict-check" in message
+
+
+def test_ota_load_check_warns_but_proceeds_on_moderate_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        rosotacom,
+        "_ota_run",
+        _fake_ota_run_factory({"/proc/loadavg": "9.0 8.0 7.0\n8\n"}),
+    )
+    rosotacom._ota_load_check(_load_plan(tmp_path), dry_run=False)
+    out = capsys.readouterr().out
+    assert "interleaved" in out
+
+
+def test_ota_load_check_is_quiet_on_an_idle_peer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The reading is printed even when it passes: a result should carry the
+    conditions it was measured under, not only the ones that stopped it."""
+    monkeypatch.setattr(
+        rosotacom,
+        "_ota_run",
+        _fake_ota_run_factory({"/proc/loadavg": "0.21 0.08 0.02\n8\n"}),
+    )
+    rosotacom._ota_load_check(_load_plan(tmp_path), dry_run=False)
+    out = capsys.readouterr().out
+    assert "0.21" in out and "8 CPUs" in out

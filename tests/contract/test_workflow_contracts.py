@@ -137,6 +137,11 @@ def _e2e_slices(workflow_name: str, job: str) -> list[str]:
     return list(workflow["jobs"][job]["strategy"]["matrix"]["slice"])
 
 
+def _e2e_variants(workflow_name: str, job: str) -> list[str]:
+    workflow = yaml.safe_load((WORKFLOWS_DIR / workflow_name).read_text(encoding="utf-8"))
+    return list(workflow["jobs"][job]["strategy"]["matrix"]["variant"])
+
+
 def _release_e2e_slices() -> list[str]:
     """The slice names the release matrix expands to."""
     return _e2e_slices("release.yml", E2E_SLICE_MATRICES["release.yml"])
@@ -157,6 +162,25 @@ def test_every_e2e_workflow_runs_the_same_slices() -> None:
     assert not mismatched, f"e2e slice lists disagree; release.yml has {reference} but: " + "; ".join(
         f"{name} has {value}" for name, value in sorted(mismatched.items())
     )
+
+
+def test_every_e2e_workflow_gates_kilted_and_lyrical() -> None:
+    expected = ["kilted", "lyrical"]
+    for workflow_name, job_name in sorted(E2E_SLICE_MATRICES.items()):
+        workflow = yaml.safe_load((WORKFLOWS_DIR / workflow_name).read_text(encoding="utf-8"))
+        job = workflow["jobs"][job_name]
+        assert _e2e_variants(workflow_name, job_name) == expected
+        assert "matrix.variant" in job["name"]
+
+        run_step = next(step for step in job["steps"] if "test-e2e-slice" in step.get("run", ""))
+        selected_config = run_step["env"]["ROSOTACOM_ROS2DOCKER_CONFIG"]
+        assert "matrix.variant == 'lyrical'" in selected_config
+        assert "ros2docker.lyrical.json" in selected_config
+
+    merge_gate = (WORKFLOWS_DIR / "pr-merge-gate.yml").read_text(encoding="utf-8")
+    assert "references-kilted.txt" in merge_gate
+    assert "references-lyrical.txt" in merge_gate
+    assert 'ROSOTACOM_ROS2DOCKER_CONFIG="$config"' in merge_gate
 
 
 def test_ci_success_checks_every_job_it_waits_for() -> None:

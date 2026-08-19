@@ -138,9 +138,10 @@ class UniversalDecompressorNode(Node):
 
         # 4) Keep track of what compressed topics we have already subscribed to
         self.subscribed_topics = set()
-        # Keep ROS entity objects alive explicitly.
-        self._subscriptions = []
-        self._publishers = []
+        # Keep our own references without shadowing rclpy.Node private fields.
+        # The create_* methods own and update those internal lists themselves.
+        self._owned_subscriptions = []
+        self._owned_publishers = []
 
         # 4b) Cache per compressed topic: created typed publisher + message class.
         #     We create these lazily on the first received message because msg_type now comes
@@ -234,7 +235,7 @@ class UniversalDecompressorNode(Node):
                             qos_profile=sub_qos,
                             callback_group=self.cb_subs,
                         )
-                        self._subscriptions.append(sub)
+                        self._owned_subscriptions.append(sub)
 
                         self.subscribed_topics.add(tname)
                         self.get_logger().info(
@@ -282,7 +283,7 @@ class UniversalDecompressorNode(Node):
 
             pub_qos = get_topic_qos(self.get_logger(), self.qos_config, out_topic, self.pub_role)
             pub = self.create_publisher(typed_cls, out_topic, qos_profile=pub_qos)
-            self._publishers.append(pub)
+            self._owned_publishers.append(pub)
             self._typed_pub_cache[compressed_topic] = {
                 'pub': pub,
                 'typed_cls': typed_cls,

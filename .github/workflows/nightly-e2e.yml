@@ -32,12 +32,13 @@ jobs:
     # nightly failed with nine "Timed out waiting for container readiness"
     # errors after 1h12m on one runner, while the same tests on the same commit
     # passed in the merge gate — where they were spread over six at the time.
-    name: smoke-e2e-${{ matrix.slice }}
+    name: smoke-e2e-${{ matrix.variant }}-${{ matrix.slice }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        variant: [kilted, lyrical]
         slice:
           - heartbeat
           - chatter
@@ -86,24 +87,27 @@ jobs:
         run: docker info
 
       - name: Run E2E slice
+        env:
+          ROSOTACOM_ROS2DOCKER_CONFIG: ${{ matrix.variant == 'lyrical' && format('{0}/src/rosotacom/resources/examples/ros2docker.lyrical.json', github.workspace) || '' }}
         run: just test-e2e-slice ${{ matrix.slice }}
 
       - name: Upload smoke session artifacts
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: session-instances-smoke-${{ matrix.slice }}
+          name: session-instances-smoke-${{ matrix.variant }}-${{ matrix.slice }}
           path: session-instances/
           if-no-files-found: ignore
 
   rmw-matrix:
-    name: rmw-${{ matrix.session }}
+    name: rmw-${{ matrix.variant }}-${{ matrix.session }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     if: github.event_name != 'schedule' || github.event.inputs.full-rmw-matrix != 'false'
     strategy:
       fail-fast: false
       matrix:
+        variant: [kilted, lyrical]
         session:
           - cyclone-local-zenoh-ros2dds-ota
           - cyclone-ota
@@ -139,12 +143,14 @@ jobs:
         run: docker info
 
       - name: Run generated RMW matrix session
+        env:
+          ROSOTACOM_ROS2DOCKER_CONFIG: ${{ matrix.variant == 'lyrical' && format('{0}/src/rosotacom/resources/examples/ros2docker.lyrical.json', github.workspace) || '' }}
         run: just test-e2e-rmw ${{ matrix.session }}
 
       - name: Upload RMW session artifacts
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: session-instances-rmw-${{ matrix.session }}
+          name: session-instances-rmw-${{ matrix.variant }}-${{ matrix.session }}
           path: session-instances/
           if-no-files-found: ignore

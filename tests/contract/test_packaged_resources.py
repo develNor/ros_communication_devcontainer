@@ -13,6 +13,13 @@ import yaml
 import rosotacom.cli as cli
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+LYRICAL_EXAMPLE_CONFIG = cli.EXAMPLE_PROJECT_DIR / "ros2docker.lyrical.json"
+PACKAGED_COMMUNICATION_CONFIGS = (
+    cli.DEFAULT_ROS2DOCKER_CONFIG,
+    cli.LYRICAL_ROS2DOCKER_CONFIG,
+    cli.EXAMPLE_PROJECT_DIR / "ros2docker.json",
+    LYRICAL_EXAMPLE_CONFIG,
+)
 
 
 def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> None:
@@ -21,9 +28,11 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
     expected = (
         "py.typed",
         "resources/ros2docker.json.example",
+        "resources/ros2docker.lyrical.json.example",
         "resources/examples/rosotacom.yaml",
         "resources/examples/.gitignore",
         "resources/examples/ros2docker.json",
+        "resources/examples/ros2docker.lyrical.json",
         "resources/examples/profiles.yaml",
         "resources/examples/deployment.example.yaml",
         "resources/examples/bags/8_drop_reference/metadata.yaml",
@@ -34,6 +43,8 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
         "resources/examples/sessions/16_remote_assist_anonymized_camera/session-definition.yaml",
         "resources/examples/sessions/17_synthetic_camera_quality/session-definition.yaml",
         "resources/examples/scenarios/2_native_chatter/scenario-definition.yaml",
+        "resources/examples/scripts/2_native_chatter/machine_a/external.lyrical.ros2docker.json",
+        "resources/examples/scripts/2_native_chatter/machine_b/external.lyrical.ros2docker.json",
         "resources/ws/session/creation/run_session.py",
         "resources/ws/session/creation/catmux_log_setup.sh",
         "resources/ws/session/creation/strip_ansi.py",
@@ -72,6 +83,7 @@ def test_cli_resource_constants_point_inside_package_resources() -> None:
     assert cli.RESOURCE_DIR == PACKAGE_ROOT / "src" / "rosotacom" / "resources"
     assert cli.WS_DIR == cli.RESOURCE_DIR / "ws"
     assert cli.DEFAULT_ROS2DOCKER_CONFIG == cli.RESOURCE_DIR / "ros2docker.json.example"
+    assert cli.LYRICAL_ROS2DOCKER_CONFIG == cli.RESOURCE_DIR / "ros2docker.lyrical.json.example"
     assert cli.EXAMPLE_PROJECT_DIR == cli.RESOURCE_DIR / "examples"
 
 
@@ -112,14 +124,56 @@ def test_default_ros2docker_config_pins_supported_kilted_noble_image() -> None:
         assert "ros-kilted-gps-msgs" in apt_packages
 
 
+def test_opt_in_lyrical_config_pins_resolute_and_source_domain_bridge() -> None:
+    root_config = cli.load_config(cli.LYRICAL_ROS2DOCKER_CONFIG)
+    example_config = cli.load_config(LYRICAL_EXAMPLE_CONFIG)
+
+    for config in (root_config, example_config):
+        assert config["image_name"] == "ros-communication-lyrical"
+        assert config["profile"] == "domain-bridge"
+        build_args = config["build_args"]
+        assert build_args["BASE_IMAGE"] == "ros:lyrical-ros-base-resolute"
+        assert build_args["DIGEST"].startswith("@sha256:")
+        assert build_args["INSTALL_DOMAIN_BRIDGE"] == "1"
+        assert build_args["INSTALL_ZENOH"] == "1"
+
+        apt_packages = set(str(build_args["APT_PACKAGES"]).split())
+        assert "ros-lyrical-domain-bridge" not in apt_packages
+        for package in (
+            "ros-lyrical-rmw-cyclonedds-cpp",
+            "ros-lyrical-rmw-zenoh-cpp",
+            "ros-lyrical-topic-tools",
+            "ros-lyrical-image-transport",
+            "ros-lyrical-compressed-image-transport",
+            "ros-lyrical-ffmpeg-image-transport",
+            "ros-lyrical-ffmpeg-image-transport-msgs",
+            "ros-lyrical-gps-msgs",
+        ):
+            assert package in apt_packages
+
+        pip_packages = str(build_args["PIP_PACKAGES"]).split()
+        assert "numpy>=2,<3" in pip_packages
+
+    assert root_config["build_args"] == example_config["build_args"]
+
+
+def test_packaged_example_keeps_kilted_as_the_default_variant() -> None:
+    project = yaml.safe_load((cli.EXAMPLE_PROJECT_DIR / "rosotacom.yaml").read_text(encoding="utf-8"))
+
+    assert project["ros2docker_config"] == "ros2docker.json"
+    assert cli.load_config(cli.EXAMPLE_PROJECT_DIR / project["ros2docker_config"])["build_args"][
+        "BASE_IMAGE"
+    ].startswith("ros:kilted-")
+
+
 # `image_transport republish` resolves a transport name to a pluginlib class at
 # runtime, so a transport nobody installed is not a build failure — it is a
 # container that starts fine and aborts on the first image message. `raw` ships
 # with image_transport itself; every other transport needs its own package.
-IMAGE_TRANSPORT_APT_PACKAGES = {
-    "raw": "ros-kilted-image-transport",
-    "compressed": "ros-kilted-compressed-image-transport",
-    "ffmpeg": "ros-kilted-ffmpeg-image-transport",
+IMAGE_TRANSPORT_APT_SUFFIXES = {
+    "raw": "image-transport",
+    "compressed": "compressed-image-transport",
+    "ffmpeg": "ffmpeg-image-transport",
 }
 
 
@@ -157,12 +211,15 @@ def test_every_image_transport_the_session_plugin_can_select_is_installed() -> N
     # Both branches of that choice, so a rewrite that drops one is visible here.
     assert {"raw", "compressed"} <= selected
 
-    unknown = selected - set(IMAGE_TRANSPORT_APT_PACKAGES)
+    unknown = selected - set(IMAGE_TRANSPORT_APT_SUFFIXES)
     assert not unknown, f"no apt package recorded for image transport(s): {sorted(unknown)}"
 
-    required = {IMAGE_TRANSPORT_APT_PACKAGES[transport] for transport in selected}
-    for config_path in (cli.DEFAULT_ROS2DOCKER_CONFIG, cli.EXAMPLE_PROJECT_DIR / "ros2docker.json"):
-        apt_packages = set(str(cli.load_config(config_path)["build_args"]["APT_PACKAGES"]).split())
+    for config_path in PACKAGED_COMMUNICATION_CONFIGS:
+        config = cli.load_config(config_path)
+        base_image = str(config["build_args"]["BASE_IMAGE"])
+        distro = base_image.split(":", 1)[1].split("-", 1)[0]
+        required = {f"ros-{distro}-{IMAGE_TRANSPORT_APT_SUFFIXES[transport]}" for transport in selected}
+        apt_packages = set(str(config["build_args"]["APT_PACKAGES"]).split())
         missing = required - apt_packages
         assert not missing, f"{config_path.name} does not install {sorted(missing)}"
 
@@ -176,12 +233,7 @@ def test_packaged_configs_do_not_fetch_rosdep_on_container_start() -> None:
     communication container before that small build and make readiness depend
     on raw.githubusercontent.com.
     """
-    configs = (
-        cli.DEFAULT_ROS2DOCKER_CONFIG,
-        cli.EXAMPLE_PROJECT_DIR / "ros2docker.json",
-    )
-
-    for config_path in configs:
+    for config_path in PACKAGED_COMMUNICATION_CONFIGS:
         config = cli.load_config(config_path)
         run_args = [str(value) for value in config["run_args"]]
 
@@ -190,7 +242,7 @@ def test_packaged_configs_do_not_fetch_rosdep_on_container_start() -> None:
 
 
 def test_external_ros2docker_configs_install_selected_rmw_implementations() -> None:
-    configs = sorted(cli.EXAMPLE_PROJECT_DIR.glob("scripts/**/external.ros2docker.json"))
+    configs = sorted(cli.EXAMPLE_PROJECT_DIR.glob("scripts/**/external*.ros2docker.json"))
     assert configs
 
     offenders: list[str] = []
@@ -202,9 +254,12 @@ def test_external_ros2docker_configs_install_selected_rmw_implementations() -> N
 
         build_args = config.get("build_args", {}) or {}
         apt_packages = set(str(build_args.get("APT_PACKAGES", "")).split())
-        if "ros-kilted-rmw-cyclonedds-cpp" not in apt_packages:
+        base_image = str(build_args.get("BASE_IMAGE", ""))
+        match = re.search(r"ros:([a-z][a-z0-9_]*)-", base_image)
+        expected_package = f"ros-{match.group(1)}-rmw-cyclonedds-cpp" if match else None
+        if expected_package is None or expected_package not in apt_packages:
             rel = config_path.relative_to(cli.EXAMPLE_PROJECT_DIR)
-            offenders.append(f"{rel} selects rmw_cyclonedds_cpp but does not install its package")
+            offenders.append(f"{rel} selects rmw_cyclonedds_cpp but does not install its distro-matched package")
 
     assert not offenders
 
@@ -228,6 +283,10 @@ def test_all_owned_configs_parse_and_validate() -> None:
 
     # 1. ros2docker.json.example
     load_config(cli.DEFAULT_ROS2DOCKER_CONFIG)
+
+    # 1b. opt-in Lyrical configs
+    load_config(cli.LYRICAL_ROS2DOCKER_CONFIG)
+    load_config(LYRICAL_EXAMPLE_CONFIG)
 
     # 2. rosotacom.yaml example
     yaml.safe_load(cli.EXAMPLE_PROJECT_DIR.joinpath("rosotacom.yaml").read_text(encoding="utf-8"))
@@ -363,9 +422,11 @@ def test_every_registered_subcommand_is_exempt_from_implicit_start(
     assert "resources" in registered
 
 
-def test_named_resources_point_at_real_packaged_directories() -> None:
+def test_named_resources_point_at_real_packaged_paths() -> None:
     for name, path in cli.NAMED_RESOURCES.items():
-        assert path.is_dir(), f"packaged resource {name!r} is not a directory: {path}"
+        assert path.exists(), f"packaged resource {name!r} does not exist: {path}"
+
+    assert cli.NAMED_RESOURCES["ros2docker-lyrical"].is_file()
 
     # com_msgs is consumed by external builds (fleet_mgmt bakes it into its
     # container images), so it must be a usable ROS 2 package, not just a folder.

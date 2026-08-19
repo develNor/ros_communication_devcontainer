@@ -306,11 +306,17 @@ def test_anonymize_cli_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
     # Mock docker running api
     container_runs = []
+    image_builds = []
 
     def mock_ros2docker_run(config_file, override, extra_run_args):
         container_runs.append((override, extra_run_args))
 
     monkeypatch.setattr(cli, "ros2docker_run", mock_ros2docker_run, raising=False)
+    monkeypatch.setattr(
+        cli,
+        "_build_image",
+        lambda config_file, override: image_builds.append((config_file, override)),
+    )
     monkeypatch.setattr(cli, "_stop_container_name", lambda *args, **kwargs: None)
     monkeypatch.setattr(cli, "_require_ros2docker", lambda: None)
 
@@ -369,6 +375,17 @@ def test_anonymize_cli_subcommand(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert len(container_runs) == 1
     override, extra_args = container_runs[0]
     assert override["container_name"] == "rosotacom_anonymizer"
+    assert override["image_name"] == "ros2docker-test-image-test_install"
+    assert image_builds == [
+        (
+            runtime.ros2docker_config,
+            {
+                "container_name": "rosotacom_anonymizer",
+                "image_name": "ros2docker-test-image-test_install",
+            },
+        )
+    ]
+    assert play_cfg["image_name"] == "ros2docker-test-image"
     # Batch job must stay headless-safe: a TTY aborts without a terminal.
     assert override["tty"] is False
     assert override["stdin_open"] is False

@@ -44,7 +44,9 @@ class UniversalOtaWrapperNode(Node):
         self.sequence_lock = Lock()
         self.subscribed_topics = set()
         self.sequence_by_topic = {}
-        self._subscriptions = []
+        # Keep our own references without shadowing rclpy.Node._subscriptions.
+        # Node.create_subscription() owns and updates that private list itself.
+        self._owned_subscriptions = []
 
         self.config = self.load_config(config_file)
 
@@ -107,7 +109,7 @@ class UniversalOtaWrapperNode(Node):
                                ),
                         qos_profile=sub_qos,
                     )
-                    self._subscriptions.append(subscription)
+                    self._owned_subscriptions.append(subscription)
                     self.subscribed_topics.add(out_topic)
 
                     self.get_logger().info(

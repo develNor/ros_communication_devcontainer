@@ -43,22 +43,28 @@ check is:
 ci-success
 ```
 
-The merge gate runs workflow lint, dependency/security review, runtime/build asset lint, Python 3.10 through 3.14 non-Docker checks, package validation, and the Docker single-machine smoke matrix (one matrix job per slice, seventeen in parallel):
+The merge gate runs workflow lint, dependency/security review, runtime/build
+asset lint, Python 3.10 through 3.14 non-Docker checks, package validation, and
+the Docker single-machine smoke matrix: seventeen diagnostic slices for each of
+the `kilted` and `lyrical` variants, 34 jobs in parallel. Scenario application
+images follow the selected communication distro through
+`ros2docker_config_by_distro`, so each variant is end-to-end rather than a
+cross-distro combination.
 
 Python 3.10–3.14 are supported for the host CLI; Python 3.12 is the reference
 interpreter for packaging and Docker E2E jobs.
 
 ### What the e2e slices wait for
 
-The only explicit barriers before the seventeen slices are their `needs`. They
-wait for exactly two jobs:
+The only explicit barriers before the 34 variant/slice jobs are their `needs`.
+They wait for exactly two jobs:
 
 - **`image`**, because a slice adopts the published image rather than building
   it, so it cannot start before that image is known to exist. On a hit this is
   two manifest inspections, and it is what sets the floor.
 - **`quick-gate`**, `just lint && just typecheck` on one interpreter: the
-  cheapest signal that the tree is not obviously broken, so seventeen runners
-  do not spend roughly 73 minutes discovering a syntax error. Four seconds of work,
+  cheapest signal that the tree is not obviously broken, so 34 runners do not
+  spend roughly 146 minutes discovering a syntax error. Four seconds of work,
   sized to finish inside `image` and therefore free.
 
 They used to wait for `preflight-success`, which meant the whole five-version
@@ -105,19 +111,23 @@ Docker E2E is not collected for coverage.
 
 ## Docker E2E
 
-`just test-e2e-smoke` runs the entire local single-machine smoke matrix through Docker. In the CI merge gate, the same collection runs as seventeen parallel
-jobs, one per slice, named `e2e-<slice>`. Each smoke run writes generated
-config, catmux pane logs, Docker logs when available, and the smoke verification
-log under `session-instances/`; collect that directory as the first debugging
-artifact when an E2E job fails.
+`just test-e2e-smoke` runs the entire local single-machine smoke matrix through
+Docker using the selected config (Kilted by default). In the CI merge gate, the
+same collection runs for both Kilted and Lyrical as 34 parallel jobs, one per
+variant/slice pair, named `e2e-<variant>-<slice>`. Each smoke run writes
+generated config, catmux pane logs, Docker logs when available, and the smoke
+verification log under `session-instances/`; collect that directory as the
+first debugging artifact when an E2E job fails.
 
 ### The e2e image is published once, not rebuilt per job
 
 Every e2e job used to build the project image from scratch. #236 measured that
 at 154s per job — 57s pulling the multi-GB ROS base from Docker Hub, 40s
 exporting layers, 47s of apt and pip — which was 33 minutes of runner time and
-thirteen Hub pulls with the matrix at that time. The image is still published
-only once now that the diagnostic matrix has seventeen jobs.
+thirteen Hub pulls with the matrix at that time. Each distribution-specific
+communication image is now published once, despite the 17 consumers per
+variant; scenario application images common to both variants are deduplicated
+by their content-addressed references.
 
 The `image` job now publishes those images to
 `ghcr.io/<owner>/rosotacom-e2e` and each slice pulls instead of building. GHCR
@@ -161,6 +171,9 @@ Two properties are worth keeping in mind when changing this:
   image from a different package list, so `rosotacom image references` walks the
   project config *and* every scenario application. Publishing only the project
   image would leave that slice adopting something nobody published.
+- **Both ROS variants are published.** The publisher resolves the project once
+  with the default Kilted config and once with the opt-in Lyrical config. A
+  variant's reference is built under the same selection that derived it.
 - **The release and nightly lanes still build from scratch**, as does the
   nightly `image-scan`. That is deliberate: they are what would notice if a
   published image and a fresh build ever stopped agreeing.
@@ -256,10 +269,12 @@ The deterministic benchmark rows gate against committed two-sided bands
 ## Nightly And Maintenance Checks
 
 `.github/workflows/nightly-e2e.yml` runs the local smoke slice plus the generated
-RMW matrix nightly on GitHub-hosted infrastructure and also supports manual
-dispatch. It is not the private OTA promotion gate.
-`.github/workflows/image-scan.yml` builds the default communication image and
-uploads an advisory Trivy report.
+RMW matrix for both Kilted and Lyrical nightly on GitHub-hosted infrastructure
+and also supports manual dispatch. It is not the private OTA promotion gate.
+`.github/workflows/image-scan.yml` builds both communication variants and
+uploads one advisory Trivy report per image. The dedicated performance gate
+remains on the default Kilted config because its committed budgets are
+distribution-specific; switching the default requires a fresh calibration.
 
 Dependabot is configured for weekly grouped GitHub Actions and Python dependency
 updates.

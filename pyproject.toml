@@ -19,7 +19,7 @@ dependencies = [
   "mcap>=1.4,<2",
   "Pillow>=10,<13",
   "PyYAML>=6",
-  "ros2docker>=0.1.5.dev8,<0.2",
+  "ros2docker>=0.1.5.dev10,<0.2",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",

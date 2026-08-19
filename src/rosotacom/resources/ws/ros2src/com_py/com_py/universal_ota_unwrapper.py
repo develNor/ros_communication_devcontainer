@@ -45,7 +45,9 @@ class UniversalOtaUnwrapperNode(Node):
         self.subscribe_lock = Lock()
         self.cache_lock = Lock()
         self.subscribed_topics = set()
-        self._subscriptions = []
+        # Keep our own references without shadowing rclpy.Node._subscriptions.
+        # Node.create_subscription() owns and updates that private list itself.
+        self._owned_subscriptions = []
         self._typed_pub_cache = {}
         self._last_seq = {}
 
@@ -101,7 +103,7 @@ class UniversalOtaUnwrapperNode(Node):
                                ),
                         qos_profile=sub_qos,
                     )
-                    self._subscriptions.append(subscription)
+                    self._owned_subscriptions.append(subscription)
                     self.subscribed_topics.add(topic_name)
 
                     self.get_logger().info(

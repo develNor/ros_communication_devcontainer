@@ -115,12 +115,13 @@ jobs:
     # identical to nightly-e2e.yml's smoke-e2e job, so the release used to be
     # the third sequential run of the same tests against the same tree; it
     # dominated release wall-clock at roughly an hour. See issue #196.
-    name: e2e-${{ matrix.slice }}
+    name: e2e-${{ matrix.variant }}-${{ matrix.slice }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
+        variant: [kilted, lyrical]
         slice:
           - heartbeat
           - chatter
@@ -169,13 +170,15 @@ jobs:
         run: docker info
 
       - name: Run E2E slice
+        env:
+          ROSOTACOM_ROS2DOCKER_CONFIG: ${{ matrix.variant == 'lyrical' && format('{0}/src/rosotacom/resources/examples/ros2docker.lyrical.json', github.workspace) || '' }}
         run: just test-e2e-slice ${{ matrix.slice }}
 
       - name: Upload session artifacts
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: session-instances-e2e-${{ matrix.slice }}
+          name: session-instances-e2e-${{ matrix.variant }}-${{ matrix.slice }}
           path: session-instances/
           if-no-files-found: ignore
 

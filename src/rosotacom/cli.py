@@ -275,6 +275,13 @@ class OtaSmokePeer:
     #: list. Naming the transport lets the narrow thing be substituted without
     #: this file having to know what narrow means.
     exec_command: str | None = None
+    #: CPUs this peer's session containers are confined to, e.g. "0-3".
+    #:
+    #: The reason it is per peer: a reservation is a property of one machine's
+    #: contention, not of the run. A bench pair is usually one busy workstation
+    #: shared with somebody else and one idle machine, and pinning the idle one
+    #: would only take capacity away from the measurement.
+    cpuset: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1189,6 +1196,11 @@ def _parse_peer_exec_overrides(overrides: list[str] | None) -> dict[str, str]:
     return parse_assignments(overrides, option="--peer-exec")
 
 
+def _parse_peer_cpuset_overrides(overrides: list[str] | None) -> dict[str, str]:
+    parsed = parse_assignments(overrides, option="--peer-cpuset")
+    return {name: validate_cpuset(value) for name, value in parsed.items()}
+
+
 def _deployment_config(runtime: RuntimeConfig) -> DeploymentConfig | None:
     return load_deployment(runtime.deployment)
 
@@ -1749,8 +1761,13 @@ def _ota_plan_from_bindings(
     checkouts: Mapping[str, str] | None = None,
     project: str | None = None,
     exec_commands: Mapping[str, str] | None = None,
+    cpusets: Mapping[str, str] | None = None,
 ) -> OtaSmokePlan:
     _ota_validate_install_mode(install_mode)
+    if cpusets:
+        unknown = sorted(set(cpusets) - set(bindings))
+        if unknown:
+            raise RuntimeError(f"--peer-cpuset names a peer the session does not have: {', '.join(unknown)}")
     if exec_commands:
         unknown = sorted(set(exec_commands) - set(bindings))
         if unknown:
@@ -1811,6 +1828,7 @@ def _ota_plan_from_bindings(
             address=binding.address,
             checkout=(checkouts or {}).get(name) if install_mode == "checkout" else None,
             exec_command=(exec_commands or {}).get(name),
+            cpuset=(cpusets or {}).get(name),
         )
         for name, binding in bindings.items()
     }
@@ -1839,6 +1857,7 @@ def _ota_write_state(instance: SessionInstance, plan: OtaSmokePlan) -> OtaSmokeP
                 "address": peer.address,
                 "ssh": peer.ssh,
                 "checkout": peer.checkout,
+                "cpuset": peer.cpuset,
                 "exec": peer.exec_command,
             }
             for name, peer in sorted(plan.peers.items())
@@ -1865,6 +1884,7 @@ def _ota_load_state(path_arg: str) -> OtaSmokePlan:
             address=str(peer_raw["address"]),
             ssh=str(peer_raw["ssh"]) if peer_raw.get("ssh") else None,
             checkout=str(peer_raw["checkout"]) if peer_raw.get("checkout") else None,
+            cpuset=str(peer_raw["cpuset"]) if peer_raw.get("cpuset") else None,
             exec_command=str(peer_raw["exec"]) if peer_raw.get("exec") else None,
         )
     install_pin = raw.get("install_pin")
@@ -2199,6 +2219,7 @@ def _ota_start_parts(
     mode: str,
     force: bool = True,
     link_trace_parts: list[str] | None = None,
+    cpuset: str | None = None,
 ) -> list[str]:
     if target.target_type == "scenario":
         parts = ["scenario", "start", target.name, "--identity", identity, "--mode", mode, "--instance-id", instance_id]
@@ -2215,6 +2236,8 @@ def _ota_start_parts(
         ]
     parts.append("--force" if force else "--no-force")
     parts.extend(link_trace_parts or [])
+    if cpuset:
+        parts.extend(["--cpuset", cpuset])
     for override in peer_args:
         parts.extend(["--peer-address", override])
     return parts
@@ -2229,6 +2252,7 @@ def _ota_communication_start_parts(
     mode: str,
     force: bool = True,
     link_trace_parts: list[str] | None = None,
+    cpuset: str | None = None,
 ) -> list[str]:
     parts = [
         "start",
@@ -2243,6 +2267,8 @@ def _ota_communication_start_parts(
     ]
     parts.append("--force" if force else "--no-force")
     parts.extend(link_trace_parts or [])
+    if cpuset:
+        parts.extend(["--cpuset", cpuset])
     for override in peer_args:
         parts.extend(["--peer-address", override])
     return parts
@@ -2658,6 +2684,7 @@ def _resolve_ota_smoke_context(
             checkouts=checkouts,
             project=project,
             exec_commands=exec_commands,
+            cpusets=_parse_peer_cpuset_overrides(getattr(args, "peer_cpuset", None)),
         )
     plan_peers = set(plan.peers)
     target_peers = set(_peer_keys_from_cfg(target.cfg))
@@ -2877,10 +2904,121 @@ def _ota_conflict_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
 _LOAD_WARN_PER_CPU = 0.7
 _LOAD_REFUSE_PER_CPU = 2.0
 
+# Thresholds for a peer whose containers are pinned to a CPU set. These are a
+# different quantity from the ones above and deliberately not the same numbers:
+# load-per-CPU counts runnable threads and is unbounded, while this is the busy
+# fraction of the pinned CPUs and cannot exceed 1.0. What it answers is the only
+# question a reservation raises — is anybody else on the cores this run was
+# given — so it is read before the run puts its own work there.
+_CPUSET_WARN_BUSY = 0.5
+_CPUSET_REFUSE_BUSY = 0.85
+
+
+#: Two snapshots of the per-CPU jiffy counters, a second apart. A busy fraction
+#: needs a delta -- the absolute counters describe the machine since boot, which
+#: says nothing about who is on those cores now.
+_CPU_BUSY_PROBE = "grep '^cpu[0-9]' /proc/stat; sleep 1; echo ---; grep '^cpu[0-9]' /proc/stat"
+
+
+def _parse_cpu_busy(stdout: str, cpus: Sequence[int]) -> dict[int, float] | None:
+    """Busy fraction per CPU between the two /proc/stat snapshots.
+
+    Busy is everything but idle and iowait: a core waiting on disk is not
+    competing for the runqueue this measurement cares about, and counting it
+    would refuse runs on a machine that is merely writing a bag.
+    """
+    before, sep, after = stdout.partition("---")
+    if not sep:
+        return None
+
+    def snapshot(text: str) -> dict[int, tuple[int, int]]:
+        out: dict[int, tuple[int, int]] = {}
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) < 6 or not fields[0].startswith("cpu") or not fields[0][3:].isdigit():
+                continue
+            try:
+                values = [int(x) for x in fields[1:]]
+            except ValueError:
+                continue
+            total = sum(values)
+            idle = values[3] + values[4]  # idle + iowait
+            out[int(fields[0][3:])] = (total, idle)
+        return out
+
+    first, second = snapshot(before), snapshot(after)
+    busy: dict[int, float] = {}
+    for cpu in cpus:
+        if cpu not in first or cpu not in second:
+            return None
+        total_delta = second[cpu][0] - first[cpu][0]
+        idle_delta = second[cpu][1] - first[cpu][1]
+        if total_delta <= 0:
+            return None
+        busy[cpu] = max(0.0, min(1.0, 1.0 - idle_delta / total_delta))
+    return busy or None
+
+
+def _ota_cpuset_load_check(peer: OtaSmokePeer, *, dry_run: bool) -> bool:
+    """Judge the CPUs this peer is pinned to, not the machine around them.
+
+    A reservation makes a machine measurable without making it quiet: the other
+    account keeps every thread it had, they just queue on fewer cores, so
+    /proc/loadavg reads higher than before and says nothing about whether the
+    reserved cores are free. Reading those cores directly is the only way the
+    preflight can tell a partitioned workstation from a saturated one.
+
+    Returns False when the probe could not produce a number, so the caller can
+    fall back to the machine-wide check rather than silently skip it.
+    """
+    if not peer.cpuset:
+        return False
+    cpus = parse_cpuset_list(peer.cpuset)
+    result = _ota_run(
+        peer,
+        _CPU_BUSY_PROBE,
+        label=f"{peer.name}: load on CPUs {peer.cpuset}",
+        dry_run=dry_run,
+        batch=True,
+        check=False,
+    )
+    if dry_run:
+        return True
+    if result.returncode != 0:
+        return False
+    busy = _parse_cpu_busy(result.stdout or "", cpus)
+    if busy is None:
+        return False
+
+    worst_cpu = max(busy, key=lambda cpu: busy[cpu])
+    mean = sum(busy.values()) / len(busy)
+    detail = " ".join(f"cpu{cpu}={busy[cpu] * 100:.0f}%" for cpu in sorted(busy))
+    summary = (
+        f"CPUs {peer.cpuset} are {mean * 100:.0f}% busy on average "
+        f"(worst cpu{worst_cpu} at {busy[worst_cpu] * 100:.0f}%) — {detail}"
+    )
+    if mean >= _CPUSET_REFUSE_BUSY:
+        raise RuntimeError(
+            f"Peer {peer.name} is pinned to CPUs {peer.cpuset}, and they are not free: {summary}.\n"
+            "The reservation is either not in force or somebody else is inside it. Check it on that "
+            "machine, pin to different CPUs, or — if this load is yours and expected — pass "
+            "--skip-conflict-check."
+        )
+    if mean >= _CPUSET_WARN_BUSY:
+        print(f"! {peer.name}: {summary} — the run has less of its reservation than it looks")
+    else:
+        print(f"+ {peer.name}: {summary}")
+    return True
+
 
 def _ota_load_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
     """Refuse to measure on a peer that is busy with someone else's work."""
     for peer in plan.peers.values():
+        # A pinned peer is judged on its own CPUs. The machine-wide figure is the
+        # wrong question there: it is high by construction on exactly the shared
+        # workstation the pinning exists for.
+        if _ota_cpuset_load_check(peer, dry_run=dry_run):
+            continue
         result = _ota_run(
             peer,
             "cut -d' ' -f1-3 /proc/loadavg; nproc",
@@ -2910,7 +3048,9 @@ def _ota_load_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
                 f"Peer {peer.name} is carrying unrelated load: {summary}.\n"
                 "A measurement taken here would describe the contention, not the link.\n"
                 "Wait for the machine to go quiet, measure on another pair, or — if this "
-                "load is yours and expected — pass --skip-conflict-check."
+                "load is yours and expected — pass --skip-conflict-check.\n"
+                "If those CPUs were reserved away from another account, pin this peer to them "
+                "with --peer-cpuset and the check will read them instead of the whole machine."
             )
         if ratio >= _LOAD_WARN_PER_CPU:
             print(f"! {peer.name}: {summary} — comparisons survive if runs are interleaved, absolute latencies do not")
@@ -3692,7 +3832,15 @@ def _ota_start_peers(
         peer = plan.peers[peer_name]
         command = _ota_rosotacom_command(
             plan,
-            _ota_start_parts(target, peer_name, instance_id, peer_args, mode=mode, link_trace_parts=link_trace_parts),
+            _ota_start_parts(
+                target,
+                peer_name,
+                instance_id,
+                peer_args,
+                mode=mode,
+                link_trace_parts=link_trace_parts,
+                cpuset=peer.cpuset,
+            ),
             peer,
         )
         _ota_run(peer, command, label=f"{peer_name}: start {target.name}", dry_run=dry_run)
@@ -4089,6 +4237,7 @@ def _ota_create_tmux(
             peer_args,
             mode="attach",
             link_trace_parts=link_trace_parts,
+            cpuset=first_peer.cpuset,
         ),
         first_peer,
     )
@@ -4169,6 +4318,7 @@ def _ota_create_tmux(
                 peer_args,
                 mode="attach",
                 link_trace_parts=link_trace_parts,
+                cpuset=peer.cpuset,
             ),
             peer,
         )
@@ -5235,6 +5385,43 @@ def _local_ipc_run_args(network_isolated: bool) -> list[str]:
     return [] if network_isolated else ["--ipc", "host"]
 
 
+_CPUSET_RE = re.compile(r"^\d+(-\d+)?(,\d+(-\d+)?)*$")
+
+
+def validate_cpuset(cpuset: str) -> str:
+    """Accept a docker `--cpuset-cpus` list, and nothing else.
+
+    This string is handed to `docker run` and travels to a peer over ssh, so it
+    is validated rather than trusted: only decimal CPU numbers and ranges, the
+    exact grammar docker documents. Anything else — a shell metacharacter, a
+    negative number, an empty element — is a caller error and says so here
+    instead of at the far end of an ssh pipe.
+    """
+    cleaned = cpuset.strip()
+    if not _CPUSET_RE.match(cleaned):
+        raise RuntimeError(
+            f"--cpuset {cpuset!r} is not a CPU list: expected decimal numbers and ranges like '0-3' or '0,2,4-7'."
+        )
+    for part in cleaned.split(","):
+        if "-" in part:
+            low, high = (int(x) for x in part.split("-", 1))
+            if high < low:
+                raise RuntimeError(f"--cpuset {cpuset!r}: range {part!r} counts backwards.")
+    return cleaned
+
+
+def parse_cpuset_list(cpuset: str) -> list[int]:
+    """Expand a validated CPU list into the individual CPU numbers."""
+    cpus: list[int] = []
+    for part in validate_cpuset(cpuset).split(","):
+        if "-" in part:
+            low, high = (int(x) for x in part.split("-", 1))
+            cpus.extend(range(low, high + 1))
+        else:
+            cpus.append(int(part))
+    return sorted(set(cpus))
+
+
 def _base_extra_run_args(
     runtime: RuntimeConfig,
     session: ResolvedSession,
@@ -5242,8 +5429,15 @@ def _base_extra_run_args(
     instance: SessionInstance,
     *,
     network_isolated: bool = False,
+    cpuset: str | None = None,
 ) -> list[str]:
     args: list[str] = _local_ipc_run_args(network_isolated)
+    if cpuset:
+        # Confine every container of this session to the given CPUs. On a shared
+        # workstation the point is not to slow this session down: it is to put it
+        # on the cores that were reserved away from whoever else is on the
+        # machine, so a latency measurement stops competing for a runqueue.
+        args.extend(["--cpuset-cpus", validate_cpuset(cpuset)])
     ros2docker_cfg = load_config(runtime.ros2docker_config)
 
     if not ros2docker_cfg.get("mount_ws"):
@@ -5427,7 +5621,9 @@ def start_session(args: argparse.Namespace) -> str:
                 " (or pass --force to replace it, --skip-conflict-check to ignore it).",
             )
     image_name = _scoped_image_name(runtime)
-    extra_run_args = _base_extra_run_args(runtime, session, cfg, instance, network_isolated=network_isolated)
+    extra_run_args = _base_extra_run_args(
+        runtime, session, cfg, instance, network_isolated=network_isolated, cpuset=getattr(args, "cpuset", None)
+    )
     run_override: dict[str, object] = {}
     network_name = getattr(args, "network_name", None)
     if network_name:
@@ -8913,6 +9109,18 @@ def _add_ota_install_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--peer-cpuset",
+        action="append",
+        default=[],
+        metavar="PEER=CPUS",
+        help=(
+            "Confine this peer's session containers to these CPUs, e.g. 'a=0-3'. For a shared "
+            "workstation whose CPUs were reserved away from another account: the run then measures "
+            "on cores nobody else can take, and the load preflight judges those cores instead of "
+            "the whole machine."
+        ),
+    )
+    parser.add_argument(
         "--peer-exec",
         action="append",
         default=[],
@@ -8980,6 +9188,14 @@ def _add_start_args(parser: argparse.ArgumentParser) -> None:
         help="Require three bounded ICMP probes to the peer to succeed before starting.",
     )
     parser.add_argument("--instance-id", help="Join or create a named runtime session instance.")
+    parser.add_argument(
+        "--cpuset",
+        help=(
+            "Confine this session's containers to these CPUs, e.g. '0-3'. Use on a shared "
+            "workstation where those CPUs were reserved away from another account: the "
+            "session then measures on cores nobody else can take."
+        ),
+    )
     parser.add_argument(
         "--skip-conflict-check",
         action="store_true",

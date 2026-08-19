@@ -394,3 +394,54 @@ def test_every_mode_delivers_the_same_topic_name(tmp_path: Path) -> None:
     delivered.add(generator._delivered_topic(unpaced_link, unpaced_link["final"]))
 
     assert len(delivered) == 1, delivered
+
+
+# The status has to be told which pacer belongs to which stage (#301).
+#
+# A decoded stage's age is the link plus a hold this session asked for, and the
+# status overview cannot tell them apart by looking at one number. The generator
+# knows both nodes, so it names the pacer's report on the stage it explains --
+# rather than the status guessing from a topic-name convention.
+
+
+def _native_in(receiver: str) -> dict:
+    spec = yaml.safe_load(receiver)
+    for topic in spec["topics"]:
+        if topic["direction"] == "inbound":
+            for stage in topic["stages"]:
+                if stage["stage"] == "native_in":
+                    return stage
+    raise AssertionError("no inbound native_in stage")
+
+
+def _receiver_spec(tmp_path: Path, playout: dict | None) -> str:
+    transport: dict = {"type": "ffmpeg", "remote_republish": "compressed"}
+    if playout is not None:
+        transport["playout"] = playout
+    generator.func(
+        session_config_obj=_camera_cfg({"transport": transport, "use_ota_wrapper": True}),
+        output_dir=str(tmp_path),
+        force=True,
+        peer_addresses={"a": "127.0.0.1", "b": "127.0.0.2"},
+    )
+    return (tmp_path / "a" / "pipeline_spec.yaml").read_text(encoding="utf-8")
+
+
+def test_a_paced_decode_names_the_pacer_that_explains_its_age(tmp_path: Path) -> None:
+    stage = _native_in(_receiver_spec(tmp_path, {"adaptive": True, "max_ms": 300}))
+
+    assert stage["paced_hold_topic"] == "/camera/image/ffmpeg/paced/hold_ms"
+
+
+def test_an_unpaced_link_names_no_pacer(tmp_path: Path) -> None:
+    """Nothing holds this stream, so nothing may be subtracted from its age."""
+    stage = _native_in(_receiver_spec(tmp_path, None))
+
+    assert "paced_hold_topic" not in stage
+
+
+def test_a_pacer_kept_off_the_display_path_explains_nothing(tmp_path: Path) -> None:
+    """`republish: unpaced` decodes the arrived stream; its age is all link."""
+    stage = _native_in(_receiver_spec(tmp_path, {"adaptive": True, "republish": "unpaced"}))
+
+    assert "paced_hold_topic" not in stage

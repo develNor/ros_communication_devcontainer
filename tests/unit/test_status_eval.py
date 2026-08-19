@@ -531,3 +531,44 @@ def test_suggest_profile_band_nests_conditional_keys_under_per_profile() -> None
     entry = band["/heartbeat_a"]["per_profile"]["cellular"]
     assert "hz" in entry and "latency_ms" in entry  # conditional keys only
     assert "presence" not in entry and "mode" not in entry  # invariant stays top-level
+
+
+# A contract about a stage the session delays on purpose (#301).
+#
+# `status_overview` classifies such a stage on what is left after the pacer's
+# own hold is taken back out. This evaluator has to measure the same thing, or a
+# session passes `rosotacom test` while its own panel reads BAD -- one contract,
+# two answers, which is worse than either answer alone.
+
+
+def _paced_report(latency_ms: float, link_latency_ms: float | None) -> dict:
+    stage = _stage("native_in", 10.0, latency_ms)
+    if link_latency_ms is not None:
+        stage["link_latency_ms"] = link_latency_ms
+        stage["pacing_hold_ms"] = latency_ms - link_latency_ms
+    return {"peer": "a", "topics": [_topic("/camera", "inbound", "OK", [stage])]}
+
+
+def test_a_paced_stage_is_asserted_on_the_link_not_the_buffer() -> None:
+    """286 ms on screen, 46 of them the link's: a 200 ms link contract holds."""
+    report = _paced_report(latency_ms=286.0, link_latency_ms=46.0)
+
+    assert evaluate_report(report, {"/camera": {"latency_ms": {"max": 200}}}) == []
+
+
+def test_a_slow_link_under_a_pacer_still_fails() -> None:
+    report = _paced_report(latency_ms=480.0, link_latency_ms=480.0)
+
+    failures = evaluate_report(report, {"/camera": {"latency_ms": {"max": 200}}})
+
+    assert len(failures) == 1
+    assert "link latency 480.0ms" in failures[0]
+
+
+def test_an_unpaced_stage_is_asserted_on_what_it_always_was() -> None:
+    report = _paced_report(latency_ms=286.0, link_latency_ms=None)
+
+    failures = evaluate_report(report, {"/camera": {"latency_ms": {"max": 200}}})
+
+    assert len(failures) == 1
+    assert "latency 286.0ms" in failures[0]

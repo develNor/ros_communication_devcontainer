@@ -79,3 +79,35 @@ def test_config_validation() -> None:
         PacerConfig(min_ms=500.0, max_ms=100.0)
     with pytest.raises(ValueError):
         PacerConfig(window=3)
+
+
+# The hold the node reports (#301).
+#
+# `.../paced/hold_ms` carries what this node actually added, so the status
+# overview can take it back out of a decoded stage's age and judge what is left
+# -- the link. The node computes `max(0, release - arrival)`; both halves of
+# that clamp are properties of the schedule, so they are asserted here rather
+# than in three lines of publishing glue.
+
+
+def _hold_ms(schedule: PlayoutSchedule, stamp: float, arrival: float) -> float:
+    """What the node publishes for a message: the delay it applied, never negative."""
+    return max(0.0, (schedule.on_message(stamp, arrival) - arrival) * 1000.0)
+
+
+def test_the_reported_hold_is_what_was_added_not_what_was_allowed() -> None:
+    schedule = PlayoutSchedule(PacerConfig(adaptive=False, target_ms=200.0))
+    # First message sets the floor at its own delay, so it is released at
+    # floor + 200 ms and waits exactly the budget.
+    assert _hold_ms(schedule, 0.0, 0.030) == pytest.approx(200.0, abs=1.0)
+    # One that arrives 150 ms later than the floor has already spent 150 of the
+    # budget on the wire and waits only the remainder.
+    assert _hold_ms(schedule, 1.0, 1.180) == pytest.approx(50.0, abs=1.0)
+
+
+def test_a_late_message_is_reported_as_held_for_nothing() -> None:
+    """The clamp: a pass-through must not be credited with a buffer it skipped."""
+    schedule = PlayoutSchedule(PacerConfig(adaptive=False, target_ms=200.0))
+    _hold_ms(schedule, 0.0, 0.030)
+
+    assert _hold_ms(schedule, 1.0, 1.400) == 0.0

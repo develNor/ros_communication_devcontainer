@@ -1378,3 +1378,127 @@ def test_a_stage_whose_input_is_flowing_and_publishes_nothing_is_broken() -> Non
 
     assert gap["owner"] == "rosotacom"
     assert gap["reason"] == "preprocessing did not come up"
+
+
+# ---------------------------------------------------------------------------
+# a stage the session delays on purpose (#301)
+#
+# `transport.playout` holds every packet before the decode, so the decoded
+# stage's age is the link plus a hold this session asked for. Judging that sum
+# against a threshold calibrated for a link reads a healthy paced stream as a
+# fault: measured on the ccng link on 2026-08-19, a flat 10 Hz picture at 286 ms
+# sat permanently on FLOWING/BAD against the 200 ms default. A red panel that
+# means nothing is how an operator learns to stop reading the panel.
+#
+# The pacer reports what it actually held, and that is the number taken back
+# out -- never the configured budget, because a late message passes straight
+# through and would otherwise be credited a buffer it never received.
+# ---------------------------------------------------------------------------
+
+
+PACED_STAGE = {
+    "stage": "native_in",
+    "topic": "/b/camera/ffmpeg/compressed",
+    "domain": "local",
+    "produced_by": "postprocessing",
+    "paced_hold_topic": "/b/camera/ffmpeg/paced/hold_ms",
+}
+
+
+def _paced_aggregator(tmp_path: Path, *, latency_s: float, hold_ms: float | None) -> core.StatusAggregator:
+    local = _FakeObserver()
+    decoded = core.StageObservation()
+    decoded.pub_count, decoded.sub_count = 1, 1
+    decoded.record(size=1024, delay_s=latency_s, now_mono=1000.0, now_wall=1_700_000_000.0)
+    local.observations[PACED_STAGE["topic"]] = decoded
+    if hold_ms is not None:
+        hold = core.StageObservation(type_str=core.SCALAR_MSG_TYPE)
+        hold.pub_count, hold.sub_count = 1, 1
+        hold.last_value = hold_ms
+        local.observations[PACED_STAGE["paced_hold_topic"]] = hold
+    return _build({"local": local, "ota": _FakeObserver()}, tmp_path)
+
+
+def test_the_hold_topic_is_observed_even_though_it_is_not_a_stage() -> None:
+    spec = {"topics": [{"type": "sensor_msgs/msg/CompressedImage", "stages": [PACED_STAGE]}]}
+
+    by_domain = core.collect_stage_topics(spec)
+
+    assert by_domain["local"][PACED_STAGE["paced_hold_topic"]] == core.SCALAR_MSG_TYPE
+    assert PACED_STAGE["paced_hold_topic"] not in by_domain["ota"]
+
+
+def test_a_paced_stage_is_judged_on_the_link_and_reports_both_numbers(tmp_path: Path) -> None:
+    """286 ms on screen, 46 of them the link's: GOOD, and the split is visible."""
+    agg = _paced_aggregator(tmp_path, latency_s=0.286, hold_ms=240.0)
+
+    result = agg.classify_stage(PACED_STAGE, None, 1000.5)
+
+    assert result["latency_ms"] == 286.0
+    assert result["pacing_hold_ms"] == 240.0
+    assert result["link_latency_ms"] == 46.0
+    assert result["quality"] == core.GOOD
+
+
+def test_the_same_age_without_a_pacer_is_still_bad(tmp_path: Path) -> None:
+    """The threshold has not moved; only what it is applied to has."""
+    stage = {key: value for key, value in PACED_STAGE.items() if key != "paced_hold_topic"}
+    local = _FakeObserver()
+    decoded = core.StageObservation()
+    decoded.pub_count, decoded.sub_count = 1, 1
+    decoded.record(size=1024, delay_s=0.286, now_mono=1000.0, now_wall=1_700_000_000.0)
+    local.observations[stage["topic"]] = decoded
+
+    result = _build({"local": local, "ota": _FakeObserver()}, tmp_path).classify_stage(stage, None, 1000.5)
+
+    assert result["quality"] == core.BAD
+    assert result["pacing_hold_ms"] is None
+
+
+def test_a_late_message_is_credited_nothing_and_still_flags(tmp_path: Path) -> None:
+    """The pacer passes a late packet straight through: hold 0, no excuse."""
+    agg = _paced_aggregator(tmp_path, latency_s=0.480, hold_ms=0.0)
+
+    result = agg.classify_stage(PACED_STAGE, None, 1000.5)
+
+    assert result["link_latency_ms"] == 480.0
+    assert result["quality"] == core.BAD
+
+
+def test_before_the_pacer_reports_nothing_is_assumed(tmp_path: Path) -> None:
+    """No hold observed yet -- neither zero nor the budget is a safe guess."""
+    agg = _paced_aggregator(tmp_path, latency_s=0.286, hold_ms=None)
+
+    result = agg.classify_stage(PACED_STAGE, None, 1000.5)
+
+    assert result["pacing_hold_ms"] is None
+    assert result["link_latency_ms"] is None
+    assert result["quality"] == core.BAD
+
+
+def test_the_text_report_shows_what_the_link_cost_and_what_was_added(tmp_path: Path) -> None:
+    agg = _paced_aggregator(tmp_path, latency_s=0.286, hold_ms=240.0)
+    stage = agg.classify_stage(PACED_STAGE, None, 1000.5)
+
+    line = agg.render_text(
+        {
+            "peer": "a",
+            "remote": "b",
+            "generated_at": "2026-08-19T12:00:00",
+            "summary": {"OK": 1, "PARTIAL": 0, "STALLED": 0, "ABSENT": 0},
+            "phase": 1,
+            "topics": [
+                {
+                    "base": "/camera",
+                    "direction": "inbound",
+                    "overall": core.OK,
+                    "reached_stage": "native_in",
+                    "blocked_at": None,
+                    "diagnosis": "",
+                    "stages": [stage],
+                }
+            ],
+        }
+    )
+
+    assert "286ms(link 46+paced 240)" in line

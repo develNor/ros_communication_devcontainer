@@ -71,6 +71,7 @@ from com_py.ffmpeg_flags import FFMPEG_PACKET_TYPE, parse_keyframe_flag
 from com_py.link_bytes import LinkByteSampler, resolve_link_interface
 from com_py.link_trace import LinkTraceRecorder
 from com_py.status_overview_core import (
+    SCALAR_MSG_TYPE,
     STARTUP_GRACE_S,
     ClockOffsetEstimator,
     StageObservation,
@@ -309,6 +310,11 @@ class StageObserver(Node):
                         "t_com_out": now_ros_s,
                         "keyframe": keyframe,
                     }
+            elif obs.type_str == SCALAR_MSG_TYPE:
+                # Not a stage: a number this node reads to interpret one. The
+                # pacing hold arrives here (`.../paced/hold_ms`); it carries no
+                # header, so there is no latency to record, only the value.
+                obs.last_value = float(msg.data)
             else:
                 header = getattr(msg, "header", None)
                 stamp = getattr(header, "stamp", None) if header is not None else None

@@ -218,7 +218,7 @@ def touches(params: dict, peer_dir: Path) -> Touches:
     for index in _slots(params, "pace_{}_topic", limit=4):
         topic = _one(params, f"pace_{index}_topic")
         result.through(str(topic), f"{topic}/paced")
-        result.writes.update({f"{topic}/paced/budget_ms", f"{topic}/paced/queue_depth"})
+        result.writes.update({f"{topic}/paced/budget_ms", f"{topic}/paced/queue_depth", f"{topic}/paced/hold_ms"})
 
     # NOR: relays a prefixed, suffixed name back onto the bare base, so a local
     # consumer (a TF tree) finds the name it expects.
@@ -245,14 +245,35 @@ def touches(params: dict, peer_dir: Path) -> Touches:
 
     # Observability: reads only, never republishes.
     result.reads.update(_many(params, "metric_stage_topics"))
+    # STAT: the status overview reads the pacing hold a stage names, to tell
+    # this session's deliberate delay from the network's. It is configured out
+    # of the pipeline spec rather than out of these parameters, but it is a read
+    # by a node this peer starts, so it belongs here -- a hold topic no pacer
+    # publishes would leave the status silently subtracting nothing.
+    result.reads.update(paced_hold_topics(peer_dir))
 
     return result
 
 
+def _spec(peer_dir: Path) -> dict:
+    path = peer_dir / "pipeline_spec.yaml"
+    if not path.is_file():
+        return {}
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+def _stages(peer_dir: Path) -> Iterator[dict]:
+    for topic in _spec(peer_dir).get("topics", []):
+        yield from topic.get("stages", [])
+
+
+def paced_hold_topics(peer_dir: Path) -> set[str]:
+    return {stage["paced_hold_topic"] for stage in _stages(peer_dir) if stage.get("paced_hold_topic")}
+
+
 def spec_topics(peer_dir: Path) -> set[str]:
     """Every topic this peer's pipeline spec models, at any stage."""
-    spec = yaml.safe_load((peer_dir / "pipeline_spec.yaml").read_text(encoding="utf-8"))
-    return {stage["topic"] for topic in spec.get("topics", []) for stage in topic.get("stages", [])}
+    return {stage["topic"] for stage in _stages(peer_dir)}
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +373,12 @@ def test_the_composed_names_are_the_ones_the_template_composes() -> None:
     # reads that name, and `touches` claims those two writes, so all three have
     # to agree -- they are three files apart and nothing else compares them.
     pacer = PACER_PY.read_text(encoding="utf-8")
-    for composed in ('declare_parameter("topic_suffix", "/paced")', '+ "/budget_ms"', '+ "/queue_depth"'):
+    for composed in (
+        'declare_parameter("topic_suffix", "/paced")',
+        '+ "/budget_ms"',
+        '+ "/queue_depth"',
+        '+ "/hold_ms"',
+    ):
         assert composed in pacer, f"the pacer no longer composes {composed}"
 
 

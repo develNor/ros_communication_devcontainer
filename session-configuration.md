@@ -720,8 +720,35 @@ ros2 run com_py playout_pacer --ros-args \
   -p target_ms:=350.0 -p adaptive:=true
 ```
 
-It republishes on `<topic>/paced` plus `.../paced/budget_ms` and
-`.../paced/queue_depth` debug topics.
+It republishes on `<topic>/paced` plus three topics next to it:
+`.../paced/budget_ms` and `.../paced/queue_depth` at 1 Hz, and
+`.../paced/hold_ms` with every release, carrying how long *that* message was
+actually held.
+
+##### What the status overview does with it
+
+A paced stage's age is the link plus a delay this session asked for, and one
+number cannot be judged against a threshold meant for the link. So the
+generator names the pacer's report on the stage it explains
+(`paced_hold_topic` in `pipeline_spec.yaml`), and `status_overview` takes the
+hold back out before classifying:
+
+```
+native_in  FLOWING  .../ffmpeg/compressed  10.0Hz 286ms(link 46+paced 240) ...
+```
+
+`latency_ms` stays the age on screen; `link_latency_ms` and `pacing_hold_ms`
+are the split, and the quality verdict uses the former. Without this the
+default 200 ms bad-threshold — set before anything on a link was held on
+purpose — marks every healthy paced stream BAD, which is how an operator learns
+to stop reading the panel.
+
+It is the *applied* hold that is subtracted, never the configured budget: a
+message that arrived later than its release time passes straight through, is
+reported as held for 0 ms, and still flags. A budget-based correction would
+credit that message a buffer it never received and quietly stop reporting a slow
+link. Before the pacer has reported at all, nothing is subtracted — neither zero
+nor the budget is a safe guess.
 
 `type: foxglove` supports (CompressedVideo):
 - `gop_size` (int)

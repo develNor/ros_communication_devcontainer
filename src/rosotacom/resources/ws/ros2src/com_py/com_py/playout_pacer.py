@@ -8,7 +8,16 @@ Inserted between the OTA unwrapper and a decoder chain it turns network jitter
 into a constant, bounded age instead of visible stutter.
 
 Debug topics next to the output: ``.../paced/budget_ms`` (current delay
-budget) and ``.../paced/queue_depth``.
+budget) and ``.../paced/queue_depth``, both at 1 Hz, and ``.../paced/hold_ms``
+— published with *every* release, carrying how long that message was actually
+held.
+
+``hold_ms`` exists so the status overview can tell the link's contribution from
+this node's. Deliberately the applied hold rather than the budget: a message
+that arrived later than its release time passes straight through and is held
+for 0 ms, so a genuinely slow link cannot be credited with a buffer it never
+used. Subtracting the *budget* would do exactly that, and would quietly stop
+reporting the problem it exists to make visible.
 """
 
 from __future__ import annotations
@@ -62,6 +71,7 @@ class PlayoutPacerNode(Node):
         self._pub = self.create_publisher(msg_cls, out_topic, qos)
         self._budget_pub = self.create_publisher(Float64, out_topic + "/budget_ms", 10)
         self._depth_pub = self.create_publisher(Int32, out_topic + "/queue_depth", 10)
+        self._hold_pub = self.create_publisher(Float64, out_topic + "/hold_ms", 10)
         self.create_subscription(msg_cls, topic, self._on_message, qos)
         # 2 ms release tick: bounds added jitter to well below frame cadence.
         self.create_timer(0.002, self._release_due)
@@ -72,12 +82,16 @@ class PlayoutPacerNode(Node):
         now = time.time()
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         release = self.schedule.on_message(stamp, now)
-        self._queue.append((release, msg))
+        self._queue.append((release, msg, now))
 
     def _release_due(self) -> None:
         now = time.time()
         while self._queue and self._queue[0][0] <= now:
-            self._pub.publish(self._queue.popleft()[1])
+            release, msg, arrival = self._queue.popleft()
+            self._pub.publish(msg)
+            # What this node added, not what it was allowed to add. Clamped
+            # because a late message's release time is already in the past.
+            self._hold_pub.publish(Float64(data=max(0.0, (release - arrival) * 1000.0)))
 
     def _publish_debug(self) -> None:
         self._budget_pub.publish(Float64(data=float(self.schedule.budget_ms)))

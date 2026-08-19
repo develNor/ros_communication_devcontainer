@@ -85,7 +85,9 @@ ROSOTACOM_ROS2DOCKER_CONFIG="$PWD/ros2docker.lyrical.json" rosotacom smoke
 For a persistent project opt-in, set
 `ros2docker_config: ros2docker.lyrical.json` in `rosotacom.yaml`. The Lyrical
 image uses ros2docker's pinned `domain_bridge` source fallback until an official
-Lyrical binary package is available.
+Lyrical binary package is available. Scenario applications with a
+`ros2docker_config_by_distro.lyrical` entry switch to their Lyrical image at the
+same time; the default application config remains Kilted.
 
 For an interactive local end-to-end debug session, use the same smoke target
 with `--interactive`:

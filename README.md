@@ -236,10 +236,11 @@ commit with a pinned compatibility patch. The build fails closed outside
 Lyrical or if that patch no longer applies. Replace this fallback with
 `ros-lyrical-domain-bridge` once the official package is released.
 
-The communication container follows this variant selection. Scenario
-application containers retain their own explicit ros2docker configs; mixed ROS
-distributions across the application/communication boundary therefore remain
-part of the tested shape.
+The communication container and any scenario application with a matching
+`ros2docker_config_by_distro` entry follow this variant selection together.
+The packaged chatter scenario supplies Lyrical application configs, because
+[ROS 2 does not guarantee cross-distribution communication](https://docs.ros.org/en/ros2_documentation/rolling/Releases.html#cross-distribution-communications).
+Applications without a matching entry retain their explicit default config.
 
 The default switch is intentionally not part of this change. Before promoting
 Lyrical, keep the two-variant E2E and RMW matrices green, point the packaged
@@ -356,9 +357,13 @@ applications:
   a:
     - name: native_application
       ros2docker_config: ../../scripts/2_native_chatter/machine_a/external.ros2docker.json
+      ros2docker_config_by_distro:
+        lyrical: ../../scripts/2_native_chatter/machine_a/external.lyrical.ros2docker.json
   b:
     - name: native_application
       ros2docker_config: ../../scripts/2_native_chatter/machine_b/external.ros2docker.json
+      ros2docker_config_by_distro:
+        lyrical: ../../scripts/2_native_chatter/machine_b/external.lyrical.ros2docker.json
 ```
 
 Start one identity's communication and local application together:
@@ -373,7 +378,11 @@ rosotacom scenario stop
 `scenario list` shows both configured scenarios and currently active
 scenario/identity pairs. `attach` and `stop` infer omitted values when exactly
 one active choice exists; otherwise their completions and error messages show
-the eligible active choices.
+the eligible active choices. `ros2docker_config` is always the fallback;
+`ros2docker_config_by_distro` selects a matching application image from the
+communication config's `BASE_IMAGE` distro, so changing the project between
+Kilted and Lyrical changes the complete scenario rather than creating an
+unsupported mixed-distro data path.
 
 The outer view uses an isolated host tmux server with one full window for
 communication and one full window per local application. Its prefix remains

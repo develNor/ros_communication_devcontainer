@@ -46,7 +46,10 @@ ci-success
 The merge gate runs workflow lint, dependency/security review, runtime/build
 asset lint, Python 3.10 through 3.14 non-Docker checks, package validation, and
 the Docker single-machine smoke matrix: seventeen diagnostic slices for each of
-the `kilted` and `lyrical` variants, 34 jobs in parallel.
+the `kilted` and `lyrical` variants, 34 jobs in parallel. Scenario application
+images follow the selected communication distro through
+`ros2docker_config_by_distro`, so each variant is end-to-end rather than a
+cross-distro combination.
 
 Python 3.10–3.14 are supported for the host CLI; Python 3.12 is the reference
 interpreter for packaging and Docker E2E jobs.

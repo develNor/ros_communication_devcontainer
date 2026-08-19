@@ -214,6 +214,7 @@ class ResolvedScenario:
 class ScenarioApplication:
     name: str
     ros2docker_config: Path
+    ros2docker_config_by_distro: tuple[tuple[str, Path], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -679,7 +680,7 @@ def _project_build_inputs(runtime: RuntimeConfig) -> list[tuple[str, Path]]:
         definition = _load_scenario_definition(_resolve_scenario(scenario_name, runtime))
         for identity, applications in sorted(definition.applications.items()):
             for application in applications:
-                config = application.ros2docker_config.resolve()
+                config = _scenario_application_config(runtime, application).resolve()
                 if config in seen:
                     continue
                 seen.add(config)
@@ -964,6 +965,9 @@ def _write_scenario_manifest(
     manifest["updated_at"] = now
     manifest["effective_config_sha256"] = _effective_config_sha256(cfg)
     scenario_runs = manifest.setdefault("scenario_runs", {})
+    selected_applications = [
+        (application, _scenario_application_config(runtime, application)) for application in applications
+    ]
     scenario_runs[run_key] = {
         "started_at": now,
         "stopped_at": None,
@@ -976,13 +980,13 @@ def _write_scenario_manifest(
         "applications": [
             {
                 "name": application.name,
-                "ros2docker_config": str(application.ros2docker_config),
+                "ros2docker_config": str(config_path),
                 "container_name": _scenario_container_name(
                     runtime, resolved.name, identity, application.name, instance.instance_id
                 ),
                 "image_name": _scenario_application_image_name(runtime, application),
             }
-            for application in applications
+            for application, config_path in selected_applications
         ],
     }
     manifest_path.write_text(
@@ -1047,7 +1051,7 @@ def _write_interactive_smoke_manifest(
             {
                 "identity": identity,
                 "name": application.name,
-                "ros2docker_config": str(application.ros2docker_config),
+                "ros2docker_config": str(_scenario_application_config(runtime, application)),
                 "container_name": _scenario_container_name(
                     runtime, target.scenario.name, identity, application.name, instance.instance_id
                 ),
@@ -4579,7 +4583,7 @@ def _load_scenario_definition(resolved: ResolvedScenario) -> ScenarioDefinition:
             context = f"scenario applications.{identity}[{index}]"
             if not isinstance(entry, dict):
                 raise RuntimeError(f"{context} must be a mapping.")
-            allowed_entry = {"name", "ros2docker_config"}
+            allowed_entry = {"name", "ros2docker_config", "ros2docker_config_by_distro"}
             extra_entry = sorted(set(entry) - allowed_entry)
             if extra_entry:
                 raise RuntimeError(
@@ -4605,8 +4609,35 @@ def _load_scenario_definition(resolved: ResolvedScenario) -> ScenarioDefinition:
             # Resolving run args here would make every peer demand every other
             # peer's machine-local artifacts (#249).
             load_config(config_path, resolve_run_args=False)
+            by_distro_raw = entry.get("ros2docker_config_by_distro", {})
+            if not isinstance(by_distro_raw, dict):
+                raise RuntimeError(f"{context}.ros2docker_config_by_distro must be a mapping.")
+            by_distro: list[tuple[str, Path]] = []
+            for distro_raw, distro_config_raw in sorted(by_distro_raw.items()):
+                if not isinstance(distro_raw, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", distro_raw):
+                    raise RuntimeError(
+                        f"{context}.ros2docker_config_by_distro keys must be lowercase ROS distro names."
+                    )
+                if not isinstance(distro_config_raw, str) or not distro_config_raw.strip():
+                    raise RuntimeError(
+                        f"{context}.ros2docker_config_by_distro.{distro_raw} must be a non-empty string."
+                    )
+                distro_config = _resolve_path(distro_config_raw, resolved.host_dir, must_exist=True)
+                assert distro_config is not None
+                if not distro_config.is_file():
+                    raise RuntimeError(
+                        f"{context}.ros2docker_config_by_distro.{distro_raw} must resolve to a file: {distro_config}"
+                    )
+                load_config(distro_config, resolve_run_args=False)
+                by_distro.append((distro_raw, distro_config))
             seen_names.add(name)
-            parsed_entries.append(ScenarioApplication(name=name, ros2docker_config=config_path))
+            parsed_entries.append(
+                ScenarioApplication(
+                    name=name,
+                    ros2docker_config=config_path,
+                    ros2docker_config_by_distro=tuple(by_distro),
+                )
+            )
         applications[identity] = tuple(parsed_entries)
 
     return ScenarioDefinition(session=session.strip(), applications=applications)
@@ -4663,8 +4694,27 @@ def _matching_scenario_containers(
     return sorted(names)
 
 
+def _ros_distro_from_ros2docker_config(config_path: Path) -> str | None:
+    config = load_config(config_path, resolve_run_args=False)
+    build_args = config.get("build_args", {}) or {}
+    if not isinstance(build_args, dict):
+        return None
+    base_image = str(build_args.get("BASE_IMAGE", ""))
+    match = re.search(r"(?:^|/)ros:([a-z][a-z0-9_]*)-", base_image)
+    return match.group(1) if match else None
+
+
+def _scenario_application_config(runtime: RuntimeConfig, application: ScenarioApplication) -> Path:
+    distro = _ros_distro_from_ros2docker_config(runtime.ros2docker_config)
+    if distro is not None:
+        by_distro = dict(application.ros2docker_config_by_distro)
+        if distro in by_distro:
+            return by_distro[distro]
+    return application.ros2docker_config
+
+
 def _scenario_application_image_name(runtime: RuntimeConfig, application: ScenarioApplication) -> str:
-    config = load_config(application.ros2docker_config, resolve_run_args=False)
+    config = load_config(_scenario_application_config(runtime, application), resolve_run_args=False)
     base = str(config.get("image_name") or "ros2docker")
     return _scoped_image_name_from_base(base, runtime.install_id)
 
@@ -5423,9 +5473,10 @@ def _stop_scenario_application(
         containers = [name for name in containers if _container_exists(name)]
     else:
         containers = _matching_scenario_containers(runtime, resolved.name, identity, application.name, all_states=True)
+    config_path = _scenario_application_config(runtime, application)
     for container_name in containers:
         ros2docker_stop(
-            config_file=application.ros2docker_config,
+            config_file=config_path,
             override={"container_name": container_name},
         )
     return bool(containers)
@@ -5587,11 +5638,12 @@ def run_scenario_application(args: argparse.Namespace) -> int:
     resolved = _resolve_scenario(args.scenario, runtime)
     definition = _load_scenario_definition(resolved)
     application = _scenario_application(definition, args.identity, args.application)
+    config_path = _scenario_application_config(runtime, application)
     instance_id = getattr(args, "instance_id", None) or _new_instance_id()
     container_name = _scenario_container_name(runtime, resolved.name, args.identity, application.name, instance_id)
     if _container_exists(container_name):
         ros2docker_stop(
-            config_file=application.ros2docker_config,
+            config_file=config_path,
             override={"container_name": container_name},
         )
     override: dict[str, object] = {
@@ -5600,14 +5652,14 @@ def run_scenario_application(args: argparse.Namespace) -> int:
     }
     network_name = getattr(args, "network_name", None)
     if network_name:
-        base_run_args = load_config(application.ros2docker_config).get("run_args", []) or []
+        base_run_args = load_config(config_path).get("run_args", []) or []
         override["run_args"] = _isolated_network_run_args(
             [str(arg) for arg in base_run_args],
             network_name,
             getattr(args, "network_ip", None),
         )
-    _build_image(application.ros2docker_config, override)
-    ros2docker_run(config_file=application.ros2docker_config, override=override)
+    _build_image(config_path, override)
+    ros2docker_run(config_file=config_path, override=override)
     return 0
 
 

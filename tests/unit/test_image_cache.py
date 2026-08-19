@@ -215,6 +215,32 @@ def test_references_lists_every_image_the_project_builds(
     assert all(reference.startswith("ghcr.io/owner/name:") for reference in references)
 
 
+def test_references_selects_scenario_image_for_active_ros_distro(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _example_project(tmp_path, monkeypatch)
+    capsys.readouterr()
+    lyrical_project_config = project / "ros2docker.lyrical.json"
+    monkeypatch.setenv("ROSOTACOM_ROS2DOCKER_CONFIG", str(lyrical_project_config))
+
+    rosotacom.image_references_command(
+        argparse.Namespace(rosotacom_config=str(project / "rosotacom.yaml"), repository="ghcr.io/owner/name")
+    )
+
+    references = set(capsys.readouterr().out.split())
+    lyrical_application = project / "scripts/2_native_chatter/machine_b/external.lyrical.ros2docker.json"
+    kilted_application = project / "scripts/2_native_chatter/machine_b/external.ros2docker.json"
+    expected_lyrical = image_cache.cached_reference(
+        "ghcr.io/owner/name", image_cache.image_fingerprint(lyrical_application)
+    )
+    default_kilted = image_cache.cached_reference(
+        "ghcr.io/owner/name", image_cache.image_fingerprint(kilted_application)
+    )
+
+    assert expected_lyrical in references
+    assert default_kilted not in references
+
+
 def test_build_refuses_a_reference_no_input_hashes_to(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The publisher may push only what its own inputs produced."""
     project = _example_project(tmp_path, monkeypatch)

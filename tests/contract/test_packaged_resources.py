@@ -43,6 +43,8 @@ def test_packaged_resources_include_curated_examples_and_runtime_workspace() -> 
         "resources/examples/sessions/16_remote_assist_anonymized_camera/session-definition.yaml",
         "resources/examples/sessions/17_synthetic_camera_quality/session-definition.yaml",
         "resources/examples/scenarios/2_native_chatter/scenario-definition.yaml",
+        "resources/examples/scripts/2_native_chatter/machine_a/external.lyrical.ros2docker.json",
+        "resources/examples/scripts/2_native_chatter/machine_b/external.lyrical.ros2docker.json",
         "resources/ws/session/creation/run_session.py",
         "resources/ws/session/creation/catmux_log_setup.sh",
         "resources/ws/session/creation/strip_ansi.py",
@@ -240,7 +242,7 @@ def test_packaged_configs_do_not_fetch_rosdep_on_container_start() -> None:
 
 
 def test_external_ros2docker_configs_install_selected_rmw_implementations() -> None:
-    configs = sorted(cli.EXAMPLE_PROJECT_DIR.glob("scripts/**/external.ros2docker.json"))
+    configs = sorted(cli.EXAMPLE_PROJECT_DIR.glob("scripts/**/external*.ros2docker.json"))
     assert configs
 
     offenders: list[str] = []
@@ -252,9 +254,12 @@ def test_external_ros2docker_configs_install_selected_rmw_implementations() -> N
 
         build_args = config.get("build_args", {}) or {}
         apt_packages = set(str(build_args.get("APT_PACKAGES", "")).split())
-        if "ros-kilted-rmw-cyclonedds-cpp" not in apt_packages:
+        base_image = str(build_args.get("BASE_IMAGE", ""))
+        match = re.search(r"ros:([a-z][a-z0-9_]*)-", base_image)
+        expected_package = f"ros-{match.group(1)}-rmw-cyclonedds-cpp" if match else None
+        if expected_package is None or expected_package not in apt_packages:
             rel = config_path.relative_to(cli.EXAMPLE_PROJECT_DIR)
-            offenders.append(f"{rel} selects rmw_cyclonedds_cpp but does not install its package")
+            offenders.append(f"{rel} selects rmw_cyclonedds_cpp but does not install its distro-matched package")
 
     assert not offenders
 

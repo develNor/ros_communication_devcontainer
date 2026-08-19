@@ -371,6 +371,17 @@ def _write_test_scenario_project(tmp_path: Path) -> tuple[rosotacom.RuntimeConfi
             ),
             encoding="utf-8",
         )
+        app_dir.joinpath(f"{identity}.lyrical.json").write_text(
+            json.dumps(
+                {
+                    "image_name": "lyrical-app",
+                    "run_type": "command",
+                    "command": ["true"],
+                    "build_args": {"BASE_IMAGE": "ros:lyrical-ros-base-resolute"},
+                }
+            ),
+            encoding="utf-8",
+        )
     scenario_dir = tmp_path / "scenarios" / "demo"
     scenario_dir.mkdir(parents=True)
     scenario_dir.joinpath("scenario-definition.yaml").write_text(
@@ -382,9 +393,13 @@ def _write_test_scenario_project(tmp_path: Path) -> tuple[rosotacom.RuntimeConfi
                 "  a:",
                 "    - name: local_app",
                 "      ros2docker_config: ../../apps/a.json",
+                "      ros2docker_config_by_distro:",
+                "        lyrical: ../../apps/a.lyrical.json",
                 "  b:",
                 "    - name: local_app",
                 "      ros2docker_config: ../../apps/b.json",
+                "      ros2docker_config_by_distro:",
+                "        lyrical: ../../apps/b.lyrical.json",
                 "",
             ]
         ),
@@ -423,11 +438,26 @@ def test_scenario_definition_resolves_and_validates_strictly(tmp_path: Path) -> 
     assert definition.session == "demo"
     assert definition.applications["a"][0].name == "local_app"
     assert definition.applications["a"][0].ros2docker_config == tmp_path / "apps" / "a.json"
+    assert definition.applications["a"][0].ros2docker_config_by_distro == (
+        ("lyrical", tmp_path / "apps" / "a.lyrical.json"),
+    )
     assert rosotacom._scenario_names(runtime) == ["demo"]
     assert rosotacom._scenario_container_name(runtime, "demo", "a", "local_app", "run1") == (
         "rosotacom_test_run1_scenario_demo_a_local_app"
     )
     assert rosotacom._scenario_application_image_name(runtime, definition.applications["a"][0]) == "ros2docker-test"
+
+    lyrical_config = tmp_path / "ros2docker.lyrical.json"
+    lyrical_config.write_text(
+        json.dumps({"build_args": {"BASE_IMAGE": "ros:lyrical-ros-base-resolute"}}),
+        encoding="utf-8",
+    )
+    lyrical_runtime = replace(runtime, ros2docker_config=lyrical_config)
+    application = definition.applications["a"][0]
+    assert rosotacom._scenario_application_config(lyrical_runtime, application) == (
+        tmp_path / "apps" / "a.lyrical.json"
+    )
+    assert rosotacom._scenario_application_image_name(lyrical_runtime, application) == "lyrical-app-test"
 
     resolved.definition_path.write_text(
         "schema_version: 1\nsession: demo\napplications: {}\nunknown: true\n",

@@ -40,3 +40,4 @@ CLAUDE.md
 # slash the pattern covers file, directory and symlink alike, and
 # tests/contract/test_packaged_resources.py fails if one is ever tracked again.
 .agents
+time-bins.jsonl

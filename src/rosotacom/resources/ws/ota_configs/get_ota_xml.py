@@ -12,6 +12,8 @@ get_fastdds_easy_mode_xml.py, get_cyclonedds_xml.py).
 import argparse
 import os
 import re
+import sys
+import tempfile
 
 
 KNOWN_PLACEHOLDERS = {"#host_ip", "#peer", "#easy_mode_ip", "#spdp_interval"}
@@ -205,10 +207,41 @@ if __name__ == "__main__":
         help="Resolved Fast DDS Easy Mode address (#easy_mode_ip).",
     )
     parser.add_argument(
+        "-o", "--output", dest="output",
+        help=(
+            "Write the rendered XML to this path, atomically. Prefer this over a shell "
+            "redirect: `> file` truncates the target before this script runs, so a "
+            "failure here leaves a zero-byte profile behind, and a zero-byte profile is "
+            "not an error to a DDS stack — it falls back to its defaults and the link "
+            "comes up carrying nothing."
+        ),
+    )
+    parser.add_argument(
         "--spdp-interval",
         dest="spdp_interval",
         default=DEFAULT_SPDP_INTERVAL,
         help=f"CycloneDDS SPDP interval duration (#spdp_interval, default: {DEFAULT_SPDP_INTERVAL}).",
     )
     args = parser.parse_args()
-    print(main(**{k: v for k, v in vars(args).items() if v is not None}))
+    output = args.output
+    rendered = main(**{k: v for k, v in vars(args).items()
+                       if v is not None and k != "output"})
+    if not output:
+        print(rendered)
+        raise SystemExit(0)
+    if not rendered.strip():
+        raise SystemExit(f"Refusing to write an empty profile to {output}.")
+    directory = os.path.dirname(os.path.abspath(output)) or "."
+    os.makedirs(directory, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, suffix=".partial")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(rendered)
+        os.replace(temporary, output)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    print(f"Wrote {output} ({len(rendered)} bytes).", file=sys.stderr)

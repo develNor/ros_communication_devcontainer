@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
 import getpass
 import hashlib
 import importlib
@@ -23,12 +24,13 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -2761,12 +2763,49 @@ def _passwordless_watchdog_command(argv: Sequence[str]) -> str:
     return f"nohup sudo -n {shlex.join(argv)} >/dev/null 2>&1 &"
 
 
+@contextlib.contextmanager
+def _terminate_via_exception() -> Iterator[None]:
+    """Make SIGTERM unwind the stack instead of ending the process outright.
+
+    The OTA run already has a `finally` that reverts shaping, collects logs and
+    stops both peers. SIGINT reaches it, because Python raises KeyboardInterrupt.
+    SIGTERM does not: the default disposition ends the process immediately, so
+    `finally` never runs and every peer keeps its containers -- and, worse, any
+    netem qdisc stays armed on the peer's own interface, quietly degrading a
+    machine nobody is looking at.
+
+    SIGTERM is not the exotic case. `timeout` sends it, systemd sends it, and a
+    CI job cancelling a step sends it. On 2026-08-19 a run killed by `timeout`
+    left containers behind on both peers, which then blocked the next run's
+    exclusivity check.
+
+    Raising SystemExit gives the same exit status while letting the cleanup run.
+    The handler is restored on the way out so this does not leak into a caller.
+    """
+
+    def handler(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    try:
+        previous = signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        # Not the main thread; the parent already owns signal disposition.
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def _ota_conflict_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
     """Fail-safe preflight: OTA runs require exclusive control of the peers.
 
-    Aborts when a peer already runs rosotacom containers or has active network
-    shaping (netem/tbf/htb) on the data interface toward another peer — both
-    signal an OTA run that is still active or was not cleaned up.
+    Aborts when a peer already runs rosotacom containers, has active network
+    shaping (netem/tbf/htb) on the data interface toward another peer, or is
+    carrying so much unrelated load that a measurement taken on it would not
+    mean anything. The first two signal an OTA run that is still active or was
+    not cleaned up; the third signals a machine somebody else is using.
     """
     from .network_shaper import ota_interface_from_route
 
@@ -2818,6 +2857,59 @@ def _ota_conflict_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
                     + f"\nStop the run that applied it, clear it (sudo tc qdisc del dev {interface} root),"
                     " or pass --skip-conflict-check."
                 )
+
+
+# A run on a machine somebody else is saturating does not fail — it succeeds
+# and reports numbers that describe the contention rather than the link. That
+# is the expensive kind of wrong, because nothing in the artefact says so
+# afterwards.
+#
+# The thresholds are per-CPU, so they read the same on an 8-core laptop and a
+# 32-thread desktop. At 2.0 the run stops: with twice as many runnable threads
+# as CPUs, a thread waits on average as long as it runs, which lands directly
+# in the scheduling latency a transport measurement is trying to resolve.
+_LOAD_WARN_PER_CPU = 0.7
+_LOAD_REFUSE_PER_CPU = 2.0
+
+
+def _ota_load_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
+    """Refuse to measure on a peer that is busy with someone else's work."""
+    for peer in plan.peers.values():
+        result = _ota_run(
+            peer,
+            "cut -d' ' -f1-3 /proc/loadavg; nproc",
+            label=f"{peer.name}: host load",
+            dry_run=dry_run,
+            batch=True,
+            check=False,
+        )
+        if dry_run or result.returncode != 0:
+            continue
+        lines = (result.stdout or "").split()
+        if len(lines) < 4:
+            continue
+        try:
+            load1, load5, load15 = (float(value) for value in lines[:3])
+            cpus = max(1, int(lines[3]))
+        except ValueError:
+            continue
+        # load5 as well as load1: a run takes minutes, and a machine that was
+        # busy a moment ago is about to be busy again.
+        ratio = max(load1, load5) / cpus
+        # Two decimals to match /proc/loadavg and uptime, so the number in an
+        # artefact can be compared against what the machine reports itself.
+        summary = f"load {load1:.2f}/{load5:.2f}/{load15:.2f} on {cpus} CPUs ({ratio:.2f} per CPU)"
+        if ratio >= _LOAD_REFUSE_PER_CPU:
+            raise RuntimeError(
+                f"Peer {peer.name} is carrying unrelated load: {summary}.\n"
+                "A measurement taken here would describe the contention, not the link.\n"
+                "Wait for the machine to go quiet, measure on another pair, or — if this "
+                "load is yours and expected — pass --skip-conflict-check."
+            )
+        if ratio >= _LOAD_WARN_PER_CPU:
+            print(f"! {peer.name}: {summary} — comparisons survive if runs are interleaved, absolute latencies do not")
+        else:
+            print(f"+ {peer.name}: {summary}")
 
 
 def _ota_preflight(
@@ -2924,6 +3016,7 @@ def _ota_preflight(
 
     if check_conflicts:
         _ota_conflict_check(plan, dry_run=dry_run)
+        _ota_load_check(plan, dry_run=dry_run)
 
 
 _OTA_STAGE_EXCLUDES = {
@@ -3137,6 +3230,7 @@ def _ota_verify_checkouts(plan: OtaSmokePlan, *, dry_run: bool) -> None:
     distinct one-line failure here, before any container starts, rather than a
     confusing one an hour later.
     """
+    peer_profiles: dict[str, list[str]] = {}
     for peer in plan.peers.values():
         checkout = shlex.quote(_ota_peer_workdir(plan, peer))
         project = shlex.quote(plan.project)
@@ -3174,6 +3268,46 @@ def _ota_verify_checkouts(plan: OtaSmokePlan, *, dry_run: bool) -> None:
             # a real hazard, but it is also a legitimate mid-migration state,
             # and a check that refuses it would be the wrong place to find out.
             print(f"+ {peer.name}: rosotacom {version.stdout.strip() or 'unknown'}")
+        profiles = _ota_run(
+            peer,
+            f"{OTA_CHECKOUT_PATH_PREFIX}"
+            'ls "$(rosotacom resources path ws)"/ota_configs/*.template '
+            "2>/dev/null | xargs -r -n1 basename | sort | tr '\\n' ' '",
+            label=f"{peer.name}: OTA profile templates",
+            dry_run=dry_run,
+            batch=True,
+            check=False,
+        )
+        if not dry_run and profiles.returncode == 0:
+            peer_profiles[peer.name] = profiles.stdout.split()
+
+    # Unlike the version, this one refuses. A peer whose installed stack lacks
+    # the template a session names does not fail loudly: the renderer errors,
+    # the profile file is left unusable, and the DDS stack silently falls back
+    # to its own defaults — multicast discovery, which no tunnelled OTA link
+    # carries. The run then completes and reports zero delivered messages, which
+    # reads as a middleware that does not work. That is exactly what happened on
+    # 2026-08-19, when #299 made fastdds_tuned.xml the Fast DDS default while
+    # the deployed stack predated the template: eight runs, all recorded as
+    # evidence about Fast DDS, none of which had ever configured it.
+    if len(peer_profiles) > 1:
+        names = sorted(peer_profiles)
+        reference = set(peer_profiles[names[0]])
+        for name in names[1:]:
+            missing = reference - set(peer_profiles[name])
+            extra = set(peer_profiles[name]) - reference
+            if missing or extra:
+                detail = []
+                if missing:
+                    detail.append(f"absent on {name}: {', '.join(sorted(missing))}")
+                if extra:
+                    detail.append(f"only on {name}: {', '.join(sorted(extra))}")
+                raise RuntimeError(
+                    f"Peers disagree about their OTA profile templates ({'; '.join(detail)}). "
+                    "A missing template renders nothing and the DDS stack falls back to "
+                    "defaults, so the link would come up and carry no data. Bring the peers "
+                    "to the same rosotacom before measuring."
+                )
 
 
 def _ota_prepare_hosts(args: argparse.Namespace, runtime: RuntimeConfig, plan: OtaSmokePlan) -> None:
@@ -4159,6 +4293,7 @@ def _start_interactive_ota_smoke(args: argparse.Namespace) -> int:
 
     if not getattr(args, "skip_preflight", False) and not getattr(args, "skip_conflict_check", False):
         _ota_conflict_check(plan, dry_run=dry_run)
+        _ota_load_check(plan, dry_run=dry_run)
     _ota_prepare_hosts(args, runtime, plan)
     instance = _resolve_session_instance(
         runtime,
@@ -4355,7 +4490,8 @@ def ota_smoke(args: argparse.Namespace) -> int:
                 "session). Run the non-interactive ota-smoke to shape the link, or apply the profile manually."
             )
         return _start_interactive_ota_smoke(args)
-    return _start_noninteractive_ota_smoke(args)
+    with _terminate_via_exception():
+        return _start_noninteractive_ota_smoke(args)
 
 
 def _scenario_name_completer(

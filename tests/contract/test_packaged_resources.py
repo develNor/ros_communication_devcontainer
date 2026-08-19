@@ -437,3 +437,42 @@ def test_no_credential_path_is_tracked_and_no_symlink_escapes_the_repository() -
         f"tracked symlinks point outside the repository: {escaping}. Checking one out overwrites "
         "whatever is at that path, and it is shipped in the sdist."
     )
+
+
+def test_dds_profiles_are_rendered_atomically_and_never_left_empty() -> None:
+    """A profile that fails to render must not leave a usable-looking file.
+
+    `get_ota_xml.py ... > file` truncates the target before the renderer runs, so
+    a missing template leaves a zero-byte profile behind — and a zero-byte
+    profile is not an error to either DDS stack. Fast DDS logs a parse error and
+    falls back to multicast discovery, which a tunnelled OTA link cannot carry,
+    so the session comes up healthy-looking and delivers nothing. That is how
+    eight runs on 2026-08-19 were recorded as "Fast DDS delivers 0 messages"
+    when the middleware had simply never been configured.
+    """
+    plugin_path = cli.WS_DIR / "session" / "content" / "base" / "session_plugin_base.yaml"
+    text = plugin_path.read_text(encoding="utf-8")
+
+    # Not [^;]* — the failure branch itself contains a ';', and stopping there
+    # would silently check only the half of the statement that cannot fail.
+    calls = [text[m.start() : m.start() + 400] for m in re.finditer(r"get_ota_xml\.py", text)]
+    assert calls, "no get_ota_xml.py call sites found — did the plugin move?"
+    for call in calls:
+        assert "--output" in call, f"renders through a shell redirect: {call[:120]}"
+        assert not re.search(r">\s*\"\$\{\w*config_file\}\"", call), f"still truncates its target: {call[:120]}"
+        assert "exit 1" in call, f"a failed render does not stop the start: {call[:120]}"
+
+
+def test_every_default_ota_profile_template_is_packaged() -> None:
+    """The default a session falls back to must exist in the installed package.
+
+    #299 pointed the Fast DDS default at fastdds_tuned.xml while the stack
+    deployed on the bench machines predated that template, so every Fast DDS run
+    rendered nothing.
+    """
+    from rosotacom.resources.ws.session.creation import generate_session_files as gsf
+
+    ota_configs = cli.WS_DIR / "ota_configs"
+    defaults = list(gsf._DDS_OTA_DEFAULT_CONFIG.values()) + list(gsf._DDS_LOCAL_DEFAULT_CONFIG.values())
+    missing = [name for name in defaults if name and not (ota_configs / f"{name}.template").exists()]
+    assert not missing, f"default profile templates absent from the package: {missing}"

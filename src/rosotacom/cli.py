@@ -8919,7 +8919,8 @@ def anonymize_command(args: argparse.Namespace) -> int:
 
     _require_ros2docker()
     ros2docker_cfg = load_config(runtime.ros2docker_config)
-    image_name = ros2docker_cfg.get("image_name", "ros2docker")
+    base_image_name = str(ros2docker_cfg.get("image_name", "ros2docker"))
+    image_name = _scoped_image_name_from_base(base_image_name, runtime.install_id)
 
     input_parent = input_bag_path.parent.resolve()
     input_name = input_bag_path.name
@@ -8951,11 +8952,15 @@ def anonymize_command(args: argparse.Namespace) -> int:
 
     print("Running anonymization inside ROS 2 docker container...")
     try:
+        common_override = {
+            "container_name": container_name,
+            "image_name": image_name,
+        }
+        _build_image(runtime.ros2docker_config, common_override)
         ros2docker_run(
             config_file=runtime.ros2docker_config,
             override={
-                "container_name": container_name,
-                "image_name": image_name,
+                **common_override,
                 "run_type": "command",
                 "command": " ".join(container_command),
                 # Batch job: a TTY would make headless runs (CI, agents) abort
@@ -9005,7 +9010,9 @@ def anonymize_command(args: argparse.Namespace) -> int:
             play_run_args.extend(["-v", "./qos-overrides.yaml:/scenario/qos-overrides.yaml:ro"])
         play_bag_cfg = {
             "container_name": f"play_bag_{peer}",
-            "image_name": image_name,
+            # Keep generated scenarios portable. Their normal launch path
+            # applies the installation scope when it runs the application.
+            "image_name": base_image_name,
             "run_type": "command",
             "command": " ".join(play_command_parts),
             "run_args": play_run_args,

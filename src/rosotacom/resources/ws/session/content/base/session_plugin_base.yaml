@@ -436,7 +436,7 @@ windows:
       - commands:
         - metric_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/metrics"
         - mkdir -p "$metric_dir"
-        - topics="${metric_stage_topics}"; ros2 bag record -s mcap -o "$metric_dir/stages_$(date +%Y%m%d_%H%M%S)" ${topics//,/ }
+        - topics="${metric_stage_topics}"; ros2 bag record -s mcap -o "$metric_dir/stages_$(date +%Y%m%d_%H%M%S)" --topics ${topics//,/ }
   - name: BEAT
     if: heartbeat
     layout: even-vertical
@@ -599,6 +599,11 @@ windows:
   # A peer then reported `STARTUP CHECK FAILED ... 4 pane(s) exited` on every
   # start while nothing was wrong, which is the one thing that check must not
   # do: it exists to make a genuinely dead pane visible in seconds.
+  #
+  # Kilted's republish node declares output-plugin parameters below `ut.*`;
+  # Lyrical declares the same parameters below `out.*`. Each version ignores
+  # the namespace it does not declare, so pass both while both distros are in
+  # the validation matrix.
   - name: IT
     if: it
     layout: even-vertical
@@ -608,14 +613,14 @@ windows:
         - if [[ "${it_1_topic}" == *"/compressed"* ]]; then it_in_transport="compressed"; else it_in_transport="raw"; fi
         - args=(ros2 run image_transport republish --ros-args -r __node:=republish1 -p in_transport:=${it_in_transport})
         - 'if [[ "${it_1_transport}" != "None" ]]; then args+=(-p "out_transport:=${it_1_transport}"); fi'
-        - 'if [[ "${it_1_compressed_jpeg_quality}" != "None" ]]; then args+=(-p "ut.compressed.jpeg_quality:=${it_1_compressed_jpeg_quality}"); fi'
-        - 'if [[ "${it_1_ffmpeg_gop_size}" != "None" ]]; then args+=(-p "ut.ffmpeg.gop_size:=${it_1_ffmpeg_gop_size}"); fi'
-        - 'if [[ "${it_1_ffmpeg_encoder_av_options}" != "None" ]]; then args+=(-p "ut.ffmpeg.encoder_av_options:=${it_1_ffmpeg_encoder_av_options}"); fi'
-        - 'if [[ "${it_1_ffmpeg_bit_rate}" != "None" ]]; then args+=(-p "ut.ffmpeg.bit_rate:=${it_1_ffmpeg_bit_rate}"); fi'
-        - 'if [[ "${it_1_foxglove_gop_size}" != "None" ]]; then args+=(-p "ut.foxglove.gop_size:=${it_1_foxglove_gop_size}"); fi'
-        - 'if [[ "${it_1_foxglove_encoder_av_options}" != "None" ]]; then args+=(-p "ut.foxglove.encoder_av_options:=${it_1_foxglove_encoder_av_options}"); fi'
-        - 'if [[ "${it_1_foxglove_bit_rate}" != "None" ]]; then args+=(-p "ut.foxglove.bit_rate:=${it_1_foxglove_bit_rate}"); fi'
-        - 'if [[ "${it_1_foxglove_qmax}" != "None" ]]; then args+=(-p "ut.foxglove.qmax:=${it_1_foxglove_qmax}"); fi'
+        - 'if [[ "${it_1_compressed_jpeg_quality}" != "None" ]]; then args+=(-p "ut.compressed.jpeg_quality:=${it_1_compressed_jpeg_quality}" -p "out.compressed.jpeg_quality:=${it_1_compressed_jpeg_quality}"); fi'
+        - 'if [[ "${it_1_ffmpeg_gop_size}" != "None" ]]; then args+=(-p "ut.ffmpeg.gop_size:=${it_1_ffmpeg_gop_size}" -p "out.ffmpeg.gop_size:=${it_1_ffmpeg_gop_size}"); fi'
+        - 'if [[ "${it_1_ffmpeg_encoder_av_options}" != "None" ]]; then args+=(-p "ut.ffmpeg.encoder_av_options:=${it_1_ffmpeg_encoder_av_options}" -p "out.ffmpeg.encoder_av_options:=${it_1_ffmpeg_encoder_av_options}"); fi'
+        - 'if [[ "${it_1_ffmpeg_bit_rate}" != "None" ]]; then args+=(-p "ut.ffmpeg.bit_rate:=${it_1_ffmpeg_bit_rate}" -p "out.ffmpeg.bit_rate:=${it_1_ffmpeg_bit_rate}"); fi'
+        - 'if [[ "${it_1_foxglove_gop_size}" != "None" ]]; then args+=(-p "ut.foxglove.gop_size:=${it_1_foxglove_gop_size}" -p "out.foxglove.gop_size:=${it_1_foxglove_gop_size}"); fi'
+        - 'if [[ "${it_1_foxglove_encoder_av_options}" != "None" ]]; then args+=(-p "ut.foxglove.encoder_av_options:=${it_1_foxglove_encoder_av_options}" -p "out.foxglove.encoder_av_options:=${it_1_foxglove_encoder_av_options}"); fi'
+        - 'if [[ "${it_1_foxglove_bit_rate}" != "None" ]]; then args+=(-p "ut.foxglove.bit_rate:=${it_1_foxglove_bit_rate}" -p "out.foxglove.bit_rate:=${it_1_foxglove_bit_rate}"); fi'
+        - 'if [[ "${it_1_foxglove_qmax}" != "None" ]]; then args+=(-p "ut.foxglove.qmax:=${it_1_foxglove_qmax}" -p "out.foxglove.qmax:=${it_1_foxglove_qmax}"); fi'
         - if [[ "${it_1_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_1_outgoing_suffix}"; else outgoing_suffix="${it_1_transport}"; fi
         - if [[ "${it_in_transport}" == "raw" ]]; then in_remap="in"; else in_remap="in/${it_in_transport}"; fi
         - args+=(--remap "${in_remap}:=${it_1_topic}" --remap "out/${it_1_transport}:=${it_1_topic}/${outgoing_suffix}")
@@ -626,14 +631,14 @@ windows:
         - if [[ "${it_2_topic}" == *"/compressed"* ]]; then it_in_transport="compressed"; else it_in_transport="raw"; fi
         - args=(ros2 run image_transport republish --ros-args -r __node:=republish2 -p in_transport:=${it_in_transport})
         - 'if [[ "${it_2_transport}" != "None" ]]; then args+=(-p "out_transport:=${it_2_transport}"); fi'
-        - 'if [[ "${it_2_compressed_jpeg_quality}" != "None" ]]; then args+=(-p "ut.compressed.jpeg_quality:=${it_2_compressed_jpeg_quality}"); fi'
-        - 'if [[ "${it_2_ffmpeg_gop_size}" != "None" ]]; then args+=(-p "ut.ffmpeg.gop_size:=${it_2_ffmpeg_gop_size}"); fi'
-        - 'if [[ "${it_2_ffmpeg_encoder_av_options}" != "None" ]]; then args+=(-p "ut.ffmpeg.encoder_av_options:=${it_2_ffmpeg_encoder_av_options}"); fi'
-        - 'if [[ "${it_2_ffmpeg_bit_rate}" != "None" ]]; then args+=(-p "ut.ffmpeg.bit_rate:=${it_2_ffmpeg_bit_rate}"); fi'
-        - 'if [[ "${it_2_foxglove_gop_size}" != "None" ]]; then args+=(-p "ut.foxglove.gop_size:=${it_2_foxglove_gop_size}"); fi'
-        - 'if [[ "${it_2_foxglove_encoder_av_options}" != "None" ]]; then args+=(-p "ut.foxglove.encoder_av_options:=${it_2_foxglove_encoder_av_options}"); fi'
-        - 'if [[ "${it_2_foxglove_bit_rate}" != "None" ]]; then args+=(-p "ut.foxglove.bit_rate:=${it_2_foxglove_bit_rate}"); fi'
-        - 'if [[ "${it_2_foxglove_qmax}" != "None" ]]; then args+=(-p "ut.foxglove.qmax:=${it_2_foxglove_qmax}"); fi'
+        - 'if [[ "${it_2_compressed_jpeg_quality}" != "None" ]]; then args+=(-p "ut.compressed.jpeg_quality:=${it_2_compressed_jpeg_quality}" -p "out.compressed.jpeg_quality:=${it_2_compressed_jpeg_quality}"); fi'
+        - 'if [[ "${it_2_ffmpeg_gop_size}" != "None" ]]; then args+=(-p "ut.ffmpeg.gop_size:=${it_2_ffmpeg_gop_size}" -p "out.ffmpeg.gop_size:=${it_2_ffmpeg_gop_size}"); fi'
+        - 'if [[ "${it_2_ffmpeg_encoder_av_options}" != "None" ]]; then args+=(-p "ut.ffmpeg.encoder_av_options:=${it_2_ffmpeg_encoder_av_options}" -p "out.ffmpeg.encoder_av_options:=${it_2_ffmpeg_encoder_av_options}"); fi'
+        - 'if [[ "${it_2_ffmpeg_bit_rate}" != "None" ]]; then args+=(-p "ut.ffmpeg.bit_rate:=${it_2_ffmpeg_bit_rate}" -p "out.ffmpeg.bit_rate:=${it_2_ffmpeg_bit_rate}"); fi'
+        - 'if [[ "${it_2_foxglove_gop_size}" != "None" ]]; then args+=(-p "ut.foxglove.gop_size:=${it_2_foxglove_gop_size}" -p "out.foxglove.gop_size:=${it_2_foxglove_gop_size}"); fi'
+        - 'if [[ "${it_2_foxglove_encoder_av_options}" != "None" ]]; then args+=(-p "ut.foxglove.encoder_av_options:=${it_2_foxglove_encoder_av_options}" -p "out.foxglove.encoder_av_options:=${it_2_foxglove_encoder_av_options}"); fi'
+        - 'if [[ "${it_2_foxglove_bit_rate}" != "None" ]]; then args+=(-p "ut.foxglove.bit_rate:=${it_2_foxglove_bit_rate}" -p "out.foxglove.bit_rate:=${it_2_foxglove_bit_rate}"); fi'
+        - 'if [[ "${it_2_foxglove_qmax}" != "None" ]]; then args+=(-p "ut.foxglove.qmax:=${it_2_foxglove_qmax}" -p "out.foxglove.qmax:=${it_2_foxglove_qmax}"); fi'
         - if [[ "${it_2_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_2_outgoing_suffix}"; else outgoing_suffix="${it_2_transport}"; fi
         - if [[ "${it_in_transport}" == "raw" ]]; then in_remap="in"; else in_remap="in/${it_in_transport}"; fi
         - args+=(--remap "${in_remap}:=${it_2_topic}" --remap "out/${it_2_transport}:=${it_2_topic}/${outgoing_suffix}")
@@ -644,14 +649,14 @@ windows:
         - if [[ "${it_3_topic}" == *"/compressed"* ]]; then it_in_transport="compressed"; else it_in_transport="raw"; fi
         - args=(ros2 run image_transport republish --ros-args -r __node:=republish3 -p in_transport:=${it_in_transport})
         - 'if [[ "${it_3_transport}" != "None" ]]; then args+=(-p "out_transport:=${it_3_transport}"); fi'
-        - 'if [[ "${it_3_compressed_jpeg_quality}" != "None" ]]; then args+=(-p "ut.compressed.jpeg_quality:=${it_3_compressed_jpeg_quality}"); fi'
-        - 'if [[ "${it_3_ffmpeg_gop_size}" != "None" ]]; then args+=(-p "ut.ffmpeg.gop_size:=${it_3_ffmpeg_gop_size}"); fi'
-        - 'if [[ "${it_3_ffmpeg_encoder_av_options}" != "None" ]]; then args+=(-p "ut.ffmpeg.encoder_av_options:=${it_3_ffmpeg_encoder_av_options}"); fi'
-        - 'if [[ "${it_3_ffmpeg_bit_rate}" != "None" ]]; then args+=(-p "ut.ffmpeg.bit_rate:=${it_3_ffmpeg_bit_rate}"); fi'
-        - 'if [[ "${it_3_foxglove_gop_size}" != "None" ]]; then args+=(-p "ut.foxglove.gop_size:=${it_3_foxglove_gop_size}"); fi'
-        - 'if [[ "${it_3_foxglove_encoder_av_options}" != "None" ]]; then args+=(-p "ut.foxglove.encoder_av_options:=${it_3_foxglove_encoder_av_options}"); fi'
-        - 'if [[ "${it_3_foxglove_bit_rate}" != "None" ]]; then args+=(-p "ut.foxglove.bit_rate:=${it_3_foxglove_bit_rate}"); fi'
-        - 'if [[ "${it_3_foxglove_qmax}" != "None" ]]; then args+=(-p "ut.foxglove.qmax:=${it_3_foxglove_qmax}"); fi'
+        - 'if [[ "${it_3_compressed_jpeg_quality}" != "None" ]]; then args+=(-p "ut.compressed.jpeg_quality:=${it_3_compressed_jpeg_quality}" -p "out.compressed.jpeg_quality:=${it_3_compressed_jpeg_quality}"); fi'
+        - 'if [[ "${it_3_ffmpeg_gop_size}" != "None" ]]; then args+=(-p "ut.ffmpeg.gop_size:=${it_3_ffmpeg_gop_size}" -p "out.ffmpeg.gop_size:=${it_3_ffmpeg_gop_size}"); fi'
+        - 'if [[ "${it_3_ffmpeg_encoder_av_options}" != "None" ]]; then args+=(-p "ut.ffmpeg.encoder_av_options:=${it_3_ffmpeg_encoder_av_options}" -p "out.ffmpeg.encoder_av_options:=${it_3_ffmpeg_encoder_av_options}"); fi'
+        - 'if [[ "${it_3_ffmpeg_bit_rate}" != "None" ]]; then args+=(-p "ut.ffmpeg.bit_rate:=${it_3_ffmpeg_bit_rate}" -p "out.ffmpeg.bit_rate:=${it_3_ffmpeg_bit_rate}"); fi'
+        - 'if [[ "${it_3_foxglove_gop_size}" != "None" ]]; then args+=(-p "ut.foxglove.gop_size:=${it_3_foxglove_gop_size}" -p "out.foxglove.gop_size:=${it_3_foxglove_gop_size}"); fi'
+        - 'if [[ "${it_3_foxglove_encoder_av_options}" != "None" ]]; then args+=(-p "ut.foxglove.encoder_av_options:=${it_3_foxglove_encoder_av_options}" -p "out.foxglove.encoder_av_options:=${it_3_foxglove_encoder_av_options}"); fi'
+        - 'if [[ "${it_3_foxglove_bit_rate}" != "None" ]]; then args+=(-p "ut.foxglove.bit_rate:=${it_3_foxglove_bit_rate}" -p "out.foxglove.bit_rate:=${it_3_foxglove_bit_rate}"); fi'
+        - 'if [[ "${it_3_foxglove_qmax}" != "None" ]]; then args+=(-p "ut.foxglove.qmax:=${it_3_foxglove_qmax}" -p "out.foxglove.qmax:=${it_3_foxglove_qmax}"); fi'
         - if [[ "${it_3_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_3_outgoing_suffix}"; else outgoing_suffix="${it_3_transport}"; fi
         - if [[ "${it_in_transport}" == "raw" ]]; then in_remap="in"; else in_remap="in/${it_in_transport}"; fi
         - args+=(--remap "${in_remap}:=${it_3_topic}" --remap "out/${it_3_transport}:=${it_3_topic}/${outgoing_suffix}")
@@ -662,14 +667,14 @@ windows:
         - if [[ "${it_4_topic}" == *"/compressed"* ]]; then it_in_transport="compressed"; else it_in_transport="raw"; fi
         - args=(ros2 run image_transport republish --ros-args -r __node:=republish4 -p in_transport:=${it_in_transport})
         - 'if [[ "${it_4_transport}" != "None" ]]; then args+=(-p "out_transport:=${it_4_transport}"); fi'
-        - 'if [[ "${it_4_compressed_jpeg_quality}" != "None" ]]; then args+=(-p "ut.compressed.jpeg_quality:=${it_4_compressed_jpeg_quality}"); fi'
-        - 'if [[ "${it_4_ffmpeg_gop_size}" != "None" ]]; then args+=(-p "ut.ffmpeg.gop_size:=${it_4_ffmpeg_gop_size}"); fi'
-        - 'if [[ "${it_4_ffmpeg_encoder_av_options}" != "None" ]]; then args+=(-p "ut.ffmpeg.encoder_av_options:=${it_4_ffmpeg_encoder_av_options}"); fi'
-        - 'if [[ "${it_4_ffmpeg_bit_rate}" != "None" ]]; then args+=(-p "ut.ffmpeg.bit_rate:=${it_4_ffmpeg_bit_rate}"); fi'
-        - 'if [[ "${it_4_foxglove_gop_size}" != "None" ]]; then args+=(-p "ut.foxglove.gop_size:=${it_4_foxglove_gop_size}"); fi'
-        - 'if [[ "${it_4_foxglove_encoder_av_options}" != "None" ]]; then args+=(-p "ut.foxglove.encoder_av_options:=${it_4_foxglove_encoder_av_options}"); fi'
-        - 'if [[ "${it_4_foxglove_bit_rate}" != "None" ]]; then args+=(-p "ut.foxglove.bit_rate:=${it_4_foxglove_bit_rate}"); fi'
-        - 'if [[ "${it_4_foxglove_qmax}" != "None" ]]; then args+=(-p "ut.foxglove.qmax:=${it_4_foxglove_qmax}"); fi'
+        - 'if [[ "${it_4_compressed_jpeg_quality}" != "None" ]]; then args+=(-p "ut.compressed.jpeg_quality:=${it_4_compressed_jpeg_quality}" -p "out.compressed.jpeg_quality:=${it_4_compressed_jpeg_quality}"); fi'
+        - 'if [[ "${it_4_ffmpeg_gop_size}" != "None" ]]; then args+=(-p "ut.ffmpeg.gop_size:=${it_4_ffmpeg_gop_size}" -p "out.ffmpeg.gop_size:=${it_4_ffmpeg_gop_size}"); fi'
+        - 'if [[ "${it_4_ffmpeg_encoder_av_options}" != "None" ]]; then args+=(-p "ut.ffmpeg.encoder_av_options:=${it_4_ffmpeg_encoder_av_options}" -p "out.ffmpeg.encoder_av_options:=${it_4_ffmpeg_encoder_av_options}"); fi'
+        - 'if [[ "${it_4_ffmpeg_bit_rate}" != "None" ]]; then args+=(-p "ut.ffmpeg.bit_rate:=${it_4_ffmpeg_bit_rate}" -p "out.ffmpeg.bit_rate:=${it_4_ffmpeg_bit_rate}"); fi'
+        - 'if [[ "${it_4_foxglove_gop_size}" != "None" ]]; then args+=(-p "ut.foxglove.gop_size:=${it_4_foxglove_gop_size}" -p "out.foxglove.gop_size:=${it_4_foxglove_gop_size}"); fi'
+        - 'if [[ "${it_4_foxglove_encoder_av_options}" != "None" ]]; then args+=(-p "ut.foxglove.encoder_av_options:=${it_4_foxglove_encoder_av_options}" -p "out.foxglove.encoder_av_options:=${it_4_foxglove_encoder_av_options}"); fi'
+        - 'if [[ "${it_4_foxglove_bit_rate}" != "None" ]]; then args+=(-p "ut.foxglove.bit_rate:=${it_4_foxglove_bit_rate}" -p "out.foxglove.bit_rate:=${it_4_foxglove_bit_rate}"); fi'
+        - 'if [[ "${it_4_foxglove_qmax}" != "None" ]]; then args+=(-p "ut.foxglove.qmax:=${it_4_foxglove_qmax}" -p "out.foxglove.qmax:=${it_4_foxglove_qmax}"); fi'
         - if [[ "${it_4_outgoing_suffix}" != "None" ]]; then outgoing_suffix="${it_4_outgoing_suffix}"; else outgoing_suffix="${it_4_transport}"; fi
         - if [[ "${it_in_transport}" == "raw" ]]; then in_remap="in"; else in_remap="in/${it_in_transport}"; fi
         - args+=(--remap "${in_remap}:=${it_4_topic}" --remap "out/${it_4_transport}:=${it_4_topic}/${outgoing_suffix}")

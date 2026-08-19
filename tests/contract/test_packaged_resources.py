@@ -537,3 +537,36 @@ def test_every_default_ota_profile_template_is_packaged() -> None:
     defaults = list(gsf._DDS_OTA_DEFAULT_CONFIG.values()) + list(gsf._DDS_LOCAL_DEFAULT_CONFIG.values())
     missing = [name for name in defaults if name and not (ota_configs / f"{name}.template").exists()]
     assert not missing, f"default profile templates absent from the package: {missing}"
+
+
+def test_benchmark_forwards_every_shared_ota_peer_option() -> None:
+    """A hand-copied field list drops new options silently, and did.
+
+    `cli_benchmark` builds an `argparse.Namespace` for the OTA layer by naming
+    each field it forwards. `--peer-cpuset` was added to the shared OTA argument
+    group, reached the parser, and was accepted on the command line — and then
+    never arrived, because this list did not mention it. Every unit test passed
+    and the feature was inert on the machine it was built for.
+
+    So the list is checked against the parser rather than maintained by hand:
+    whatever `_add_ota_install_args` defines has to appear here too.
+    """
+    import argparse
+    import inspect
+
+    import rosotacom.cli as cli
+    import rosotacom.cli_benchmark as cli_benchmark
+
+    parser = argparse.ArgumentParser()
+    cli._add_ota_install_args(parser)
+    peer_dests = {
+        action.dest for action in parser._actions if action.dest.startswith("peer_") and action.dest != "help"
+    }
+    assert peer_dests, "the shared OTA argument group defines no --peer-* options"
+
+    forwarded = inspect.getsource(cli_benchmark)
+    missing = sorted(dest for dest in peer_dests if f"{dest}=getattr(args" not in forwarded)
+    assert not missing, (
+        f"cli_benchmark does not forward {', '.join(missing)} into the OTA namespace, "
+        "so the option is accepted on the command line and then ignored"
+    )

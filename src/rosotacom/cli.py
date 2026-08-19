@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
 import getpass
 import hashlib
 import importlib
@@ -23,12 +24,13 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -2737,6 +2739,41 @@ def _passwordless_watchdog_command(argv: Sequence[str]) -> str:
     return f"nohup sudo -n {shlex.join(argv)} >/dev/null 2>&1 &"
 
 
+@contextlib.contextmanager
+def _terminate_via_exception() -> Iterator[None]:
+    """Make SIGTERM unwind the stack instead of ending the process outright.
+
+    The OTA run already has a `finally` that reverts shaping, collects logs and
+    stops both peers. SIGINT reaches it, because Python raises KeyboardInterrupt.
+    SIGTERM does not: the default disposition ends the process immediately, so
+    `finally` never runs and every peer keeps its containers -- and, worse, any
+    netem qdisc stays armed on the peer's own interface, quietly degrading a
+    machine nobody is looking at.
+
+    SIGTERM is not the exotic case. `timeout` sends it, systemd sends it, and a
+    CI job cancelling a step sends it. On 2026-08-19 a run killed by `timeout`
+    left containers behind on both peers, which then blocked the next run's
+    exclusivity check.
+
+    Raising SystemExit gives the same exit status while letting the cleanup run.
+    The handler is restored on the way out so this does not leak into a caller.
+    """
+
+    def handler(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    try:
+        previous = signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        # Not the main thread; the parent already owns signal disposition.
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def _ota_conflict_check(plan: OtaSmokePlan, *, dry_run: bool) -> None:
     """Fail-safe preflight: OTA runs require exclusive control of the peers.
 
@@ -4429,7 +4466,8 @@ def ota_smoke(args: argparse.Namespace) -> int:
                 "session). Run the non-interactive ota-smoke to shape the link, or apply the profile manually."
             )
         return _start_interactive_ota_smoke(args)
-    return _start_noninteractive_ota_smoke(args)
+    with _terminate_via_exception():
+        return _start_noninteractive_ota_smoke(args)
 
 
 def _scenario_name_completer(

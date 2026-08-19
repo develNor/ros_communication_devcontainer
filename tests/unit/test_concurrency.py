@@ -8,6 +8,8 @@ parallel/conflict end-to-end half lives in tests/e2e/test_parallel_smoke.py.
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -646,3 +648,33 @@ def test_ota_load_check_is_quiet_on_an_idle_peer(
     rosotacom._ota_load_check(_load_plan(tmp_path), dry_run=False)
     out = capsys.readouterr().out
     assert "0.21" in out and "8 CPUs" in out
+
+
+def test_sigterm_unwinds_so_cleanup_runs() -> None:
+    """SIGTERM must reach the run's `finally`, not end the process outright.
+
+    `timeout`, systemd, and a cancelled CI step all send SIGTERM. Under the
+    default disposition Python exits immediately, so the OTA run's cleanup —
+    revert shaping, collect logs, stop both peers — never happens. On
+    2026-08-19 a run killed by `timeout` left containers on both peers, which
+    then blocked the next run's exclusivity check.
+    """
+    cleaned: list[str] = []
+
+    with pytest.raises(SystemExit) as excinfo:
+        with rosotacom._terminate_via_exception():
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+            finally:
+                cleaned.append("teardown ran")
+
+    assert cleaned == ["teardown ran"]
+    assert excinfo.value.code == 128 + signal.SIGTERM
+
+
+def test_sigterm_disposition_is_restored() -> None:
+    """The handler must not leak into whatever called us."""
+    before = signal.getsignal(signal.SIGTERM)
+    with rosotacom._terminate_via_exception():
+        assert signal.getsignal(signal.SIGTERM) is not before
+    assert signal.getsignal(signal.SIGTERM) is before

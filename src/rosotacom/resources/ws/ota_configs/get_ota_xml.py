@@ -15,8 +15,20 @@ import re
 import sys
 import tempfile
 
-
-KNOWN_PLACEHOLDERS = {"#host_ip", "#peer", "#easy_mode_ip", "#spdp_interval"}
+KNOWN_PLACEHOLDERS = {
+    "#host_ip",
+    "#peer",
+    "#easy_mode_ip",
+    "#spdp_interval",
+    #: A template that scopes its settings to one ROS domain resolves these.
+    #: Cyclone applies a <Domain> section to the domain its Id names, so a
+    #: single configuration can hold the OTA settings for the OTA domain and
+    #: leave the local domain alone — which is what lets every process on a
+    #: host share one configuration instead of half of them carrying the OTA
+    #: profile and half the local one.
+    "#local_domain",
+    "#ota_domain",
+}
 PLACEHOLDER_PATTERN = re.compile(r"#[A-Za-z_][A-Za-z0-9_]*")
 DEFAULT_SPDP_INTERVAL = "30s"
 
@@ -46,6 +58,19 @@ def _resolved_address(value: str, label: str) -> str:
     if not address:
         raise ValueError(f"{label} must be a non-empty resolved address.")
     return address
+
+
+def _resolved_domain(value: str, label: str) -> str:
+    """A ROS domain id, validated rather than pasted into the XML.
+
+    An unusable Id is worse than a missing one: Cyclone keeps a <Domain>
+    section it cannot match to any domain, so the settings vanish without a
+    word and the link comes up on defaults.
+    """
+    domain = str(value).strip()
+    if not domain.isdigit() or not 0 <= int(domain) <= 232:
+        raise ValueError(f"{label} must be a ROS domain id between 0 and 232, got {value!r}.")
+    return str(int(domain))
 
 
 def _resolved_spdp_interval(value: str) -> str:
@@ -99,9 +124,7 @@ def _expand_peer_block(content: str, peer_ips: list) -> str:
 
     has_markers = PEER_BLOCK_OPEN in content
     if has_markers and (PEER_BLOCK_CLOSE not in content):
-        raise RuntimeError(
-            f"Template has '{PEER_BLOCK_OPEN}' without matching '{PEER_BLOCK_CLOSE}'."
-        )
+        raise RuntimeError(f"Template has '{PEER_BLOCK_OPEN}' without matching '{PEER_BLOCK_CLOSE}'.")
 
     if len(peer_ips) == 1 and not has_markers:
         return content.replace("#peer", peer_ips[0])
@@ -116,9 +139,7 @@ def _expand_peer_block(content: str, peer_ips: list) -> str:
 
     matches = list(PEER_BLOCK_PATTERN.finditer(content))
     if len(matches) != 1:
-        raise RuntimeError(
-            f"Template must contain exactly one peer-block region; found {len(matches)}."
-        )
+        raise RuntimeError(f"Template must contain exactly one peer-block region; found {len(matches)}.")
     m = matches[0]
     block = m.group(1)
     if "#peer" not in block:
@@ -128,11 +149,11 @@ def _expand_peer_block(content: str, peer_ips: list) -> str:
 
     # Preserve the indentation of the marker line so duplicated blocks align.
     line_start = content.rfind("\n", 0, m.start()) + 1
-    indent = content[line_start:m.start()]
+    indent = content[line_start : m.start()]
     sep = ("\n" + indent) if not indent.strip() else ""
 
     rendered = sep.join(block.replace("#peer", ip) for ip in peer_ips)
-    return content[:m.start()] + rendered + content[m.end():]
+    return content[: m.start()] + rendered + content[m.end() :]
 
 
 def main(
@@ -141,12 +162,14 @@ def main(
     peer: str = None,
     easy_mode_ip: str = None,
     spdp_interval: str = DEFAULT_SPDP_INTERVAL,
+    local_domain: str = None,
+    ota_domain: str = None,
 ) -> str:
     path = _template_path(config)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Template not found: {path}")
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         content = f.read()
 
     found = set(PLACEHOLDER_PATTERN.findall(content))
@@ -159,9 +182,7 @@ def main(
 
     if "#host_ip" in found:
         if not host_ip:
-            raise RuntimeError(
-                f"Template '{os.path.basename(path)}' uses #host_ip but --host-ip was not provided."
-            )
+            raise RuntimeError(f"Template '{os.path.basename(path)}' uses #host_ip but --host-ip was not provided.")
         content = content.replace("#host_ip", _resolved_address(host_ip, "Host IP"))
 
     if "#easy_mode_ip" in found:
@@ -169,45 +190,60 @@ def main(
             raise RuntimeError(
                 f"Template '{os.path.basename(path)}' uses #easy_mode_ip but --easy-mode-ip was not provided."
             )
-        content = content.replace(
-            "#easy_mode_ip", _resolved_address(easy_mode_ip, "Easy Mode IP")
-        )
+        content = content.replace("#easy_mode_ip", _resolved_address(easy_mode_ip, "Easy Mode IP"))
 
     if "#spdp_interval" in found:
         content = content.replace("#spdp_interval", _resolved_spdp_interval(spdp_interval))
 
+    for placeholder, value, option in (
+        ("#local_domain", local_domain, "--local-domain"),
+        ("#ota_domain", ota_domain, "--ota-domain"),
+    ):
+        if placeholder in found:
+            if value is None or not str(value).strip():
+                raise RuntimeError(
+                    f"Template '{os.path.basename(path)}' uses {placeholder} but {option} was not provided."
+                )
+            content = content.replace(placeholder, _resolved_domain(value, placeholder))
+
     if "#peer" in found:
         if not peer:
-            raise RuntimeError(
-                f"Template '{os.path.basename(path)}' uses #peer but --peer was not provided."
-            )
+            raise RuntimeError(f"Template '{os.path.basename(path)}' uses #peer but --peer was not provided.")
         content = _expand_peer_block(content, _resolve_peer_ips(peer))
 
     return content
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Resolve placeholders in an OTA DDS XML template."
-    )
+    parser = argparse.ArgumentParser(description="Resolve placeholders in an OTA DDS XML template.")
     parser.add_argument(
-        "-c", "--config", required=True,
+        "-c",
+        "--config",
+        required=True,
         help="Template name (e.g. fastdds_v1.xml, cyclonedds.xml, fastdds_easy_mode.xml).",
     )
     parser.add_argument(
-        "-i", "--host-ip", dest="host_ip",
+        "-i",
+        "--host-ip",
+        dest="host_ip",
         help="Resolved local host address (#host_ip).",
     )
     parser.add_argument(
-        "-p", "--peer", dest="peer",
+        "-p",
+        "--peer",
+        dest="peer",
         help="Resolved peer address, or comma-separated addresses (#peer).",
     )
     parser.add_argument(
-        "-e", "--easy-mode-ip", dest="easy_mode_ip",
+        "-e",
+        "--easy-mode-ip",
+        dest="easy_mode_ip",
         help="Resolved Fast DDS Easy Mode address (#easy_mode_ip).",
     )
     parser.add_argument(
-        "-o", "--output", dest="output",
+        "-o",
+        "--output",
+        dest="output",
         help=(
             "Write the rendered XML to this path, atomically. Prefer this over a shell "
             "redirect: `> file` truncates the target before this script runs, so a "
@@ -217,6 +253,16 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--local-domain",
+        dest="local_domain",
+        help="Local ROS domain id, for a template that scopes a section to it (#local_domain).",
+    )
+    parser.add_argument(
+        "--ota-domain",
+        dest="ota_domain",
+        help="OTA ROS domain id, for a template that scopes a section to it (#ota_domain).",
+    )
+    parser.add_argument(
         "--spdp-interval",
         dest="spdp_interval",
         default=DEFAULT_SPDP_INTERVAL,
@@ -224,8 +270,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     output = args.output
-    rendered = main(**{k: v for k, v in vars(args).items()
-                       if v is not None and k != "output"})
+    rendered = main(**{k: v for k, v in vars(args).items() if v is not None and k != "output"})
     if not output:
         print(rendered)
         raise SystemExit(0)

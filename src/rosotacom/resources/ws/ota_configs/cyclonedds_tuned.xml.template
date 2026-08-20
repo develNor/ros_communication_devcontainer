@@ -6,7 +6,18 @@
                 <NetworkInterface address="#host_ip"/>
             </Interfaces>
             <MulticastRecvNetworkInterfaceAddresses>none</MulticastRecvNetworkInterfaceAddresses>
-            <FragmentSize>1200B</FragmentSize>
+            <!-- Strictly below MaxMessageSize, and that is the whole point: an RTPS
+                 message carries headers as well as the fragment, so a fragment of
+                 exactly MaxMessageSize cannot be sent at all. Both were 1200B, which
+                 CycloneDDS 0.10.5 coped with and 11.0.1 does not — under Lyrical no
+                 fragmented sample crossed, silently: the endpoints matched and the
+                 reader never saw a sample, while a sample small enough not to
+                 fragment arrived normally. Measured between two hosts with a 64 kB
+                 sample: 1200/1200 delivers nothing on 11.0.1 and everything on
+                 0.10.5; 1024/1200 delivers on both. The datagram stays inside the
+                 same MTU budget the 1200B was chosen for; only the header room is
+                 added. -->
+            <FragmentSize>1024B</FragmentSize>
             <MaxMessageSize>1200B</MaxMessageSize>
             <MaxRexmitMessageSize>1200B</MaxRexmitMessageSize>
         </General>

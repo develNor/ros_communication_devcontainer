@@ -10,7 +10,7 @@ this dangerous: an 84 B heartbeat crossing at 10 Hz with 0.0% loss is a link
 that looks alive from every direction except the one that matters.
 
 The obvious reason to set it is symmetry with CycloneDDS, whose OTA profile
-carries this link at `FragmentSize`/`MaxMessageSize` 1200 B and works. The
+carries this link at a 1024 B fragment inside a 1200 B datagram and works. The
 symmetry does not transfer: on ROS 2 Kilted with Fast DDS 3.2.4 the cap is the
 single knob that breaks the link, at 1200 B and at 8192 B, with a synchronous
 writer and with an asynchronous one.

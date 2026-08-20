@@ -2258,6 +2258,19 @@ def test_resolve_session_and_base_extra_run_args(tmp_path: Path, monkeypatch: py
     assert resolved.container_dir == "/session/definitions/1_heartbeat"
     assert f"{rosotacom.WS_DIR.resolve()}:/ws" in args
     assert f"{runtime.session_configs_dir[0]}:/session/definitions:ro" in args
+    assert "--cpuset-cpus" not in args
+
+    # A cpuset confines every container of the session. Without this the CPUs a
+    # shared workstation reserved are merely idle, not used by the run.
+    pinned = rosotacom._base_extra_run_args(runtime, resolved, {"peers": {"a": {}, "b": {}}}, instance, cpuset=" 0-3 ")
+    assert pinned[pinned.index("--cpuset-cpus") + 1] == "0-3"
+
+    # It is validated here too, not only where it is parsed: this is the last
+    # place before the string becomes part of a docker command line.
+    with pytest.raises(RuntimeError):
+        rosotacom._base_extra_run_args(
+            runtime, resolved, {"peers": {"a": {}, "b": {}}}, instance, cpuset="0-3; rm -rf /"
+        )
     assert f"{runtime.session_instances_dir}:/session/instances" in args
     assert "Configured sessions:" in rosotacom._format_available_sessions(runtime)
     # A peer shares the host IPC namespace, so it can exchange local-domain

@@ -796,3 +796,150 @@ def test_the_load_check_does_not_retry(
         rosotacom._ota_load_check(_load_plan(tmp_path), dry_run=False)
 
     assert len(calls) == 1
+
+
+def test_validate_cpuset_accepts_a_cpu_list_and_nothing_else() -> None:
+    assert rosotacom.validate_cpuset("0-3") == "0-3"
+    assert rosotacom.validate_cpuset(" 0,2,4-7 ") == "0,2,4-7"
+    assert rosotacom.parse_cpuset_list("0-3,8") == [0, 1, 2, 3, 8]
+
+    # The string reaches `docker run` and travels over ssh, so it is validated
+    # rather than trusted.
+    for bad in ("0-3; rm -rf /", "$(id)", "0..3", "-1", "", "0-", "a-b"):
+        with pytest.raises(RuntimeError):
+            rosotacom.validate_cpuset(bad)
+    with pytest.raises(RuntimeError) as excinfo:
+        rosotacom.validate_cpuset("7-2")
+    assert "backwards" in str(excinfo.value)
+
+
+def test_cpu_busy_is_read_from_two_snapshots() -> None:
+    """A busy fraction needs the delta; the absolute counters describe boot onward."""
+    stdout = (
+        "cpu0 100 0 100 800 0 0 0 0 0 0\n"
+        "cpu1 100 0 100 800 0 0 0 0 0 0\n"
+        "---\n"
+        # cpu0 gains 100 busy and 900 idle -> 10% busy.
+        "cpu0 150 0 150 1700 0 0 0 0 0 0\n"
+        # cpu1 gains 900 busy and 100 idle -> 90% busy.
+        "cpu1 550 0 550 900 0 0 0 0 0 0\n"
+    )
+    busy = rosotacom._parse_cpu_busy(stdout, [0, 1])
+    assert busy is not None
+    assert busy[0] == pytest.approx(0.10, abs=0.01)
+    assert busy[1] == pytest.approx(0.90, abs=0.01)
+
+    # iowait does not count as competition for the runqueue: a peer writing a
+    # bag must not read as a peer that cannot be measured on.
+    io = "cpu0 0 0 0 100 0 0 0 0 0 0\n---\ncpu0 0 0 0 100 900 0 0 0 0 0\n"
+    busy_io = rosotacom._parse_cpu_busy(io, [0])
+    assert busy_io is not None
+    assert busy_io[0] == pytest.approx(0.0, abs=0.01)
+
+    assert rosotacom._parse_cpu_busy("no separator here", [0]) is None
+    assert rosotacom._parse_cpu_busy(stdout, [9]) is None  # a CPU the peer does not have
+
+
+def _pinned_peer(cpuset: str = "0-3") -> rosotacom.OtaSmokePeer:
+    return rosotacom.OtaSmokePeer("a", "robot-a", "10.0.0.10", cpuset=cpuset)
+
+
+def _busy_probe(fraction: float) -> str:
+    """Two snapshots in which every CPU is `fraction` busy."""
+    lines = [f"cpu{cpu} 0 0 0 0 0 0 0 0 0 0" for cpu in range(4)]
+    after = [f"cpu{cpu} {int(1000 * fraction)} 0 0 {int(1000 * (1 - fraction))} 0 0 0 0 0 0" for cpu in range(4)]
+    return "\n".join(lines) + "\n---\n" + "\n".join(after) + "\n"
+
+
+def test_cpuset_check_refuses_when_the_reserved_cpus_are_not_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reservation that is not in force must not read as a quiet machine."""
+    monkeypatch.setattr(
+        rosotacom,
+        "_ota_run",
+        lambda peer, script, **kw: subprocess.CompletedProcess([script], 0, _busy_probe(0.95), ""),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        rosotacom._ota_cpuset_load_check(_pinned_peer(), dry_run=False)
+    message = str(excinfo.value)
+    assert "not free" in message
+    assert "0-3" in message
+
+
+def test_cpuset_check_passes_on_reserved_cpus_that_are_idle(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        rosotacom,
+        "_ota_run",
+        lambda peer, script, **kw: subprocess.CompletedProcess([script], 0, _busy_probe(0.02), ""),
+    )
+    assert rosotacom._ota_cpuset_load_check(_pinned_peer(), dry_run=False) is True
+    assert "CPUs 0-3 are 2% busy" in capsys.readouterr().out
+
+
+def test_a_pinned_peer_is_not_judged_by_the_machine_wide_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point: a reserved workstation reads high and is still measurable.
+
+    Measured on majestic on 2026-08-19: 68-75 on 32 CPUs with four cores reserved
+    away from the account carrying that load. loadavg cannot see the reservation
+    — the other account's threads all stayed runnable, they just queue on fewer
+    cores — so judging the machine refuses a run the reservation made possible.
+    """
+    scripts: list[str] = []
+
+    def fake_ota_run(peer: object, script: str, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        scripts.append(script)
+        if "/proc/stat" in script:
+            return subprocess.CompletedProcess([script], 0, _busy_probe(0.01), "")
+        return subprocess.CompletedProcess([script], 0, "75.68 68.49 67.20\n32\n", "")
+
+    monkeypatch.setattr(rosotacom, "_ota_run", fake_ota_run)
+    plan = rosotacom.OtaSmokePlan(
+        state_path=tmp_path / "ota-deployment.yaml",
+        workdir="/tmp/rosotacom_ota",
+        rosotacom="rosotacom",
+        project="rosotacom.yaml",
+        peers={"a": _pinned_peer()},
+    )
+
+    rosotacom._ota_load_check(plan, dry_run=False)  # must not raise
+
+    assert any("/proc/stat" in s for s in scripts)
+    assert not any("loadavg" in s for s in scripts), "a pinned peer must not fall back to loadavg"
+
+
+def test_an_unpinned_peer_still_uses_the_machine_wide_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        rosotacom,
+        "_ota_run",
+        _fake_ota_run_factory({"/proc/loadavg": "78.24 81.86 81.28\n32\n"}),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        rosotacom._ota_load_check(_load_plan(tmp_path), dry_run=False)
+    assert "--peer-cpuset" in str(excinfo.value), "the refusal should name the way out"
+
+
+def test_a_pinned_peer_confines_its_containers(tmp_path: Path) -> None:
+    """The reservation only buys anything if the containers actually land on it."""
+    target = rosotacom.InteractiveSmokeTarget(
+        name="s",
+        target_type="session",
+        session=rosotacom.ResolvedSession(host_dir=tmp_path, container_dir="/s", source="test"),
+        cfg={},
+    )
+    parts = rosotacom._ota_start_parts(target, "a", "id-1", [], mode="detached", cpuset="0-3")
+    assert "--cpuset" in parts
+    assert parts[parts.index("--cpuset") + 1] == "0-3"
+
+    # And without one, nothing is added: the flag must not appear on a peer that
+    # was never pinned, or every unpinned run changes shape too.
+    assert "--cpuset" not in rosotacom._ota_start_parts(target, "a", "id-1", [], mode="detached")

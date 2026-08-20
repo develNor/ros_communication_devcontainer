@@ -5214,6 +5214,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 peer_address=getattr(args, "peer_address", None),
                 peer_ssh=getattr(args, "peer_ssh", None),
                 peer_checkout=getattr(args, "peer_checkout", None),
+                peer_cpuset=getattr(args, "peer_cpuset", None),
                 peer_exec=getattr(args, "peer_exec", None),
                 install_mode=getattr(args, "install_mode", None),
                 install_pin=getattr(args, "install_pin", None),

@@ -30,6 +30,16 @@ rosotacom ota-smoke 13_link_latency --link-trace
 `--link-trace-interval` and `--link-trace-modem-command` also enable the
 recorder and force `shared.use_status_overview: true` for the generated instance.
 
+`interval_s` is the period between rows, and the status-overview node is ticked
+at the same period when the trace is enabled. Those two being equal is what
+makes the trace continuous: each row's `passive_counter_delta` covers one tick,
+so consecutive rows meet rather than leaving traffic between them. The recorder
+therefore schedules against an advancing deadline with a small tolerance instead
+of a stopwatch since the last row — without that, a tick landing a hair early is
+rejected and waits a whole further period, which halves the trace and leaves
+every second interval described by no row at all (measured on a 5 h drive:
+1.984 s between rows carrying 1.002 s windows).
+
 ## Row Schema
 
 Each line is one JSON object:

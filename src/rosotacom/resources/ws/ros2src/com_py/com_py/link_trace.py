@@ -152,6 +152,12 @@ def build_link_trace_sample(
 class LinkTraceRecorder:
     """Write link trace rows as append-only JSONL."""
 
+    #: How early a tick may be and still count as on time. The caller ticks at
+    #: the same nominal period, so its jitter is the whole question; a tenth of
+    #: the interval absorbs that without ever letting rows run at half the
+    #: configured period.
+    _TOLERANCE_FRACTION = 0.1
+
     def __init__(
         self,
         path: str,
@@ -166,13 +172,37 @@ class LinkTraceRecorder:
         self.modem_metrics_command = modem_metrics_command
         self.modem_metrics_timeout_s = modem_metrics_timeout_s
         self._clock = clock
-        self._last_write: Optional[float] = None
+        self._due_at: Optional[float] = None
 
     def maybe_write(self, snapshot: Dict[str, Any], link_sample: Optional[Dict[str, Any]]) -> bool:
+        """Write one row if this tick is the one the schedule was waiting for.
+
+        The schedule is a *deadline that advances*, not a stopwatch since the
+        last row, and the tolerance is not cosmetic. The caller is deliberately
+        ticking at the same period as this one — `generate_session_files` sets
+        `status_write_interval_s` to the trace interval — so a plain
+        "never faster than interval_s" gate rejects every tick that lands a hair
+        early and, with no catch-up, makes it wait a whole further period.
+
+        That halves the trace, and it does not merely halve its resolution: the
+        passive counter delta in a row covers the caller's own tick, so with
+        rows twice as far apart every second of traffic is described by no row
+        at all. Measured on the 2026-08-19 drive before this fix: rows 1.984 s
+        apart carrying 1.002 s windows.
+        """
         now = self._clock()
-        if self._last_write is not None and now - self._last_write < self.interval_s:
+        if self._due_at is None:
+            self._due_at = now
+        if now < self._due_at - self._TOLERANCE_FRACTION * self.interval_s:
             return False
-        self._last_write = now
+        # Advance the deadline rather than restarting it from now, so the rows
+        # stay on one cadence instead of drifting by the jitter of every tick.
+        # After a stall long enough that the next deadline is already behind us,
+        # start a fresh interval from the present rather than bursting through
+        # the deadlines that were missed: the rows describe the link now, and a
+        # burst of them would describe nothing.
+        next_due = self._due_at + self.interval_s
+        self._due_at = next_due if next_due > now else now + self.interval_s
         modem = run_modem_metrics_hook(
             self.modem_metrics_command,
             timeout_s=self.modem_metrics_timeout_s,

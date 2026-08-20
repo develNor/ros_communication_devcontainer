@@ -129,3 +129,75 @@ def test_link_trace_recorder_appends_jsonl_on_interval(tmp_path: Path) -> None:
 
     rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert [row["kind"] for row in rows] == ["link_trace", "link_trace"]
+
+
+def _recorder(tmp_path: Path, ticks: list[float], interval_s: float = 1.0) -> tuple[LinkTraceRecorder, list[float]]:
+    remaining = iter(ticks)
+    path = tmp_path / "status" / "link_trace.jsonl"
+    return LinkTraceRecorder(str(path), interval_s=interval_s, clock=lambda: next(remaining)), ticks
+
+
+SNAPSHOT = {"generated_at": "2026-08-19T13:52:11.000", "peer": "a", "remote": "b", "topics": []}
+
+
+def test_a_caller_ticking_at_the_configured_period_gets_a_row_per_tick(tmp_path: Path) -> None:
+    """The caller ticks at exactly this period, so its jitter is the whole question.
+
+    `generate_session_files` sets `status_write_interval_s` to the trace
+    interval, so every tick lands one period after the last — sometimes a
+    millisecond early. A gate that rejects those outright makes each of them
+    wait a further full period, which is how the 2026-08-19 drive ended up with
+    rows 1.984 s apart at `interval_s: 1.0`.
+    """
+    ticks = [100.0, 100.999, 101.998, 102.997, 103.996]
+    recorder, _ = _recorder(tmp_path, ticks)
+
+    written = [recorder.maybe_write(SNAPSHOT, None) for _ in ticks]
+
+    assert written == [True] * len(ticks)
+
+
+def test_half_the_traffic_is_not_left_between_two_rows(tmp_path: Path) -> None:
+    """Why the tick above matters more than resolution.
+
+    A row's passive counter delta covers the caller's own tick. With rows twice
+    as far apart as the ticks, every second interval is described by no row at
+    all — so the trace undercounts the bytes it exists to account for.
+    """
+    ticks = [0.0, 0.999, 1.998, 2.997]
+    recorder, _ = _recorder(tmp_path, ticks)
+    for _ in ticks:
+        recorder.maybe_write(SNAPSHOT, {"passive_counter_delta": {"window_s": 1.0}})
+
+    rows = [
+        json.loads(line) for line in (tmp_path / "status" / "link_trace.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    stamps = [row["monotonic_s"] for row in rows]
+    gaps = [b - a for a, b in zip(stamps, stamps[1:], strict=False)]
+    assert gaps, "more than one row"
+    assert max(gaps) < 1.5, "no second of the drive falls between two rows"
+
+
+def test_a_much_faster_caller_is_still_held_to_the_interval(tmp_path: Path) -> None:
+    """The tolerance must not turn the interval into a suggestion."""
+    ticks = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]
+    recorder, _ = _recorder(tmp_path, ticks)
+
+    written = [recorder.maybe_write(SNAPSHOT, None) for _ in ticks]
+
+    assert written == [True, False, False, False, False, True, False]
+
+
+def test_a_stall_resynchronises_instead_of_bursting(tmp_path: Path) -> None:
+    """After a gap, the rows describe the link now.
+
+    Emitting the deadlines that were missed would produce a burst of rows that
+    describe nothing, and would make the trace's own timestamps disagree with
+    the counters in it.
+    """
+    ticks = [0.0, 30.0, 30.2, 31.0]
+    recorder, _ = _recorder(tmp_path, ticks)
+
+    written = [recorder.maybe_write(SNAPSHOT, None) for _ in ticks]
+
+    assert written == [True, True, False, True]

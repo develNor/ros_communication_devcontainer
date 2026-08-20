@@ -28,7 +28,9 @@ PLUGIN_BASE = (
     REPO_ROOT / "src" / "rosotacom" / "resources" / "ws" / "session" / "content" / "base" / "session_plugin_base.yaml"
 )
 
-OTA_FRAGMENT_BYTES = 1200
+OTA_FRAGMENT_BYTES = 1024
+#: The datagram cap the fragment has to fit inside, headers included.
+OTA_DATAGRAM_BYTES = 1200
 
 
 def _load(path: Path, name: str) -> ModuleType:
@@ -73,7 +75,15 @@ def test_only_cyclone_caps_the_datagram_and_fast_dds_must_not() -> None:
     cyclone = _resolved("cyclonedds_tuned.xml")
 
     assert f"<FragmentSize>{OTA_FRAGMENT_BYTES}B</FragmentSize>" in cyclone
-    assert f"<MaxMessageSize>{OTA_FRAGMENT_BYTES}B</MaxMessageSize>" in cyclone
+    assert f"<MaxMessageSize>{OTA_DATAGRAM_BYTES}B</MaxMessageSize>" in cyclone
+
+    # Strictly smaller, not equal, and this is the assertion the numbers exist
+    # for: an RTPS message carries headers as well as the fragment, so a
+    # fragment of exactly MaxMessageSize cannot be sent. Both were 1200 B, which
+    # CycloneDDS 0.10.5 coped with and 11.0.1 does not — no fragmented sample
+    # arrived at all, silently, while a 40 B one kept crossing
+    # (docs/findings/cyclone-fragment-equal-to-max-drops-fragmented-samples.md).
+    assert OTA_FRAGMENT_BYTES < OTA_DATAGRAM_BYTES
 
     for config in ("fastdds_tuned.xml", "fastdds_easy_mode.xml"):
         resolved = _without_comments(_resolved(config))

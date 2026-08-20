@@ -882,6 +882,61 @@ def _append_log(path: Path, text: str) -> None:
             fp.write("\n")
 
 
+#: A provenance read must never be what makes an instance fail to start.
+_SOURCE_REVISION_TIMEOUT_S = 5.0
+
+
+def _source_revision(path: Path | str) -> dict[str, Any] | None:
+    """The VCS revision of the directory this session was taken from.
+
+    `rosotacom_version` pins the tool. This pins its *input*: the session source
+    is normally a checkout of a deployment repository, and that checkout moves.
+    A consumer reading the manifest later cannot recover the revision by looking
+    at the machine, because looking at the machine answers a different question —
+    on one two-machine drive the vehicle had been synced by the time the
+    recording was consolidated the next morning, so the only commit anybody
+    could still read was not the commit that ran. The manifest is written once
+    at creation and never rewritten, which is exactly what such a fact needs.
+
+    `dirty` deliberately ignores untracked files: deployment checkouts routinely
+    carry recordings, logs and scratch files that are not the code, so counting
+    them would make every real deployment permanently dirty and the flag
+    meaningless. What it reports is tracked content differing from the commit.
+
+    Best effort throughout — not a directory, no git, not a repository, a git
+    that hangs: all yield None.
+    """
+    directory = Path(path)
+    if not directory.is_dir():
+        return None
+
+    def git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(directory), *args],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_SOURCE_REVISION_TIMEOUT_S,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    commit = git("rev-parse", "HEAD")
+    if not commit:
+        return None
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    tracked_changes = git("status", "--porcelain", "--untracked-files=no")
+    return {
+        "vcs": "git",
+        "commit": commit,
+        "branch": None if branch in (None, "HEAD") else branch,
+        "dirty": None if tracked_changes is None else bool(tracked_changes),
+        "root": git("rev-parse", "--show-toplevel"),
+    }
+
+
 def _effective_config_sha256(cfg: dict[str, Any]) -> str:
     text = yaml.safe_dump(cfg, sort_keys=True, default_flow_style=False, allow_unicode=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -908,6 +963,7 @@ def _write_instance_manifest(
             "instance_id": instance.instance_id,
             "rosotacom_version": __version__,
             "source_session_host_dir": str(session.host_dir),
+            "source_revision": _source_revision(session.host_dir),
             "source_session_container_dir": session.container_dir,
             "source": session.source,
             "config_dir": str(instance.config_host_dir),
@@ -962,6 +1018,7 @@ def _write_scenario_manifest(
             "instance_id": instance.instance_id,
             "rosotacom_version": __version__,
             "source_session_host_dir": str(session.host_dir),
+            "source_revision": _source_revision(session.host_dir),
             "source_session_container_dir": session.container_dir,
             "source": session.source,
             "config_dir": str(instance.config_host_dir),
@@ -1028,6 +1085,7 @@ def _write_interactive_smoke_manifest(
             "instance_id": instance.instance_id,
             "rosotacom_version": __version__,
             "source_session_host_dir": str(target.session.host_dir),
+            "source_revision": _source_revision(target.session.host_dir),
             "source_session_container_dir": target.session.container_dir,
             "source": target.session.source,
             "config_dir": str(instance.config_host_dir),
@@ -2445,6 +2503,7 @@ def _ota_write_manifest(
             "instance_id": instance.instance_id,
             "rosotacom_version": __version__,
             "source_session_host_dir": str(target.session.host_dir),
+            "source_revision": _source_revision(target.session.host_dir),
             "source_session_container_dir": target.session.container_dir,
             "source": target.session.source,
             "config_dir": str(instance.config_host_dir),

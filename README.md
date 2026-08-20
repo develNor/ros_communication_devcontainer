@@ -322,7 +322,7 @@ Peer reachability is opt-in because some valid networks block ICMP and peers may
 be started in either order. `rosotacom start` accepts the same
 `--require-peer-reachable` policy when a deployment does require it.
 
-`rosotacom` reads the static session input and creates generated files under `session-instances/<date>/<session>_<timestamp>_<id>/config/`, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`. Catmux pane output is logged under the same instance in `logs/<peer>/catmux/`.
+`rosotacom` reads the static session input and creates generated files under `session-instances/<date>/<session>_<timestamp>_<id>/config/`, including per-peer plugin/session specs, topic lists, optional QoS, and optional `domain_bridge.yaml`. The instance's `manifest.yaml` records what produced it: `rosotacom_version`, the effective config SHA, and `source_revision` — the commit, branch and tracked-dirtiness of the session source directory at creation time, so a recording stays attributable to a revision after the checkout has moved on (`null` when the source is not a git repository). Catmux pane output is logged under the same instance in `logs/<peer>/catmux/`.
 
 What else a run leaves under `logs/<peer>/`, and which file to open first when a
 peer looked healthy but did nothing:

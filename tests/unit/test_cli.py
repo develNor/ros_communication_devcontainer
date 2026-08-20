@@ -3721,3 +3721,81 @@ def test_ota_cleanup_refuses_to_act_on_a_guessed_plan(capsys: pytest.CaptureFixt
 
     assert calls == []
     assert "no deployment state" in capsys.readouterr().out
+
+
+def _git_repo(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+    for args in (
+        ["init", "--initial-branch", "main"],
+        ["config", "commit.gpgsign", "false"],
+    ):
+        subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True, env=env)
+    (path / "session-definition.yaml").write_text("shared: {}\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(path), "commit", "-m", "seed"], check=True, capture_output=True, env=env)
+
+
+def test_the_manifest_records_the_revision_of_the_session_it_was_built_from(
+    tmp_path: Path,
+) -> None:
+    """rosotacom_version pins the tool; this pins its input.
+
+    Without it the only recoverable commit is whatever the machine holds when
+    somebody looks, which is a different fact — and a wrong one as soon as the
+    machine has been synced in between.
+    """
+    session = tmp_path / "sessions" / "demo"
+    _git_repo(session)
+
+    revision = rosotacom._source_revision(session)
+
+    assert revision is not None
+    assert revision["vcs"] == "git"
+    assert re.fullmatch(r"[0-9a-f]{40}", revision["commit"])
+    assert revision["branch"] == "main"
+    assert revision["dirty"] is False
+    assert Path(revision["root"]).resolve() == session.resolve()
+
+
+def test_a_session_source_that_differs_from_its_commit_says_so(tmp_path: Path) -> None:
+    session = tmp_path / "sessions" / "demo"
+    _git_repo(session)
+    (session / "session-definition.yaml").write_text("shared: {changed: true}\n", encoding="utf-8")
+
+    assert rosotacom._source_revision(session)["dirty"] is True
+
+
+def test_untracked_files_beside_a_session_do_not_make_it_dirty(tmp_path: Path) -> None:
+    """A deployment checkout carries recordings, logs and scratch files.
+
+    Counting those would leave every real deployment permanently dirty, which is
+    the same as reporting nothing.
+    """
+    session = tmp_path / "sessions" / "demo"
+    _git_repo(session)
+    (session / "rosbag2_2026_01_01-00_00_00").mkdir()
+    (session / "rosbag2_2026_01_01-00_00_00" / "metadata.yaml").write_text("x\n", encoding="utf-8")
+
+    assert rosotacom._source_revision(session)["dirty"] is False
+
+
+@pytest.mark.parametrize("case", ["not_a_repository", "not_a_directory", "missing"])
+def test_a_source_without_a_revision_is_null_and_not_an_error(tmp_path: Path, case: str) -> None:
+    """An instance must never fail to start over a provenance read."""
+    if case == "not_a_repository":
+        target = tmp_path / "plain"
+        target.mkdir()
+    elif case == "not_a_directory":
+        target = tmp_path / "file"
+        target.write_text("x\n", encoding="utf-8")
+    else:
+        target = tmp_path / "gone"
+
+    assert rosotacom._source_revision(target) is None

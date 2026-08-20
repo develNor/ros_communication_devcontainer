@@ -37,7 +37,7 @@ gracefully when absent:
 |---|---|
 | `status.json` | declared topic types (FFMPEGPacket detection) |
 | `link_trace.jsonl` ([link trace recorder](link-trace.md)) | link state around each incident |
-| `manifest.yaml` | instance id + config SHA provenance |
+| `manifest.yaml` | instance id, config SHA, and `source_revision` — the commit of the session source at instance creation |
 | `--profile NAME --profiles-file FILE` | RFC 0004 environment context (static params or timeline steps) |
 | `state_transition` rows in `events.jsonl` | pipeline diagnoses around each incident |
 

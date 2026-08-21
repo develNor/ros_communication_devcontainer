@@ -70,6 +70,61 @@ def test_ota_xml_rejects_invalid_spdp_interval(tmp_path: Path, monkeypatch: pyte
         module.main(config="test.xml", spdp_interval="2min")
 
 
+def test_ota_xml_renders_default_and_overridden_fragment_size(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default is the shipped number; a session may name the other one.
+
+    1024B and 1200B are both correct on CycloneDDS 0.10.5 and only the smaller
+    one is correct on 11.0.1, so which of them a run used has to be a property
+    of the session rather than of the installed package version.
+    """
+    module = _module()
+    template = tmp_path / "test.xml.template"
+    template.write_text("<FragmentSize>#fragment_size</FragmentSize>\n", encoding="utf-8")
+    monkeypatch.setattr(module, "_template_path", lambda _name: str(template))
+
+    assert module.main(config="test.xml") == "<FragmentSize>1024B</FragmentSize>\n"
+    assert module.main(config="test.xml", fragment_size="1200B") == "<FragmentSize>1200B</FragmentSize>\n"
+
+
+def test_ota_xml_rejects_invalid_fragment_size(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module()
+    template = tmp_path / "test.xml.template"
+    template.write_text("<FragmentSize>#fragment_size</FragmentSize>\n", encoding="utf-8")
+    monkeypatch.setattr(module, "_template_path", lambda _name: str(template))
+
+    with pytest.raises(ValueError, match="byte size"):
+        module.main(config="test.xml", fragment_size="big")
+    with pytest.raises(ValueError, match="> 0"):
+        module.main(config="test.xml", fragment_size="0B")
+
+
+def test_ota_xml_warns_when_the_fragment_fills_the_datagram(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Allowed, because it is the profile the Kilted-era link ran — and said.
+
+    A fragment of exactly MaxMessageSize leaves no room for the RTPS header, so
+    on CycloneDDS 11.0.1 nothing fragmented arrives and nothing says why. That
+    is worth reproducing deliberately and worth never choosing by accident, so
+    this is a warning rather than a refusal.
+    """
+    module = _module()
+    template = tmp_path / "test.xml.template"
+    template.write_text(
+        "<FragmentSize>#fragment_size</FragmentSize><MaxMessageSize>1200B</MaxMessageSize>\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "_template_path", lambda _name: str(template))
+
+    module.main(config="test.xml", fragment_size="1024B")
+    assert capsys.readouterr().err == ""
+
+    module.main(config="test.xml", fragment_size="1200B")
+    warning = capsys.readouterr().err
+    assert "WARNING" in warning
+    assert "11.0.1" in warning
+
+
 def test_ota_xml_scopes_sections_to_their_domains(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = _module()
     template = tmp_path / "test.xml.template"

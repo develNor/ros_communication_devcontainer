@@ -194,7 +194,8 @@ class YamlBlockScalar:
 #   - a string: cyclone | fastdds | zenoh_connect_endpoints | zenoh_ros2dds | <raw rmw string>
 #     (zenoh_ros2dds is allowed for ota only; raw rmw strings are for local only)
 #   - a tagged-union mapping with exactly one key (the RMW name):
-#       {cyclone: {config?: <fname.xml>, easy_mode_ip?: <address>, spdp_interval?: <duration>}}
+#       {cyclone: {config?: <fname.xml>, easy_mode_ip?: <address>, spdp_interval?: <duration>,
+#                 fragment_size?: <size, e.g. 1200B>}}
 #       {fastdds: {config?: <fname.xml>, easy_mode_ip?: <address>}}
 #       {zenoh_connect_endpoints: {transport?: tcp|udp, main_peer?: <peer_key>, main_port?: 7447}}
 #       {zenoh_ros2dds: {transport?: udp|tcp, main_peer?: <peer_key>, main_port?: 7447}}
@@ -207,7 +208,11 @@ _OTA_SHORTS = {"cyclone", "fastdds", *_NATIVE_ZENOH_OTA_SHORTS, "zenoh_ros2dds"}
 _LOCAL_SHORTS = {"cyclone", "fastdds", "zenoh"}
 _SHORTCUT_ALLOWED = {"cyclone", "fastdds", "zenoh"}
 
-_DDS_CFG_KEYS = {"config", "easy_mode_ip", "spdp_interval"}
+_DDS_CFG_KEYS = {"config", "easy_mode_ip", "spdp_interval", "fragment_size"}
+#: A CycloneDDS size: digits and an optional unit. Validated here so an
+#: unusable value is a session error rather than a profile the DDS stack
+#: silently ignores on its way to defaults.
+_DDS_SIZE_RE = re.compile(r"(\d+)\s*(B|kB|KB|KiB|MB|MiB)?\Z")
 _ZEN_OTA_CFG_KEYS = {"transport", "main_peer", "main_port"}
 #: Inter-host transports the native zenoh router may be pointed at. Both are
 #: plain zenoh locator schemes; tls/quic would additionally need certificates
@@ -280,6 +285,7 @@ class RmwSideSpec:
     dds_config: Optional[str] = None
     dds_easy_mode_ip: Optional[str] = None
     dds_spdp_interval: Optional[str] = None
+    dds_fragment_size: Optional[str] = None
     # zenoh (native) and zenoh_ros2dds
     zen_main_peer: Optional[str] = None
     zen_transport: Optional[str] = None
@@ -345,6 +351,19 @@ def _parse_rmw_side(value: Any, ctx: str, *, is_local: bool) -> RmwSideSpec:
                 raise RuntimeError(f"{ctx}.{impl}.spdp_interval must be a non-empty duration if provided.")
             _validate_positive_seconds(cfg["spdp_interval"], f"{ctx}.{impl}.spdp_interval")
             spec.dds_spdp_interval = cfg["spdp_interval"].strip()
+        if cfg.get("fragment_size") is not None:
+            if impl != "cyclone":
+                raise RuntimeError(f"{ctx}.{impl}.fragment_size is only supported for CycloneDDS.")
+            if not isinstance(cfg["fragment_size"], str) or not cfg["fragment_size"].strip():
+                raise RuntimeError(f"{ctx}.{impl}.fragment_size must be a non-empty size if provided.")
+            size = cfg["fragment_size"].strip()
+            match = _DDS_SIZE_RE.fullmatch(size)
+            if not match or int(match.group(1)) <= 0:
+                raise RuntimeError(
+                    f"{ctx}.{impl}.fragment_size must be a positive byte size, e.g. '1024B' or '1200B'; "
+                    f"got {cfg['fragment_size']!r}."
+                )
+            spec.dds_fragment_size = size
     elif _is_native_zenoh_ota(impl):
         extra = set(cfg.keys()) - _ZEN_OTA_CFG_KEYS
         if extra:
@@ -2279,6 +2298,8 @@ def func(
                 )
             if side.impl == "cyclone" and side.dds_spdp_interval:
                 items.append(("local_spdp_interval", side.dds_spdp_interval))
+            if side.impl == "cyclone" and side.dds_fragment_size:
+                items.append(("local_fragment_size", side.dds_fragment_size))
         return items
 
     def _build_ota_rmw_items() -> List[Tuple[str, Any]]:
@@ -2306,6 +2327,8 @@ def func(
                 )
             if ota.impl == "cyclone" and ota.dds_spdp_interval:
                 items.append(("ota_spdp_interval", ota.dds_spdp_interval))
+            if ota.impl == "cyclone" and ota.dds_fragment_size:
+                items.append(("ota_fragment_size", ota.dds_fragment_size))
         return items
 
     def _build_zenoh_block(

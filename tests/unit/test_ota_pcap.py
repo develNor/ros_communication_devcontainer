@@ -345,6 +345,10 @@ def test_the_node_launches_it_through_sudo_and_hands_root_straight_back() -> Non
     source because the node needs rclpy, which the host suite does not have."""
     source = (WS_PY / "com_py" / "status_overview.py").read_text(encoding="utf-8")
     assert 'argv = ["sudo", "-n", *argv]' in source
+    # By path, never `-m`: sudo resets the environment, so PYTHONPATH does not
+    # reach the other side of it and the package is not importable there.
+    assert '"-m", "com_py.ota_pcap"' not in source
+    assert 'Path(__file__).resolve().with_name("ota_pcap.py")' in source
     assert '"--drop-to", f"{os.getuid()}:{os.getgid()}"' in source
     # And the stop goes the same way: the child is root, so an ordinary kill
     # would be refused — and it must be SIGINT, which is what writes ota.json.

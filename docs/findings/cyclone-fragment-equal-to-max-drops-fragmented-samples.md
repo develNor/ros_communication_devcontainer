@@ -73,6 +73,21 @@ the same MTU budget the 1200 B was chosen for — only the header room is added 
 and the value works on both versions, so it is one number rather than a branch
 on the distribution.
 
+The 1200 B profile stays reachable, deliberately. It is what every 0.10.5 run
+before 2026-08-20 carried, so a comparison against one of those runs has to be
+able to reproduce it rather than approximate it:
+
+```yaml
+shared:
+  rmw:
+    ota:
+      cyclone: {config: cyclonedds_tuned.xml, fragment_size: 1200B}
+```
+
+`get_ota_xml.py` warns on stderr whenever the rendered fragment reaches the
+datagram cap, naming 11.0.1 — a profile worth choosing on purpose is not one
+worth choosing by accident.
+
 ## Publication notes
 
 A distribution bump silently changed what a profile *means*, and the profile

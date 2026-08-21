@@ -47,8 +47,9 @@ template, not a replacement, and a session that does not name it is unchanged.
       </Interfaces>
       <MulticastRecvNetworkInterfaceAddresses>none</MulticastRecvNetworkInterfaceAddresses>
       <!-- Strictly below MaxMessageSize; see cyclonedds_tuned.xml for what
-           making them equal cost. -->
-      <FragmentSize>1024B</FragmentSize>
+           making them equal cost, and for why the number is settable
+           (`shared.rmw.<side>.cyclone.fragment_size`) rather than literal. -->
+      <FragmentSize>#fragment_size</FragmentSize>
       <MaxMessageSize>1200B</MaxMessageSize>
       <MaxRexmitMessageSize>1200B</MaxRexmitMessageSize>
     </General>

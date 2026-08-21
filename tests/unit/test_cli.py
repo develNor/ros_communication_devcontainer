@@ -3166,6 +3166,88 @@ def test_run_session_passes_cyclone_spdp_interval_to_plugin(tmp_path: Path) -> N
     assert plugin["parameters"]["ota_spdp_interval"] == "150s"
 
 
+def test_run_session_passes_cyclone_fragment_size_to_plugin(tmp_path: Path) -> None:
+    """The number reaches the peer that renders the profile, not just the YAML."""
+    from session.creation import run_session
+
+    source = tmp_path / "sessions" / "fragment"
+    output = tmp_path / "session-instances" / "2026-01-01" / "fragment_run" / "config"
+    source.mkdir(parents=True)
+    (source / "session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "peers:",
+                "  a: {}",
+                "  b: {}",
+                "shared:",
+                "  rmw:",
+                "    local: cyclone",
+                "    ota:",
+                "      cyclone:",
+                "        fragment_size: 1200B",
+                "topics:",
+                "  a_to_b:",
+                "    - topic: /x",
+                "      type: std_msgs/msg/String",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    peer_dir = run_session._resolve_peer_dir(
+        str(source),
+        str(output),
+        "a",
+        force=True,
+        rewrite_formatting=False,
+        peer_address=["a=127.0.0.1", "b=127.0.0.2"],
+    )
+
+    plugin = yaml.safe_load((Path(peer_dir) / "plugin.yaml").read_text(encoding="utf-8"))
+    assert plugin["parameters"]["ota_fragment_size"] == "1200B"
+
+
+def test_run_session_rejects_a_fragment_size_no_template_can_use(tmp_path: Path) -> None:
+    """An unusable size is a session error, not a profile that renders wrong."""
+    from session.creation import run_session
+
+    source = tmp_path / "sessions" / "bad_fragment"
+    output = tmp_path / "session-instances" / "2026-01-01" / "bad_fragment_run" / "config"
+    source.mkdir(parents=True)
+    (source / "session-definition.yaml").write_text(
+        "\n".join(
+            [
+                "peers:",
+                "  a: {}",
+                "  b: {}",
+                "shared:",
+                "  rmw:",
+                "    local: cyclone",
+                "    ota:",
+                "      cyclone:",
+                "        fragment_size: plenty",
+                "topics:",
+                "  a_to_b:",
+                "    - topic: /x",
+                "      type: std_msgs/msg/String",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="positive byte size"):
+        run_session._resolve_peer_dir(
+            str(source),
+            str(output),
+            "a",
+            force=True,
+            rewrite_formatting=False,
+            peer_address=["a=127.0.0.1", "b=127.0.0.2"],
+        )
+
+
 def test_create_session_yaml_injects_catmux_logging_command(tmp_path: Path) -> None:
     from session.creation import create_session_yaml
 

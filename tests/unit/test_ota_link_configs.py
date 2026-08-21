@@ -91,6 +91,48 @@ def test_only_cyclone_caps_the_datagram_and_fast_dds_must_not() -> None:
         assert "max_msg_size=" not in resolved, config
 
 
+def test_every_bootstrap_forwards_the_fragment_size_it_was_given() -> None:
+    """One forgotten window renders the default and nothing says so.
+
+    The OTA profile is rendered in three windows (COM, IN, OUT) and the local
+    one in a fourth. A session that names a fragment size and gets it in three
+    of the four has two profiles on one host, which is the failure mode
+    cyclonedds_scoped.xml exists to remove — and it would look healthy.
+    """
+    plugin_base = PLUGIN_BASE.read_text(encoding="utf-8")
+
+    assert plugin_base.count('ota_args+=(--fragment-size "${ota_fragment_size}")') == 3
+    assert plugin_base.count('local_args+=(--fragment-size "${local_fragment_size}")') == 1
+    # Declared, so an unset one renders as "None" and is skipped rather than
+    # left as a literal ${...} in the command line.
+    assert "\n  ota_fragment_size:" in plugin_base
+    assert "\n  local_fragment_size:" in plugin_base
+
+
+def test_a_session_may_ask_the_packaged_templates_for_the_older_profile() -> None:
+    """Both shipped Cyclone OTA templates resolve the size, not just one.
+
+    The two-profile arrangement renders cyclonedds_tuned.xml and the scoped one
+    renders cyclonedds_scoped.xml. A Kilted-versus-Lyrical comparison needs the
+    same fragment size whichever arrangement it runs, so neither template may
+    keep the number as a literal.
+    """
+    module = _load(OTA_CONFIGS / "get_ota_xml.py", "rosotacom_get_ota_xml_fragment")
+    for config in ("cyclonedds_tuned.xml", "cyclonedds_scoped.xml"):
+        rendered = str(
+            module.main(
+                config=config,
+                host_ip="10.0.0.1",
+                peer="10.0.0.2",
+                fragment_size="1200B",
+                local_domain="47",
+                ota_domain="48",
+            )
+        )
+        assert "<FragmentSize>1200B</FragmentSize>" in rendered, config
+        assert f"<MaxMessageSize>{OTA_DATAGRAM_BYTES}B</MaxMessageSize>" in rendered, config
+
+
 def test_both_default_ota_templates_pin_the_interface_and_the_peer() -> None:
     for config in ("cyclonedds_tuned.xml", "fastdds_tuned.xml"):
         resolved = _resolved(config)

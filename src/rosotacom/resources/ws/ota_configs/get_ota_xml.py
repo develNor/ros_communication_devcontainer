@@ -2,8 +2,9 @@
 """Unified OTA DDS XML generator.
 
 Loads an XML template from /ws/ota_configs/<config>(.template), detects which
-placeholders it uses (#host_ip, #peer, #easy_mode_ip, #spdp_interval),
-substitutes already resolved addresses, and prints the resulting XML to stdout.
+placeholders it uses (#host_ip, #peer, #easy_mode_ip, #spdp_interval,
+#fragment_size), substitutes already resolved addresses, and prints the
+resulting XML to stdout.
 
 Replaces the old per-template scripts (get_fastdds_xml.py,
 get_fastdds_easy_mode_xml.py, get_cyclonedds_xml.py).
@@ -28,9 +29,22 @@ KNOWN_PLACEHOLDERS = {
     #: profile and half the local one.
     "#local_domain",
     "#ota_domain",
+    #: How large an RTPS fragment this link sends. A template resolves it so
+    #: that the number is a property of the session rather than of the
+    #: installed package: 1024B and 1200B are both correct on CycloneDDS
+    #: 0.10.5, only the smaller one is correct on 11.0.1, and a run comparing
+    #: the two ROS distributions has to be able to say which it used.
+    "#fragment_size",
 }
 PLACEHOLDER_PATTERN = re.compile(r"#[A-Za-z_][A-Za-z0-9_]*")
 DEFAULT_SPDP_INTERVAL = "30s"
+#: Strictly below the templates' MaxMessageSize; see cyclonedds_tuned.xml for
+#: what making the two equal cost under ROS 2 Lyrical.
+DEFAULT_FRAGMENT_SIZE = "1024B"
+
+#: CycloneDDS size suffixes, and what each one is worth in bytes.
+SIZE_UNITS = {"B": 1, "KB": 1000, "KIB": 1024, "MB": 1000_000, "MIB": 1024 * 1024}
+SIZE_PATTERN = re.compile(r"(\d+)\s*(B|kB|KB|KiB|MB|MiB)?\Z")
 
 
 def _template_path(name: str) -> str:
@@ -84,6 +98,60 @@ def _resolved_spdp_interval(value: str) -> str:
     if number <= 0.0:
         raise ValueError("SPDP interval must be > 0.")
     return interval
+
+
+def _parse_size(value: str) -> int:
+    """A CycloneDDS size, in bytes, or None when it is not one this script wrote.
+
+    Used both to validate what a session asked for and to read the template's
+    own MaxMessageSize back out of the rendered XML, so the warning below can
+    compare the two.
+    """
+    match = SIZE_PATTERN.fullmatch(value.strip())
+    if not match:
+        return None
+    return int(match.group(1)) * SIZE_UNITS[(match.group(2) or "B").upper()]
+
+
+def _resolved_fragment_size(value: str) -> str:
+    size = value.strip()
+    if not size:
+        raise ValueError("Fragment size must be a non-empty size.")
+    parsed = _parse_size(size)
+    if parsed is None:
+        raise ValueError("Fragment size must be a byte size, e.g. '1024B', '1200B' or '4KiB'.")
+    if parsed <= 0:
+        raise ValueError("Fragment size must be > 0.")
+    return size
+
+
+def _warn_if_fragment_fills_the_datagram(content: str, path: str) -> None:
+    """Say so when the rendered profile is the one Lyrical cannot carry.
+
+    An RTPS message carries headers as well as its fragment, so a fragment of
+    exactly MaxMessageSize cannot be sent at all. CycloneDDS 0.10.5 coped with
+    that; 11.0.1 drops every fragmented sample and drops it silently, with the
+    endpoints matched and small samples still arriving. That combination is a
+    legitimate thing to ask for -- it is what the Kilted-era link ran, and
+    reproducing it is the reason the fragment size is settable -- so this warns
+    rather than refuses. Refusing would make the older profile unreachable; not
+    saying anything would let it be chosen by accident.
+    """
+    fragment = re.search(r"<FragmentSize>([^<]+)</FragmentSize>", content)
+    maximum = re.search(r"<MaxMessageSize>([^<]+)</MaxMessageSize>", content)
+    if not fragment or not maximum:
+        return
+    fragment_bytes = _parse_size(fragment.group(1))
+    maximum_bytes = _parse_size(maximum.group(1))
+    if fragment_bytes is None or maximum_bytes is None or fragment_bytes < maximum_bytes:
+        return
+    print(
+        f"WARNING - {os.path.basename(path)} renders FragmentSize {fragment.group(1)} against "
+        f"MaxMessageSize {maximum.group(1)}. A fragment leaves no room for the RTPS header, so "
+        "on CycloneDDS 11.0.1 (ROS 2 Lyrical) no fragmented sample will arrive, silently. "
+        "Correct on 0.10.5 (Kilted), which is what this profile reproduces.",
+        file=sys.stderr,
+    )
 
 
 def _resolve_peer_ips(value: str) -> list:
@@ -162,6 +230,7 @@ def main(
     peer: str = None,
     easy_mode_ip: str = None,
     spdp_interval: str = DEFAULT_SPDP_INTERVAL,
+    fragment_size: str = DEFAULT_FRAGMENT_SIZE,
     local_domain: str = None,
     ota_domain: str = None,
 ) -> str:
@@ -195,6 +264,9 @@ def main(
     if "#spdp_interval" in found:
         content = content.replace("#spdp_interval", _resolved_spdp_interval(spdp_interval))
 
+    if "#fragment_size" in found:
+        content = content.replace("#fragment_size", _resolved_fragment_size(fragment_size))
+
     for placeholder, value, option in (
         ("#local_domain", local_domain, "--local-domain"),
         ("#ota_domain", ota_domain, "--ota-domain"),
@@ -211,6 +283,7 @@ def main(
             raise RuntimeError(f"Template '{os.path.basename(path)}' uses #peer but --peer was not provided.")
         content = _expand_peer_block(content, _resolve_peer_ips(peer))
 
+    _warn_if_fragment_fills_the_datagram(content, path)
     return content
 
 
@@ -267,6 +340,12 @@ if __name__ == "__main__":
         dest="spdp_interval",
         default=DEFAULT_SPDP_INTERVAL,
         help=f"CycloneDDS SPDP interval duration (#spdp_interval, default: {DEFAULT_SPDP_INTERVAL}).",
+    )
+    parser.add_argument(
+        "--fragment-size",
+        dest="fragment_size",
+        default=DEFAULT_FRAGMENT_SIZE,
+        help=f"CycloneDDS RTPS fragment size (#fragment_size, default: {DEFAULT_FRAGMENT_SIZE}).",
     )
     args = parser.parse_args()
     output = args.output

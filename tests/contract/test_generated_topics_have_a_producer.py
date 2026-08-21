@@ -315,7 +315,7 @@ SPEC_OWNS = (
 #: options. Listed by pattern so an unclassified newcomer fails the guard.
 NO_TOPIC = (
     r"dir_path|before_command|peer_dir|session_dir",
-    r"(rmw|ota|local)_(local|ota|config_template|config_file|easy_mode_ip|spdp_interval|domain_id|name)",
+    r"(rmw|ota|local)_(local|ota|config_template|config_file|easy_mode_ip|spdp_interval|fragment_size|domain_id|name)",
     r"domain_bridge_config_file|use_domain_bridge",
     r"ip_(local|remote)|remote_name|qos_config_file|topic_types_file",
     r"in|out|use_zenoh_(rmw|ros2dds)",

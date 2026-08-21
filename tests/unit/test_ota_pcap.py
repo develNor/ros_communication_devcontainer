@@ -306,3 +306,52 @@ def test_the_node_is_handed_the_remote_peers_address_to_narrow_the_capture() -> 
     other conversation the machine is having."""
     text = PLUGIN_BASE.read_text(encoding="utf-8")
     assert "-p ota_pcap_peer_ip:=${ip_remote}" in text
+
+
+# ---------------------------------------------------------------------------
+# root for one system call
+# ---------------------------------------------------------------------------
+
+
+def test_the_capture_gives_root_back_as_soon_as_the_socket_exists(monkeypatch) -> None:
+    """Launched through sudo, dropped straight after — so the pcap belongs to
+    the same user as `link_trace.jsonl` beside it, not to root."""
+    calls = {}
+    monkeypatch.setattr(ota_pcap.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(ota_pcap.os, "setgroups", lambda g: calls.setdefault("groups", g))
+    monkeypatch.setattr(ota_pcap.os, "setgid", lambda gid: calls.setdefault("gid", gid))
+    monkeypatch.setattr(ota_pcap.os, "setuid", lambda uid: calls.setdefault("uid", uid))
+
+    assert ota_pcap.drop_privileges("1000:1001") == "1000:1001"
+    assert calls == {"groups": [], "gid": 1001, "uid": 1000}
+
+
+def test_a_capture_that_is_not_root_leaves_the_ids_alone(monkeypatch) -> None:
+    monkeypatch.setattr(ota_pcap.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(ota_pcap.os, "setuid", lambda uid: pytest.fail("must not be called"))
+    assert ota_pcap.drop_privileges("1000:1000") is None
+
+
+@pytest.mark.parametrize("spec", [None, "", "root", "1000:nobody"])
+def test_a_spec_that_is_not_uid_gid_never_changes_the_process(spec, monkeypatch) -> None:
+    monkeypatch.setattr(ota_pcap.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(ota_pcap.os, "setuid", lambda uid: pytest.fail("must not be called"))
+    assert ota_pcap.drop_privileges(spec) is None
+
+
+def test_the_node_launches_it_through_sudo_and_hands_root_straight_back() -> None:
+    """The node runs as `containeruser`, whose CapEff is zero, so no `--cap-add`
+    on the container would let it open an AF_PACKET socket. Asserted over the
+    source because the node needs rclpy, which the host suite does not have."""
+    source = (WS_PY / "com_py" / "status_overview.py").read_text(encoding="utf-8")
+    assert 'argv = ["sudo", "-n", *argv]' in source
+    assert '"--drop-to", f"{os.getuid()}:{os.getgid()}"' in source
+    # And the stop goes the same way: the child is root, so an ordinary kill
+    # would be refused — and it must be SIGINT, which is what writes ota.json.
+    assert '"sudo", "-n", "kill", "-INT"' in source
+
+
+def test_the_capture_is_a_process_not_a_thread_in_the_status_node() -> None:
+    """A capture that misbehaves must not reach the snapshot an operator watches."""
+    source = (WS_PY / "com_py" / "status_overview.py").read_text(encoding="utf-8")
+    assert "subprocess.Popen(argv, start_new_session=True)" in source

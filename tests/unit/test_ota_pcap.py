@@ -11,6 +11,7 @@ Three layers, like the status overview it is started beside:
 from __future__ import annotations
 
 import importlib.util
+import json
 import socket
 import struct
 import sys
@@ -359,3 +360,44 @@ def test_the_capture_is_a_process_not_a_thread_in_the_status_node() -> None:
     """A capture that misbehaves must not reach the snapshot an operator watches."""
     source = (WS_PY / "com_py" / "status_overview.py").read_text(encoding="utf-8")
     assert "subprocess.Popen(argv, start_new_session=True)" in source
+
+
+# ---------------------------------------------------------------------------
+# neither file depends on a clean shutdown
+# ---------------------------------------------------------------------------
+
+
+def test_the_sidecar_says_running_until_something_stops_the_capture() -> None:
+    """A session usually ends by its container being stopped, which never
+    reaches this process. So the sidecar exists from the first moment and says
+    what it is, rather than appearing only if the capture is asked nicely."""
+    capture = ota_pcap.Capture("tun0", Path("/tmp/x.pcap"))
+    assert capture.sidecar()["stopped_because"] == "running"
+
+
+def test_the_sidecar_is_written_before_a_single_packet_arrives(tmp_path: Path) -> None:
+    capture = ota_pcap.Capture("tun0", tmp_path / "ota.pcap")
+    capture.write_sidecar()
+    written = json.loads((tmp_path / "ota.json").read_text(encoding="utf-8"))
+    assert written["interface"] == "tun0"
+    assert written["packets"] == 0
+    assert written["stopped_because"] == "running"
+
+
+def test_a_sidecar_that_cannot_be_written_is_a_warning_not_a_crash(tmp_path: Path, capsys) -> None:
+    """The capture is the artifact; its description is not worth losing it for."""
+    capture = ota_pcap.Capture("tun0", tmp_path / "no" / "such" / "dir" / "ota.pcap")
+    capture.write_sidecar()
+    assert "WARN" in capsys.readouterr().out
+
+
+def test_the_capture_checkpoints_rather_than_trusting_the_shutdown() -> None:
+    source = (WS_PY / "com_py" / "ota_pcap.py").read_text(encoding="utf-8")
+    assert "CHECKPOINT_S" in source
+    body = source[source.index("def run(self, stop") : source.index("def _collect")]
+    assert "handle.flush()" in body
+    assert "self.write_sidecar()" in body
+    # And the deadline is monotonic, compared against a name the timestamp
+    # fallback cannot rebind — that collision would checkpoint every packet.
+    assert "tick = time.monotonic()" in body
+    assert "if tick >= next_checkpoint:" in body

@@ -71,6 +71,13 @@ parameters:
   link_trace_interval_s: 1.0
   link_trace_modem_command: ""
   link_trace_modem_timeout_s: 2.0
+  # Header-only capture of the OTA link (docs/ota-pcap.md). Off here, so a
+  # session that does not ask for it renders the same command line it always
+  # did; `shared.ota_pcap.enabled` is what turns it on.
+  ota_pcap: false
+  ota_pcap_snaplen: 96
+  ota_pcap_max_mb: 2000
+  ota_pcap_peer_filter: true
   metric_stage_bag: false
   metric_stage_topics:
 
@@ -427,6 +434,11 @@ windows:
             -p link_trace_interval_s:=${link_trace_interval_s}
             -p "link_trace_modem_command:='${link_trace_modem_command}'"
             -p link_trace_modem_timeout_s:=${link_trace_modem_timeout_s}
+            -p ota_pcap:=${ota_pcap}
+            -p ota_pcap_snaplen:=${ota_pcap_snaplen}
+            -p ota_pcap_max_mb:=${ota_pcap_max_mb}
+            -p ota_pcap_peer_filter:=${ota_pcap_peer_filter}
+            -p ota_pcap_peer_ip:=${ip_remote}
       - commands:
         - status_out_dir="$(dirname "${ROSOTACOM_CATMUX_LOG_DIR:-/tmp/rosotacom_logs/catmux}")/status"
         - status_txt="$status_out_dir/status.txt"

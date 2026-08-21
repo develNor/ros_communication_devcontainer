@@ -321,7 +321,9 @@ NO_TOPIC = (
     r"in|out|use_zenoh_(rmw|ros2dds)",
     r"zen_.*",
     r"topic_monitor|tm_.*",
-    r"status_.*|link_trace.*|metric_stage_bag|network_monitor",
+    # The two link instruments write files, not topics: the trace's JSONL and
+    # the header-only capture's pcap both land in logs/<peer>/status/.
+    r"status_.*|link_trace.*|ota_pcap.*|metric_stage_bag|network_monitor",
     r"heartbeat|heartbeat_(out_hz|delay_bad_ms|loss3_bad_pct)",
     r"rs|lat|trickle|fb|comp|deco|otaw|otau|nor|drp|drp2|thr|ipx|it|irt|pace",
     r"lat_keepalive_hz|trickle_rate_hz",

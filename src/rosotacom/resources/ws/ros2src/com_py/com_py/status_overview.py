@@ -54,6 +54,9 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import sys
 import threading
 from typing import Dict, Optional
 
@@ -375,6 +378,14 @@ class StatusOverview(Node):
         # (the snapshot's `link` block is null).
         self.declare_parameter("ota_interface", "")
         self.declare_parameter("ota_local_ip", "")
+        # Header-only capture of the OTA link, beside the link trace. Off
+        # unless a session definition asks for it; it needs the same interface
+        # resolution as the link sampler above and nothing else.
+        self.declare_parameter("ota_pcap", False)
+        self.declare_parameter("ota_pcap_snaplen", 96)
+        self.declare_parameter("ota_pcap_max_mb", 2000)
+        self.declare_parameter("ota_pcap_peer_filter", True)
+        self.declare_parameter("ota_pcap_peer_ip", "")
         self.declare_parameter("link_trace", False)
         self.declare_parameter("link_trace_interval_s", 1.0)
         self.declare_parameter("link_trace_modem_command", "")
@@ -475,6 +486,10 @@ class StatusOverview(Node):
                     f"'{ota_interface}' ({provenance})"
                 )
 
+        self._pcap: Optional[subprocess.Popen] = None
+        if bool(self.get_parameter("ota_pcap").value):
+            self._start_ota_pcap(output_dir, ota_interface if link_sampler else "")
+
         link_trace_recorder = None
         if bool(self.get_parameter("link_trace").value):
             link_trace_path = os.path.join(output_dir, "link_trace.jsonl")
@@ -518,10 +533,88 @@ class StatusOverview(Node):
         ):
             executor.add_node(self._ota_observer)
 
+    def _start_ota_pcap(self, output_dir: str, interface: str) -> None:
+        """Begin the header-only capture, or say why there is none.
+
+        A separate process, not a thread: this node writes the status snapshot
+        every interval and is the thing an operator watches, so a capture that
+        misbehaves must not be able to reach it. It is still the same container
+        — no capability, no image and no `docker ps` line is added by the
+        option — which is the whole reason the capture lives here rather than
+        beside a recorder.
+
+        Never raises. The capture is a sidecar to the link, not a precondition
+        for it, and a session that cannot capture must still run.
+        """
+        if not interface:
+            # `ota_local_ip`/`ota_interface` are what resolve it, and the
+            # resolution above already said why it failed — including the
+            # loopback refusal, which is the failure worth repeating (#267).
+            self.get_logger().warning(
+                "status_overview: ota_pcap is enabled but no OTA interface was "
+                "resolved; capturing nothing. Set shared.ota_pcap only where "
+                "ota_local_ip resolves, and read the warning above for why."
+            )
+            return
+
+        path = os.path.join(output_dir, "ota.pcap")
+        argv = [
+            sys.executable, "-m", "com_py.ota_pcap",
+            "--iface", interface,
+            "--out", path,
+            "--snaplen", str(int(self.get_parameter("ota_pcap_snaplen").value)),
+            "--max-mb", str(int(self.get_parameter("ota_pcap_max_mb").value)),
+        ]
+        # Narrowed to the remote peer by default. On a VPN tunnel the whole
+        # device is the link and the filter changes nothing; on a LAN port it
+        # is the difference between the link and every other conversation the
+        # machine is having.
+        peer_ip = str(self.get_parameter("ota_pcap_peer_ip").value or "").strip()
+        if bool(self.get_parameter("ota_pcap_peer_filter").value) and peer_ip:
+            argv += ["--peer", peer_ip]
+
+        try:
+            self._pcap = subprocess.Popen(argv, start_new_session=True)
+        except OSError as exc:  # noqa: BLE001 - a sidecar may not stop a session
+            self.get_logger().warning(
+                f"status_overview: ota_pcap could not start ({exc}); "
+                "the session runs without a capture"
+            )
+            self._pcap = None
+            return
+        self.get_logger().info(
+            f"status_overview: ota_pcap capturing {interface} -> {path}"
+            + (f" (to/from {peer_ip})" if peer_ip and
+               bool(self.get_parameter("ota_pcap_peer_filter").value) else "")
+        )
+
+    def _stop_ota_pcap(self) -> None:
+        """SIGINT and wait, so the sidecar JSON and the drop counts are written.
+
+        Killed instead, the pcap on disk is still readable — it is written as
+        it goes — but `kernel_drops` never lands, and that is the one number
+        that separates a gap in the file from a gap on the link.
+        """
+        child, self._pcap = self._pcap, None
+        if child is None or child.poll() is not None:
+            return
+        try:
+            child.send_signal(signal.SIGINT)
+            child.wait(timeout=20.0)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            try:
+                child.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass
+        except OSError:
+            pass
+
     def _on_write(self) -> None:
         self.aggregator.write()
 
     def shutdown(self) -> None:
+        self._stop_ota_pcap()
         if self._ota_executor is not None:
             try:
                 self._ota_executor.shutdown()

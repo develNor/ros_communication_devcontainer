@@ -140,6 +140,13 @@ thread, so a capture that misbehaves cannot reach the snapshot an operator is
 watching. It is stopped with `SIGINT` and waited for, because that is what
 writes the sidecar JSON.
 
+It is launched by **file path**, not as `python3 -m com_py.ota_pcap`. sudo
+resets the environment, so `PYTHONPATH` does not survive it and the package is
+not importable on the other side — which is what a two-host run answered,
+`No module named 'com_py'`, once the permission problem was out of the way.
+`ota_pcap.py` imports nothing but the standard library, so a path needs no
+package at all, and a test pins that it stays that way.
+
 ## Cost
 
 Header-only at 96 bytes: about 6 MB per minute at 500 packets/s, so a two-hour

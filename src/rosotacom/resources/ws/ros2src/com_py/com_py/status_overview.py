@@ -58,6 +58,7 @@ import signal
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from typing import Dict, Optional
 
 import yaml
@@ -558,8 +559,21 @@ class StatusOverview(Node):
             return
 
         path = os.path.join(output_dir, "ota.pcap")
+        # By file path, not `-m com_py.ota_pcap`. sudo resets the environment,
+        # so PYTHONPATH does not survive and the package is not importable on
+        # the other side of it — a two-host run answered exactly that,
+        # "No module named 'com_py'", after the permission problem was fixed.
+        # `ota_pcap.py` imports nothing but the standard library (a test pins
+        # that), so a path needs no package at all.
+        script = Path(__file__).resolve().with_name("ota_pcap.py")
+        if not script.is_file():
+            self.get_logger().warning(
+                f"status_overview: ota_pcap is enabled but {script} is not here; "
+                "capturing nothing"
+            )
+            return
         argv = [
-            sys.executable, "-m", "com_py.ota_pcap",
+            sys.executable, str(script),
             "--iface", interface,
             "--out", path,
             "--snaplen", str(int(self.get_parameter("ota_pcap_snaplen").value)),

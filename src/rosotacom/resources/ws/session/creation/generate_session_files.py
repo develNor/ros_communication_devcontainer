@@ -1063,6 +1063,7 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                 "heartbeat",
                 "metric_backbone",
                 "link_trace",
+                "ota_pcap",
                 "use_in",
                 "use_out",
                 "rmw",
@@ -1134,6 +1135,27 @@ def _validate_session_template_cfg(cfg: Dict[str, Any]) -> None:
                     raise RuntimeError(
                         "shared.link_trace.modem_metrics_timeout_s must be a positive number if provided."
                     )
+
+        if "ota_pcap" in shared and shared["ota_pcap"] is not None:
+            ota_pcap = _assert_mapping(shared.get("ota_pcap"), "shared.ota_pcap")
+            _assert_allowed_keys(
+                "shared.ota_pcap",
+                ota_pcap,
+                {"enabled", "snaplen", "max_mb", "peer_filter"},
+            )
+            if "enabled" in ota_pcap and not isinstance(ota_pcap["enabled"], bool):
+                raise RuntimeError("shared.ota_pcap.enabled must be boolean if provided.")
+            if "peer_filter" in ota_pcap and not isinstance(ota_pcap["peer_filter"], bool):
+                raise RuntimeError("shared.ota_pcap.peer_filter must be boolean if provided.")
+            for key, low, high in (("snaplen", 40, 65535), ("max_mb", 1, 1_000_000)):
+                if key in ota_pcap and ota_pcap[key] is not None:
+                    value = ota_pcap[key]
+                    if not isinstance(value, int) or isinstance(value, bool) \
+                            or not (low <= value <= high):
+                        raise RuntimeError(
+                            f"shared.ota_pcap.{key} must be an integer between "
+                            f"{low} and {high} if provided."
+                        )
 
     # peer_settings is optional
     if "peer_settings" in cfg and cfg["peer_settings"] is not None:
@@ -2135,6 +2157,19 @@ def func(
     link_trace_modem_timeout_s = float(link_trace.get("modem_metrics_timeout_s", 2.0))
     if link_trace_enabled and not use_status_overview:
         raise RuntimeError("shared.link_trace.enabled requires shared.use_status_overview=true.")
+    ota_pcap = shared.get("ota_pcap", {}) or {}
+    if not isinstance(ota_pcap, dict):
+        raise RuntimeError("shared.ota_pcap must be a mapping if provided.")
+    ota_pcap_enabled = bool(ota_pcap.get("enabled", False))
+    ota_pcap_snaplen = int(ota_pcap.get("snaplen", 96))
+    ota_pcap_max_mb = int(ota_pcap.get("max_mb", 2000))
+    ota_pcap_peer_filter = bool(ota_pcap.get("peer_filter", True))
+    if ota_pcap_enabled and not use_status_overview:
+        # The capture is started by the status_overview node, which is also
+        # what resolves the OTA interface from the peer's own address — the
+        # resolution that refuses loopback (#267). Without it there is nothing
+        # to hang the capture on and no safe way to name an interface.
+        raise RuntimeError("shared.ota_pcap.enabled requires shared.use_status_overview=true.")
     shared_use_in = shared.get("use_in", None)
     shared_use_out = shared.get("use_out", None)
 
@@ -3167,6 +3202,16 @@ def func(
                             ("link_trace_modem_timeout_s", link_trace_modem_timeout_s),
                         ]
                         if link_trace_enabled
+                        else []
+                    )
+                    + (
+                        [
+                            ("ota_pcap", True),
+                            ("ota_pcap_snaplen", ota_pcap_snaplen),
+                            ("ota_pcap_max_mb", ota_pcap_max_mb),
+                            ("ota_pcap_peer_filter", ota_pcap_peer_filter),
+                        ]
+                        if ota_pcap_enabled
                         else []
                     ),
                 )

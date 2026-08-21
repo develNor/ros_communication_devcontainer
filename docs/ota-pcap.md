@@ -87,6 +87,16 @@ reached the packet.
 }
 ```
 
+`stopped_because` reads `running` until something stops the capture, and that
+is deliberate: **neither file depends on a clean shutdown.** A session usually
+ends by its container being stopped, which does not reach this process as a
+signal it can act on — the first bench run ended exactly that way and left a
+pcap truncated at a buffer boundary and no sidecar at all. The pcap is flushed
+once a second and the sidecar is written at the start and rewritten on the same
+interval, so a killed capture still leaves a readable file and a description of
+it. Verified by `SIGKILL`ing a running capture: `capinfos` reads the pcap and
+the sidecar reports the packets up to the last checkpoint.
+
 **`kernel_drops` is a gap in the file, not on the link.** A capture that fell
 behind looks exactly like radio loss to anyone reading the pcap months later,
 so subtract it before reading any loss out of the capture. Zero is the normal

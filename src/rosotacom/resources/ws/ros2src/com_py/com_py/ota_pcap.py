@@ -79,6 +79,15 @@ A capture that quietly drops packets is worse than none: the analysis would
 read the gap as radio loss. So `PACKET_STATISTICS` is read from the kernel and
 the sidecar `.json` reports `kernel_drops` next to `packets`. A non-zero drop
 count means this process fell behind, not that the link did.
+
+Neither file depends on a clean shutdown, and that is deliberate. A session
+usually ends by the container being stopped, which does not reach this process
+as a signal it can act on — the first bench run ended exactly that way and left
+a pcap truncated at a buffer boundary and no sidecar at all. So the pcap is
+flushed on an interval and the sidecar is written at the *start* and rewritten
+on the same interval, with `stopped_because: "running"` until something stops
+it. A killed capture therefore still leaves a readable pcap and a sidecar that
+says what it was and how much it had seen, rather than an unexplained file.
 """
 
 from __future__ import annotations
@@ -134,6 +143,12 @@ DEFAULT_MAX_MB = 2000
 #: 4 MiB of kernel socket buffer. The default is a few hundred kilobytes, which
 #: is where `kernel_drops` comes from on a burst.
 RCVBUF_BYTES = 4 << 20
+
+#: How often the pcap is flushed and the sidecar rewritten. A session that ends
+#: by having its container stopped never reaches this process, so what is on
+#: disk at any moment is what the run will be read from. One second costs a
+#: ~300-byte write and bounds the loss to the packets of that second.
+CHECKPOINT_S = 1.0
 
 
 def log(message: str) -> None:
@@ -326,7 +341,7 @@ class Capture:
         self.kernel_seen = 0
         self.first_ts: float | None = None
         self.last_ts: float | None = None
-        self.stopped_because = "signal"
+        self.stopped_because = "running"
 
     def sidecar(self) -> dict:
         """What the file is, and what it is missing. Written next to the pcap."""
@@ -348,6 +363,14 @@ class Capture:
             "stopped_because": self.stopped_because,
         }
 
+    def write_sidecar(self) -> None:
+        """The sidecar as of now. Cheap enough to call on every checkpoint."""
+        try:
+            self.out.with_suffix(".json").write_text(
+                json.dumps(self.sidecar(), indent=2) + "\n", encoding="utf-8")
+        except OSError as error:
+            log(f"WARN could not write the sidecar: {error}")
+
     def run(self, stop: list) -> None:
         sock = open_socket(self.iface)
         # Root was needed for that one call and for nothing after it.
@@ -360,8 +383,22 @@ class Capture:
         with open(self.out, "wb", buffering=1 << 20) as handle:
             handle.write(pcap_header(self.snaplen))
             self.bytes_written = 24
+            handle.flush()
+            # Written before a single packet arrives, so a capture that is
+            # killed with its container still explains itself.
+            self.write_sidecar()
+            next_checkpoint = time.monotonic() + CHECKPOINT_S
             sock.settimeout(0.5)
             while not stop:
+                # `tick`, not `now`: the timestamp fallback below rebinds `now`
+                # to wall-clock time, and comparing that against a monotonic
+                # deadline would checkpoint on every single packet.
+                tick = time.monotonic()
+                if tick >= next_checkpoint:
+                    next_checkpoint = tick + CHECKPOINT_S
+                    self._collect(sock)
+                    handle.flush()
+                    self.write_sidecar()
                 try:
                     packet, ancdata, _flags, address = sock.recvmsg(65535, ancillary)
                 except socket.timeout:
@@ -395,8 +432,9 @@ class Capture:
                         f"after {self.packets} packets — the recording is untouched")
                     self.stopped_because = "size ceiling"
                     break
-                if self.packets % 20000 == 0:
-                    self._collect(sock)
+            handle.flush()
+        if self.stopped_because == "running":
+            self.stopped_because = "signal"
         self._collect(sock)
         sock.close()
 
@@ -445,9 +483,8 @@ def main(argv: list[str] | None = None) -> int:
         log(f"FAIL {error}")
         return 3
 
+    capture.write_sidecar()
     sidecar = capture.sidecar()
-    args.out.with_suffix(".json").write_text(
-        json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
     log(f"{sidecar['packets']} packets, {sidecar['bytes'] / 1e6:.1f} MB, "
         f"{sidecar['kernel_drops']} dropped by the kernel")
     if sidecar["kernel_drops"]:

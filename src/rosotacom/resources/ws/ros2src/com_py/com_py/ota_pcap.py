@@ -35,9 +35,22 @@ to a 6 Mbit/s link and survived a field session (#267). A capture that has to
 re-derive link knowledge is in the wrong place; this one asks the same
 resolution the status snapshot's own link block uses.
 
-It also needs no privilege here. This container already runs as root with
-`CAP_NET_RAW` in the default docker set, so the option adds no capability, no
-image change and no container.
+WHAT IT NEEDS, MEASURED RATHER THAN ASSUMED
+-------------------------------------------
+`sudo`, and only until the socket is open. ros2docker's entrypoint runs this
+container's processes as `containeruser`, whose `CapEff` is
+0000000000000000 — a non-root process cannot open an `AF_PACKET` socket
+however the container was started, so `--cap-add` buys nothing. `containeruser`
+does have passwordless sudo here, which the NET pane's `sudo iftop` already
+relies on, so the capture is launched through it and `--drop-to` hands the
+process back to `containeruser` the moment the socket exists. The pcap in
+`logs/<peer>/status/` therefore belongs to the same user as `link_trace.jsonl`
+beside it.
+
+That is the whole cost: no image change, no rebuild, no added capability and no
+extra container. Two earlier attempts at this assumed root from a `docker run`
+that bypassed the entrypoint, and both were wrong in the same way — check the
+*running* container, not the image.
 
 THE FILE
 --------
@@ -72,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import socket
 import struct
@@ -240,6 +254,40 @@ def open_socket(iface: str) -> socket.socket:
     return sock
 
 
+def drop_privileges(spec: str | None) -> str | None:
+    """Hand the process back to the user that started it.
+
+    The capture is launched through `sudo` — see the module header — because a
+    non-root process cannot open an `AF_PACKET` socket. Nothing after that call
+    needs root, and the artifacts in `logs/<peer>/status/` belong to
+    `containeruser` like `link_trace.jsonl` beside them: a root-owned file in
+    that directory is a `sudo rm` waiting to happen months later, and
+    `gather_drive.py` would copy it without noticing.
+
+    `spec` is "uid:gid". An argument rather than an environment variable
+    because sudo does not pass the environment through. Returns what it did, or
+    None when there was nothing to do.
+    """
+    if not spec:
+        return None
+    try:
+        uid_text, _, gid_text = spec.partition(":")
+        uid, gid = int(uid_text), int(gid_text or uid_text)
+    except ValueError:
+        log(f"WARN --drop-to {spec!r} is not uid:gid — staying as I am")
+        return None
+    if os.geteuid() != 0:
+        return None
+    try:
+        os.setgroups([])
+        os.setgid(gid)
+        os.setuid(uid)
+    except OSError as error:
+        log(f"WARN could not drop to {uid}:{gid} ({error}) — the file will be root's")
+        return None
+    return f"{uid}:{gid}"
+
+
 def kernel_timestamp(ancdata) -> tuple[int, int] | None:
     """(seconds, microseconds) out of SCM_TIMESTAMPNS, if the kernel sent it."""
     for level, kind, data in ancdata:
@@ -264,7 +312,9 @@ class Capture:
     """One pcap file, and the counts needed to trust it."""
 
     def __init__(self, iface: str, out: Path, *, snaplen: int = DEFAULT_SNAPLEN,
-                 peer: str | None = None, max_bytes: int = DEFAULT_MAX_MB * 1000 * 1000):
+                 peer: str | None = None, max_bytes: int = DEFAULT_MAX_MB * 1000 * 1000,
+                 drop_to: str | None = None):
+        self.drop_to = drop_to
         self.iface = iface
         self.out = out
         self.snaplen = snaplen
@@ -300,6 +350,10 @@ class Capture:
 
     def run(self, stop: list) -> None:
         sock = open_socket(self.iface)
+        # Root was needed for that one call and for nothing after it.
+        dropped = drop_privileges(self.drop_to)
+        if dropped:
+            log(f"privileges dropped to {dropped}; the socket stays open")
         packet_statistics(sock)  # zero the counters; the run owns them from here
         ancillary = socket.CMSG_SPACE(16)
         self.out.parent.mkdir(parents=True, exist_ok=True)
@@ -365,10 +419,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--peer", help="keep only packets to or from this address")
     parser.add_argument("--max-mb", type=int, default=DEFAULT_MAX_MB,
                         help=f"stop after this many MB (default {DEFAULT_MAX_MB})")
+    parser.add_argument("--drop-to", metavar="UID:GID",
+                        help="give root back once the socket is open, so the pcap "
+                             "belongs to the user that started the session")
     args = parser.parse_args(argv)
 
     capture = Capture(args.iface, args.out, snaplen=args.snaplen, peer=args.peer,
-                      max_bytes=args.max_mb * 1000 * 1000)
+                      max_bytes=args.max_mb * 1000 * 1000, drop_to=args.drop_to)
 
     stop: list = []
     for name in (signal.SIGINT, signal.SIGTERM):
@@ -379,9 +436,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         capture.run(stop)
     except PermissionError:
-        log("FAIL no permission to open a packet socket. Inside the recorder "
-            "container this should not happen — CAP_NET_RAW is in docker's "
-            "default set. Outside it, run as root.")
+        log("FAIL no permission to open a packet socket. This is meant to run "
+            "through `sudo` from inside the communication container, where "
+            "containeruser has passwordless sudo; a non-root process cannot "
+            "open AF_PACKET whatever capabilities the container was given.")
         return 3
     except OSError as error:
         log(f"FAIL {error}")

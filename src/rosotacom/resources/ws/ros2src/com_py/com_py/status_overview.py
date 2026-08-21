@@ -564,6 +564,9 @@ class StatusOverview(Node):
             "--out", path,
             "--snaplen", str(int(self.get_parameter("ota_pcap_snaplen").value)),
             "--max-mb", str(int(self.get_parameter("ota_pcap_max_mb").value)),
+            # Root opens the socket; this hands it straight back, so the pcap
+            # belongs to the same user as link_trace.jsonl beside it.
+            "--drop-to", f"{os.getuid()}:{os.getgid()}",
         ]
         # Narrowed to the remote peer by default. On a VPN tunnel the whole
         # device is the link and the filter changes nothing; on a LAN port it
@@ -572,6 +575,16 @@ class StatusOverview(Node):
         peer_ip = str(self.get_parameter("ota_pcap_peer_ip").value or "").strip()
         if bool(self.get_parameter("ota_pcap_peer_filter").value) and peer_ip:
             argv += ["--peer", peer_ip]
+
+        # An `AF_PACKET` socket needs root, and this node is `containeruser`:
+        # its `CapEff` is zero, so no `--cap-add` on the container would help.
+        # `containeruser` has passwordless sudo here — the NET pane's
+        # `sudo iftop` already depends on it — so the capture goes through it
+        # and gives root back as soon as the socket exists. Where there is no
+        # sudo (this module run somewhere else, or already as root) the plain
+        # command is tried instead rather than refused.
+        if os.geteuid() != 0 and self._sudo_available():
+            argv = ["sudo", "-n", *argv]
 
         try:
             self._pcap = subprocess.Popen(argv, start_new_session=True)
@@ -588,6 +601,16 @@ class StatusOverview(Node):
                bool(self.get_parameter("ota_pcap_peer_filter").value) else "")
         )
 
+    @staticmethod
+    def _sudo_available() -> bool:
+        """Can this process become root without being asked for a password?"""
+        try:
+            return subprocess.run(
+                ["sudo", "-n", "true"], capture_output=True, timeout=5.0
+            ).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
     def _stop_ota_pcap(self) -> None:
         """SIGINT and wait, so the sidecar JSON and the drop counts are written.
 
@@ -599,7 +622,15 @@ class StatusOverview(Node):
         if child is None or child.poll() is not None:
             return
         try:
-            child.send_signal(signal.SIGINT)
+            # Through sudo the child is root, so an ordinary kill would be
+            # refused; `sudo -n kill` is how a non-root parent signals it.
+            # SIGINT and not SIGTERM, because SIGINT is what makes the capture
+            # write ota.json on the way out.
+            if os.geteuid() != 0:
+                subprocess.run(["sudo", "-n", "kill", "-INT", str(child.pid)],
+                               capture_output=True, timeout=5.0)
+            else:
+                child.send_signal(signal.SIGINT)
             child.wait(timeout=20.0)
         except subprocess.TimeoutExpired:
             child.kill()

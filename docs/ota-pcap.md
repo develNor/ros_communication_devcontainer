@@ -110,9 +110,25 @@ runs on. `shared.ota_pcap.enabled` therefore requires
 
 ## Privilege, containers, and what the option costs
 
-Nothing is added. The communication container already runs as root with
-`CAP_NET_RAW` in docker's default set, so the capture needs no `--cap-add`, no
-image change, no rebuild and no extra container in `docker ps`.
+No image change, no rebuild, no added capability and no extra container in
+`docker ps`. What it does need is `sudo`, and only until the socket is open.
+
+ros2docker's entrypoint runs this container's processes as `containeruser`,
+whose `CapEff` is `0000000000000000`. A non-root process cannot open an
+`AF_PACKET` socket however the container was started, so `--cap-add NET_RAW`
+would buy nothing. `containeruser` does have passwordless sudo here — the NET
+pane's `sudo iftop` already depends on it — so the capture is launched through
+it, and `--drop-to` hands the process back to `containeruser` the moment the
+socket exists. The pcap therefore belongs to the same user as
+`link_trace.jsonl` beside it, rather than to root.
+
+Two earlier attempts at this assumed root from a `docker run` that bypassed the
+entrypoint, and were wrong in the same way both times. If you change this,
+check the **running** container:
+
+```bash
+docker exec <com-container> bash -lc 'id; grep CapEff /proc/self/status'
+```
 
 `CAP_NET_ADMIN` is *not* taken and is not needed: it buys promiscuous mode,
 which this capture deliberately does not use. Everything of interest is

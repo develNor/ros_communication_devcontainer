@@ -644,7 +644,8 @@ is which fragment was lost, whether a retransmit followed, or how one sample's
 sub-messages were spaced, enable the [header-only OTA capture](docs/ota-pcap.md)
 next to them — `shared.ota_pcap.enabled`, off by default, roughly 1 % of payload
 volume, and every packet labelled uplink or downlink. It needs no capability,
-no image change and no extra container.
+no image change and no extra container — only the passwordless sudo the
+container already has, and only until its socket is open.
 
 Convert a recorded link trace into a profiles-file entry when you want to replay
 the same drive conditions in a repeatable benchmark:

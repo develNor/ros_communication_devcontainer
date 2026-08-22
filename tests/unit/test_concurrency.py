@@ -943,3 +943,76 @@ def test_a_pinned_peer_confines_its_containers(tmp_path: Path) -> None:
     # And without one, nothing is added: the flag must not appear on a peer that
     # was never pinned, or every unpinned run changes shape too.
     assert "--cpuset" not in rosotacom._ota_start_parts(target, "a", "id-1", [], mode="detached")
+
+
+# --------------------------------------------------- instance resolution by name
+#
+# A session's instances are found by globbing its slug. The slug of one session
+# can be a prefix of another's — `ccng_remote_assist` and
+# `ccng_remote_assist_kilted_dds` are the pair that exposed it — and a pattern
+# that ends the slug with `*` then matches both. The matches are ordered by
+# name, so the answer is whichever sorts last, and a letter sorts after a digit:
+# the *other* session's run wins over this session's own newest one.
+#
+# What that cost: on 2026-08-21 `rosotacom status ccng_remote_assist` reported a
+# `ccng_remote_assist_kilted_dds` run that had been shut down 45 minutes
+# earlier. Three two-host runs waited ten minutes each and concluded their link
+# never came up, while their own status file said it had been OK the whole time.
+
+
+def _session(tmp_path: Path, name: str) -> rosotacom.ResolvedSession:
+    host_dir = tmp_path / "sessions" / name
+    host_dir.mkdir(parents=True, exist_ok=True)
+    return rosotacom.ResolvedSession(host_dir, f"/session/{name}", "test")
+
+
+def _instance(root: Path, slug: str, stamp: str, instance_id: str) -> Path:
+    day, _, _ = stamp.partition("_")
+    path = root / day / f"{slug}_{stamp}_{instance_id}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_a_longer_session_name_does_not_capture_this_session_s_instances(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    root = tmp_path / "instances"
+    mine = _instance(root, "ccng_remote_assist", "2026-08-21_21-42-01", "35285739")
+    # Older, another session, and its name sorts after mine because 'k' > '2'.
+    _instance(root, "ccng_remote_assist_kilted_dds", "2026-08-21_20-57-05", "52a752d6")
+
+    found = rosotacom._find_latest_instance_dir(runtime, _session(tmp_path, "ccng_remote_assist"), None)
+
+    assert found == mine.resolve()
+
+
+def test_the_longer_name_still_finds_its_own_newest(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    root = tmp_path / "instances"
+    _instance(root, "ccng_remote_assist", "2026-08-21_21-42-01", "35285739")
+    _instance(root, "ccng_remote_assist_kilted_dds", "2026-08-21_20-48-37", "643792ab")
+    newest = _instance(root, "ccng_remote_assist_kilted_dds", "2026-08-21_20-57-05", "52a752d6")
+
+    found = rosotacom._find_latest_instance_dir(runtime, _session(tmp_path, "ccng_remote_assist_kilted_dds"), None)
+
+    assert found == newest.resolve()
+
+
+def test_instances_are_ordered_by_their_stamp(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    root = tmp_path / "instances"
+    _instance(root, "link", "2026-08-20_23-59-59", "aaaaaaaa")
+    newest = _instance(root, "link", "2026-08-21_00-00-01", "00000000")
+
+    found = rosotacom._find_latest_instance_dir(runtime, _session(tmp_path, "link"), None)
+
+    # The id sorts first among these two; the stamp is what has to decide.
+    assert found == newest.resolve()
+
+
+def test_a_named_instance_of_another_session_is_not_answered(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    root = tmp_path / "instances"
+    _instance(root, "ccng_remote_assist_kilted_dds", "2026-08-21_20-57-05", "52a752d6")
+
+    with pytest.raises(RuntimeError, match="No session instance found"):
+        rosotacom._find_latest_instance_dir(runtime, _session(tmp_path, "ccng_remote_assist"), "52a752d6")

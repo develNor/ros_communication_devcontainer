@@ -794,6 +794,31 @@ def _new_instance_id() -> str:
     return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
 
 
+#: The timestamp every instance directory carries between its session slug and
+#: its id: `<slug>_YYYY-MM-DD_HH-MM-SS_<id>`. Spelled out digit by digit rather
+#: than left as `*`, because a session's name may be a *prefix* of another
+#: session's name and `f"{slug}_*"` then collects the other session's instances
+#: too. `ccng_remote_assist_*` matches every `ccng_remote_assist_kilted_dds_*`,
+#: and because the matches are ordered by name, `[-1]` answers with the wrong
+#: session's run whenever the longer name sorts after a digit — which `k` does.
+#:
+#: That is not hypothetical. On 2026-08-21 it made `rosotacom status
+#: ccng_remote_assist` report a `ccng_remote_assist_kilted_dds` run that had
+#: been shut down 45 minutes earlier, so three two-host runs concluded their
+#: link never came up while it was in fact carrying traffic for eleven minutes.
+#: Nothing in the reading said it came from another session.
+_INSTANCE_STAMP_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
+
+
+def _instance_glob(session_slug: str, instance_id: str | None = None) -> str:
+    """The pattern matching this session's instances, and no other session's.
+
+    With the stamp pinned, the names sort chronologically, so `sorted(...)[-1]`
+    is the newest instance rather than merely the last name.
+    """
+    return f"*/{session_slug}_{_INSTANCE_STAMP_GLOB}_{instance_id or '*'}"
+
+
 def _session_instances_root(runtime: RuntimeConfig) -> Path:
     return (runtime.session_instances_dir or (Path.cwd() / "session-instances")).resolve()
 
@@ -818,7 +843,7 @@ def _resolve_session_instance(
     resolved_instance_id = _safe_path_token(instance_id or _new_instance_id())
 
     if instance_id:
-        matches = sorted(root.glob(f"*/{session_slug}_*_{resolved_instance_id}"))
+        matches = sorted(root.glob(_instance_glob(session_slug, resolved_instance_id)))
         if matches:
             host_dir = matches[-1].resolve()
         else:
@@ -8781,10 +8806,7 @@ def smoke(args: argparse.Namespace) -> int:
 def _find_latest_instance_dir(runtime: RuntimeConfig, session: ResolvedSession, instance_id: str | None) -> Path:
     root = _session_instances_root(runtime)
     session_slug = _session_instance_slug(session, runtime)
-    if instance_id:
-        pattern = f"*/{session_slug}_*_{_safe_path_token(instance_id)}"
-    else:
-        pattern = f"*/{session_slug}_*"
+    pattern = _instance_glob(session_slug, _safe_path_token(instance_id) if instance_id else None)
     matches = sorted(p for p in root.glob(pattern) if p.is_dir())
     if not matches:
         raise RuntimeError(

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from rosotacom.network_profiles import (
@@ -25,6 +27,7 @@ from rosotacom.network_profiles import (
     required_dist_installs,
     resolve_profile_selection,
     shaping_commands,
+    tc_lib_dir_probe,
     teardown_command,
 )
 
@@ -518,3 +521,43 @@ def test_load_profiles_file_resolves_distribution_files_and_lists_installs(tmp_p
         )
         == []
     )
+
+
+def _probe(root) -> str:
+    return subprocess.run(
+        ["sh", "-c", tc_lib_dir_probe(str(root))],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def test_the_distribution_table_goes_where_tc_reads_it(tmp_path):
+    """A table installed into `/usr/lib/tc` on a multiarch image is invisible.
+
+    iproute2 compiles its library directory in, so a Debian or Ubuntu build
+    reads `/usr/lib/<triplet>/tc` and never looks at `/usr/lib/tc`. netem then
+    fails at arming time with "No distribution data", which reads like a broken
+    profile rather than a misplaced file -- so the directory is resolved from
+    the image instead of assumed.
+    """
+    multiarch = tmp_path / "usr/lib/x86_64-linux-gnu/tc"
+    multiarch.mkdir(parents=True)
+    (multiarch / "normal.dist").write_text("0\n", encoding="utf-8")
+    (tmp_path / "usr/lib/tc").mkdir(parents=True)
+
+    # Both exist; the one carrying iproute2's own table is the one tc reads.
+    assert _probe(tmp_path) == str(multiarch)
+
+
+def test_a_directory_that_merely_exists_is_the_second_choice(tmp_path):
+    multiarch = tmp_path / "usr/lib/aarch64-linux-gnu/tc"
+    multiarch.mkdir(parents=True)
+    assert _probe(tmp_path) == str(multiarch)
+
+
+def test_an_image_with_neither_gets_one_created(tmp_path):
+    (tmp_path / "usr/lib").mkdir(parents=True)
+    out = _probe(tmp_path)
+    assert out == str(tmp_path / "usr/lib/tc")
+    assert (tmp_path / "usr/lib/tc").is_dir()

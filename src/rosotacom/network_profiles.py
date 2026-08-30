@@ -440,9 +440,46 @@ def _resolve_distribution_files(profile: Profile, base: Path) -> Profile:
     return replace(profile, uplink=fix(profile.uplink), downlink=fix(profile.downlink))
 
 
+#: Where `tc` looks for a delay-distribution table, in the order to try.
+#: iproute2 compiles the directory in (``LIBDIR "/tc"``), so on a multiarch
+#: Debian or Ubuntu build it is ``/usr/lib/<triplet>/tc`` and ``/usr/lib/tc``
+#: does not exist at all. A table written to the latter is then invisible with
+#: no error of its own: netem answers ``No distribution data for <name>`` and
+#: the run dies at arming time, which is what every profile carrying a fitted
+#: table did until this was found. The directory holding iproute2's own tables
+#: is the one it reads, so that is the evidence to look for rather than a
+#: guessed triplet.
+TC_LIB_DIR_CANDIDATES = ("/usr/lib/*-linux-gnu*/tc", "/usr/lib/tc")
+
+#: A table iproute2 ships, used as the marker for "this is the directory".
+TC_LIB_DIR_MARKERS = ("normal.dist", "pareto.dist")
+
+
+def tc_lib_dir_probe(root: str = "") -> str:
+    """A ``sh -c`` program that prints the directory ``tc`` reads tables from.
+
+    Three rungs, in order: a candidate that already holds one of iproute2's own
+    tables (proof, not inference); a candidate that merely exists; and finally
+    ``/usr/lib/tc``, created, for an image that has neither. `root` exists so
+    the rungs are testable without a container.
+    """
+    cands = " ".join(f"{root}{c}" for c in TC_LIB_DIR_CANDIDATES)
+    marker = " || ".join(f'[ -f "$d/{m}" ]' for m in TC_LIB_DIR_MARKERS)
+    fallback = f"{root}/usr/lib/tc"
+    return (
+        f"for d in {cands}; do "
+        f'  if {marker}; then printf %s "$d"; exit 0; fi; '
+        f"done; "
+        f"for d in {cands}; do "
+        f'  if [ -d "$d" ]; then printf %s "$d"; exit 0; fi; '
+        f"done; "
+        f"mkdir -p {fallback} && printf %s {fallback}"
+    )
+
+
 def required_dist_installs(profile: Profile) -> list[tuple[str, str]]:
     """``(table_name, file_path)`` pairs a runner must install as
-    ``/usr/lib/tc/<table_name>.dist`` inside the shaping netns before arming.
+    ``<tc lib dir>/<table_name>.dist`` inside the shaping netns before arming.
 
     Builtin distributions need nothing; duplicates collapse; conflicting files
     for one name are an error (two segments must mean the same table).

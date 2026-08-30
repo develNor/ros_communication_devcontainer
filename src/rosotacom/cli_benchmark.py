@@ -5614,22 +5614,40 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                     dist_installs = required_dist_installs(profile_obj)
                     if dist_installs:
                         # Custom delay-distribution tables must exist inside the
-                        # shaping netns before netem references them by name.
+                        # shaping netns before netem references them by name, and
+                        # in the directory this image's `tc` was compiled to read
+                        # -- see tc_lib_dir_probe for why that is not a constant.
+                        from .network_profiles import tc_lib_dir_probe
+
                         for dist_container in (a_container, b_container):
                             if not dist_container:
                                 continue
+                            probe = subprocess.run(
+                                ["docker", "exec", "-u", "root", dist_container, "sh", "-c", tc_lib_dir_probe()],
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                            )
+                            tc_lib_dir = probe.stdout.strip()
+                            if probe.returncode != 0 or not tc_lib_dir.startswith("/"):
+                                raise RuntimeError(
+                                    f"could not locate the tc library directory in {dist_container}: "
+                                    f"{probe.stderr or probe.stdout}"
+                                )
                             for table_name, file_path in dist_installs:
-                                dist_target = f"/usr/lib/tc/{table_name}.dist"
-                                for install_cmd in (
-                                    ["docker", "exec", "-u", "root", dist_container, "mkdir", "-p", "/usr/lib/tc"],
+                                dist_target = f"{tc_lib_dir}/{table_name}.dist"
+                                res = subprocess.run(
                                     ["docker", "cp", file_path, f"{dist_container}:{dist_target}"],
-                                ):
-                                    res = subprocess.run(install_cmd, capture_output=True, text=True, check=False)
-                                    if res.returncode != 0:
-                                        raise RuntimeError(
-                                            f"failed to install netem distribution table {table_name!r} in "
-                                            f"{dist_container}: {' '.join(install_cmd)} -> {res.stderr or res.stdout}"
-                                        )
+                                    capture_output=True,
+                                    text=True,
+                                    check=False,
+                                )
+                                if res.returncode != 0:
+                                    raise RuntimeError(
+                                        f"failed to install netem distribution table {table_name!r} in "
+                                        f"{dist_container}: {file_path} -> {dist_target}: "
+                                        f"{res.stderr or res.stdout}"
+                                    )
                                 print(
                                     f"  netem distribution {table_name!r} installed in {dist_container}: {dist_target}"
                                 )

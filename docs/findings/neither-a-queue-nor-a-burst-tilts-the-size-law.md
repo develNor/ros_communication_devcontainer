@@ -107,9 +107,9 @@ At 60 messages/s the one-packet cell lost 10.774 % under the bursty profile and
 10.626 % under the independent one, and at 380 messages/s 48.391 % and 48.430 %.
 Two different loss processes cannot agree to three digits; what both were
 reporting is the depth-1 OTA queue overwriting its own backlog before the link
-sees it — the same mechanism as
-[depth-1 overwrite](depth1-overwrite-bundled-publications.md), reached by
-accident.
+sees it. That is the depth-1 overwrite of bundled publications, which the
+operator harness's ledger records against a real drive, reached here by
+accident and against a synthetic one.
 
 What works is to leave the message rate at the field's 10 Hz and rescale the
 chain: multiplying `p` and `r` by `380/(N × 10)` in each cell leaves the

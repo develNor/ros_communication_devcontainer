@@ -293,6 +293,12 @@ class OtaSmokePlan:
     peers: dict[str, OtaSmokePeer]
     install_mode: str = "source"
     install_pin: str | None = None
+    #: Where the peers write session instances, relative to the project file's
+    #: own directory. `session-instances` is the default a project that says
+    #: nothing gets; a project that sets `session_instances_dir` to anything
+    #: else -- `../instances`, say -- used to have its artifacts looked for in a
+    #: directory nothing writes to, and the miss was silent.
+    instances_rel: str = "session-instances"
 
 
 @dataclass(frozen=True)
@@ -1835,6 +1841,26 @@ def _ota_checkout_project_path(project_config: Path) -> tuple[Path, str]:
     )
 
 
+def _ota_instances_rel(runtime: RuntimeConfig) -> str:
+    """Where this project writes session instances, relative to its own file.
+
+    The peers resolve the project from their own checkout, so the *relative*
+    answer is the one that travels; an absolute path is the orchestrator's and
+    means nothing on the far side. A project that says nothing gets
+    `session-instances`, which is what the collection used to assume for every
+    project -- and a project that says `../instances` had its artifacts looked
+    for in a directory nothing writes to.
+    """
+    default = "session-instances"
+    if not runtime.rosotacom_config:
+        return default
+    raw = _load_yaml_file(runtime.rosotacom_config)
+    value = raw.get("session_instances_dir")
+    if not value:
+        return default
+    return str(value)
+
+
 def _ota_plan_from_bindings(
     bindings: dict[str, PeerBinding],
     *,
@@ -1845,6 +1871,7 @@ def _ota_plan_from_bindings(
     project: str | None = None,
     exec_commands: Mapping[str, str] | None = None,
     cpusets: Mapping[str, str] | None = None,
+    instances_rel: str = "session-instances",
 ) -> OtaSmokePlan:
     _ota_validate_install_mode(install_mode)
     if cpusets:
@@ -1923,6 +1950,7 @@ def _ota_plan_from_bindings(
         peers=peers,
         install_mode=install_mode,
         install_pin=install_pin,
+        instances_rel=instances_rel,
     )
 
 
@@ -1935,6 +1963,7 @@ def _ota_write_state(instance: SessionInstance, plan: OtaSmokePlan) -> OtaSmokeP
         "project": plan.project,
         "install_mode": plan.install_mode,
         "install_pin": plan.install_pin,
+        "instances_rel": plan.instances_rel,
         "peers": {
             name: {
                 "address": peer.address,
@@ -1979,6 +2008,7 @@ def _ota_load_state(path_arg: str) -> OtaSmokePlan:
         peers=peers,
         install_mode=_ota_validate_install_mode(str(raw["install_mode"])),
         install_pin=str(install_pin) if install_pin else None,
+        instances_rel=str(raw.get("instances_rel") or "session-instances"),
     )
 
 
@@ -2404,12 +2434,26 @@ def _ota_stop_parts(
     return parts
 
 
+#: How a benchmark's load maps onto `publish-test-topics` flags. The keys are
+#: `_sized_publisher_param_args`'s own, so a load dict travels from the
+#: benchmark to the peer's publisher without being rewritten on the way.
+_OTA_LOAD_FLAGS: tuple[tuple[str, str], ...] = (
+    ("size", "--load-size"),
+    ("pattern", "--load-size-pattern"),
+    ("rate", "--load-rate-hz"),
+    ("streams", "--load-streams"),
+    ("interval_jitter_ms", "--load-interval-jitter-ms"),
+    ("interval_jitter_seed", "--load-interval-jitter-seed"),
+)
+
+
 def _ota_publish_parts(
     target: InteractiveSmokeTarget,
     identity: str,
     peer_args: list[str],
     *,
     stop: bool = False,
+    load: Mapping[str, Any] | None = None,
 ) -> list[str]:
     parts = [
         "publish-test-topics",
@@ -2421,6 +2465,13 @@ def _ota_publish_parts(
     ]
     if stop:
         parts.append("--stop")
+    else:
+        merged = dict(load or {})
+        if "size" not in merged and merged.get("size_a") is not None:
+            merged["size"] = merged["size_a"]
+        for key, flag in _OTA_LOAD_FLAGS:
+            if merged.get(key) is not None:
+                parts.extend([flag, str(merged[key])])
     for override in peer_args:
         parts.extend(["--peer-address", override])
     return parts
@@ -2769,6 +2820,7 @@ def _resolve_ota_smoke_context(
             project=project,
             exec_commands=exec_commands,
             cpusets=_parse_peer_cpuset_overrides(getattr(args, "peer_cpuset", None)),
+            instances_rel=_ota_instances_rel(runtime),
         )
     plan_peers = set(plan.peers)
     target_peers = set(_peer_keys_from_cfg(target.cfg))
@@ -3732,14 +3784,41 @@ def _resolve_ota_profile(
     return name, profile
 
 
-def _profile_directions(plan: OtaSmokePlan, cfg: dict[str, Any]) -> dict[str, str]:
+def _loaded_peer(cfg: dict[str, Any]) -> str | None:
+    """Which peer's egress carries this session's dominant direction.
+
+    A profile's ``uplink`` leg is the impaired one in almost every profile this
+    project ships, so which peer it lands on decides what the run measures. The
+    session already says: `topics.a_to_b` and `topics.b_to_a` are its two
+    directions, and the one with more topics is the one the load runs over.
+    Reading it here is what keeps a one-host and a two-host run of the *same*
+    session under the *same* profile from shaping opposite directions -- which
+    they did, silently, until 2026-08-31.
+    """
+    topics = cfg.get("topics")
+    if not isinstance(topics, dict):
+        return None
+    a_to_b = len(topics.get("a_to_b") or ())
+    b_to_a = len(topics.get("b_to_a") or ())
+    if a_to_b == b_to_a:
+        return None
+    return "a" if a_to_b > b_to_a else "b"
+
+
+def _profile_directions_for(peers: list[str], cfg: dict[str, Any]) -> dict[str, str]:
     """Map each peer to the profile direction its egress carries (RFC 0004).
 
-    Default for the a/b convention: the first peer (center / receiver) shapes
-    ``downlink``, the second (vehicle / sender) shapes ``uplink`` — the dominant
-    telemetry direction. Override with ``shared.profile_directions: { a: …, b: … }``."""
-    peers = sorted(plan.peers)
-    directions: dict[str, str] = {peers[0]: "downlink", peers[1]: "uplink"} if len(peers) == 2 else {}
+    The sender of the session's dominant direction shapes ``uplink``; the other
+    peer shapes ``downlink``. Where the two directions carry the same number of
+    topics the session does not say, and the a/b convention decides: the first
+    peer is the centre and receives, the second is the vehicle and sends.
+    ``shared.profile_directions: { a: …, b: … }`` overrides either.
+    """
+    directions: dict[str, str] = {}
+    if len(peers) == 2:
+        sender = _loaded_peer(cfg) or peers[1]
+        other = next(name for name in peers if name != sender)
+        directions = {sender: "uplink", other: "downlink"}
     shared = cfg.get("shared")
     override = shared.get("profile_directions") if isinstance(shared, dict) else None
     if isinstance(override, dict):
@@ -3749,6 +3828,11 @@ def _profile_directions(plan: OtaSmokePlan, cfg: dict[str, Any]) -> dict[str, st
     if invalid:
         raise RuntimeError(f"shared.profile_directions values must be 'uplink' or 'downlink'; got {invalid}")
     return directions
+
+
+def _profile_directions(plan: OtaSmokePlan, cfg: dict[str, Any]) -> dict[str, str]:
+    """`_profile_directions_for` against a plan's peers."""
+    return _profile_directions_for(sorted(plan.peers), cfg)
 
 
 def _ota_resolve_interfaces(peer: OtaSmokePeer, peer_addr: str, *, dry_run: bool) -> tuple[str, str | None]:
@@ -3935,6 +4019,7 @@ def _ota_start_session_publishers(
     plan: OtaSmokePlan,
     *,
     dry_run: bool,
+    load: Mapping[str, Any] | None = None,
 ) -> None:
     if target.target_type != "session":
         print("OTA smoke: target is a scenario; using its application publishers.")
@@ -3942,7 +4027,7 @@ def _ota_start_session_publishers(
     peer_args = _ota_peer_address_args(plan)
     for peer_name in sorted(plan.peers):
         peer = plan.peers[peer_name]
-        command = _ota_rosotacom_command(plan, _ota_publish_parts(target, peer_name, peer_args), peer)
+        command = _ota_rosotacom_command(plan, _ota_publish_parts(target, peer_name, peer_args, load=load), peer)
         result = _ota_run(peer, command, label=f"{peer_name}: start synthetic publishers", dry_run=dry_run, check=False)
         _print_completed_output(result)
         if result.returncode != 0:
@@ -4068,21 +4153,44 @@ def _ota_collect_logs(
     dry_run: bool,
 ) -> None:
     project = shlex.quote(plan.project)
+    instances_rel = shlex.quote(plan.instances_rel)
     instance_suffix = shlex.quote(f"*_{instance.instance_id}")
+    collected = 0
     for peer in plan.peers.values():
         script = (
             f"cd {shlex.quote(_ota_peer_workdir(plan, peer))} && "
             f"project_dir=$(dirname {project}) && "
-            f'instance_dir=$(find "$project_dir/session-instances" -mindepth 2 -maxdepth 2 '
+            f'instances_root=$(cd "$project_dir" && cd "$(dirname {instances_rel})" 2>/dev/null '
+            f'&& printf %s "$PWD/$(basename {instances_rel})") && '
+            f'instance_dir=$(find "$instances_root" -mindepth 2 -maxdepth 2 '
             f"-type d -name {instance_suffix} -print -quit 2>/dev/null) && "
             'if [ -n "$instance_dir" ]; then '
-            'relative=${instance_dir#"$project_dir"/}; '
-            'tar cz -C "$project_dir" "$relative" 2>/dev/null | base64; fi'
+            'root=$(dirname "$(dirname "$instance_dir")"); '
+            'relative=${instance_dir#"$root"/}; '
+            'tar cz -C "$root" "$relative" 2>/dev/null | base64; fi'
         )
         result = _ota_run(peer, script, label=f"{peer.name}: collect session-instances", dry_run=dry_run, check=False)
-        if dry_run or not result.stdout.strip():
+        if dry_run:
+            continue
+        if not result.stdout.strip():
+            # Silence here used to end as "no status/events.jsonl files found"
+            # after the run was already over, which describes the symptom and
+            # not the cause. Say which peer, and where it was looked for.
+            print(
+                f"OTA smoke: peer {peer.name} returned no session instance matching "
+                f"*_{instance.instance_id} under its {plan.instances_rel!r} "
+                f"(relative to {plan.project!r}).",
+                file=sys.stderr,
+            )
             continue
         _ota_extract_peer_artifacts(instance, peer, result.stdout)
+        collected += 1
+    if not dry_run and not collected:
+        print(
+            "OTA smoke: nothing was collected from any peer -- the run produced no local records. "
+            "Check that the project's session_instances_dir is the one the peers write to.",
+            file=sys.stderr,
+        )
 
 
 def _ota_extract_peer_artifacts(instance: SessionInstance, peer: OtaSmokePeer, encoded: str) -> None:
@@ -7372,9 +7480,30 @@ def _smoke_topic_pub_qos_args(qos: dict[str, Any] | None) -> str:
     return " ".join(shlex.quote(arg) for arg in args) + (" " if args else "")
 
 
-def _smoke_publisher_command(spec: SmokeTopicSpec, ros_setup: str, duration: float) -> str:
+def _smoke_publisher_command(
+    spec: SmokeTopicSpec,
+    ros_setup: str,
+    duration: float,
+    load: Mapping[str, Any] | None = None,
+) -> str:
+    """The publisher command for one crossed topic.
+
+    `load` overrides what the session's own `expect` says, and only for a
+    `SizedPayload` stream: a benchmark chooses its load, and a session that also
+    declares one is describing what it expects to see rather than what a
+    measurement should offer. Without this the benchmark's `--size` and
+    `--rate-hz` reached the local runner and stopped there, so a two-host run
+    measured the session's defaults while reporting the load that was asked for.
+    """
     assert spec.publish_topic is not None and spec.publish_type is not None
     if spec.publish_type == "com_msgs/msg/SizedPayload":
+        from .cli_benchmark import _sized_publisher_param_args
+
+        if load:
+            args = " ".join(
+                shlex.quote(str(part)) for part in _sized_publisher_param_args(spec.publish_topic, dict(load))
+            )
+            return f"{ros_setup} && timeout {duration} ros2 run com_py sized_publisher --ros-args {args}"
         size = spec.expected_size or SMOKE_SIZED_PAYLOAD_BYTES
         return (
             f"{ros_setup} && timeout {duration} ros2 run com_py sized_publisher --ros-args "
@@ -7427,16 +7556,18 @@ def _start_smoke_topic_publishers(
     log_line: Callable[[str], None] = print,
     duration: float = 180.0,
     source_peer_key: str | None = None,
+    load: Mapping[str, Any] | None = None,
 ) -> list[SmokeTopicSpec]:
     started: list[SmokeTopicSpec] = []
     for spec in _smoke_publish_specs(cfg, source_peer_key=source_peer_key):
         assert spec.publish_topic is not None and spec.publish_type is not None
         container = containers[spec.source_peer_key]
         ros_setup = ros_setups[spec.source_peer_key]
-        cmd = _smoke_publisher_command(spec, ros_setup, duration)
+        cmd = _smoke_publisher_command(spec, ros_setup, duration, load)
+        offered = f" at {load.get('rate', spec.publish_rate)} Hz (benchmark load)" if load else ""
         log_line(
             f"Starting smoke publisher {spec.source_peer_key}->{spec.receiver_peer_key} "
-            f"{spec.publish_topic} ({spec.publish_type}) in {container}"
+            f"{spec.publish_topic} ({spec.publish_type}) in {container}{offered}"
         )
         subprocess.run(
             ["docker", "exec", "-d", container, "bash", "-c", cmd],
@@ -7801,6 +7932,30 @@ def probe_content_command(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _publish_load_override(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The benchmark's load as `_sized_publisher_param_args` wants it, or None.
+
+    None means "use what the session expects", which is what an ordinary smoke
+    run wants. A benchmark always passes something, because choosing the load is
+    the whole point of it.
+    """
+    load: dict[str, Any] = {}
+    if getattr(args, "load_size", None) is not None:
+        load["size"] = int(args.load_size)
+        load["size_a"] = int(args.load_size)
+    if getattr(args, "load_size_pattern", None):
+        load["pattern"] = args.load_size_pattern
+    if getattr(args, "load_rate_hz", None) is not None:
+        load["rate"] = float(args.load_rate_hz)
+    if getattr(args, "load_streams", None) is not None:
+        load["streams"] = int(args.load_streams)
+    if getattr(args, "load_interval_jitter_ms", None) is not None:
+        load["interval_jitter_ms"] = float(args.load_interval_jitter_ms)
+    if getattr(args, "load_interval_jitter_seed", None) is not None:
+        load["interval_jitter_seed"] = int(args.load_interval_jitter_seed)
+    return load or None
+
+
 def publish_test_topics_command(args: argparse.Namespace) -> int:
     """Start or stop synthetic local app publishers for the peer's crossed topics.
 
@@ -7826,6 +7981,7 @@ def publish_test_topics_command(args: argparse.Namespace) -> int:
             cfg,
             duration=args.duration,
             source_peer_key=args.identity,
+            load=_publish_load_override(args),
         )
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -10357,6 +10513,16 @@ def main(argv: list[str] | None = None) -> int:
     publish_test_topics_parser.add_argument(
         "--stop", action="store_true", help="Stop running synthetic test topic publishers."
     )
+    # The benchmark's load, for the peer that publishes it. Without these a
+    # two-host benchmark offered the session's own expected load and reported
+    # the one that was asked for -- a run that reads as a success and measures
+    # something else.
+    publish_test_topics_parser.add_argument("--load-size", type=int, help=argparse.SUPPRESS)
+    publish_test_topics_parser.add_argument("--load-size-pattern", help=argparse.SUPPRESS)
+    publish_test_topics_parser.add_argument("--load-rate-hz", type=float, help=argparse.SUPPRESS)
+    publish_test_topics_parser.add_argument("--load-streams", type=int, help=argparse.SUPPRESS)
+    publish_test_topics_parser.add_argument("--load-interval-jitter-ms", type=float, help=argparse.SUPPRESS)
+    publish_test_topics_parser.add_argument("--load-interval-jitter-seed", type=int, help=argparse.SUPPRESS)
     publish_test_topics_parser.set_defaults(func=publish_test_topics_command)
 
     list_parser = subparsers.add_parser("list-sessions", help="List configured sessions.")

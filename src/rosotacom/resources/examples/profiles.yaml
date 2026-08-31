@@ -245,3 +245,74 @@ profiles:
       distribution_file: dist/field-20260817.dist
       loss: 1%
     downlink: { delay: 7ms, jitter: 5ms }
+
+  # B1-prime -- the two-state process with its chain rescaled per cell.
+  #
+  # netem advances a Gilbert-Elliott chain once per *packet*, so the fitted p
+  # and r describe a process in packets and not in time. At the drive's own
+  # 380 fragments/s they mean a bad run of about 105 ms; on a size ladder at a
+  # fixed 10 Hz the packet rate is N x 10, so the same p and r stretch the bad
+  # run by 380/(N x 10) and every cell meets a different link. Forcing the
+  # packet rate constant instead was tried and measured the wrong thing: the
+  # pipeline serves messages, not packets, and at 60 messages/s the depth-1 OTA
+  # queue overwrites its own backlog -- both loss processes then reported
+  # 10.7 % to two digits.
+  #
+  # So the chain is rescaled instead: p and r are multiplied by 380/(N x 10) in
+  # each cell, which leaves the stationary bad fraction at 3.92 % and the mean
+  # loss at 1 % while making the bad run 105 ms of wall clock everywhere. The
+  # comparison against `tilt-iid` is then a comparison of one thing.
+
+  bp-frag-one:
+    uplink:
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss_gemodel: { p: 3.876%, r: 95%, loss_bad: 13.5%, loss_good: 0.49% }
+    downlink: { delay: 7ms, jitter: 5ms }
+
+  bp-frag-two:
+    uplink:
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss_gemodel: { p: 1.938%, r: 47.5%, loss_bad: 13.5%, loss_good: 0.49% }
+    downlink: { delay: 7ms, jitter: 5ms }
+
+  bp-frag-four:
+    uplink:
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss_gemodel: { p: 0.969%, r: 23.75%, loss_bad: 13.5%, loss_good: 0.49% }
+    downlink: { delay: 7ms, jitter: 5ms }
+
+  bp-frag-six:
+    uplink:
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss_gemodel: { p: 0.646%, r: 15.83%, loss_bad: 13.5%, loss_good: 0.49% }
+    downlink: { delay: 7ms, jitter: 5ms }
+
+  bp-frag-twelve:
+    uplink:
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss_gemodel: { p: 0.323%, r: 7.917%, loss_bad: 13.5%, loss_good: 0.49% }
+    downlink: { delay: 7ms, jitter: 5ms }
+
+  bp-frag-thirtyeight:
+    uplink:
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss_gemodel: { p: 0.102%, r: 2.5%, loss_bad: 13.5%, loss_good: 0.49% }
+    downlink: { delay: 7ms, jitter: 5ms }

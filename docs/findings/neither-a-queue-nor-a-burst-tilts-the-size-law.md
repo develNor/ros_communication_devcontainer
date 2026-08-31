@@ -10,6 +10,7 @@ were emulated against the same measurement chain, and none of them produces it.
 | | 300 B | 1.1 kB | 3.1 kB | 6.1 kB | 12.1 kB | 38.1 kB |
 |---|---:|---:|---:|---:|---:|---:|
 | independent per packet | 1.05 % | 1.47 % | 3.47 % | 6.28 % | 11.23 % | 31.92 % |
+| a two-state process, same mean, 105 ms bad runs | 1.47 % | 1.76 % | 2.76 % | 5.09 % | 10.00 % | **21.98 %** |
 | + a token bucket a burst can fill (4 Mbit/s) | 1.14 % | 1.33 % | 2.57 % | 4.99 % | 13.43 % | 32.92 % |
 | a serialisation constraint (1.5 Mbit/s) | — | 1.62 % | — | — | 11.60 % | **97.54 %** |
 
@@ -17,6 +18,16 @@ were emulated against the same measurement chain, and none of them produces it.
   law is reproduced with residuals of 1.20, 0.85, 1.01, 1.06, 0.97 and 1.00 —
   flat over three decades of size. Whatever tilts the field, it is not the
   wrapper, the join, or the way the fit is taken.
+- **Clustered loss is not the cause, and it bends the curve the other way.**
+  A two-state process at the same 1 % mean, with its chain rescaled per cell so
+  that a bad run is the same 105 ms of wall clock in every one of them, makes
+  the largest class lose **31 % less** than the independent law rather than
+  more: 21.98 % against 31.92 %, intervals 20.3–23.8 against 30.0–33.9. The
+  reason is the one that makes it a mechanism rather than a coincidence — a
+  38-packet message occupies about the length of one bad run, so its packets
+  share a fate and the message is lost once instead of thirty-eight times
+  independently. The field's residual has the opposite sign, so burstiness at
+  this scale does not explain it; it makes it harder to explain.
 - **A burst meeting a queue is not the cause.** A token bucket at 4 Mbit/s —
   above the largest class's mean offered rate of 3.0 Mbit/s and far below its
   instantaneous one, so a 38-packet message meets a queue and a 1-packet
@@ -81,17 +92,30 @@ The queued arm on the same ladder: 24, 28, 54, 105, 283 and 693 losses of about
 2100 offered, giving the second row of the claim table. The tight arm: 34 of
 2104, 244 of 2103, and 1826 of 1872.
 
-**A two-state loss process could not be measured on this ladder, and the reason
-is worth recording.** `netem`'s Gilbert–Elliott model advances its chain once
-per *packet*, not once per second, so a size ladder at a fixed message rate runs
-the chain at a different speed in every cell — 10 packets/s for a one-fragment
+**Measuring the two-state arm took two attempts, and the reason is worth
+recording.** `netem`'s Gilbert–Elliott model advances its chain once per
+*packet*, not once per second, so a size ladder at a fixed message rate runs the
+chain at a different speed in every cell — 10 packets/s for a one-fragment
 message against 380 for a 38-fragment one. The cells then do not share a loss
-process and cannot be compared; the arm measured at a fixed 10 Hz duly reported
-a per-packet mean of 0.33 % in its smallest cell and 0.69 % fitted over the
-ladder, against a stationary 1.00 %, because the small cells never sampled
-enough of the chain. Holding the offered *packet* rate constant is what makes
-such a ladder one experiment, and the profiles file says so beside the fitted
-parameters.
+process. The arm measured that way duly reported a per-packet mean of 0.33 % in
+its smallest cell against a stationary 1.00 %, because that cell never sampled
+enough of the chain.
+
+Holding the offered *packet* rate constant instead was the obvious fix and it
+measured something else entirely: **the pipeline serves messages, not packets.**
+At 60 messages/s the one-packet cell lost 10.774 % under the bursty profile and
+10.626 % under the independent one, and at 380 messages/s 48.391 % and 48.430 %.
+Two different loss processes cannot agree to three digits; what both were
+reporting is the depth-1 OTA queue overwriting its own backlog before the link
+sees it — the same mechanism as
+[depth-1 overwrite](depth1-overwrite-bundled-publications.md), reached by
+accident.
+
+What works is to leave the message rate at the field's 10 Hz and rescale the
+chain: multiplying `p` and `r` by `380/(N × 10)` in each cell leaves the
+stationary bad fraction at 3.92 % and the mean loss at 1 % while making the bad
+run 105 ms of wall clock everywhere, which is the drive's own figure. The six
+`bp-frag-*` profiles are that ladder.
 
 Verification: manual, from a source checkout with Docker:
 
@@ -109,9 +133,19 @@ rosotacom benchmark probe --project src/rosotacom/resources/examples/rosotacom.y
   --repeats 1 --sudo-mode container --no-plot
 ```
 
+```bash
+for pair in 200:one 1000:two 3000:four 6000:six 12000:twelve 38000:thirtyeight; do
+  rosotacom benchmark probe \
+    --project src/rosotacom/resources/examples/rosotacom.yaml \
+    --profile "bp-frag-${pair##*:}" --size "${pair%%:*}" --rate-hz 10 \
+    --duration 240 --repeats 1 --sudo-mode container --no-plot
+done
+```
+
 The independent ladder must fit one `(p, F)` to within about ten per cent at
-every point; the queued ladder must not differ from it systematically; and the
-tight cell at 38 kB must be near-total loss while its 1 kB cell is not.
+every point; the queued ladder must not differ from it systematically; the
+rescaled two-state ladder must fall below it at the large end and not above; and
+the tight cell at 38 kB must be near-total loss while its 1 kB cell is not.
 
 ## Status
 
@@ -126,11 +160,20 @@ the tilt is not an artefact of the accounting, it is not what a queue does to a
 burst, and it is not a serialisation limit, because a serialisation limit does
 not tilt a curve, it truncates it.
 
-What is left to attack is correlation *inside* one message's own burst on a
-real radio — loss events shorter than the time a large message spends on the
-wire, which `netem`'s per-packet chain cannot express at all. The
-Gilbert–Elliott note above is the reason: the tool models a process in packets,
-and the candidate mechanism lives in milliseconds.
+The clustered arm is the one that changes the reading rather than confirming
+it. A reviewer's first guess for a size-systematic residual is burstiness, and
+burstiness at the drive's own time scale produces the **opposite sign**: it
+protects large messages, because a message long enough to span a bad run is lost
+once rather than in each of its packets. So the field's residual is not
+explained by the mechanism that the field's own two-layer model already
+contains, which is worth saying out loud.
+
+What is left to attack is correlation at a scale *shorter* than a large
+message's own time on the wire — short enough that a message straddles a loss
+event more often than a single packet does, without its packets sharing one.
+`netem` cannot express that at all: its chain advances per packet, so a run is
+always measured in packets rather than in milliseconds, and the two coincide
+only at one message size.
 
 The serialisation row deserves one sentence wherever a duty-cycled uplink is
 discussed. It shows that the observable signature of such a link — small

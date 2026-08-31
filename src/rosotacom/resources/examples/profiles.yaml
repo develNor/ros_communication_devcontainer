@@ -169,3 +169,79 @@ profiles:
   # camera stream - a source-side case. Deliberately unshaped: play the case
   # bag with `--profile none` to see that the link is not the cause.
   field-20260817-case6-source-gap: {}
+
+  # ---- fragment-law tilt (B1): three loss processes, one delay model -------
+  # The field fit says message loss follows 1-(1-p)^ceil(size/F) and the field
+  # residual is systematic in size: the smallest class loses about half of what
+  # the fit predicts and the largest about 2.9x more. The campaign cannot
+  # separate an accounting artefact from a property of the link. These three
+  # can: the delay model is the drive's own table in all of them, and the only
+  # thing that moves is how the loss is distributed over packets.
+  #
+  # The rate is raised to ~1% per packet in every arm so a 240 s run at 10 Hz
+  # resolves the small end; the law's *form* is what is under test, and it does
+  # not depend on the level.
+
+  # A -- independent per packet. The law is exact by construction here, so this
+  # arm measures the measurement chain and nothing else.
+  tilt-iid:
+    uplink:
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss: 1%
+    downlink: { delay: 7ms, jitter: 5ms }
+
+  # B -- the drive's own two-state process, scaled to the same mean. Clustering
+  # correlates the fragments of one message, so large messages should lose
+  # *less* than the independent law predicts -- the opposite sign to the field.
+  # p and r are the drive's, so the runs and gaps keep their measured lengths.
+  tilt-bursty:
+    uplink:
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss_gemodel: { p: 0.102%, r: 2.5%, loss_bad: 13.5%, loss_good: 0.49% }
+    downlink: { delay: 7ms, jitter: 5ms }
+
+  # C -- A plus a queue a burst can fill. 4 Mbit/s is above the largest class's
+  # mean offered rate (38 kB at 10 Hz is ~3.0 Mbit/s of payload) and below its
+  # instantaneous one, so a 38-fragment message meets a queue and a 1-fragment
+  # message does not. That is the burst-tilt candidate, isolated.
+  tilt-iid-queued:
+    uplink:
+      rate: 4mbit
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss: 1%
+    downlink: { delay: 7ms, jitter: 5ms }
+
+  # B2 -- the boundary of the design rule. Same delay model, two per-fragment
+  # rates: the one the rule is applied at, and one twice as bad. The rule says
+  # what the size distribution does; it does not say what the link will be.
+  tilt-iid-worse:
+    uplink:
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss: 2%
+    downlink: { delay: 7ms, jitter: 5ms }
+
+  # B4 -- a serialisation constraint tight enough that a burst cannot fit in
+  # its own send interval, which is the shape an EN-DC uplink on a TDD carrier
+  # would present from above: a small probe survives what a 38-fragment burst
+  # does not.
+  tilt-iid-tight:
+    uplink:
+      rate: 1.5mbit
+      delay: 25ms
+      jitter: 18ms
+      distribution: field-20260817
+      distribution_file: dist/field-20260817.dist
+      loss: 1%
+    downlink: { delay: 7ms, jitter: 5ms }

@@ -41,12 +41,15 @@ its largest message class* carries that scope with it.
 
 - Host pair / topology: one host, the packaged local benchmark rig — two
   communication containers on their own Docker network, `tc` inside each
-  container's own netns (`--sudo-mode container`), no host privileges.
+  container's own netns (`--sudo-mode container`), no host privileges. The
+  confirmation ladder runs the same session across two machines joined by a
+  point-to-point VPN, each shaping its own tunnel device, with the control
+  plane on a separate interface so the profile never touches it.
 - Session: `bench_1_1_capacity` from the packaged example project, one
   `a->b:/bench_capacity` stream at 10 Hz, OTA QoS best_effort / KEEP_LAST
   depth 1, `--rmw` the only thing that differs between the three ladders.
-- rosotacom SHA: measured at `7bb420c`; re-runs record theirs. The runs need
-  2.5.dev74 or later, because before it a profile carrying a fitted delay table
+- rosotacom SHA: measured at `7bb420c` on one host and `b3c573d` across two;
+  re-runs record theirs. The one-host runs need 2.5.dev74 or later, because before it a profile carrying a fitted delay table
   could not be armed at all
   ([a fitted delay table never reached the shaper](a-fitted-delay-table-never-reached-the-shaper.md)).
 - Profile: `tilt-iid` in
@@ -90,6 +93,22 @@ zenoh native on the identical profile: 0.571, 0.998, 0.712, 0.996, 0.475,
 **61.693 %**. No fit is reported because there is nothing of this family to
 fit — five points are flat and the sixth is a cliff.
 
+**The CycloneDDS ladder is not an artefact of two containers on one host.**
+Repeated across two machines over a point-to-point VPN — different NICs, a real
+clock offset, the shaping on each host's own tunnel device rather than on a
+docker bridge — it reproduces:
+
+| payload | wrapped | one host | two hosts | ratio |
+|---:|---:|---:|---:|---:|
+| 200 B | 300 B | 1.047 % | 0.952 % | 0.91 |
+| 3 kB | 3.1 kB | 3.468 % | 3.465 % | 1.00 |
+| 12 kB | 12.1 kB | 11.227 % | 12.149 % | 1.08 |
+| 38 kB | 38.1 kB | 31.922 % | 31.773 % | 1.00 |
+
+The two extremes agree to within half a per cent and the worst point to within
+eight. What the second host adds — serialisation on a real interface, a clock
+that is not shared, a tunnel MTU — does not move the transfer function.
+
 **The effective packet is smaller than the fragment, and by a measurable
 amount.** CycloneDDS's fitted `F` lands at 872–1008 B against a configured
 1024 B fragment, i.e. every packet carries roughly 15 % of itself in headers.
@@ -115,6 +134,13 @@ Read the per-size counts from `logs/b/status/events.jsonl` of each instance
 rows) rather than from `result.json`. The CycloneDDS ladder must fit one
 `(p, F)` to within about ten per cent at every point; the zenoh ladder must be
 flat below 12 kB.
+
+Across two machines the same ladder runs through `ota-benchmark probe` with
+`--install-mode checkout` and a `--peer-exec` transport on each peer. It needs
+2.5.dev78 or later: before it the profile's impaired leg landed on the peer the
+a/b convention calls the sender rather than the one the session's topic map
+does, the benchmark's load never reached the peers' publishers, and the
+collection looked for their artifacts in a directory the project does not use.
 
 ## Status
 

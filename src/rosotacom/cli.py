@@ -7564,7 +7564,12 @@ def _start_smoke_topic_publishers(
         container = containers[spec.source_peer_key]
         ros_setup = ros_setups[spec.source_peer_key]
         cmd = _smoke_publisher_command(spec, ros_setup, duration, load)
-        offered = f" at {load.get('rate', spec.publish_rate)} Hz (benchmark load)" if load else ""
+        # The rate the publisher was actually given, not the one the session
+        # expects: they differ exactly when a benchmark chose the load, and a
+        # log that reports the session's number there is how a run that measured
+        # the wrong load reads as one that measured the right one.
+        rate = (load or {}).get("rate", spec.publish_rate)
+        offered = f" at {rate:g} Hz" + (" (benchmark load)" if load else "")
         log_line(
             f"Starting smoke publisher {spec.source_peer_key}->{spec.receiver_peer_key} "
             f"{spec.publish_topic} ({spec.publish_type}) in {container}{offered}"
@@ -7580,7 +7585,7 @@ def _start_smoke_topic_publishers(
                 log_line(
                     f"OK: smoke publisher {spec.source_peer_key}->{spec.receiver_peer_key} "
                     f"{spec.publish_topic} ({spec.publish_type}) is advertising in {container} "
-                    f"at {spec.publish_rate:g} Hz"
+                    f"at {rate:g} Hz"
                 )
                 started.append(spec)
                 break

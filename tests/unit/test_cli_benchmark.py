@@ -2309,7 +2309,15 @@ def test_live_lab_run_point_uses_instance_scoped_smoke_network(
     monkeypatch.setattr(cli, "_load_runtime_config", lambda args: runtime)
     monkeypatch.setattr(cli, "_resolve_session", lambda session_name, runtime: session)
     monkeypatch.setattr(cli, "_resolve_session_instance", lambda runtime, session, instance_id=None: instance)
-    monkeypatch.setattr(cli, "_effective_session_config", lambda *args, **kwargs: {"topics": {"a_to_b": []}})
+    # One a->b topic, as every benchmark session has: which container meets the
+    # profile's `uplink` leg follows the session's own loaded direction, so a
+    # fixture with no topics would be asserting an arbitrary default rather than
+    # the rule.
+    monkeypatch.setattr(
+        cli,
+        "_effective_session_config",
+        lambda *args, **kwargs: {"topics": {"a_to_b": [{"topic": "/bench_capacity"}], "b_to_a": []}},
+    )
     monkeypatch.setattr(cli, "_list_docker_containers", lambda all_states=False: [])
     monkeypatch.setattr(
         cli, "_ensure_smoke_network", lambda name, subnet, labels=None: networks_created.append((name, subnet))

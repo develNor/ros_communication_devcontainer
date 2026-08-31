@@ -5163,6 +5163,7 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
         _peer_command_runner,
         _peer_watchdog_launcher,
         _profile_directions,
+        _profile_directions_for,
         _remove_smoke_network,
         _resolve_ota_profile,
         _resolve_ota_smoke_context,
@@ -5327,7 +5328,10 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                 _ota_start_peers(target, plan, instance.instance_id, dry_run=dry_run)
                 if not dry_run:
                     time.sleep(12)
-                _ota_start_session_publishers(target, plan, dry_run=dry_run)
+                # The load is the benchmark's, not the session's expectation:
+                # without this the peer published what its own `expect` declares
+                # and the run reported the load that was asked for.
+                _ota_start_session_publishers(target, plan, dry_run=dry_run, load=load)
 
                 if not dry_run:
                     if profile_obj is not None and profile_obj.is_timeline:
@@ -5651,34 +5655,36 @@ def _make_live_run_point(args: argparse.Namespace, session_name: str) -> RunPoin
                                 print(
                                     f"  netem distribution {table_name!r} installed in {dist_container}: {dist_target}"
                                 )
+                    # Which peer's egress carries `uplink` is the session's
+                    # answer, not the runner's: the same session under the same
+                    # profile must be shaped identically here and across two
+                    # machines, and hard-coding a=uplink here while the OTA path
+                    # hard-coded b=uplink meant it was not.
+                    lab_directions = _profile_directions_for(["a", "b"], cfg)
+                    lab_containers = {"a": a_container, "b": b_container}
                     if profile_obj.is_timeline:
-                        # Peer A shapes uplink (egress to B)
-                        shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
-                        lab_shapers.append(shaper_a)
-                        steps_a = expand_timeline(profile_obj, "eth0", direction="uplink")
-                        lab_peer_steps["a"] = (shaper_a, steps_a)
-
-                        # Peer B shapes downlink (egress to A)
-                        shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
-                        lab_shapers.append(shaper_b)
-                        steps_b = expand_timeline(profile_obj, "eth0", direction="downlink")
-                        lab_peer_steps["b"] = (shaper_b, steps_b)
+                        for peer_name in ("a", "b"):
+                            shaper = ProfileShaper("eth0", make_container_runner(lab_containers[peer_name]))
+                            lab_shapers.append(shaper)
+                            steps = expand_timeline(profile_obj, "eth0", direction=lab_directions[peer_name])
+                            lab_peer_steps[peer_name] = (shaper, steps)
 
                         for shaper in lab_shapers:
                             shaper.arm([])
                     else:
-                        if profile_obj.uplink and not profile_obj.uplink.is_empty:
-                            shaper_a = ProfileShaper("eth0", make_container_runner(a_container))
-                            lab_shapers.append(shaper_a)
-                            shaper_a.arm(shaping_commands("eth0", profile_obj.uplink))
-                        if profile_obj.downlink and not profile_obj.downlink.is_empty:
-                            shaper_b = ProfileShaper("eth0", make_container_runner(b_container))
-                            lab_shapers.append(shaper_b)
-                            shaper_b.arm(shaping_commands("eth0", profile_obj.downlink))
+                        for peer_name in ("a", "b"):
+                            leg = profile_obj.uplink if lab_directions[peer_name] == "uplink" else profile_obj.downlink
+                            if leg is None or leg.is_empty:
+                                continue
+                            shaper = ProfileShaper("eth0", make_container_runner(lab_containers[peer_name]))
+                            lab_shapers.append(shaper)
+                            shaper.arm(shaping_commands("eth0", leg))
 
                 # 4. Verify shaping was applied (diagnostic)
                 if profile_obj is not None and not getattr(args, "dry_run", False):
-                    for label, container in [("A (uplink)", a_container), ("B (downlink)", b_container)]:
+                    for peer_name in ("a", "b"):
+                        label = f"{peer_name.upper()} ({lab_directions[peer_name]})"
+                        container = lab_containers[peer_name]
                         tc_binary = container_tc_overrides.get(container, "tc")
                         res = subprocess.run(
                             ["docker", "exec", "-u", "root", container, tc_binary, "qdisc", "show", "dev", "eth0"],

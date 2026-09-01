@@ -90,10 +90,10 @@ confirmed, 2026-09-01.
 ## Publication notes
 
 This is the control the field could not supply. On a real cellular uplink the
-two signals never separate — in the KAMO August campaign, thirty-five
-pre-registered filling episodes (delay rising for three or more consecutive
-seconds, gaining at least 150 ms) lose 2.34 % against the 2.25 % their own
-seconds' rate predicts, P(at most this many) = 0.73 — because whatever reduces
+two signals never separate — in the KAMO August campaign, thirty-six
+pre-registered filling episodes over 168 s (delay rising for three or more
+consecutive seconds, gaining at least 150 ms) lose 2.34 % against the 2.27 %
+their own seconds' rate predicts, P(at most this many) = 0.71 — because whatever reduces
 the grant also raises the error rate. Reading that field result alone, one would
 conclude a filling queue loses. This finding shows it does not: the loss belongs
 to the link and arrives whether or not the queue is filling.

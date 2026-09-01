@@ -19,10 +19,17 @@ whole of the second signal.
 
 ## Setup
 
-- Host pair / topology: `tks-lamborghini`, rosotacom local benchmark mode using
-  the packaged example project; two peer containers on a private bridge, uplink
-  shaping via `tc` inside the peers' own netns (no host privileges).
-- rosotacom SHA: `c5ce52f` (harness), submodule `c2d2467`.
+- Host pair / topology, arm 1: `tks-lamborghini`, rosotacom local benchmark mode
+  using the packaged example project; two peer containers on a private bridge,
+  uplink shaping via `tc` inside the peers' own netns (no host privileges).
+- Host pair / topology, arm 2: `tks-seat` -> `tks-majestic` over the TKS tunnel,
+  orchestrated from `tks-lamborghini` through `remote-ota` and
+  `--install-mode checkout`; project `session/bench/rosotacom.yaml` in
+  remote-assist, shaping through `--sudo-mode container`. Runbook and the
+  interface constraint that decides which alias may carry the data plane:
+  `remote-assist/session/bench/README.md`.
+- rosotacom SHA: `c5ce52f` (harness), submodule `c2d2467`; arm 2 on the
+  published `rosotacom-dev 2.5.dev78` on both peers.
 - Profile: four conditions in one file, offer held at 1.035 Mbit/s throughout so
   only the shaping differs.
 
@@ -83,9 +90,29 @@ the command above for each profile and read `time-bins.jsonl` beside
 climbing `latency_p50_ms` with `lost = 0`, and `q-squeeze-loss` must show the
 same climb with `lost` at the unshaped arm's rate.
 
+The two-host arm is the same reading, on machines instead of containers, and
+takes about four minutes per condition:
+
+```bash
+cd ~/dev/remote-assist
+rosotacom ota-benchmark probe --project session/bench/rosotacom.yaml \
+  --target bench_1_1_capacity --target-type session \
+  --peer a=seat_tks --peer b=majestic_tks \
+  --peer-exec 'a=remote-ota seat run remote-assist' \
+  --peer-exec 'b=remote-ota majestic run remote-assist' \
+  --install-mode checkout \
+  --peer-checkout a=/home/go914_local/dev/remote-assist \
+  --peer-checkout b=/home/go914/dev/remote-assist \
+  --sudo-mode container --profile q-squeeze \
+  --size 4173 --rate-hz 31 --duration 45 --bin-s 1 --no-attach --no-plot
+```
+
+Both peers must be current (`remote-sync <host> check remote-assist`): checkout
+mode installs nothing, so a stale peer measures the old code and nothing warns.
+
 ## Status
 
-confirmed, 2026-09-01.
+confirmed, 2026-09-01, on one host and independently on a two-machine pair.
 
 ## Publication notes
 
@@ -98,17 +125,47 @@ the grant also raises the error rate. Reading that field result alone, one would
 conclude a filling queue loses. This finding shows it does not: the loss belongs
 to the link and arrives whether or not the queue is filling.
 
-A two-host repeat over the FZI LAN (lamborghini orchestrating, seat as peer b
-through `remote-ota`) reached the peer, docker, and the containerized shaping
-capability on both sides and then stopped: `--peer-exec` requires
-`--install-mode checkout`, and checkout mode needs the project config inside the
-peer's own checkout, while the only OTA project registered on seat is
-`remote-assist`, whose session set has no synthetic benchmark session. So the
-LAN arm needs either a bench session in `remote-assist` or the harness on a
-second machine, and the four conditions above are single-host. That is the
-weaker setting for network realism and the stronger one for this question: on
-one host the shaper is the only thing between the peers, so a lossless ramp
-cannot be a property of some intervening link.
+**It reproduces on two physical machines** (2026-09-01, added after the
+single-host arm above). seat publishing to majestic over the TKS tunnel,
+orchestrated from lamborghini, which is on neither end of the data plane. Same
+four profiles, same 1.035 Mbit/s offer, a constant 4173 B at 31 Hz instead of the
+size pattern:
+
+| condition | one-way delay p50 | filling | lost while filling | whole run |
+|---|---:|---:|---:|---:|
+| `q-clean` | 32.3 ms flat | — | — | 0 / 1432 |
+| `q-loss` | 32.5 ms flat | — | — | 43 / 1357 = 3.17 % |
+| `q-squeeze` | 111 -> 6250 ms | 21 bins | **0 / 651** | 195 / 1610 |
+| `q-squeeze-loss` | 94 -> 6021 ms | 21 bins | **22 / 650 = 3.38 %** | 225 / 1574 |
+
+Twenty-one consecutive one-second bins of monotone delay growth over six
+seconds, and not one message lost, where the same link without a queue loses
+3.17 % per message: 20.6 expected, P(0) = 1.1e-9, and the filling phase's own
+rate is below 0.46 % at 95 %. The lossy arm loses 3.38 % while filling against
+that link's queue-free 3.17 % — +0.22 pp, 95 % CI [-1.4, +1.9]. Then both knee
+into the buffer's limit within one bin, as on one host.
+
+The filling phase is cut here as every bin from the first above the floor up to
+the last before the delay peaks. That is still delay-only, and it is the cut to
+state on this pair: the 250 ms slope rule swallows `q-squeeze`'s knee bin, whose
+gain is 423 ms, and reports 14 of 682 for a phase whose first twenty-one bins
+lose nothing. Both readings are above; the slope rule is the one that was
+written down first and it is reported first for that reason.
+
+Two machines is the stronger setting for network realism -- a real NIC, a real
+tunnel, two kernels, two DDS participants that have to discover each other over
+it -- and the weaker one for attribution, because the tunnel is a second queue
+the shaper does not own. One host is the reverse. Both give the same answer,
+which is the useful part.
+
+The two-host arm uses a constant `--size` rather than the mixed
+`--size-pattern` of the single-host arm because the pattern did not survive the
+OTA hop: `parse_size_pattern_load` produces one `size_<label>` per distinct
+size and only `size_a` crossed, so the peer's publisher died on `Pattern
+references size 'b' but it was not provided` inside a detached `docker exec`
+whose output was discarded, and the orchestrator could only report that the
+topic never advertised. Fixed in #344. Until a release carries it, a mixed load
+is single-host only.
 
 It supersedes the reading in
 [oversubscription-queues-not-losses.md](oversubscription-queues-not-losses.md),

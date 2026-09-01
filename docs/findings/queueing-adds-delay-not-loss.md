@@ -112,7 +112,10 @@ mode installs nothing, so a stale peer measures the old code and nothing warns.
 
 ## Status
 
-confirmed, 2026-09-01, on one host and independently on a two-machine pair.
+confirmed, 2026-09-01.
+
+On one host and, independently, on a two-machine pair; the arms are described
+under Setup and their numbers under Publication notes.
 
 ## Publication notes
 

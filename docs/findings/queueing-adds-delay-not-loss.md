@@ -98,6 +98,18 @@ the grant also raises the error rate. Reading that field result alone, one would
 conclude a filling queue loses. This finding shows it does not: the loss belongs
 to the link and arrives whether or not the queue is filling.
 
+A two-host repeat over the FZI LAN (lamborghini orchestrating, seat as peer b
+through `remote-ota`) reached the peer, docker, and the containerized shaping
+capability on both sides and then stopped: `--peer-exec` requires
+`--install-mode checkout`, and checkout mode needs the project config inside the
+peer's own checkout, while the only OTA project registered on seat is
+`remote-assist`, whose session set has no synthetic benchmark session. So the
+LAN arm needs either a bench session in `remote-assist` or the harness on a
+second machine, and the four conditions above are single-host. That is the
+weaker setting for network realism and the stronger one for this question: on
+one host the shaper is the only thing between the peers, so a lossless ramp
+cannot be a property of some intervening link.
+
 It supersedes the reading in
 [oversubscription-queues-not-losses.md](oversubscription-queues-not-losses.md),
 which reported the same lossless ramp but attributed the boundary losses to the

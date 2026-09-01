@@ -3562,6 +3562,35 @@ def _ota_remote_package_dir(peer: OtaSmokePeer, plan: OtaSmokePlan, *, dry_run: 
     return located
 
 
+def _ota_missing_project_message(plan: OtaSmokePlan, peer: OtaSmokePeer) -> str:
+    """Why one peer has no project file, in the terms that make it fixable.
+
+    `test -f` failing is the single most common way a checkout-mode run stops,
+    and the bare "exit code 1" it used to raise says nothing about the contract
+    it broke. The path is not resolved per peer: `--project` is split once, on
+    the orchestrator, into (checkout root, path inside it), and that *relative*
+    path is then asserted inside every peer's own `--peer-checkout`. So the
+    peers do not merely need a rosotacom project each — they need the same
+    repository, with the project at the same place in it.
+
+    The failure therefore has two ordinary causes and they want opposite fixes:
+    the peer is behind (sync it), or the project lives in a repository this peer
+    does not have (move the project, or point the peer at the repository that
+    holds it). Naming both is the difference between a minute and an afternoon.
+    """
+    workdir = _ota_peer_workdir(plan, peer)
+    return (
+        f"{peer.name}: {workdir}/{plan.project} does not exist.\n"
+        f"  --install-mode checkout resolves the project once, on this machine, into a checkout root and "
+        f"the path {plan.project!r} inside it, and then asserts that same relative path inside every peer's "
+        f"--peer-checkout. Every peer therefore needs the same repository, with the project at the same "
+        f"place in it -- not a project of its own.\n"
+        f"  If {peer.name} has that repository, it is behind: sync it and run again.\n"
+        f"  If it does not, the project is in the wrong repository for this run. Move it into the one the "
+        f"peers actually have, or give this peer --peer-checkout for a checkout that holds it."
+    )
+
+
 def _ota_verify_checkouts(plan: OtaSmokePlan, *, dry_run: bool) -> None:
     """Checkout mode's replacement for staging: assert, do not install.
 
@@ -3583,13 +3612,16 @@ def _ota_verify_checkouts(plan: OtaSmokePlan, *, dry_run: bool) -> None:
             dry_run=dry_run,
             batch=True,
         )
-        _ota_run(
+        found = _ota_run(
             peer,
             f"test -f {checkout}/{project}",
             label=f"{peer.name}: project config {plan.project} inside the checkout",
             dry_run=dry_run,
+            check=False,
             batch=True,
         )
+        if found.returncode != 0:
+            raise RuntimeError(_ota_missing_project_message(plan, peer))
         _ota_run(
             peer,
             f"{OTA_CHECKOUT_PATH_PREFIX}command -v rosotacom >/dev/null 2>&1",

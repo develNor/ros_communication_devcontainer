@@ -138,22 +138,26 @@ size pattern:
 |---|---:|---:|---:|---:|
 | `q-clean` | 32.3 ms flat | — | — | 0 / 1432 |
 | `q-loss` | 32.5 ms flat | — | — | 43 / 1357 = 3.17 % |
-| `q-squeeze` | 111 -> 6250 ms | 21 bins | **0 / 651** | 195 / 1610 |
-| `q-squeeze-loss` | 94 -> 6021 ms | 21 bins | **22 / 650 = 3.38 %** | 225 / 1574 |
+| `q-squeeze` | 434 -> 6250 ms | 20 bins | **0 / 620** | 195 / 1610 |
+| `q-squeeze-loss` | 383 -> 6021 ms | 20 bins | **22 / 620 = 3.55 %** | 225 / 1574 |
 
-Twenty-one consecutive one-second bins of monotone delay growth over six
-seconds, and not one message lost, where the same link without a queue loses
-3.17 % per message: 20.6 expected, P(0) = 1.1e-9, and the filling phase's own
-rate is below 0.46 % at 95 %. The lossy arm loses 3.38 % while filling against
-that link's queue-free 3.17 % — +0.22 pp, 95 % CI [-1.4, +1.9]. Then both knee
-into the buffer's limit within one bin, as on one host.
+Twenty consecutive one-second bins of monotone delay growth to 6.25 s, and not
+one message lost, where the same link without a queue loses 3.17 % per message:
+19.6 expected, P(0) = 2.9e-9, and the filling phase's own rate is below 0.48 %
+at 95 %. The lossy arm loses 3.55 % while filling against that link's
+queue-free 3.17 % — +0.38 pp, 95 % CI [-1.3, +2.0]. Then both knee into the
+buffer's limit within one bin, as on one host.
 
-The filling phase is cut here as every bin from the first above the floor up to
-the last before the delay peaks. That is still delay-only, and it is the cut to
-state on this pair: the 250 ms slope rule swallows `q-squeeze`'s knee bin, whose
-gain is 423 ms, and reports 14 of 682 for a phase whose first twenty-one bins
-lose nothing. Both readings are above; the slope rule is the one that was
-written down first and it is reported first for that reason.
+The cut is the single-host one plus a truncation this pair made necessary. The
+ramp is still the longest run gaining at least 250 ms/s, but it now also ends
+before the delay's maximum, because where that run ends otherwise depends on how
+much delay the last accepted second happened to gain: 221 ms on one host, so the
+knee fell out by the threshold, 423 ms here, so it stayed in and carried its 14
+losses into a phase whose other twenty seconds lose nothing (the slope rule
+alone reports 21 bins, 434 -> 6673 ms, 14 of 651). A threshold that decides the
+knee by accident is not a rule; the buffer stops accepting exactly where the
+delay stops rising. Still delay only, and on the single-host runs the two cuts
+are the same eighteen bins, so nothing above them moves.
 
 Two machines is the stronger setting for network realism -- a real NIC, a real
 tunnel, two kernels, two DDS participants that have to discover each other over

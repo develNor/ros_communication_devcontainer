@@ -3506,6 +3506,32 @@ def test_ota_checkout_mode_runs_each_peer_from_its_own_checkout(tmp_path: Path) 
     assert "--rosotacom-config session/rosotacom.yaml" in command
 
 
+def test_ota_checkout_mode_names_the_shared_repository_when_a_peer_lacks_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The path is split once here and asserted on every peer, so a peer whose
+    # checkout is a *different* repository fails this probe -- and used to fail
+    # it as a bare "exit code 1", which reads as a broken machine rather than as
+    # the contract it is. Two runs were spent on that in one afternoon: a bench
+    # driven from the harness checkout, with a peer that only has the fleet
+    # repository, cannot resolve one relative path on both sides.
+    plan = _ota_checkout_plan(_write_checkout_project(tmp_path))
+
+    def fake_run(peer, script, *, label, **kwargs):
+        code = 1 if script.startswith("test -f") and peer.name == "b" else 0
+        return subprocess.CompletedProcess([], code, "", "")
+
+    monkeypatch.setattr(rosotacom, "_ota_run", fake_run)
+
+    with pytest.raises(RuntimeError) as error:
+        rosotacom._ota_verify_checkouts(plan, dry_run=False)
+
+    message = str(error.value)
+    assert "/home/other/fleet_mgmt/session/rosotacom.yaml does not exist" in message
+    assert "the same repository" in message
+    assert "it is behind: sync it" in message
+
+
 def test_ota_checkout_mode_puts_pipx_on_path_because_ssh_is_not_a_login_shell(tmp_path: Path) -> None:
     # `ssh host 'cmd'` skips the login profile, so a pipx install in
     # ~/.local/bin is invisible and the peer answers "command not found" —

@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
+from rosotacom.benchmark import parse_size_pattern_load
 from rosotacom.cli import (
     _ota_instances_rel,
     _ota_publish_parts,
     _profile_directions_for,
     _publish_load_override,
 )
+from rosotacom.cli_benchmark import _sized_publisher_param_args
 
 
 class _Target:
@@ -72,11 +76,67 @@ def test_the_benchmark_load_reaches_the_peer_command():
     assert "--load-streams" in parts and parts[parts.index("--load-streams") + 1] == "2"
 
 
-def test_a_size_pattern_travels_as_itself():
-    parts = _ota_publish_parts(_Target(), "a", [], load={"pattern": "a*4,b*1", "size_a": 5000})
-    assert parts[parts.index("--load-size-pattern") + 1] == "a*4,b*1"
+def test_a_size_pattern_travels_as_the_string_it_was_given():
+    """The source pattern, not the expanded token form it was compiled into.
+
+    `parse_size_pattern_load` turns one string into `sizes`, `pattern`,
+    `size_pattern` and a `size_<label>` per distinct size, and only three of
+    those used to cross the hop. A two-size pattern arrived as `a*6,b*1` with a
+    `size_a` and no `size_b`, so the peer's publisher died on `Pattern
+    references size 'b' but it was not provided` -- inside a detached
+    `docker exec`, which the orchestrator could only report as the topic never
+    advertising. Sending the source string cannot lose a size.
+    """
+    load = parse_size_pattern_load("6x200B+1x28000B")
+    parts = _ota_publish_parts(_Target(), "a", [], load=load)
+
+    assert parts[parts.index("--load-size-pattern") + 1] == "6x200B+1x28000B"
+    assert "a*6,b*1" not in parts
     # `size_a` is the pattern's own base size and must reach the peer as --load-size.
-    assert parts[parts.index("--load-size") + 1] == "5000"
+    assert parts[parts.index("--load-size") + 1] == "200"
+
+
+def test_a_hand_built_pattern_load_is_refused_rather_than_silently_truncated():
+    with pytest.raises(RuntimeError, match="without the size pattern it came from"):
+        _ota_publish_parts(_Target(), "a", [], load={"pattern": "a*4,b*1", "size_a": 5000})
+
+
+def test_every_size_of_a_pattern_survives_the_round_trip_to_the_publisher():
+    """Orchestrator load -> peer flags -> peer load -> publisher parameters.
+
+    The end the defect lived at: each step looked right on its own, and only
+    the whole chain shows that the second size never arrives.
+    """
+    parts = _ota_publish_parts(_Target(), "a", [], load=parse_size_pattern_load("6x200B+1x28000B"))
+    args = argparse.Namespace(
+        load_size=int(parts[parts.index("--load-size") + 1]),
+        load_size_pattern=parts[parts.index("--load-size-pattern") + 1],
+        load_rate_hz=None,
+        load_streams=None,
+        load_interval_jitter_ms=None,
+        load_interval_jitter_seed=None,
+    )
+    peer_load = _publish_load_override(args)
+    assert peer_load is not None
+
+    params = _sized_publisher_param_args("/bench_capacity", dict(peer_load))
+
+    assert "size_a:=200" in params
+    assert "size_b:=28000" in params
+    assert "pattern:=a*6,b*1" in params
+
+
+def test_a_peer_newer_than_its_orchestrator_says_so_instead_of_failing_obscurely():
+    args = argparse.Namespace(
+        load_size=5000,
+        load_size_pattern="a*4,b*1",
+        load_rate_hz=None,
+        load_streams=None,
+        load_interval_jitter_ms=None,
+        load_interval_jitter_seed=None,
+    )
+    with pytest.raises(RuntimeError, match="same rosotacom"):
+        _publish_load_override(args)
 
 
 def test_no_load_leaves_the_session_to_say_what_it_expects():

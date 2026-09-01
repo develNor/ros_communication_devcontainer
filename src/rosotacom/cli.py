@@ -2437,9 +2437,19 @@ def _ota_stop_parts(
 #: How a benchmark's load maps onto `publish-test-topics` flags. The keys are
 #: `_sized_publisher_param_args`'s own, so a load dict travels from the
 #: benchmark to the peer's publisher without being rewritten on the way.
+#:
+#: `size_pattern` and not `pattern`, and that distinction is the whole reason a
+#: mixed-size load never reached a peer. `parse_size_pattern_load` turns one CLI
+#: string into five keys -- `sizes`, `pattern`, `size_pattern`, and one
+#: `size_<label>` per distinct size -- and only three of them used to cross the
+#: hop. A two-size pattern therefore arrived as `pattern=a*6,b*1` with `size_a`
+#: and no `size_b`, and the publisher died on `Pattern references size 'b' but
+#: it was not provided` inside a detached `docker exec`, which the orchestrator
+#: reported as the topic not advertising. Sending the *source* string instead
+#: cannot lose a size, whatever the pattern turns out to contain.
 _OTA_LOAD_FLAGS: tuple[tuple[str, str], ...] = (
     ("size", "--load-size"),
-    ("pattern", "--load-size-pattern"),
+    ("size_pattern", "--load-size-pattern"),
     ("rate", "--load-rate-hz"),
     ("streams", "--load-streams"),
     ("interval_jitter_ms", "--load-interval-jitter-ms"),
@@ -2469,6 +2479,16 @@ def _ota_publish_parts(
         merged = dict(load or {})
         if "size" not in merged and merged.get("size_a") is not None:
             merged["size"] = merged["size_a"]
+        if merged.get("pattern") and not merged.get("size_pattern"):
+            # Only `parse_size_pattern_load` produces `pattern`, and it always
+            # produces `size_pattern` beside it. A load carrying one without the
+            # other was assembled by hand, and sending the expanded form would
+            # drop every size but the first -- loudly here rather than as a peer
+            # whose publisher will not start.
+            raise RuntimeError(
+                f"load carries pattern {merged['pattern']!r} without the size pattern it came from; "
+                "build it with parse_size_pattern_load so every size reaches the peer."
+            )
         for key, flag in _OTA_LOAD_FLAGS:
             if merged.get(key) is not None:
                 parts.extend([flag, str(merged[key])])
@@ -7580,6 +7600,33 @@ def _smoke_publish_specs(cfg: dict[str, Any], source_peer_key: str | None = None
     return specs
 
 
+#: Where a detached smoke publisher's own output goes inside its container.
+#: `docker exec -d` returns before the process says anything and keeps nothing,
+#: so without this the only evidence of a publisher that refused to start is the
+#: topic never appearing -- which reads as a broken graph rather than as a bad
+#: parameter. One file per topic, overwritten per attempt.
+_SMOKE_PUBLISHER_LOG_DIR = "/tmp"
+
+
+def _smoke_publisher_log_path(topic: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", topic).strip("_") or "topic"
+    return f"{_SMOKE_PUBLISHER_LOG_DIR}/rosotacom-smoke-publisher-{slug}.log"
+
+
+def _smoke_publisher_failure_detail(container: str, log_path: str) -> str:
+    """What the publisher said before it stopped, if it said anything."""
+    result = subprocess.run(
+        ["docker", "exec", container, "tail", "-n", "20", log_path],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    detail = ((result.stdout or "") + (result.stderr or "")).strip()
+    if not detail:
+        return f" Nothing was written to {log_path} in the container, so it never got as far as starting."
+    return f"\nWhat it wrote to {log_path}:\n{detail}"
+
+
 def _start_smoke_topic_publishers(
     containers: dict[str, str],
     ros_setups: dict[str, str],
@@ -7606,8 +7653,9 @@ def _start_smoke_topic_publishers(
             f"Starting smoke publisher {spec.source_peer_key}->{spec.receiver_peer_key} "
             f"{spec.publish_topic} ({spec.publish_type}) in {container}{offered}"
         )
+        log_path = _smoke_publisher_log_path(spec.publish_topic)
         subprocess.run(
-            ["docker", "exec", "-d", container, "bash", "-c", cmd],
+            ["docker", "exec", "-d", container, "bash", "-c", f"{{ {cmd} ; }} > {shlex.quote(log_path)} 2>&1"],
             capture_output=True,
             text=True,
             check=False,
@@ -7626,6 +7674,7 @@ def _start_smoke_topic_publishers(
             raise RuntimeError(
                 f"Smoke publisher {spec.source_peer_key}->{spec.receiver_peer_key} "
                 f"{spec.publish_topic} ({spec.publish_type}) did not advertise in {container}."
+                + _smoke_publisher_failure_detail(container, log_path)
             )
     return started
 
@@ -7981,7 +8030,21 @@ def _publish_load_override(args: argparse.Namespace) -> dict[str, Any] | None:
         load["size"] = int(args.load_size)
         load["size_a"] = int(args.load_size)
     if getattr(args, "load_size_pattern", None):
-        load["pattern"] = args.load_size_pattern
+        # Re-derived here rather than carried in pieces: the orchestrator sends
+        # the pattern it was given, and this side expands it into `sizes`,
+        # `pattern` and every `size_<label>` the publisher needs. `size_a` from
+        # `--load-size` above is overwritten on purpose -- a pattern names its
+        # own sizes, and the scalar is only a fallback for callers without one.
+        from .benchmark import parse_size_pattern_load
+
+        try:
+            load.update(parse_size_pattern_load(str(args.load_size_pattern)))
+        except ValueError as error:
+            raise RuntimeError(
+                f"--load-size-pattern {args.load_size_pattern!r} is not a size pattern ({error}). "
+                "An orchestrator older than this peer sends the expanded token form here instead of the "
+                "pattern; the two sides have to agree, so bring them to the same rosotacom."
+            ) from error
     if getattr(args, "load_rate_hz", None) is not None:
         load["rate"] = float(args.load_rate_hz)
     if getattr(args, "load_streams", None) is not None:

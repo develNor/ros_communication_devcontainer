@@ -7178,9 +7178,27 @@ def _smoke_local_domain_id(cfg: dict[str, Any], receiver_peer_key: str) -> str |
     return str(session_gen._parse_optional_domain_id(domain_id, f"peer_settings.{receiver_peer_key}.domain_id"))
 
 
+#: The OTA Cyclone template that carries the local domain as well (#323). A
+#: session on it renders no local profile at all: its local-domain processes
+#: read the OTA file, so that is the file a smoke or probe publisher has to read.
+SCOPED_CYCLONE_OTA_TEMPLATE = "cyclonedds_scoped.xml"
+
+
 def _smoke_local_config_commands(config_container_dir: str, cfg: dict[str, Any], receiver_peer_key: str) -> list[str]:
-    local = _smoke_rmw_spec(cfg).local
+    """The DDS environment a publisher on the local domain needs to be heard.
+
+    It has to be the configuration the session's own local-domain processes use.
+    On CycloneDDS 11 two participants with different configurations on one host
+    and one domain discover and match each other and deliver nothing, so a
+    publisher on the inline default beside a session on the scoped file is heard
+    by its own `ros2 topic list` and by nothing in the session (#346).
+    """
+    spec = _smoke_rmw_spec(cfg)
+    local = spec.local
     if not local.dds_config:
+        if spec.ota.impl == "cyclone" and spec.ota.dds_config == SCOPED_CYCLONE_OTA_TEMPLATE:
+            scoped_file = f"{config_container_dir}/{receiver_peer_key}/ota_dds.xml"
+            return [f"export CYCLONEDDS_URI={shlex.quote(f'file://{scoped_file}')}"]
         return []
     config_file = f"{config_container_dir}/{receiver_peer_key}/local_dds.xml"
     if local.impl == "cyclone":

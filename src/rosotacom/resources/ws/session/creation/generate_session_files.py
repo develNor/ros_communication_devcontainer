@@ -255,6 +255,24 @@ _DDS_LOCAL_DEFAULT_CONFIG = {
 }
 
 
+def effective_local_rmw_impl(
+    local_impl: Optional[str], local_domain_id: Optional[int], ota_domain_id: Optional[int]
+) -> Optional[str]:
+    """The RMW a peer's local-domain processes run on.
+
+    The stock `domain_bridge` binary needs a deterministic DDS RMW, so a peer
+    that bridges its local domain into a separate OTA domain runs cyclone
+    locally unless the session names another. Whatever is started on that
+    domain beside the session has to be put on the same one: a probe publisher
+    that was given no `RMW_IMPLEMENTATION` ran on the image's default (Fast DDS
+    in the Lyrical image) next to a session on cyclone (#346).
+    """
+    bridged = local_domain_id is not None and ota_domain_id is not None and local_domain_id != ota_domain_id
+    if local_impl is None and bridged:
+        return "cyclone"
+    return local_impl
+
+
 def _validate_positive_seconds(value: str, ctx: str) -> None:
     text = value.strip().lower()
     match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(ms|s)?", text)
@@ -2276,12 +2294,7 @@ def func(
     def _build_local_rmw_items(peer: str) -> List[Tuple[str, Any]]:
         """Plugin.yaml block for local-side RMW (rmw_local + optional DDS config)."""
         side = rmw_spec.local
-        # Effective impl: the stock `domain_bridge` binary needs a
-        # deterministic DDS RMW. Fall back to cyclone when split-domain
-        # bridging is in play on this peer but the user didn't pin a local RMW.
-        effective_impl = side.impl
-        if effective_impl is None and _use_domain_bridge(peer):
-            effective_impl = "cyclone"
+        effective_impl = effective_local_rmw_impl(side.impl, peer_local_domain_id[peer], ota_domain_id)
         items: List[Tuple[str, Any]] = []
         if effective_impl is not None:
             items.append(("rmw_local", effective_impl))

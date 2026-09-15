@@ -7144,9 +7144,22 @@ def _smoke_rmw_spec(cfg: dict[str, Any]) -> Any:
     return session_gen._parse_rmw_block(shared.get("rmw"), list(peers.keys()))
 
 
-def _smoke_rmw_env_value(cfg: dict[str, Any]) -> str | None:
-    rmw_spec = _smoke_rmw_spec(cfg)
-    local_impl = rmw_spec.local.impl
+def _smoke_rmw_env_value(cfg: dict[str, Any], receiver_peer_key: str) -> str | None:
+    """The `RMW_IMPLEMENTATION` a publisher on this peer's local domain needs.
+
+    The one the session's own local processes run on, resolved by the rule the
+    generator applies rather than read off `shared.rmw.local`: a session that
+    names only its OTA side still runs cyclone on a bridged local domain, and a
+    publisher given nothing runs on the image's default instead (#346).
+    """
+    shared = cfg.get("shared", {}) or {}
+    shared = shared if isinstance(shared, dict) else {}
+    local_domain_id = _smoke_local_domain_id(cfg, receiver_peer_key)
+    local_impl = session_gen.effective_local_rmw_impl(
+        _smoke_rmw_spec(cfg).local.impl,
+        int(local_domain_id) if local_domain_id is not None else None,
+        session_gen._parse_optional_domain_id(shared.get("ota_domain_id"), "shared.ota_domain_id"),
+    )
     if local_impl is None:
         return None
     return str(session_gen.RMW_ALIASES.get(local_impl, local_impl))
@@ -7178,27 +7191,18 @@ def _smoke_local_domain_id(cfg: dict[str, Any], receiver_peer_key: str) -> str |
     return str(session_gen._parse_optional_domain_id(domain_id, f"peer_settings.{receiver_peer_key}.domain_id"))
 
 
-#: The OTA Cyclone template that carries the local domain as well (#323). A
-#: session on it renders no local profile at all: its local-domain processes
-#: read the OTA file, so that is the file a smoke or probe publisher has to read.
-SCOPED_CYCLONE_OTA_TEMPLATE = "cyclonedds_scoped.xml"
-
-
 def _smoke_local_config_commands(config_container_dir: str, cfg: dict[str, Any], receiver_peer_key: str) -> list[str]:
-    """The DDS environment a publisher on the local domain needs to be heard.
+    """The DDS profile a publisher on the local domain reads, when the session renders one.
 
-    It has to be the configuration the session's own local-domain processes use.
-    On CycloneDDS 11 two participants with different configurations on one host
-    and one domain discover and match each other and deliver nothing, so a
-    publisher on the inline default beside a session on the scoped file is heard
-    by its own `ros2 topic list` and by nothing in the session (#346).
+    A session that names no local profile renders none, whatever its OTA side
+    reads: on the scoped Cyclone arrangement the relay, the wrappers and the
+    observers export no `CYCLONEDDS_URI` either, and a publisher on the inline
+    default beside them delivers on CycloneDDS 11 once it is on their RMW
+    (measured under Lyrical, #346).
     """
     spec = _smoke_rmw_spec(cfg)
     local = spec.local
     if not local.dds_config:
-        if spec.ota.impl == "cyclone" and spec.ota.dds_config == SCOPED_CYCLONE_OTA_TEMPLATE:
-            scoped_file = f"{config_container_dir}/{receiver_peer_key}/ota_dds.xml"
-            return [f"export CYCLONEDDS_URI={shlex.quote(f'file://{scoped_file}')}"]
         return []
     config_file = f"{config_container_dir}/{receiver_peer_key}/local_dds.xml"
     if local.impl == "cyclone":
@@ -7219,7 +7223,7 @@ def _smoke_ros_setup(config_container_dir: str, cfg: dict[str, Any], receiver_pe
         "{ [ ! -f /opt/custom_ws/install/setup.bash ] || source /opt/custom_ws/install/setup.bash; }",
         "{ [ ! -f /ros2ws/install/setup.bash ] || source /ros2ws/install/setup.bash; }",
     ]
-    rmw_env = _smoke_rmw_env_value(cfg)
+    rmw_env = _smoke_rmw_env_value(cfg, receiver_peer_key)
     if rmw_env:
         commands.append(f"export RMW_IMPLEMENTATION={shlex.quote(rmw_env)}")
         if rmw_env == "rmw_fastrtps_cpp":

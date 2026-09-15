@@ -2645,7 +2645,7 @@ def test_smoke_ros_setup_keeps_explicit_cyclonedds_config() -> None:
     assert "MaxAutoParticipantIndex" not in setup
 
 
-def test_smoke_ros_setup_follows_a_scoped_cyclone_arrangement_onto_its_ota_file() -> None:
+def test_smoke_ros_setup_on_a_scoped_cyclone_arrangement_is_the_environment_measured_to_deliver() -> None:
     cfg = {
         "peers": {"a": {}, "b": {}},
         "peer_settings": {"a": {"domain_id": 50}, "b": {"domain_id": 51}},
@@ -2654,11 +2654,13 @@ def test_smoke_ros_setup_follows_a_scoped_cyclone_arrangement_onto_its_ota_file(
 
     setup = rosotacom._smoke_ros_setup("/config", cfg, "a")
 
-    # The session's local-domain processes read the scoped OTA file; a publisher
-    # on the inline default beside them is heard by nothing on CycloneDDS 11.
-    assert "export CYCLONEDDS_URI=file:///config/a/ota_dds.xml" in setup
-    assert "MaxAutoParticipantIndex" not in setup
+    # The session renders no local profile, so the publisher keeps the inline
+    # default; on cyclone beside the session that delivered 1486 of 1486 messages
+    # seat -> majestic under Lyrical (#346). The OTA file is not the local one.
+    assert "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" in setup
     assert "export ROS_DOMAIN_ID=50" in setup
+    assert "MaxAutoParticipantIndex>99<" in setup
+    assert "ota_dds.xml" not in setup
 
 
 def test_smoke_ros_setup_keeps_the_inline_default_beside_an_unscoped_ota_profile() -> None:
@@ -2672,6 +2674,27 @@ def test_smoke_ros_setup_keeps_the_inline_default_beside_an_unscoped_ota_profile
 
     assert "ota_dds.xml" not in setup
     assert "MaxAutoParticipantIndex>99<" in setup
+
+
+def test_smoke_ros_setup_puts_the_publisher_on_the_rmw_the_session_resolves_locally() -> None:
+    """A session that names only its OTA side still runs cyclone on a bridged local
+    domain. The publisher was given no RMW_IMPLEMENTATION there and ran on the
+    image's default beside it (#346)."""
+    scoped = {
+        "peers": {"a": {}, "b": {}},
+        "peer_settings": {"a": {"domain_id": 50}, "b": {"domain_id": 51}},
+        "shared": {"ota_domain_id": 52, "rmw": {"ota": {"cyclone": {"config": "cyclonedds_scoped.xml"}}}},
+    }
+    unbridged = {
+        "peers": {"a": {}, "b": {}},
+        "shared": {"rmw": {"ota": "cyclone"}},
+    }
+
+    for peer in ("a", "b"):
+        assert "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" in rosotacom._smoke_ros_setup("/config", scoped, peer)
+    # Without a bridge the generator renders no local RMW either, so there is
+    # nothing to match and the publisher keeps the image's default.
+    assert "RMW_IMPLEMENTATION" not in rosotacom._smoke_ros_setup("/config", unbridged, "a")
 
 
 def test_smoke_publish_specs_use_source_target_prefix_and_qos() -> None:
